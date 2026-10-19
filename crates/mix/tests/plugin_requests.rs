@@ -142,3 +142,48 @@ fn the_latency_after_a_clap_restart_reaches_delay_compensation() {
     let tail: Vec<&str> = log.iter().map(String::as_str).skip_while(|c| *c != "stop_processing").collect();
     assert_eq!(&tail[..4], ["stop_processing", "deactivate", "activate", "latency.changed"], "{log:?}");
 }
+
+/// Review R1: the block the effect is parked for a restart is not its dry input (+12 dB here,
+/// and early by its latency): the mixer gets silence faded from the effect's last output, and
+/// delay compensation keeps the latency the slot reports until the restart is done.
+#[test]
+fn a_parked_clap_effect_is_silent_not_dry_and_keeps_its_compensation() {
+    let mut s = session();
+    let t = s.tracks[0].id;
+    let src = soundcraft_model::SourceId(77);
+    let dc = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 96_000]; 2] };
+    s.pool.insert(src, std::sync::Arc::new(soundcraft_model::SourceAudio::new(dc)));
+    let clip = s.new_clip_id();
+    let tr = s.track_mut(t).unwrap();
+    tr.playlist_mut().unwrap().clips.push(soundcraft_model::Clip::audio(clip, "dc", src, 0, 0, 96_000));
+    tr.mixer.inserts[0].as_mut().unwrap().params.insert("7".into(), 0.25);
+    // At its 9th block (on the audio thread) the plug-in asks for a restart, keeping 5 samples.
+    let (mut eng, _reader) = engine(&s, b"CMD:restart-at:9:5");
+    let mut out = vec![vec![0.0f32; BLOCK]; 2];
+    let mut pos = 0i64;
+    let mut block = |eng: &mut MixEngine| {
+        eng.render(&s, pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        out[0].clone()
+    };
+    let mut wet = Vec::new();
+    for _ in 0..9 {
+        wet = block(&mut eng);
+    }
+    let level = wet[BLOCK - 1];
+    assert!(level > 0.0 && wet.iter().all(|x| (x - level).abs() < 1e-6), "steady wet level {level}");
+    assert_eq!(eng.latency, 5);
+    assert_eq!(soundcraft_clap_host::service_requests().restarts_waiting, 1, "parks on the next block");
+    let parked = block(&mut eng);
+    let fade = 96; // 2 ms at 48 kHz
+    for (i, &x) in parked.iter().enumerate() {
+        let want = if i < fade { level * (1.0 - i as f32 / fade as f32) } else { 0.0 };
+        assert!((x - want).abs() < 1e-5, "sample {i}: {x}, want {want} (wet {level}; the dry input is 4x that)");
+    }
+    assert_eq!(eng.latency, 5, "compensation unchanged while parked");
+    assert_eq!(soundcraft_clap_host::service_requests().restarted, 1);
+    let back = block(&mut eng);
+    assert!(back[0].abs() < 1e-6 && (back[BLOCK - 1] - level).abs() < 1e-5, "fades back in to the wet level");
+    assert!(back.iter().all(|&x| x <= level + 1e-6), "no level jump");
+    assert_eq!(eng.latency, 5);
+}
