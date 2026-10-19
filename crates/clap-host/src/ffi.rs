@@ -14,10 +14,11 @@ use crate::{ClapError, scan};
 use clap_sys::audio_buffer::clap_audio_buffer;
 use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::{
-    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE, CLAP_EVENT_TRANSPORT,
-    CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE, CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE,
-    CLAP_TRANSPORT_IS_PLAYING, CLAP_TRANSPORT_IS_RECORDING, clap_event_header, clap_event_midi, clap_event_note, clap_event_param_value,
-    clap_event_transport, clap_input_events, clap_output_events,
+    CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_MIDI, CLAP_EVENT_NOTE_EXPRESSION, CLAP_EVENT_NOTE_OFF, CLAP_EVENT_NOTE_ON, CLAP_EVENT_PARAM_VALUE,
+    CLAP_EVENT_TRANSPORT, CLAP_NOTE_EXPRESSION_PRESSURE, CLAP_TRANSPORT_HAS_BEATS_TIMELINE, CLAP_TRANSPORT_HAS_SECONDS_TIMELINE,
+    CLAP_TRANSPORT_HAS_TEMPO, CLAP_TRANSPORT_HAS_TIME_SIGNATURE, CLAP_TRANSPORT_IS_PLAYING, CLAP_TRANSPORT_IS_RECORDING, clap_event_header,
+    clap_event_midi, clap_event_note, clap_event_note_expression, clap_event_param_value, clap_event_transport, clap_input_events,
+    clap_output_events,
 };
 use clap_sys::ext::audio_ports::{CLAP_AUDIO_PORT_IS_MAIN, CLAP_EXT_AUDIO_PORTS, clap_audio_port_info, clap_plugin_audio_ports};
 use clap_sys::ext::gui::{CLAP_EXT_GUI, clap_host_gui, clap_plugin_gui, clap_window, clap_window_handle};
@@ -56,6 +57,9 @@ pub(crate) const MAX_PORT_CHANNELS: u32 = 64;
 const MAX_FEATURES: usize = 64;
 /// Capacity of the per-block event list (preallocated: `process` never allocates).
 pub(crate) const EVENT_CAP: usize = 1024;
+/// Event entries kept for releases (F10): one per note and pedal the mix holds open (224 + 32),
+/// plus one reset. Other events are refused once only these remain.
+pub(crate) const RELEASE_RESERVE: usize = 257;
 /// Largest plugin state we accept from `clap_plugin_state.save` (hostile-input cap).
 pub(crate) const MAX_STATE_BYTES: usize = 64 << 20;
 /// Most editor parameter edits buffered between two UI frames.
@@ -516,6 +520,8 @@ unsafe extern "C" fn host_get_extension(_host: *const clap_host, id: *const c_ch
 // ---- events --------------------------------------------------------------------------------
 
 /// A host → plugin event, safe to build anywhere; converted to CLAP structs inside `process`.
+/// Notes carry their MIDI channel (0..=15) and the host's voice id (`-1`: none) as CLAP's
+/// `channel` and `note_id`, on note port 0.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Event {
     Param {
@@ -527,10 +533,23 @@ pub(crate) enum Event {
         time: u32,
         key: u8,
         velocity: f64,
+        channel: u8,
+        id: i32,
     },
     NoteOff {
         time: u32,
         key: u8,
+        velocity: f64,
+        channel: u8,
+        id: i32,
+    },
+    /// Poly pressure as a pressure note expression (0..1).
+    Pressure {
+        time: u32,
+        key: u8,
+        value: f64,
+        channel: u8,
+        id: i32,
     },
     /// A raw MIDI 1.0 message (for plugins whose note port speaks only MIDI).
     Midi {
@@ -542,12 +561,20 @@ pub(crate) enum Event {
 impl Event {
     pub fn time(&self) -> u32 {
         match *self {
-            Event::Param { time, .. } | Event::NoteOn { time, .. } | Event::NoteOff { time, .. } | Event::Midi { time, .. } => time,
+            Event::Param { time, .. }
+            | Event::NoteOn { time, .. }
+            | Event::NoteOff { time, .. }
+            | Event::Pressure { time, .. }
+            | Event::Midi { time, .. } => time,
         }
     }
     pub fn set_time(&mut self, t: u32) {
         match self {
-            Event::Param { time, .. } | Event::NoteOn { time, .. } | Event::NoteOff { time, .. } | Event::Midi { time, .. } => *time = t,
+            Event::Param { time, .. }
+            | Event::NoteOn { time, .. }
+            | Event::NoteOff { time, .. }
+            | Event::Pressure { time, .. }
+            | Event::Midi { time, .. } => *time = t,
         }
     }
 }
@@ -555,6 +582,7 @@ impl Event {
 #[derive(Clone, Copy)]
 enum RawEvent {
     Note(clap_event_note),
+    Expression(clap_event_note_expression),
     Param(clap_event_param_value),
     Midi(clap_event_midi),
 }
@@ -565,6 +593,7 @@ impl RawEvent {
         // a pointer to the whole event, as CLAP expects.
         match self {
             RawEvent::Note(e) => &e.header,
+            RawEvent::Expression(e) => &e.header,
             RawEvent::Param(e) => &e.header,
             RawEvent::Midi(e) => &e.header,
         }
@@ -589,21 +618,30 @@ impl RawEvent {
                 key: -1,
                 value,
             }),
-            Event::NoteOn { time, key, velocity } => RawEvent::Note(clap_event_note {
+            Event::NoteOn { time, key, velocity, channel, id } => RawEvent::Note(clap_event_note {
                 header: header(size_of::<clap_event_note>(), CLAP_EVENT_NOTE_ON, time),
-                note_id: -1,
+                note_id: id,
                 port_index: 0,
-                channel: 0,
+                channel: i16::from(channel & 0x0F),
                 key: i16::from(key),
                 velocity,
             }),
-            Event::NoteOff { time, key } => RawEvent::Note(clap_event_note {
+            Event::NoteOff { time, key, velocity, channel, id } => RawEvent::Note(clap_event_note {
                 header: header(size_of::<clap_event_note>(), CLAP_EVENT_NOTE_OFF, time),
-                note_id: -1,
+                note_id: id,
                 port_index: 0,
-                channel: 0,
+                channel: i16::from(channel & 0x0F),
                 key: i16::from(key),
-                velocity: 0.0,
+                velocity,
+            }),
+            Event::Pressure { time, key, value, channel, id } => RawEvent::Expression(clap_event_note_expression {
+                header: header(size_of::<clap_event_note_expression>(), CLAP_EVENT_NOTE_EXPRESSION, time),
+                expression_id: CLAP_NOTE_EXPRESSION_PRESSURE,
+                note_id: id,
+                port_index: 0,
+                channel: i16::from(channel & 0x0F),
+                key: i16::from(key),
+                value,
             }),
             Event::Midi { time, data } => {
                 RawEvent::Midi(clap_event_midi { header: header(size_of::<clap_event_midi>(), CLAP_EVENT_MIDI, time), port_index: 0, data })

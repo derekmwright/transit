@@ -40,11 +40,12 @@
 //! editor handle's `idle`, only on the thread that created the instance (CLAP creates plug-ins
 //! on the main thread); other threads leave the requests alone.
 
-use crate::ffi::{EVENT_CAP, Event, GuiLink, HostState, Instance, NotePort, PortBuffers};
+use crate::ffi::{EVENT_CAP, Event, GuiLink, HostState, Instance, NotePort, PortBuffers, RELEASE_RESERVE};
 use crate::gate::{Gate, MAX_CHANNELS};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
 use clap_sys::ext::params::{CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES};
 use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL, clap_process_status};
+use soundcraft_dsp::event::{Message, NoteId, PluginEvent};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
@@ -386,12 +387,14 @@ pub struct ClapPlugin {
     /// CLAP id of each `info.params` entry (same order).
     ids: Vec<u32>,
     values: Vec<f32>,
-    /// Pending events, kept sorted by time (stable for equal times). Never grows past `EVENT_CAP`.
+    /// Pending events, kept sorted by time (stable for equal times). Never grows past `EVENT_CAP`;
+    /// the last `RELEASE_RESERVE` entries only take releases.
     queue: Vec<Event>,
     notes: NoteMode,
     /// The note port takes raw MIDI (controllers, pitch bend, program changes).
     midi_in: bool,
-    held: [bool; 128],
+    /// Keys held per MIDI channel, for `all_notes_off` and `reset`.
+    held: [[bool; 128]; 16],
     channels: usize,
     steady: i64,
     transport: Option<Transport>,
@@ -449,7 +452,7 @@ impl ClapPlugin {
             queue: Vec::with_capacity(EVENT_CAP),
             notes: NoteMode::None,
             midi_in: false,
-            held: [false; 128],
+            held: [[false; 128]; 16],
             channels: 2,
             steady: 0,
             transport: None,
@@ -476,14 +479,55 @@ impl ClapPlugin {
         self.shared.processed_gen.store(self.shared.host_gen.load(Ordering::Acquire), Ordering::Release);
     }
 
-    /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
-    /// allocates on the audio thread).
-    fn push(&mut self, e: Event) {
-        if self.queue.len() >= self.queue.capacity() {
-            return;
+    /// Inserts keeping the queue time-sorted (after events at the same time). Refuses it when the
+    /// queue is full, or for a non-release when only the release reserve is left. Never allocates
+    /// on the audio thread.
+    fn push(&mut self, e: Event, release: bool) -> bool {
+        let room = if release { self.queue.capacity() } else { self.queue.capacity().saturating_sub(RELEASE_RESERVE) };
+        if self.queue.len() >= room {
+            return false;
         }
         let pos = self.queue.iter().rposition(|q| q.time() <= e.time()).map_or(0, |i| i + 1);
         self.queue.insert(pos, e);
+        true
+    }
+
+    /// An event as MIDI 1.0 bytes on `channel` (two messages for a 14-bit controller).
+    fn push_midi(&mut self, time: u32, channel: u8, ev: &PluginEvent, release: bool) -> bool {
+        let mut ok = true;
+        for data in ev.message.midi1(channel).into_iter().flatten() {
+            ok &= self.push(Event::Midi { time, data }, release);
+        }
+        ok
+    }
+
+    /// Queues a parameter value at `time`, replacing one queued for the same parameter and time.
+    fn param_at(&mut self, time: u32, cid: u32, value: f64) -> bool {
+        if let Some(Event::Param { value: v, .. }) =
+            self.queue.iter_mut().find(|e| matches!(e, Event::Param { id, time: t, .. } if *id == cid && *t == time))
+        {
+            *v = value;
+            true
+        } else {
+            self.push(Event::Param { time, id: cid, value }, false)
+        }
+    }
+
+    /// The host-set value of parameter `id`, clamped and noted: (CLAP id, value).
+    fn host_value(&mut self, id: &str, value: f32) -> Option<(u32, f64)> {
+        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let (Some(pi), Some(&cid)) = (self.info.params.get(i), self.ids.get(i)) else { return None };
+        let v = pi.clamp(value);
+        if let Some(slot) = self.values.get_mut(i) {
+            *slot = v;
+        }
+        if let Some(view) = self.shared.view.get(i) {
+            view.store(f64::from(v).to_bits(), Ordering::Relaxed);
+        }
+        if let Some(at) = self.shared.set_at.get(i) {
+            at.store(self.shared.host_gen.fetch_add(1, Ordering::AcqRel) + 1, Ordering::Release);
+        }
+        Some((cid, f64::from(v)))
     }
 }
 
@@ -577,25 +621,16 @@ impl Plugin for ClapPlugin {
     }
 
     fn set_param(&mut self, id: &str, value: f32) -> bool {
-        let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return false };
-        let (Some(pi), Some(&cid)) = (self.info.params.get(i), self.ids.get(i)) else { return false };
-        let v = pi.clamp(value);
-        if let Some(slot) = self.values.get_mut(i) {
-            *slot = v;
-        }
-        if let Some(view) = self.shared.view.get(i) {
-            view.store(f64::from(v).to_bits(), Ordering::Relaxed);
-        }
-        if let Some(at) = self.shared.set_at.get(i) {
-            at.store(self.shared.host_gen.fetch_add(1, Ordering::AcqRel) + 1, Ordering::Release);
-        }
-        // Coalesce with a pending change of the same parameter.
-        if let Some(Event::Param { value, .. }) = self.queue.iter_mut().find(|e| matches!(e, Event::Param { id, .. } if *id == cid)) {
-            *value = f64::from(v);
-        } else {
-            self.push(Event::Param { time: 0, id: cid, value: f64::from(v) });
-        }
+        let Some((cid, v)) = self.host_value(id, value) else { return false };
+        // Coalesce with a pending change of the same parameter at the block start.
+        self.param_at(0, cid, v);
         true
+    }
+
+    /// One `Event::Param` per offset: points of one parameter coalesce only at an equal time.
+    fn set_param_at(&mut self, offset: u32, id: &str, value: f32) -> bool {
+        let Some((cid, v)) = self.host_value(id, value) else { return false };
+        self.param_at(offset, cid, v)
     }
 
     fn param(&self, id: &str) -> Option<f32> {
@@ -734,46 +769,75 @@ impl Plugin for ClapPlugin {
     }
 
     fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
-        if note > 127 {
-            return;
-        }
-        let time = u32::try_from(offset).unwrap_or(u32::MAX);
-        let vel = velocity.min(127);
-        match self.notes {
-            NoteMode::Clap => self.push(Event::NoteOn { time, key: note, velocity: f64::from(vel) / 127.0 }),
-            NoteMode::Midi => self.push(Event::Midi { time, data: [0x90, note, vel] }),
-            NoteMode::None => return,
-        }
-        if let Some(h) = self.held.get_mut(note as usize) {
-            *h = true;
-        }
+        let message = Message::NoteOn { key: note, velocity, id: NoteId::NONE };
+        self.event(u32::try_from(offset).unwrap_or(u32::MAX), &PluginEvent { channel: 0, note_id: PluginEvent::NO_ID, message });
     }
 
     fn note_off(&mut self, offset: usize, note: u8) {
-        if note > 127 {
-            return;
-        }
-        let time = u32::try_from(offset).unwrap_or(u32::MAX);
-        match self.notes {
-            NoteMode::Clap => self.push(Event::NoteOff { time, key: note }),
-            NoteMode::Midi => self.push(Event::Midi { time, data: [0x80, note, 0] }),
-            NoteMode::None => return,
-        }
-        if let Some(h) = self.held.get_mut(note as usize) {
-            *h = false;
-        }
+        let message = Message::NoteOff { key: note, velocity: 0, id: NoteId::NONE };
+        self.event(u32::try_from(offset).unwrap_or(u32::MAX), &PluginEvent { channel: 0, note_id: PluginEvent::NO_ID, message });
     }
 
     fn midi(&mut self, offset: usize, msg: [u8; 3]) {
         if self.midi_in {
-            self.push(Event::Midi { time: u32::try_from(offset).unwrap_or(u32::MAX), data: msg });
+            self.push(Event::Midi { time: u32::try_from(offset).unwrap_or(u32::MAX), data: msg }, midi_is_release(msg));
+        }
+    }
+
+    /// CLAP-dialect ports get note events (with channel and `note_id`) and poly pressure as a
+    /// pressure note expression; MIDI-dialect ports get the bytes with the channel nibble.
+    /// Controllers, bend, channel pressure and programs need a port that takes MIDI. Releases
+    /// may use the reserved entries.
+    fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        let ch = ev.channel & 0x0F;
+        let release = ev.is_release();
+        let unit = |v: u8| f64::from(v.min(127)) / 127.0;
+        let held = |me: &mut Self, key: u8, on: bool| {
+            if let Some(h) = me.held.get_mut(usize::from(ch)).and_then(|h| h.get_mut(usize::from(key))) {
+                *h = on;
+            }
+        };
+        match (ev.message, self.notes) {
+            (Message::NoteOn { key, .. } | Message::NoteOff { key, .. } | Message::PolyPressure { key, .. }, _) if key > 127 => true,
+            (_, NoteMode::None) if !self.midi_in => true,
+            (Message::NoteOn { key, velocity, .. }, NoteMode::Clap) => {
+                let ok = self.push(Event::NoteOn { time: offset, key, velocity: unit(velocity), channel: ch, id: ev.note_id }, release);
+                if ok {
+                    held(self, key, true);
+                }
+                ok
+            }
+            (Message::NoteOff { key, velocity, .. }, NoteMode::Clap) => {
+                held(self, key, false);
+                self.push(Event::NoteOff { time: offset, key, velocity: unit(velocity), channel: ch, id: ev.note_id }, release)
+            }
+            (Message::PolyPressure { key, value, .. }, NoteMode::Clap) => {
+                self.push(Event::Pressure { time: offset, key, value: unit(value), channel: ch, id: ev.note_id }, release)
+            }
+            (Message::NoteOn { key, .. }, NoteMode::Midi) => {
+                let ok = self.push_midi(offset, ch, ev, release);
+                if ok {
+                    held(self, key, true);
+                }
+                ok
+            }
+            (Message::NoteOff { key, .. }, NoteMode::Midi) => {
+                held(self, key, false);
+                self.push_midi(offset, ch, ev, release)
+            }
+            (Message::NoteOn { .. } | Message::NoteOff { .. }, NoteMode::None) => true,
+            _ if self.midi_in => self.push_midi(offset, ch, ev, release),
+            _ => true,
         }
     }
 
     fn all_notes_off(&mut self) {
-        for k in 0..128u8 {
-            if self.held.get(k as usize).copied().unwrap_or(false) {
-                self.note_off(0, k);
+        for ch in 0..16u8 {
+            for key in 0..128u8 {
+                if self.held.get(usize::from(ch)).and_then(|h| h.get(usize::from(key))).copied().unwrap_or(false) {
+                    let message = Message::NoteOff { key, velocity: 0, id: NoteId::NONE };
+                    self.event(0, &PluginEvent { channel: ch, note_id: PluginEvent::NO_ID, message });
+                }
             }
         }
     }
@@ -858,20 +922,33 @@ impl PluginEditor for ClapEditor {
 /// drop the rest. Each held key gets an off at time 0 (a CLAP note-off, or a MIDI 0x80 message for
 /// MIDI-only ports) and any off already queued survives, so a note that was sounding when the
 /// transport stopped is still released on the next block.
-fn keep_releases_on_reset(queue: &mut Vec<Event>, held: &mut [bool; 128], notes: NoteMode) {
+fn keep_releases_on_reset(queue: &mut Vec<Event>, held: &mut [[bool; 128]; 16], notes: NoteMode) {
     queue.retain(|e| match e {
         Event::Param { .. } | Event::NoteOff { .. } => true,
         Event::Midi { data, .. } => data[0] & 0xF0 == 0x80,
-        Event::NoteOn { .. } => false,
+        Event::NoteOn { .. } | Event::Pressure { .. } => false,
     });
-    for (key, h) in (0u8..).zip(held.iter_mut()) {
-        if std::mem::take(h) && queue.len() < queue.capacity() {
-            let off = match notes {
-                NoteMode::Midi => Event::Midi { time: 0, data: [0x80, key, 0] },
-                NoteMode::Clap | NoteMode::None => Event::NoteOff { time: 0, key },
-            };
-            queue.insert(0, off);
+    for (channel, keys) in (0u8..).zip(held.iter_mut()) {
+        for (key, h) in (0u8..).zip(keys.iter_mut()) {
+            if std::mem::take(h) && queue.len() < queue.capacity() {
+                let off = match notes {
+                    NoteMode::Midi => Event::Midi { time: 0, data: [0x80 | channel, key, 0] },
+                    NoteMode::Clap | NoteMode::None => Event::NoteOff { time: 0, key, velocity: 0.0, channel, id: -1 },
+                };
+                queue.insert(0, off);
+            }
         }
+    }
+}
+
+/// The release class of a raw MIDI 1.0 message (see `Message::is_release`).
+fn midi_is_release(msg: [u8; 3]) -> bool {
+    let [status, d1, d2] = msg;
+    match status & 0xF0 {
+        0x80 => true,
+        0x90 => d2 == 0,
+        0xB0 => Message::Control { cc: d1 & 0x7F, value: d2 & 0x7F }.is_release(),
+        _ => false,
     }
 }
 
@@ -920,11 +997,11 @@ mod tests {
     #[test]
     fn reset_keeps_the_releases_it_owes() {
         let mut queue = Vec::with_capacity(EVENT_CAP);
-        queue.push(Event::NoteOn { time: 3, key: 72, velocity: 1.0 });
-        queue.push(Event::NoteOff { time: 5, key: 67 });
-        let mut held = [false; 128];
-        held[60] = true;
-        held[64] = true;
+        queue.push(Event::NoteOn { time: 3, key: 72, velocity: 1.0, channel: 0, id: -1 });
+        queue.push(Event::NoteOff { time: 5, key: 67, velocity: 0.0, channel: 0, id: -1 });
+        let mut held = [[false; 128]; 16];
+        held[0][60] = true;
+        held[0][64] = true;
         keep_releases_on_reset(&mut queue, &mut held, NoteMode::Clap);
         let mut keys: Vec<u8> = queue
             .iter()
@@ -935,13 +1012,13 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, [60, 64, 67], "reset must queue an off for every held or already-released key");
-        assert!(held.iter().all(|h| !h), "reset must clear held");
+        assert!(held.iter().flatten().all(|h| !h), "reset must clear held");
 
         // A MIDI-only port gets 0x80 messages for the held keys instead.
         let mut queue = Vec::with_capacity(EVENT_CAP);
-        let mut held = [false; 128];
-        held[60] = true;
-        held[64] = true;
+        let mut held = [[false; 128]; 16];
+        held[0][60] = true;
+        held[0][64] = true;
         keep_releases_on_reset(&mut queue, &mut held, NoteMode::Midi);
         let mut msgs: Vec<[u8; 3]> = queue
             .iter()
@@ -952,6 +1029,6 @@ mod tests {
             .collect();
         msgs.sort_unstable();
         assert_eq!(msgs, [[0x80, 60, 0], [0x80, 64, 0]]);
-        assert!(held.iter().all(|h| !h), "reset must clear held");
+        assert!(held.iter().flatten().all(|h| !h), "reset must clear held");
     }
 }
