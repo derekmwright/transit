@@ -15,4 +15,8 @@ path = "src/lib.rs"
 [dependencies]
 clap-sys = "0.5"
 
+[features]
+# Builds a binary that lists only the requests plug-in (see src/lib.rs).
+requests = []
+
 [workspace]

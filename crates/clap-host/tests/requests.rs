@@ -87,7 +87,7 @@ fn mixer_block(p: &mut Box<dyn Plugin>) -> bool {
 /// A requests fixture created and prepared on this thread, its state reader, and how many log
 /// entries the set-up wrote (all on this thread: creation and `prepare` are main-thread work).
 fn new_requests() -> (Box<dyn Plugin>, Box<dyn PluginStateReader>, usize) {
-    common::fixture_dir();
+    common::requests_fixture_dir();
     let mut p = soundcraft_clap_host::create(REQUESTS).expect("requests fixture");
     p.prepare(48_000.0, BLOCK, 2);
     assert!(p.editor().is_none(), "the requests fixture has no editor");

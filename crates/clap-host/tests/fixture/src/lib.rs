@@ -10,7 +10,8 @@
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
 //! reported as an output parameter event by the next `process`.
 //!
-//! - `org.soundcraft.test.requests`: a stereo gain effect (params as the gain plugin, latency 5,
+//! - `org.soundcraft.test.requests` (only in the build with the `requests` feature, which lists
+//!   nothing else): a stereo gain effect (params as the gain plugin, latency 5,
 //!   no GUI) that sleeps (`CLAP_PROCESS_SLEEP`) after every block and exercises the host requests
 //!   (audit F08, ADR 0012 G7). It logs every lifecycle call with a token of the calling thread.
 //!   Commands arrive as a "state" to load, `CMD:<command>` (see `requests_command`); its saved
@@ -689,17 +690,20 @@ unsafe extern "C" fn on_main_thread(p: *const clap_plugin) {
 
 // ---- factory + entry ----
 
+/// The plug-ins this binary lists: the gain and the synth, or (feature `requests`) only the
+/// requests plug-in, built as a binary of its own so that tests counting the default fixture's
+/// plug-ins (here and in other crates) are unaffected.
+#[cfg(not(feature = "requests"))]
+static DESCS: [&clap_plugin_descriptor; 2] = [&GAIN_DESC, &SYNTH_DESC];
+#[cfg(feature = "requests")]
+static DESCS: [&clap_plugin_descriptor; 1] = [&REQUESTS_DESC];
+
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
-    3
+    DESCS.len() as u32
 }
 
 unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *const clap_plugin_descriptor {
-    match i {
-        0 => &GAIN_DESC,
-        1 => &SYNTH_DESC,
-        2 => &REQUESTS_DESC,
-        _ => std::ptr::null(),
-    }
+    DESCS.get(i as usize).map_or(std::ptr::null(), |d| *d as *const _)
 }
 
 unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const clap_host, id: *const c_char) -> *const clap_plugin {

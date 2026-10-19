@@ -2,8 +2,9 @@
 //! is processed again when it asks (`request_process`), with no audio and no editor, and the
 //! latency it reports after a restart reaches delay compensation.
 //!
-//! Uses soundcraft-clap-host's fixture plug-ins (built from `crates/clap-host/tests/fixture`); the
-//! requests plug-in reports its lifecycle log as its "state" (see that crate's `tests/requests.rs`).
+//! Uses soundcraft-clap-host's fixture built with its `requests` feature (from
+//! `crates/clap-host/tests/fixture`); the requests plug-in reports its lifecycle log as its
+//! "state" (see that crate's `tests/requests.rs`).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_dsp::PluginStateReader;
@@ -17,16 +18,17 @@ use std::time::{Duration, Instant};
 const REQUESTS: &str = "clap:org.soundcraft.test.requests";
 const BLOCK: usize = 512;
 
-/// Builds the CLAP fixture once and adds its folder to the CLAP search path.
+/// Builds the CLAP fixture's requests plug-in once and adds its folder to the CLAP search path.
 fn fixture() {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../clap-host/tests/fixture/Cargo.toml");
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clap-fixture-target");
+        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("clap-requests-fixture-target");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let st = Command::new(cargo)
             .args(["build", "--quiet", "--manifest-path"])
             .arg(&manifest)
+            .args(["--features", "requests"])
             .arg("--target-dir")
             .arg(&target)
             .env_remove("RUSTFLAGS")
@@ -40,17 +42,17 @@ fn fixture() {
         } else {
             "libclap_fixture.so"
         };
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mix-clap-fixture-{}", std::process::id()));
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mix-clap-requests-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         if cfg!(target_os = "macos") {
-            let exe = dir.join("Fixture.clap/Contents/MacOS");
+            let exe = dir.join("Requests.clap/Contents/MacOS");
             std::fs::create_dir_all(&exe).unwrap();
-            std::fs::copy(target.join("debug").join(lib), exe.join("Fixture")).unwrap();
+            std::fs::copy(target.join("debug").join(lib), exe.join("Requests")).unwrap();
         } else {
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::copy(target.join("debug").join(lib), dir.join("Fixture.clap")).unwrap();
+            std::fs::copy(target.join("debug").join(lib), dir.join("Requests.clap")).unwrap();
         }
-        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 3);
+        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 1);
         dir
     });
 }
