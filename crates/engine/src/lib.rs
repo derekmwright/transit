@@ -162,6 +162,15 @@ pub struct Engine {
     pub imports: import::Imports,
 }
 
+/// Logs the routing loops a document holds as it is opened (an older file: the mix renders it
+/// with each loop's feedback edge dropped). Control side only, never the audio thread.
+fn log_route_loops(s: &Session) {
+    let g = s.route_graph();
+    for l in g.layering().loops {
+        log::warn!("session `{}`: routing loop {}; it plays without its feedback edge", s.name, l.describe(s));
+    }
+}
+
 impl Default for Engine {
     fn default() -> Self {
         Engine::new(Session::default())
@@ -171,6 +180,7 @@ impl Default for Engine {
 impl Engine {
     pub fn new(session: Session) -> Self {
         install_panic_hook();
+        log_route_loops(&session);
         let doc = Arc::new(session);
         Engine {
             saved: Arc::clone(&doc),
@@ -221,6 +231,7 @@ impl Engine {
 
     /// Replace the whole document (open / new); clears history.
     pub fn replace_session(&mut self, s: Session) {
+        log_route_loops(&s);
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
         self.transport_requests.clear();
         self.transport_requests.push(TransportRequest::ResetSession);
@@ -383,9 +394,25 @@ impl Engine {
             return self.execute_view(spec, params);
         }
         let before = Arc::clone(&self.doc);
+        let saved = Arc::clone(&self.saved);
         let rev = self.revision;
         let dirty = self.dirty;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, params)));
+        // L22: no edit may close a routing loop, whichever command makes it (folder moves, track
+        // deletes that promote members, presets, imported session data, ...). Opening a document
+        // (it replaces the saved one too) may hold one: the mix breaks it and it was logged.
+        let result = match result {
+            Ok(Ok(v)) if !Arc::ptr_eq(&before, &self.doc) && Arc::ptr_eq(&saved, &self.saved) => {
+                match soundcraft_model::new_cycle(&before, &self.doc) {
+                    Some(path) => Ok(Err(cmd::bad(
+                        id,
+                        format!("that route would create a routing loop: {}", soundcraft_model::describe_cycle(&self.doc, &path)),
+                    ))),
+                    None => Ok(Ok(v)),
+                }
+            }
+            other => other,
+        };
         let result = match result {
             Ok(r) => r,
             Err(p) => {

@@ -142,3 +142,121 @@ fn a_refused_command_after_other_edits_keeps_undo_and_redo() {
     assert_eq!(e.undo_history(), history);
     assert!(e.can_redo(), "a refused command does not clear redo");
 }
+
+// ---- Commands beyond the three routing commands (refutation review of L22) ----
+
+fn id(v: &serde_json::Value) -> u64 {
+    v["tracks"][0].as_u64().unwrap()
+}
+
+fn aux(e: &mut Engine, n: &str) -> u64 {
+    let v = e.execute("track.new", &json!({"kind": "aux", "name": n})).unwrap();
+    e.execute("track.input", &json!({"tracks": [n], "input": format!("{n} In")})).unwrap();
+    id(&v)
+}
+
+fn folder(e: &mut Engine, n: &str) -> u64 {
+    id(&e.execute("track.new", &json!({"kind": "folder", "name": n})).unwrap())
+}
+
+fn acyclic(e: &Engine) {
+    let s = e.session();
+    assert!(s.route_graph().find_cycle().is_none(), "loop in the session: {:?}", s.route_graph().find_cycle().map(|c| c.describe(s)));
+}
+
+#[test]
+fn move_to_folder_refuses_a_loop() {
+    let mut e = Engine::default();
+    let x = aux(&mut e, "X");
+    let f = folder(&mut e, "F");
+    e.execute("track.output", &json!({"tracks": [f], "output": "X In"})).unwrap();
+    refused(&mut e, "track.move_to_folder", json!({"tracks": [x], "folder": f}), "X → F → X");
+    acyclic(&e);
+}
+
+/// X in F in P; F to main, P into X's input.
+fn nested(e: &mut Engine) -> (u64, u64, u64) {
+    let x = aux(e, "X");
+    let p = folder(e, "P");
+    let f = folder(e, "F");
+    e.execute("track.move_to_folder", &json!({"tracks": [f], "folder": p})).unwrap();
+    e.execute("track.move_to_folder", &json!({"tracks": [x], "folder": f})).unwrap();
+    e.execute("track.output", &json!({"tracks": [f], "output": "main"})).unwrap();
+    e.execute("track.output", &json!({"tracks": [p], "output": "X In"})).unwrap();
+    acyclic(e);
+    (x, p, f)
+}
+
+#[test]
+fn remove_from_folder_refuses_a_loop() {
+    let mut e = Engine::default();
+    let (x, _, _) = nested(&mut e);
+    refused(&mut e, "track.remove_from_folder", json!({"tracks": [x]}), "X → P → X");
+    acyclic(&e);
+}
+
+#[test]
+fn deleting_a_folder_that_promotes_a_member_into_a_loop_is_refused() {
+    let mut e = Engine::default();
+    let (_, _, f) = nested(&mut e);
+    let tracks = e.session().tracks.len();
+    refused(&mut e, "track.delete", json!({"tracks": [f]}), "X → P → X");
+    assert_eq!(e.session().tracks.len(), tracks, "nothing deleted");
+    acyclic(&e);
+}
+
+#[test]
+fn loading_a_preset_with_a_send_into_the_own_input_is_refused() {
+    let dir = std::env::temp_dir().join(format!("route-cycles-preset-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.json");
+    let mut e = Engine::default();
+    let a = aux(&mut e, "A");
+    let b = aux(&mut e, "B");
+    e.execute("mix.send", &json!({"track": b, "slot": 0, "bus": "A In"})).unwrap();
+    e.execute("track.save_preset", &json!({"path": path.to_string_lossy(), "track": b, "tracks": [b]})).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refused(&mut e, "track.load_preset", json!({"path": path.to_string_lossy(), "tracks": [a]}), "A → A");
+    }));
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+    acyclic(&e);
+}
+
+#[test]
+fn importing_session_data_that_closes_a_loop_is_refused() {
+    let dir = std::env::temp_dir().join(format!("route-cycles-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("other.json");
+    let mut other = Engine::default();
+    aux(&mut other, "Q");
+    other.execute("track.output", &json!({"tracks": ["Q"], "output": "R In"})).unwrap();
+    std::fs::write(&path, other.session().to_json().unwrap()).unwrap();
+    let mut e = Engine::default();
+    aux(&mut e, "R");
+    e.execute("track.output", &json!({"tracks": ["R"], "output": "Q In"})).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refused(&mut e, "file.import_session_data", json!({"path": path.to_string_lossy(), "tracks": ["Q"]}), "Q → R → Q");
+    }));
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+    acyclic(&e);
+}
+
+#[test]
+fn opening_a_session_with_a_loop_is_still_allowed() {
+    let dir = std::env::temp_dir().join(format!("route-cycles-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut e = auxes(&["A", "B"]);
+    chain(&mut e, &["A", "B"]);
+    let mut s = e.session().clone();
+    let a_in = s.bus_by_name("A In").unwrap().id;
+    s.tracks.iter_mut().find(|t| t.name == "B").unwrap().mixer.output = Route::Bus(a_in);
+    let path = dir.join("loop.json");
+    std::fs::write(&path, s.to_json().unwrap()).unwrap();
+    let mut f = Engine::default();
+    let r = f.execute("session.open", &json!({"path": path.to_string_lossy()}));
+    let _ = std::fs::remove_dir_all(&dir);
+    r.unwrap();
+    assert!(f.session().route_graph().find_cycle().is_some(), "an older file's loop loads (the mix breaks it)");
+}
