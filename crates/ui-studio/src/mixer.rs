@@ -1568,7 +1568,7 @@ fn strip(
         });
     }
     let mut y = r.min.y + 26.0;
-    // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).
+    // Hardware/bus input for audio tracks; device/channel input for MIDI and instruments.
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     if matches!(t.kind, TrackKind::Audio | TrackKind::Aux) {
         let cur = route_label(s, &m.input, true, if t.kind == TrackKind::Audio { t.channels() } else { 0 });
@@ -1583,9 +1583,20 @@ fn strip(
         }
         sl.input = r4(in_r);
         sl.input_label = cur;
-    } else {
-        let label = if t.kind.is_midi() { "MIDI in" } else { "" };
-        p.text(in_r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(10.0), TOKENS.text_dim);
+    } else if t.kind.is_midi() {
+        let view = crate::midi_input::InputView::read(app.player.as_ref());
+        let label = view.label(&t.midi_input);
+        let resp = ui.interact(in_r.intersect(clip), ui.id().with(("midi-input", id.0)), Sense::click());
+        p.rect_filled(in_r, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
+        let text_r = in_r.shrink2(vec2(4.0, 0.0));
+        p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &label, FontId::proportional(10.5), TOKENS.text);
+        crate::icons::paint(&p, pos2(in_r.max.x - 7.0, in_r.center().y), crate::icons::Icon::ChevronDown, 10.0, TOKENS.text_dim);
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "MIDI input"));
+        if let Some(params) = view.popup(&resp, id, &t.midi_input) {
+            let _ = app.run("midi.input", params);
+        }
+        sl.input = r4(in_r);
+        sl.input_label = label;
     }
     y += 19.0;
     // Inserts (Logic: under the input), then sends.

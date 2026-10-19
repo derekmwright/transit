@@ -174,6 +174,43 @@ fn no_cost(what: &str, e: &Edit) {
     assert_eq!(e.dropped_in_callback, 0, "{what}: nothing dropped in the callback");
 }
 
+#[test]
+fn new_document_replaces_every_slot_kind_without_callback_allocation() {
+    let (mut s, t, clip) = session_with_clip();
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.gain"));
+    let instrument = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    s.track_mut(instrument).unwrap().instrument = Some(builtin("sampler"));
+    for (module, id) in [("eq", "eq_7band"), ("comp", "compressor")] {
+        let param = soundcraft_dsp::plugin_info(id).unwrap().params.first().unwrap();
+        s.edit.values.insert(format!("clip_fx.{}.{}.{}", clip.0, module, param.id), f64::from(param.default));
+    }
+    let mut rig = Rig::new(&s);
+    let original = rig.compiler.active_bindings();
+    assert_eq!(original.len(), 4, "hosted insert, instrument, clip EQ and compressor");
+    rig.generation = rig.generation.checked_next().unwrap();
+    let shared = Arc::clone(&rig.shared);
+    let mut env = rig
+        .compiler
+        .compile_with_mode(Arc::new(s), rig.compiler.active(), rig.generation, soundcraft_mix::CompileMode::NewDocument, &mut |spec, _| {
+            make(&shared, spec)
+        })
+        .unwrap();
+    let before = rig.shared.drops.lock().unwrap().len();
+    let (adoption, stats) = measure(|| rig.callback(&mut env));
+    assert_eq!(adoption, Adoption::Adopted);
+    assert_eq!(stats, AllocStats::default());
+    assert_eq!(rig.shared.drops.lock().unwrap().len(), before);
+    assert_eq!(env.plan().instances(), original.len());
+    rig.compiler.reclaim(env);
+    let replacement = rig.compiler.active_bindings();
+    assert_eq!(replacement.len(), original.len());
+    for (old, new) in original.iter().zip(&replacement) {
+        assert_eq!((old.0, old.1), (new.0, new.1));
+        assert_ne!(old.2, new.2);
+    }
+    assert_eq!(rig.compiler.take_released(), original);
+}
+
 fn session_with_clip() -> (Session, TrackId, ClipId) {
     let mut s = Session::default();
     let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);

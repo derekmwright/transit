@@ -15,6 +15,7 @@ pub mod fonts;
 pub mod icons;
 pub mod menus;
 pub mod midi_editor;
+mod midi_input;
 pub mod midi_keyboard;
 pub mod mix_window;
 pub mod ops_windows;
@@ -314,6 +315,8 @@ pub struct SoundApp {
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<control::PendingShot>,
     last_rev: u64,
+    /// A ResetSession boundary awaiting successful admission or device reopen.
+    restore_pending: bool,
     fonts_ready: bool,
     fonts_installed: bool,
     /// The palette last applied to the context (light?), so visuals are set only on a change.
@@ -399,6 +402,7 @@ impl SoundApp {
             control_rx: None,
             pending_shots: Vec::new(),
             last_rev: 0,
+            restore_pending: false,
             fonts_ready: false,
             fonts_installed: false,
             theme_applied: None,
@@ -432,7 +436,7 @@ impl SoundApp {
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
         }
-        if id.starts_with("session.save") || id.starts_with("file.bounce") {
+        if id.starts_with("session.save") || id.starts_with("file.bounce") || matches!(id, "track.commit" | "track.bounce") {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states()?;
         }
@@ -488,11 +492,10 @@ impl SoundApp {
     }
 
     fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
+        if !self.sync_player_session() {
+            return;
+        }
         if let Some(p) = &self.player {
-            if self.player_requests.result(&mut self.ui.status, p.update_session(self.engine.session_arc())).is_none() {
-                return;
-            }
-            self.last_rev = self.engine.revision;
             let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.play(from, end, looped)) else { return };
             self.player_requests.play = Some(sequence);
             self.ui.status = "Play pending".into();
@@ -623,12 +626,11 @@ impl SoundApp {
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        if !self.sync_player_session() {
+            self.finish_recording();
+            return;
+        }
         if let Some(p) = &self.player {
-            if self.player_requests.result(&mut self.ui.status, p.update_session(self.engine.session_arc())).is_none() {
-                self.finish_recording();
-                return;
-            }
-            self.last_rev = self.engine.revision;
             let Some(recorder) = self.recorder.as_ref() else {
                 self.finish_recording();
                 return;
@@ -676,9 +678,49 @@ impl SoundApp {
         Ok(takes)
     }
 
+    /// Synchronize the immutable snapshot, including view-only COW changes.
+    /// Revision alone cannot establish the lineage required by state capture.
+    pub(crate) fn sync_player_session(&mut self) -> bool {
+        let Some(p) = &self.player else {
+            self.restore_pending = false;
+            self.last_rev = self.engine.revision;
+            return true;
+        };
+        // ResetSession must first stop/close old-document transport and input.
+        if self.engine.transport_requests.contains(&TransportRequest::ResetSession) {
+            return false;
+        }
+        let session = self.engine.session_arc();
+        if !self.restore_pending && self.last_rev == self.engine.revision && p.has_requested_session(&session) {
+            return true;
+        }
+        let result = if self.restore_pending { p.replace_session(session) } else { p.update_session(session) };
+        if matches!(result, Err(soundcraft_playback::PlayerError::NeedsReopen { .. })) {
+            self.reconnect_audio();
+            if self.player.as_ref().is_some_and(|p| p.has_requested_session(&self.engine.session_arc())) {
+                self.restore_pending = false;
+                self.last_rev = self.engine.revision;
+                return true;
+            }
+            return false;
+        }
+        if self.player_requests.result(&mut self.ui.status, result).is_none() {
+            return false;
+        }
+        self.restore_pending = false;
+        self.last_rev = self.engine.revision;
+        true
+    }
+
     /// Reads every live third-party plugin's state and stores it on its insert
     /// (`mix.insert_state`), so saves and bounces include it.
     pub fn capture_plugin_states(&mut self) -> Result<(), String> {
+        // Saving must not supersede the prerequisite of an admitted Play/Locate.
+        let action_pending = self.player_requests.play.is_some() || self.player_requests.locate.is_some() || self.player_requests.recording.is_some();
+        let changed = self.player.as_ref().is_some_and(|p| !p.has_requested_session(&self.engine.session_arc()));
+        if (action_pending && changed) || !self.sync_player_session() {
+            return Err("The audio session is still updating; try again after it applies".into());
+        }
         let Some(p) = &self.player else { return Ok(()) };
         let states = p.capture_states(&self.engine.session_arc());
         self.store_plugin_states(states)
@@ -699,8 +741,12 @@ impl SoundApp {
 
     /// Parameter edits made in plugin editors go into the session (one undo step per gesture).
     fn apply_editor_edits(&mut self) {
+        let discard = self.restore_pending || self.engine.transport_requests.contains(&TransportRequest::ResetSession);
         let Some(p) = &self.player else { return };
         let Some(edits) = self.player_requests.result(&mut self.ui.status, p.idle()) else { return };
+        if discard {
+            return;
+        }
         for (t, slot, param, value) in edits {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
@@ -1164,6 +1210,7 @@ impl SoundApp {
         for r in reqs {
             match r {
                 TransportRequest::ResetSession => {
+                    self.restore_pending = true;
                     if let Some(p) = &self.player {
                         if let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.stop()) {
                             self.player_requests.stop = Some(sequence);
@@ -1172,9 +1219,6 @@ impl SoundApp {
                             self.player_requests.recording = Some(sequence);
                         }
                         p.set_speed(1.0);
-                        if let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.locate(self.engine.transport.position)) {
-                            self.player_requests.locate = Some(sequence);
-                        }
                     }
                     self.sim = None;
                     // The old capture belongs to the replaced document, never to the new one.
@@ -1187,6 +1231,12 @@ impl SoundApp {
                     self.edit_layout.follow_hold = false;
                     self.meters.clear();
                     self.main_meter = MeterDisplay::default();
+                    if self.sync_player_session()
+                        && let Some(p) = &self.player
+                        && let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.locate(self.engine.transport.position))
+                    {
+                        self.player_requests.locate = Some(sequence);
+                    }
                 }
                 TransportRequest::Play => {
                     if !self.is_playing() && self.player_requests.play.is_none() {
@@ -1340,18 +1390,8 @@ impl SoundApp {
         self.watch_input();
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
-        if self.engine.revision != self.last_rev
-            && self.player_requests.play.is_none()
-            && self.player_requests.locate.is_none()
-            && self.player_requests.recording.is_none()
-        {
-            let admitted = self
-                .player
-                .as_ref()
-                .is_none_or(|p| self.player_requests.result(&mut self.ui.status, p.update_session(self.engine.session_arc())).is_some());
-            if admitted {
-                self.last_rev = self.engine.revision;
-            }
+        if self.player_requests.play.is_none() && self.player_requests.locate.is_none() && self.player_requests.recording.is_none() {
+            self.sync_player_session();
         }
         self.autosave_changes();
         self.write_automation(ctx);

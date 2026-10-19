@@ -82,10 +82,23 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     }
 
     pub fn update_session(&mut self, session: Arc<Session>) -> Result<SessionRequestId, PlayerError> {
+        self.request_session(session, false)
+    }
+
+    /// Restore a new document on this device, retaining restore intent through coalescing.
+    pub fn replace_session(&mut self, session: Arc<Session>) -> Result<SessionRequestId, PlayerError> {
+        self.request_session(session, true)
+    }
+
+    fn request_session(&mut self, session: Arc<Session>, replace: bool) -> Result<SessionRequestId, PlayerError> {
         if self.faulted() {
             return Err(PlayerError::Faulted);
         }
-        let request = self.control.request(Arc::clone(&session), self.input.clone())?;
+        let request = if replace {
+            self.control.replace_session(Arc::clone(&session), self.input.clone())?
+        } else {
+            self.control.request(Arc::clone(&session), self.input.clone())?
+        };
         self.requested = session;
         self.request = request;
         self.state = RequestState::Preparing;
@@ -311,7 +324,10 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         Ok(self.handles.capture_states())
     }
     pub fn idle_editors(&mut self) -> Vec<EditorEdit> {
-        self.handles.idle()
+        // Service and drain the old editors, but do not apply their parameter edits
+        // to a replacement document before its instances have been adopted.
+        let edits = self.handles.idle();
+        if self.control.sessions.restore.is_some() { Vec::new() } else { edits }
     }
 
     /// Creating thread only, after the device owner has established quiescence.

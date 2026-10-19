@@ -13,6 +13,7 @@ soundcraft-audio-io.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
 soundcraft-dsp.workspace = true
+soundcraft-rt.workspace = true
 soundcraft-clap-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-asio-panel.workspace = true
@@ -33,6 +34,8 @@ cpal = { workspace = true, features = ["audio_thread_priority"] }
 cpal = { workspace = true, features = ["wasm-bindgen"] }
 
 [features]
+# Device-free callback probes used only by dependent crates' tests.
+test-hooks = []
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
 # (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p soundcraft --features asio`.
 asio = ["cpal/asio", "soundcraft-asio-panel/asio"]

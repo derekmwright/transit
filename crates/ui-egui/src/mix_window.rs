@@ -140,12 +140,32 @@ pub(crate) fn route_name(app: &SoundApp, r: &Route) -> String {
 }
 
 pub(crate) fn input_name(app: &SoundApp, track: &Track) -> String {
+    if track.kind.is_midi() {
+        return crate::midi_input::InputView::read(app.player.as_ref()).label(&track.midi_input);
+    }
     if track.kind.has_playlist() && track.mixer.input == Route::None { "In 1".to_string() } else { route_name(app, &track.mixer.input) }
+}
+
+fn midi_input_selector(app: &mut SoundApp, ui: &mut Ui, track: &Track, rect: Rect, color: Color32) {
+    let view = crate::midi_input::InputView::read(app.player.as_ref());
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("midi-input", track.id.0, rect.min.y.to_bits())).max_rect(rect));
+    let response = selector_box(&mut child, rect.width(), rect.height(), &view.label(&track.midi_input), color);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "MIDI input"));
+    if let Some(params) = view.popup(&response, track.id, &track.midi_input) {
+        let _ = app.run("midi.input", params);
+    }
 }
 
 /// The input or output menu under `resp`. It closes only on a click outside, so its bus search
 /// field can be typed in.
 pub(crate) fn route_popup(app: &mut SoundApp, resp: &egui::Response, id: TrackId, input: bool) {
+    if input && let Some(track) = app.engine.session().track(id).filter(|t| t.kind.is_midi()) {
+        let view = crate::midi_input::InputView::read(app.player.as_ref());
+        if let Some(params) = view.popup(resp, id, &track.midi_input) {
+            let _ = app.run("midi.input", params);
+        }
+        return;
+    }
     egui::Popup::menu(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| route_menu(app, ui, id, input));
 }
 
@@ -199,7 +219,7 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
             _ if track.kind == TrackKind::Instrument => instrument_slot(app, ui, track, sr),
             Some(k) => insert_slot(app, ui, track, k, sr),
             None if track.kind == TrackKind::Midi => {
-                ui.painter().text(sr.center(), Align2::CENTER_CENTER, "MIDI in: all", regular(9.0), t.text_dim);
+                midi_input_selector(app, ui, track, sr, t.text);
             }
             None => {}
         }
@@ -284,10 +304,14 @@ fn strip(app: &mut SoundApp, ui: &mut Ui, id: TrackId, snap: Option<&MeterSnapsh
         section_label(ui, sec, "I / O", narrow);
         let in_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 15.0), vec2(inner_w - 4.0, 16.0));
         let out_r = Rect::from_min_size(pos2(x0 + 2.0, sec.min.y + 33.0), vec2(inner_w - 4.0, 16.0));
-        let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("mix-input", id.0)).max_rect(in_r));
-        let resp = selector_box(&mut c, in_r.width(), in_r.height(), &input_name(app, track), t.text);
-        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Input"));
-        route_popup(app, &resp, id, true);
+        if track.kind.is_midi() {
+            midi_input_selector(app, ui, track, in_r, t.text);
+        } else {
+            let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("mix-input", id.0)).max_rect(in_r));
+            let resp = selector_box(&mut c, in_r.width(), in_r.height(), &input_name(app, track), t.text);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Input"));
+            route_popup(app, &resp, id, true);
+        }
         let mut c = ui.new_child(egui::UiBuilder::new().id_salt(("mix-output", id.0)).max_rect(out_r));
         let resp = selector_box(&mut c, out_r.width(), out_r.height(), &route_name(app, &track.mixer.output), t.text);
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Output"));

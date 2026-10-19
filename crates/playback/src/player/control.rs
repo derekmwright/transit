@@ -38,6 +38,13 @@ impl<T: Copy, R: Copy> Control<T, R> {
         Ok(id)
     }
 
+    pub fn replace_session(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) -> Result<SessionRequestId, PlayerError> {
+        let id = self.sessions.replace_session(session, input)?;
+        self.target = Some((id, RequestState::Preparing));
+        self.resolve();
+        Ok(id)
+    }
+
     pub fn service(&mut self, make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>) {
         let in_flight = self.sessions.published;
         self.sessions.service(make);

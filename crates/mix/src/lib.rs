@@ -57,6 +57,11 @@
 //! without changing anything, then only swaps: reused cells (a strip's running state, plug-in
 //! slots) move into the new tables, and everything the old plan owned goes back in the same
 //! envelope, to be dropped on the control thread at [`PlanCompiler::reclaim`].
+//! [`PlanCompiler::compile`] preserves matching instances for edits and Save snapshots within
+//! one document. Opening/replacing a document or explicitly restoring its saved state requires
+//! [`PlanCompiler::compile_with_mode`] with [`CompileMode::NewDocument`]: every slot is prepared
+//! afresh with the incoming state and a new [`SlotGen`]. The render target stays unchanged;
+//! playback must preserve this restore intent through coalescing until adoption is confirmed.
 //! [`MixEngine::render_active`] renders the active plan. The `adopt`/`sync`/`render` path
 //! described above is unchanged and still drives offline renders and today's playback.
 //!
@@ -83,7 +88,7 @@ mod plan;
 #[cfg(test)]
 mod plan_tests;
 
-pub use compile::{CompileError, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
+pub use compile::{CompileError, CompileMode, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
 pub use events::{
     Arrival, Due, EngineEpoch, EventLimits, EventOutcome, EventStatus, InstrumentEvent, MAX_OPEN, MAX_PEDALS, MAX_PORTS, Message, NoteId,
     PluginEvent, QUEUE_CAP, RenderFrame, Shed, ShedCounts, Source, TapRecord, TransportEpoch,

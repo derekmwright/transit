@@ -4,6 +4,40 @@ use super::*;
 use soundcraft_mix::{DeviceGeneration, PlanLimits, RenderTarget};
 use soundcraft_rt::testing::measure;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn audio_dispatch_recovery_is_independent_of_stale_worker_signals_and_main_polling() {
+    let (_plans, mut plans, mut control, mut audio) = setup();
+    let old = control.register(7).unwrap();
+    let stale = control.permit(old).unwrap();
+    let request = control.revoke(old).unwrap();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| Ok(()));
+    control.release(request).unwrap();
+    let current = control.register(7).unwrap();
+    let permit = control.permit(current).unwrap();
+    let (_, heap) = measure(|| {
+        audio.invalidate(7, current.generation());
+        stale.invalidate();
+    });
+    assert!(heap.is_zero());
+    assert!(!permit.admits());
+    assert!(!audio.permits(7, current.generation()));
+    let mut released = None;
+    let report = audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |port, generation, _| {
+        released = Some((port, generation));
+        Ok(())
+    });
+    assert_eq!(report.revoked, 1);
+    assert_eq!(released, Some((7, current.generation())));
+    let request = control.revoke(current).unwrap();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| panic!("already released"));
+    control.release(request).unwrap();
+    let newer = control.register(7).unwrap();
+    audio.invalidate(7, current.generation());
+    stale.invalidate();
+    assert!(control.permit(newer).unwrap().admits());
+}
+
 fn setup() -> (plan_bridge::Control, plan_bridge::Audio, Control, Audio) {
     let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 };
     let (plans, audio) = plan_bridge::pair(target, PlanLimits::default());

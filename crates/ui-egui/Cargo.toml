@@ -28,6 +28,8 @@ log.workspace = true
 image.workspace = true
 
 [dev-dependencies]
+soundcraft-playback = { workspace = true, features = ["test-hooks"] }
+soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 
 [lints]

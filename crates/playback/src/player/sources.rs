@@ -84,6 +84,9 @@ struct Port {
     generation: AtomicU64,
     admitted: AtomicBool,
     invalidated: AtomicU64,
+    // Sole writer is the non-clone Audio endpoint. Keep this separate from
+    // worker fetch_max so audio recovery never needs a CAS retry loop.
+    audio_invalidated: AtomicU64,
     cutoff: AtomicU64,
     requested: AtomicU64,
     acknowledged: AtomicU64,
@@ -120,6 +123,7 @@ impl Permit {
             && port.port.load(Ordering::Relaxed) == u32::from(self.token.port)
             && port.admitted.load(Ordering::Acquire)
             && port.invalidated.load(Ordering::Acquire) < self.token.generation
+            && port.audio_invalidated.load(Ordering::Acquire) < self.token.generation
             && port.generation.load(Ordering::Acquire) == self.token.generation
     }
     /// Raw input sequence admission. Carry this original sequence through every
@@ -222,6 +226,7 @@ impl Control {
         !self.faulted()
             && self.entry(token).is_ok_and(|entry| entry.request.is_none())
             && self.shared.ports[usize::from(token.slot)].invalidated.load(Ordering::Acquire) < token.generation
+            && self.shared.ports[usize::from(token.slot)].audio_invalidated.load(Ordering::Acquire) < token.generation
     }
     pub fn permit(&self, token: Token) -> Result<Permit, Error> {
         if self.faulted() {
@@ -331,6 +336,20 @@ impl Drop for Control {
 }
 
 impl Audio {
+    /// A refused release during final native-input dispatch must close the
+    /// source even when Main and the ingress worker are stalled. Registration
+    /// generations never repeat, so this cannot invalidate a newer binding.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn invalidate(&self, port: u16, generation: u64) {
+        for shared in &self.shared.ports {
+            if generation != 0 && shared.generation.load(Ordering::Acquire) == generation && shared.port.load(Ordering::Relaxed) == u32::from(port) {
+                let previous = shared.audio_invalidated.load(Ordering::Relaxed);
+                if previous < generation {
+                    shared.audio_invalidated.store(generation, Ordering::Release);
+                }
+            }
+        }
+    }
     /// Validate AGAIN immediately before event dispatch. Main may have revoked
     /// this source since admission; the local tombstone also prevents a stale load
     /// of the shared admission flag from undoing an already acknowledged revoke.
@@ -355,6 +374,7 @@ impl Audio {
                 && shared.port.load(Ordering::Relaxed) == u32::from(port)
                 && shared.admitted.load(Ordering::Acquire)
                 && shared.invalidated.load(Ordering::Acquire) < generation
+                && shared.audio_invalidated.load(Ordering::Acquire) < generation
                 && sequence.is_none_or(|sequence| sequence >= shared.cutoff.load(Ordering::Acquire))
                 && shared.generation.load(Ordering::Acquire) == observed
         })
@@ -388,7 +408,9 @@ impl Audio {
             let port = &self.shared.ports[slot];
             let requested = port.requested.load(Ordering::Acquire);
             let generation = port.generation.load(Ordering::Acquire);
-            let worker_recovery = generation != 0 && port.invalidated.load(Ordering::Acquire) >= generation && generation > self.revoked[slot];
+            let worker_recovery = generation != 0
+                && (port.invalidated.load(Ordering::Acquire) >= generation || port.audio_invalidated.load(Ordering::Acquire) >= generation)
+                && generation > self.revoked[slot];
             if requested <= self.seen[slot] && !worker_recovery {
                 continue;
             }

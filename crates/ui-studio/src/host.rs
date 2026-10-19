@@ -29,11 +29,10 @@ const COUNT_IN_SKIPPED: &str = "Count-in skipped: no room before bar 1";
 impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.clear_clip_latches();
+        if !self.sync_player_session() {
+            return;
+        }
         if let Some(p) = &self.player {
-            if self.player_requests.result(&mut self.status, p.update_session(self.engine.session_arc())).is_none() {
-                return;
-            }
-            self.last_rev = self.engine.revision;
             let Some(sequence) = self.player_requests.result(&mut self.status, p.play(from, end, looped)) else { return };
             self.player_requests.play = Some(sequence);
             self.status = "Play pending".into();
@@ -168,12 +167,11 @@ impl StudioApp {
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        if !self.sync_player_session() {
+            self.finish_recording();
+            return;
+        }
         if let Some(p) = &self.player {
-            if self.player_requests.result(&mut self.status, p.update_session(self.engine.session_arc())).is_none() {
-                self.finish_recording();
-                return;
-            }
-            self.last_rev = self.engine.revision;
             let Some(recorder) = self.recorder.as_ref() else {
                 self.finish_recording();
                 return;
@@ -221,9 +219,49 @@ impl StudioApp {
         Ok(takes)
     }
 
+    /// Synchronize the immutable snapshot, including view-only COW changes.
+    /// Revision alone cannot establish the lineage required by state capture.
+    pub(crate) fn sync_player_session(&mut self) -> bool {
+        let Some(p) = &self.player else {
+            self.restore_pending = false;
+            self.last_rev = self.engine.revision;
+            return true;
+        };
+        // ResetSession must first stop/close old-document transport and input.
+        if self.engine.transport_requests.contains(&TransportRequest::ResetSession) {
+            return false;
+        }
+        let session = self.engine.session_arc();
+        if !self.restore_pending && self.last_rev == self.engine.revision && p.has_requested_session(&session) {
+            return true;
+        }
+        let result = if self.restore_pending { p.replace_session(session) } else { p.update_session(session) };
+        if matches!(result, Err(soundcraft_playback::PlayerError::NeedsReopen { .. })) {
+            self.reconnect_audio();
+            if self.player.as_ref().is_some_and(|p| p.has_requested_session(&self.engine.session_arc())) {
+                self.restore_pending = false;
+                self.last_rev = self.engine.revision;
+                return true;
+            }
+            return false;
+        }
+        if self.player_requests.result(&mut self.status, result).is_none() {
+            return false;
+        }
+        self.restore_pending = false;
+        self.last_rev = self.engine.revision;
+        true
+    }
+
     /// Reads every live third-party plugin's state and stores it on its insert
     /// (`mix.insert_state`), so saves, bounces and autosaves include it.
     pub fn capture_plugin_states(&mut self) -> Result<(), String> {
+        // Saving must not supersede the prerequisite of an admitted Play/Locate.
+        let action_pending = self.player_requests.play.is_some() || self.player_requests.locate.is_some() || self.player_requests.recording.is_some();
+        let changed = self.player.as_ref().is_some_and(|p| !p.has_requested_session(&self.engine.session_arc()));
+        if (action_pending && changed) || !self.sync_player_session() {
+            return Err("The audio session is still updating; try again after it applies".into());
+        }
         let Some(p) = &self.player else { return Ok(()) };
         let states = p.capture_states(&self.engine.session_arc());
         self.store_plugin_states(states)
@@ -245,8 +283,12 @@ impl StudioApp {
     /// Parameter edits made in plugin editors go into the session (one undo step per gesture).
     /// Calls `Player::idle`, which hosted editors need every frame (E7).
     pub(crate) fn apply_editor_edits(&mut self) {
+        let discard = self.restore_pending || self.engine.transport_requests.contains(&TransportRequest::ResetSession);
         let Some(p) = &self.player else { return };
         let Some(edits) = self.player_requests.result(&mut self.status, p.idle()) else { return };
+        if discard {
+            return;
+        }
         for (t, slot, param, value) in edits {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
@@ -687,6 +729,7 @@ impl StudioApp {
         while let Some(r) = reqs.pop_front() {
             match r {
                 TransportRequest::ResetSession => {
+                    self.restore_pending = true;
                     if let Some(p) = &self.player {
                         if let Some(sequence) = self.player_requests.result(&mut self.status, p.stop()) {
                             self.player_requests.stop = Some(sequence);
@@ -695,9 +738,6 @@ impl StudioApp {
                             self.player_requests.recording = Some(sequence);
                         }
                         p.set_speed(1.0);
-                        if let Some(sequence) = self.player_requests.result(&mut self.status, p.locate(self.engine.transport.position)) {
-                            self.player_requests.locate = Some(sequence);
-                        }
                     }
                     self.sim = None;
                     // The old capture belongs to the replaced document, never to the new one.
@@ -716,6 +756,12 @@ impl StudioApp {
                     self.auto.gesture = None;
                     self.auto.selection.clear();
                     self.engine.transport.position = self.cursor();
+                    if self.sync_player_session()
+                        && let Some(p) = &self.player
+                        && let Some(sequence) = self.player_requests.result(&mut self.status, p.locate(self.engine.transport.position))
+                    {
+                        self.player_requests.locate = Some(sequence);
+                    }
                 }
                 TransportRequest::Play => {
                     if !self.is_playing() && self.player_requests.play.is_none() {

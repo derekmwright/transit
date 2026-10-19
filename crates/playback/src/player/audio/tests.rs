@@ -16,7 +16,7 @@ use std::sync::{
 fn fixture(device_rate: u32) -> (Control<Command, ActionResult>, Audio, Arc<Shared>) {
     fixture_session(device_rate, Arc::new(Session::default()))
 }
-fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Control<Command, ActionResult>, Audio, Arc<Shared>) {
+pub(super) fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Control<Command, ActionResult>, Audio, Arc<Shared>) {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
@@ -31,14 +31,14 @@ fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Control<Command,
     control.service(&mut make);
     (control, audio, shared)
 }
-fn make(spec: &InstanceSpec, _: SlotGen) -> Option<NewInstance> {
+pub(super) fn make(spec: &InstanceSpec, _: SlotGen) -> Option<NewInstance> {
     soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)
 }
-fn fill(audio: &mut Audio, out: &mut [f32]) {
+pub(super) fn fill(audio: &mut Audio, out: &mut [f32]) {
     audio.fill(out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()).unwrap();
 }
 
-fn recording_clock(audio: &mut Audio, rate: u32) {
+pub(super) fn recording_clock(audio: &mut Audio, rate: u32) {
     use crate::device_clock::{ClockFitter, Observation, Quality, Stamp};
     let key = audio.transport.clock_key;
     let mut fitter = ClockFitter::new(key);
@@ -386,7 +386,7 @@ fn stop_cuts_pending_audio_and_invalid_play_does_not_move_the_playhead() {
     control.send_action(Command::Play { from: 500, end: None, looped: None }, true).unwrap();
     let mut out = [0.0; 2];
     fill(&mut audio, &mut out);
-    assert!(audio.pending as f64 > audio.read);
+    assert!(!audio.read.covers(audio.pending));
     let stop = control.stop().unwrap();
     let stopped_at = shared.position.load(Ordering::Relaxed);
     fill(&mut audio, &mut out);
@@ -449,7 +449,7 @@ fn changed_layout_waits_for_old_render_ahead_and_releases_it_on_control() {
     surround.outputs[0].format = soundcraft_model::ChannelFormat::Surround51;
     control.request(Arc::new(surround), None).unwrap();
     control.service(&mut make);
-    assert!(audio.read < audio.pending as f64);
+    assert!(!audio.read.covers(audio.pending));
     let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 2]));
     assert!(heap.is_zero(), "{heap:?}");
     assert_eq!(audio.plans.engine().active().generation, old);
@@ -508,7 +508,7 @@ fn a_seek_discards_real_pending_audio_and_session_retirement_runs_off_callback()
     let mut out = [0.0; 2];
     fill(&mut audio, &mut out);
     assert!(out.iter().any(|sample| *sample != 0.0));
-    assert!(audio.read < audio.pending as f64);
+    assert!(!audio.read.covers(audio.pending));
     control.send_action(Command::Locate(10_000), true).unwrap();
     let ((), heap) = measure(|| fill(&mut audio, &mut out));
     assert!(heap.is_zero(), "{heap:?}");

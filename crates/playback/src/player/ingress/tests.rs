@@ -12,12 +12,12 @@ fn route() -> Route {
 fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
     plan_bridge::pair(RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 }, PlanLimits::default())
 }
-fn pump(lane: action_lane::Control<Packet, ActionResult>) -> (SyncSender<Input>, Pump) {
+fn pump(lane: action_lane::Control<Packet, ActionResult>) -> (SyncSender<Update>, Pump) {
     let (send, receive) = mpsc::sync_channel(sources::PORTS);
     (send, Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::default() })
 }
-fn input(consumer: InputConsumer, permit: sources::Permit) -> Input {
-    Input { consumer, permit, route: route() }
+fn input(consumer: InputConsumer, permit: sources::Permit) -> Update {
+    Update::Input(Input { id: 1, consumer, routes: vec![(permit, route())] })
 }
 
 #[test]
@@ -281,4 +281,132 @@ fn native_worker_ingests_and_shutdown_invalidates_while_main_does_not_service() 
     assert_eq!(observed.unwrap().raw.backend_time_us, 55_000);
     drop(worker);
     assert!(!audio_sources.permits(0, token.generation()), "shutdown closes admission synchronously without joining");
+}
+
+#[test]
+fn one_raw_consumer_fans_out_with_independent_channels_and_identical_timestamps() {
+    let (control, mut plans) = bridge();
+    let (mut registry, sources) = sources::pair(&control).unwrap();
+    let first = registry.register(0).unwrap();
+    let second = registry.register(1).unwrap();
+    let (lane, mut audio) = action_lane::pair_with_result(&control);
+    let (send, mut worker) = pump(lane);
+    let fake = Fake::default();
+    let key = fake.add_input("Fanout");
+    let (_handle, consumer) = fake.io().open_input(&key, InputConfig::default()).unwrap();
+    let a = route();
+    let b = Route { target: (TrackId(8), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: 1 << 1, ..a };
+    send.send(Update::Input(Input { id: 1, consumer, routes: vec![(registry.permit(first).unwrap(), a), (registry.permit(second).unwrap(), b)] }))
+        .ok()
+        .unwrap();
+    fake.input_port(&key).unwrap().deliver(77_000, &[0x90, 60, 100, 0x91, 61, 100, 0x92, 62, 100]);
+    worker.step();
+    let mut packets = [None; 4];
+    let mut count = 0;
+    let (_, heap) = measure(|| {
+        audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |event, _| {
+            let action_lane::Event::Action { payload, .. } = event else { panic!("unexpected recovery") };
+            assert!(sources.permits_sequence(payload.source.port, payload.source.generation, payload.raw.seq));
+            packets[count] = Some(payload);
+            count += 1;
+            ActionResult::MidiBuffered
+        });
+    });
+    assert!(heap.is_zero(), "{heap:?}");
+    assert_eq!(count, 4);
+    let packets = packets.map(Option::unwrap);
+    assert_eq!(
+        packets.map(|p| (p.target.0, p.source.port, p.source.channel, p.raw.seq)),
+        [(TrackId(7), 0, 0, 0), (TrackId(7), 0, 1, 1), (TrackId(8), 1, 1, 1), (TrackId(7), 0, 2, 2),]
+    );
+    assert_eq!(packets[1].raw, packets[2].raw);
+    assert!(packets.iter().all(|packet| packet.raw.backend_time_us == 77_000));
+    worker.step();
+    assert_eq!(worker.lane.note_credits(), action_lane::NOTE_CAPACITY);
+}
+
+#[test]
+fn reconfiguration_retires_only_removed_routes_and_new_routes_skip_old_raw_offers() {
+    let (control, mut plans) = bridge();
+    let (mut registry, sources) = sources::pair(&control).unwrap();
+    let removed = registry.register(0).unwrap();
+    let retained = registry.register(1).unwrap();
+    let replacement = registry.register(2).unwrap();
+    let (lane, mut audio) = action_lane::pair_with_result(&control);
+    let (send, mut worker) = pump(lane);
+    let fake = Fake::default();
+    let key = fake.add_input("Reconfigure pending raw input");
+    let (handle, consumer) = fake.io().open_input(&key, InputConfig::default()).unwrap();
+    let target = route();
+    send.send(Update::Input(Input {
+        id: 1,
+        consumer,
+        routes: vec![(registry.permit(removed).unwrap(), target), (registry.permit(retained).unwrap(), target)],
+    }))
+    .ok()
+    .unwrap();
+    worker.step();
+    let port = fake.input_port(&key).unwrap();
+    port.deliver(1_000, &[0x80, 60, 0]); // offered before the new route, still in the raw ring
+    registry.cancel_before(replacement, handle.boundary().cutoff()).unwrap();
+    let next_target = Route { target: (TrackId(9), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), ..target };
+    let applied = Arc::new(AtomicBool::new(false));
+    send.send(Update::Routes {
+        id: 1,
+        routes: vec![(registry.permit(retained).unwrap(), target), (registry.permit(replacement).unwrap(), next_target)],
+        applied: Arc::clone(&applied),
+    })
+    .ok()
+    .unwrap();
+    assert!(!applied.load(Ordering::Acquire), "enqueuing a route is not applying it");
+    port.deliver(2_000, &[0x90, 64, 100]);
+    worker.step();
+    assert!(applied.load(Ordering::Acquire));
+    assert!(!sources.permits(removed.port(), removed.generation()));
+    assert!(sources.permits(retained.port(), retained.generation()));
+    assert!(sources.permits(replacement.port(), replacement.generation()));
+    let mut observed = Vec::new();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |event, _| {
+        let action_lane::Event::Action { payload, .. } = event else { panic!("unexpected recovery") };
+        observed.push((payload.target.0, payload.source.port, payload.raw.seq));
+        ActionResult::MidiBuffered
+    });
+    assert_eq!(observed, [(TrackId(7), 1, 0), (TrackId(7), 1, 1), (TrackId(9), 2, 1)]);
+    worker.step();
+    assert!(registry.admits(retained));
+    assert!(registry.admits(replacement));
+    assert_eq!(handle.boundary().cutoff(), 2);
+}
+
+#[test]
+fn pending_initial_route_preserves_post_boundary_input_until_acknowledged() {
+    let (control, mut plans) = bridge();
+    let (mut registry, _sources) = sources::pair(&control).unwrap();
+    let token = registry.register(0).unwrap();
+    let (lane, mut audio) = action_lane::pair_with_result(&control);
+    let (send, mut worker) = pump(lane);
+    let fake = Fake::default();
+    let key = fake.add_input("Initial route pending");
+    let (handle, consumer) = fake.io().open_input(&key, InputConfig::default()).unwrap();
+    send.send(Update::Input(Input { id: 1, consumer, routes: Vec::new() })).ok().unwrap();
+    worker.step();
+    let port = fake.input_port(&key).unwrap();
+    port.deliver(1_000, &[0x90, 60, 100]);
+    registry.cancel_before(token, handle.boundary().cutoff()).unwrap();
+    port.deliver(2_000, &[0x90, 64, 100]);
+    worker.step(); // native input is attached, but its routing update has not arrived
+    assert_eq!(worker.shared.offered.load(Ordering::Relaxed), 0, "pending routing must not discard post-cutoff input");
+    let applied = Arc::new(AtomicBool::new(false));
+    send.send(Update::Routes { id: 1, routes: vec![(registry.permit(token).unwrap(), route())], applied: Arc::clone(&applied) }).ok().unwrap();
+    assert!(!applied.load(Ordering::Acquire));
+    worker.step();
+    assert!(applied.load(Ordering::Acquire));
+    let mut observed = Vec::new();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |event, _| {
+        let action_lane::Event::Action { payload, .. } = event else { panic!("unexpected recovery") };
+        observed.push((payload.raw.seq, payload.raw.backend_time_us));
+        ActionResult::MidiBuffered
+    });
+    assert_eq!(observed, [(1, 2_000)]);
+    assert_eq!(worker.shared.cancelled.load(Ordering::Relaxed), 1);
 }

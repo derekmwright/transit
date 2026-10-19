@@ -8,8 +8,8 @@
 
 use crate::{MeterSnapshot, fold_gains, publication, record::InputRing, session_has_hosted};
 use soundcraft_mix::{
-    Adoption, CompileError, EnvelopeState, InstanceSpec, MAX_CHANNELS, MixEngine, NewInstance, PlanCompiler, PlanEnvelope, PlanGeneration,
-    PlanLimits, PlanStatus, RenderTarget, SlotBinding, SlotGen, StripMeter, main_channels,
+    Adoption, CompileError, CompileMode, EnvelopeState, InstanceSpec, MAX_CHANNELS, MixEngine, NewInstance, PlanCompiler, PlanEnvelope,
+    PlanGeneration, PlanLimits, PlanStatus, RenderTarget, SlotBinding, SlotGen, StripMeter, main_channels,
 };
 use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::Samples;
@@ -176,6 +176,7 @@ struct Envelope {
 }
 
 struct Request {
+    mode: CompileMode,
     session: Arc<Session>,
     input: Option<Arc<InputRing>>,
 }
@@ -316,7 +317,11 @@ impl Control {
     }
     /// Coalesce before construction. Replaced unsent owners die here, on control.
     pub fn request(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) {
-        self.latest = Some(Request { session, input });
+        self.request_with_mode(session, input, CompileMode::Update);
+    }
+
+    pub(super) fn request_with_mode(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>, mode: CompileMode) {
+        self.latest = Some(Request { session, input, mode });
     }
 
     /// Reclaim at most one return and observe one coherent status. Call before preparation.
@@ -362,7 +367,7 @@ impl Control {
         }
         let next = self.issued.checked_next().ok_or(CompileError::GenerationExhausted)?;
         let buffers = Buffers::prepare(&request.session, request.input, self.target, self.limits)?;
-        let plan = self.compiler.compile(request.session, self.compiler.active(), next, make)?;
+        let plan = self.compiler.compile_with_mode(request.session, self.compiler.active(), next, request.mode, make)?;
         self.issued = next;
         self.pending_meters = Some(Arc::clone(&buffers.meters));
         let previous = self.counters.published.load(Ordering::Relaxed);
@@ -573,6 +578,10 @@ impl Audio {
 
     pub fn engine(&self) -> &MixEngine {
         &self.mix
+    }
+    #[cfg(test)]
+    pub(crate) fn install_event_tap_for_test(&mut self, capacity: usize) {
+        self.mix.install_event_tap(capacity);
     }
     /// Publish permanent callback failure without invoking or destroying processors.
     pub fn fault(&mut self) {

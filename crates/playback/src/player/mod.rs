@@ -3,7 +3,7 @@
 
 use crate::{MeterSnapshot, action_lane, plan_bridge, record::InputRing};
 use soundcraft_mix::{
-    CompileError, EnvelopeState, InstanceSpec, NewInstance, PlanGeneration, PlanLimits, RejectReason, RenderTarget, SlotBinding, SlotGen,
+    CompileError, CompileMode, EnvelopeState, InstanceSpec, NewInstance, PlanGeneration, PlanLimits, RejectReason, RenderTarget, SlotBinding, SlotGen,
 };
 use soundcraft_model::Session;
 use std::collections::VecDeque;
@@ -19,6 +19,10 @@ mod runtime;
 pub use runtime::{AudioPorts, Retirement, RuntimeControl, ServiceReport};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ingress;
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native::Status as MidiStatus;
 pub mod sources;
 
 mod audio;
@@ -109,6 +113,7 @@ struct Requested {
 }
 #[derive(Clone, Copy)]
 struct Published {
+    restore: Option<SessionRequestId>,
     id: SessionRequestId,
     generation: PlanGeneration,
 }
@@ -123,6 +128,8 @@ pub struct SessionControl {
     latest: Option<Requested>,
     published: Option<Published>,
     active: Option<Published>,
+    /// Latest document boundary, retained until a plan for that boundary is adopted.
+    restore: Option<SessionRequestId>,
     notices: VecDeque<SessionNotice>,
     credits: usize,
     faulted: bool,
@@ -140,6 +147,7 @@ pub fn session_pair(target: RenderTarget, limits: PlanLimits) -> (SessionControl
             latest: None,
             published: None,
             active: None,
+            restore: None,
             notices: VecDeque::with_capacity(SESSION_REQUESTS),
             credits: SESSION_REQUESTS,
             faulted: false,
@@ -170,6 +178,13 @@ impl SessionControl {
         }
         Ok(id)
     }
+    /// Replace the document even when IDs/topology are unchanged. Ordinary requests
+    /// coalesce into this boundary until its successful adoption.
+    pub fn replace_session(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) -> Result<SessionRequestId, PlayerError> {
+        let id = self.request(session, input)?;
+        self.restore = Some(id);
+        Ok(id)
+    }
     fn finish(&mut self, request: SessionRequestId, outcome: SessionOutcome) {
         // The request reserved this slot before any coalescing/compilation/adoption.
         self.notices.push_back(SessionNotice { request, outcome });
@@ -188,10 +203,12 @@ impl SessionControl {
             return;
         }
         let Some(request) = self.latest.take() else { return };
-        self.bridge.request(request.session, request.input);
+        let restore = self.restore;
+        let mode = if restore.is_some() { CompileMode::NewDocument } else { CompileMode::Update };
+        self.bridge.request_with_mode(request.session, request.input, mode);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.bridge.prepare(make)));
         match result {
-            Ok(Ok(true)) => self.published = Some(Published { id: request.id, generation: self.bridge.issued() }),
+            Ok(Ok(true)) => self.published = Some(Published { id: request.id, generation: self.bridge.issued(), restore }),
             Ok(Ok(false)) => {
                 self.fault(); // Credit/publication invariant failed; do not pretend this is queued.
                 self.finish(request.id, SessionOutcome::Rejected(SessionFailure::Faulted));
@@ -220,6 +237,9 @@ impl SessionControl {
                     match report.state {
                         EnvelopeState::Returned { .. } => {
                             self.active = Some(published);
+                            if self.restore == published.restore {
+                                self.restore = None;
+                            }
                             SessionOutcome::Applied { generation: published.generation }
                         }
                         EnvelopeState::Rejected { reason, .. } => SessionOutcome::Rejected(SessionFailure::Adoption(reason)),

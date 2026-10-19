@@ -22,6 +22,7 @@ pub mod icons;
 pub mod import;
 pub mod keys;
 pub mod menus;
+mod midi_input;
 pub mod mixer;
 pub mod plugin_scan;
 pub mod shortcuts;
@@ -233,6 +234,8 @@ pub struct StudioApp {
     pub frame_ms: f32,
     last_frame: Option<f64>,
     last_rev: u64,
+    /// A ResetSession boundary awaiting successful admission or device reopen.
+    restore_pending: bool,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<control::PendingShot>,
     pub synthetic: Vec<egui::Event>,
@@ -305,6 +308,7 @@ impl StudioApp {
             frame_ms: 0.0,
             last_frame: None,
             last_rev: 0,
+            restore_pending: false,
             control_rx: None,
             pending_shots: Vec::new(),
             synthetic: Vec::new(),
@@ -629,18 +633,8 @@ impl StudioApp {
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         automation::write_pass(self, ctx);
-        if self.engine.revision != self.last_rev
-            && self.player_requests.play.is_none()
-            && self.player_requests.locate.is_none()
-            && self.player_requests.recording.is_none()
-        {
-            let admitted = self
-                .player
-                .as_ref()
-                .is_none_or(|p| self.player_requests.result(&mut self.status, p.update_session(self.engine.session_arc())).is_some());
-            if admitted {
-                self.last_rev = self.engine.revision;
-            }
+        if self.player_requests.play.is_none() && self.player_requests.locate.is_none() && self.player_requests.recording.is_none() {
+            self.sync_player_session();
         }
         self.autosave_changes();
         self.autosave();

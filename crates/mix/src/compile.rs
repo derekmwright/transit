@@ -5,6 +5,16 @@ use super::plan::{Attach, CellKind, CellLoc, CellMove, PlanTables, PreparedPlan,
 use super::*;
 use std::collections::{BTreeMap, HashMap};
 
+/// Whether compilation edits the active document or restores a document's saved state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileMode {
+    /// Keep matching live instances and running state, including across Save snapshots.
+    Update,
+    /// Open/replace a document or explicitly restore its state. Rebuild every slot and strip
+    /// with fresh identities, even when track IDs, topology, and saved bytes are identical.
+    NewDocument,
+}
+
 /// Resource limits of one plan. Every size is checked (with checked arithmetic) before anything
 /// is allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,12 +409,12 @@ impl PlanCompiler {
     /// The delay capacity of `t`'s strip in the next plan, and whether the strip keeps its live
     /// lines (it moves, and they hold at least that much). Lines never shrink under a moved
     /// strip, so a tail in them survives every plan.
-    fn strip_cap(&self, t: &Track, ch: usize, need: usize, hints: bool) -> (usize, bool) {
-        let hint = if hints { self.hints.get(&t.id).copied().unwrap_or(0) } else { 0 };
+    fn strip_cap(&self, t: &Track, ch: usize, need: usize, hints: bool, mode: CompileMode) -> (usize, bool) {
+        let hint = if hints && mode == CompileMode::Update { self.hints.get(&t.id).copied().unwrap_or(0) } else { 0 };
         let want = self.delay_capacity(need.max(hint));
         let ch16 = u16::try_from(ch).unwrap_or(u16::MAX);
         match self.active.movable_strip(t.id, ch16, layout_code(strip_format(t, ch))) {
-            Some((_, old)) if old.cap >= want => (old.cap, true),
+            Some((_, old)) if mode == CompileMode::Update && old.cap >= want => (old.cap, true),
             _ => (want, false),
         }
     }
@@ -459,6 +469,29 @@ impl PlanCompiler {
         next: PlanGeneration,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
     ) -> Result<PlanEnvelope, CompileError> {
+        self.compile_with_mode(session, base, next, CompileMode::Update, make)
+    }
+
+    /// Compiles with an explicit document/state-restore boundary.
+    ///
+    /// `Update` has the same semantics as [`Self::compile`]: saved state changes alone never
+    /// reset live plug-ins. Use `NewDocument` for opening/replacing a project or explicitly
+    /// restoring saved state. It calls `make` for every slot with the incoming saved state and
+    /// a fresh [`SlotGen`], without reusing active or rejected-plan instances. The factory must
+    /// restore that state before returning the prepared instance (as with initial compilation).
+    /// Old instances remain active until adoption, then retire through the returned envelope.
+    ///
+    /// The render target/device clock is unchanged. `next` must still increase; the caller must
+    /// retain `NewDocument` through request coalescing until the restore is actually adopted.
+    /// An ordinary edit or Save snapshot must use `Update`, not `NewDocument`.
+    pub fn compile_with_mode(
+        &mut self,
+        session: Arc<Session>,
+        base: PlanGeneration,
+        next: PlanGeneration,
+        mode: CompileMode,
+        make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
+    ) -> Result<PlanEnvelope, CompileError> {
         if self.faulted.is_some() {
             return Err(CompileError::Faulted);
         }
@@ -480,15 +513,15 @@ impl PlanCompiler {
         let block = self.target.block();
         // Every count, and the bytes with the smallest delay lines (a lower bound), before anything
         // is allocated: walking the route graph below allocates its scratch.
-        let least = |t: &Track, ch: usize| match self.strip_cap(t, ch, 0, false) {
+        let least = |t: &Track, ch: usize| match self.strip_cap(t, ch, 0, false, mode) {
             (_, true) => 0,
             (cap, false) => cap,
         };
         measure(&session, &self.limits, block, &least)?;
         // Path-based (F05): the slowest path into any summing point bounds every edge's delay.
-        let need = path_need(&session, &|t: &Track| self.active.track_latency(t.id));
+        let need = path_need(&session, &|t: &Track| if mode == CompileMode::Update { self.active.track_latency(t.id) } else { 0 });
         let sized = |me: &Self, hints: bool| {
-            let cap_of = |t: &Track, ch: usize| match me.strip_cap(t, ch, need, hints) {
+            let cap_of = |t: &Track, ch: usize| match me.strip_cap(t, ch, need, hints, mode) {
                 (_, true) => 0,
                 (cap, false) => cap,
             };
@@ -505,13 +538,13 @@ impl PlanCompiler {
         }
 
         let id = PlanIdentity { generation: next, base, target: self.target };
-        let (desc, rows, phase1, aux_end, specs, loops) = self.describe(&session, need);
+        let (desc, rows, phase1, aux_end, specs, loops) = self.describe(&session, need, mode);
         // A session loaded with a routing loop: say so once, not on every plan.
         if loops != self.loops {
             log_loops(&session, &loops);
             self.loops = loops;
         }
-        if self.active.desc.as_ref() == Some(&desc) {
+        if mode == CompileMode::Update && self.active.desc.as_ref() == Some(&desc) {
             let plan = PreparedPlan {
                 id,
                 session,
@@ -527,7 +560,7 @@ impl PlanCompiler {
             self.pending = Some(Pending { generation: next, shadow: None });
             return Ok(PlanEnvelope::new(plan));
         }
-        let built = self.build(&session, desc, &rows, phase1, aux_end, specs, make, need);
+        let built = self.build(&session, desc, &rows, phase1, aux_end, specs, make, need, mode);
         let (tables, moves, attach, shadow) = match built {
             Ok(b) => b,
             Err(e) => {
@@ -563,7 +596,12 @@ impl PlanCompiler {
     /// The structure `s` needs: its description, the strips' tracks in render order (with the
     /// sizes of the first two groups), and the instance specs by slot.
     #[allow(clippy::type_complexity)]
-    fn describe(&self, s: &Session, need: usize) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>, Vec<RouteCycle>) {
+    fn describe(
+        &self,
+        s: &Session,
+        need: usize,
+        mode: CompileMode,
+    ) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>, Vec<RouteCycle>) {
         let main_ch = main_channels(s);
         let specs: HashMap<(TrackId, usize), InstanceSpec> = realtime_instance_specs(s).into_iter().map(|x| ((x.track, x.slot), x)).collect();
         let (rows, phase1, aux_end, loops) = render_rows(s);
@@ -581,7 +619,7 @@ impl PlanCompiler {
             };
             let clips = clip_entries(t.id, &specs);
             let index = u16::try_from(ti).unwrap_or(u16::MAX);
-            let (cap, _) = self.strip_cap(t, ch, need, true);
+            let (cap, _) = self.strip_cap(t, ch, need, true, mode);
             desc.strips.push((
                 t.id,
                 index,
@@ -610,11 +648,13 @@ impl PlanCompiler {
         &mut self,
         p: &mut PlannedSlot,
         layout: u16,
+        mode: CompileMode,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
     ) -> Result<(), CompileError> {
         let sample = sample_id(p.sample.as_ref());
         let long = if needs_storage(p.params) { p.params } else { 0 };
         if let Some(old) = self.active.slots.get(&p.key)
+            && mode == CompileMode::Update
             && old.kind == p.kind
             && old.spec.id == p.spec.id
             && old.spec.ch == p.spec.ch
@@ -632,7 +672,8 @@ impl PlanCompiler {
                 return Ok(());
             }
         }
-        let slot = self.pool.iter().position(|x| x.key == p.key && x.spec == p.spec).map(|i| self.pool.swap_remove(i).slot);
+        let slot =
+            self.pool.iter().position(|x| mode == CompileMode::Update && x.key == p.key && x.spec == p.spec).map(|i| self.pool.swap_remove(i).slot);
         let slot = match slot {
             Some(s) => Some(s),
             None => {
@@ -678,6 +719,7 @@ impl PlanCompiler {
         specs: &HashMap<(TrackId, usize), InstanceSpec>,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
         out: &mut Vec<PlannedStrip>,
+        mode: CompileMode,
     ) -> Result<(), CompileError> {
         let main_ch = main_channels(s);
         for &ti in rows {
@@ -710,7 +752,7 @@ impl PlanCompiler {
                 let Some((_, _, planned, _)) = out.last_mut() else { continue };
                 planned.push(p);
                 if let Some(p) = planned.last_mut() {
-                    self.plan_slot(p, layout, make)?;
+                    self.plan_slot(p, layout, mode, make)?;
                 }
             }
             if let Some((_, _, _, c)) = out.last_mut() {
@@ -731,6 +773,7 @@ impl PlanCompiler {
         specs: HashMap<(TrackId, usize), InstanceSpec>,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
         need0: usize,
+        mode: CompileMode,
     ) -> Result<(PlanTables, Vec<CellMove>, Vec<Attach>, Shadow), CompileError> {
         let block = self.target.block();
         let main_ch = main_channels(s);
@@ -739,7 +782,7 @@ impl PlanCompiler {
         let mut per_strip: Vec<PlannedStrip> = Vec::new();
         // The factory and the instances run plug-in code that may unwind: report what was made (or
         // taken from the pool) before the unwind drops it, then let it continue.
-        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_slots(s, rows, &specs, make, &mut per_strip)));
+        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_slots(s, rows, &specs, make, &mut per_strip, mode)));
         match planned {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -772,7 +815,7 @@ impl PlanCompiler {
         let need = need0.max(need1);
         if need > need0 {
             // Fresh instances need longer lines than measured before they existed: check again.
-            let cap_of = |t: &Track, ch: usize| match self.strip_cap(t, ch, need, true) {
+            let cap_of = |t: &Track, ch: usize| match self.strip_cap(t, ch, need, true, mode) {
                 (_, true) => 0,
                 (cap, false) => cap,
             };
@@ -794,7 +837,7 @@ impl PlanCompiler {
             let Some(t) = s.tracks.get(*ti) else { continue };
             let ch = strip_channels(t, main_ch);
             let ch16 = u16::try_from(ch).unwrap_or(u16::MAX);
-            let (cap, keep) = self.strip_cap(t, ch, need, true);
+            let (cap, keep) = self.strip_cap(t, ch, need, true, mode);
             let mut st = Strip::new();
             st.buf = vec![vec![0.0; block]; ch];
             st.pre = (0..ch).map(|_| Vec::with_capacity(block)).collect();
@@ -812,7 +855,7 @@ impl PlanCompiler {
             st.layout = *layout;
             st.meter = StripMeter { peaks: vec![0.0; ch], ..StripMeter::default() };
             st.clip_fx = ClipFxTable(clips.iter().map(|(c, _, _)| (*c, ClipFx::new(sr, ch, false))).collect());
-            let generation = match self.active.movable_strip(t.id, ch16, *layout) {
+            let generation = match self.active.movable_strip(t.id, ch16, *layout).filter(|_| mode == CompileMode::Update) {
                 Some((from, old)) => {
                     strip_moves.push(CellMove { kind: CellKind::Strip, from: from as u16, to: si as u16, expect: old.generation });
                     old.generation

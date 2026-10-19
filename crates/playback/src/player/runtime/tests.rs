@@ -18,6 +18,19 @@ fn session() -> Arc<Session> {
     Arc::new(session)
 }
 // A mutable latency REPORT fixture, not a signal-alignment/calibration oracle.
+struct ConstantEditor(u8);
+impl soundcraft_dsp::PluginEditor for ConstantEditor {
+    fn open(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn close(&mut self) {}
+    fn is_open(&self) -> bool {
+        false
+    }
+    fn idle(&mut self) -> Vec<(String, f32)> {
+        vec![("fixture".into(), f32::from(self.0))]
+    }
+}
 struct Latency {
     inner: Box<dyn Plugin>,
     value: Arc<AtomicUsize>,
@@ -44,6 +57,9 @@ impl Plugin for Latency {
     }
     fn latency(&self) -> usize {
         self.value.load(Ordering::Relaxed)
+    }
+    fn editor(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginEditor>> {
+        Some(Box::new(ConstantEditor(self.state)))
     }
     fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
         let state = self.state;
@@ -524,5 +540,41 @@ fn rejected_document_cannot_capture_its_predecessor_but_a_failed_internal_refres
     runtime.service();
     assert!(matches!(runtime.requested_state().1, RequestState::Finished(SessionOutcome::Rejected(_))));
     assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending));
+    runtime.retire(ports);
+}
+
+#[test]
+fn explicit_same_topology_restore_changes_capture_lineage_but_cow_update_keeps_it() {
+    let (mut runtime, mut ports, value) = setup(PlanLimits::default());
+    let original = Arc::clone(runtime.requested_session());
+    let bindings = runtime.control.sessions.active_bindings();
+    assert_eq!(runtime.idle_editors()[0].3, f32::from(0xa1u8));
+    runtime.replace_session(Arc::clone(&original)).unwrap();
+    assert!(runtime.idle_editors().is_empty(), "old-document editor edits must be discarded");
+    assert_eq!(runtime.capture_states(&original), Err(PlayerError::SessionPending));
+    let handles = &mut runtime.handles;
+    runtime.control.service(&mut |spec, generation| {
+        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch).unwrap();
+        handles.capture(
+            (spec.track, spec.slot, generation),
+            NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0xb2 }), refused_state: false },
+        )
+    });
+    adopt(&mut ports.plans);
+    runtime.service();
+    assert_ne!(runtime.control.sessions.active_bindings(), bindings);
+    assert_eq!(runtime.capture_states(&original).unwrap()[0].2, [0xb2]);
+    assert_eq!(runtime.idle_editors()[0].3, f32::from(0xb2u8));
+    let restored = runtime.control.sessions.active_bindings();
+    let mut view = Arc::clone(&original);
+    Arc::make_mut(&mut view).edit.zoom.scroll = 64;
+    assert_eq!(runtime.capture_states(&view), Err(PlayerError::SessionPending));
+    runtime.update_session(Arc::clone(&view)).unwrap();
+    runtime.service();
+    adopt(&mut ports.plans);
+    runtime.service();
+    assert_eq!(runtime.control.sessions.active_bindings(), restored);
+    assert_eq!(runtime.capture_states(&view).unwrap()[0].2, [0xb2]);
+    assert_eq!(runtime.capture_states(&original), Err(PlayerError::SessionPending));
     runtime.retire(ports);
 }

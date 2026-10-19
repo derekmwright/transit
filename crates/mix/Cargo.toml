@@ -24,6 +24,7 @@ rayon.workspace = true
 
 [dev-dependencies]
 soundcraft-rt = { workspace = true, features = ["testing"] }
+soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

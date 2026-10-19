@@ -184,3 +184,88 @@ fn atomic_record_start_receipt_updates_transport_and_clock_refusal_collects_the_
         }
     }
 }
+
+// The fixture uses a floating mock GUI; macOS GUI calls need a main-thread runner.
+#[cfg(windows)]
+mod track_render_state {
+    use super::*;
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+        sync::OnceLock,
+    };
+
+    fn fixture() {
+        static READY: OnceLock<()> = OnceLock::new();
+        READY.get_or_init(|| {
+            soundcraft_clap_host::set_scan_extra_dirs_only(true);
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../clap-host/tests/fixture/Cargo.toml");
+            let target = std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+                .join("ui-track-state-fixture");
+            let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                .args(["build", "--quiet", "--manifest-path"])
+                .arg(manifest)
+                .arg("--target-dir")
+                .arg(&target)
+                .env_remove("RUSTFLAGS")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let dir = target.join(format!("plugins-{}", std::process::id()));
+            let dest = dir.join("Fixture.clap");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(target.join("debug/clap_fixture.dll"), dest).unwrap();
+            assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 2);
+        });
+    }
+    fn state(gain: f64) -> Vec<u8> {
+        [gain.to_le_bytes(), 0.0f64.to_le_bytes()].concat()
+    }
+    fn run_alias(alias: &str) {
+        fixture();
+        let mut engine = soundcraft_engine::Engine::default();
+        let session = engine.session_mut();
+        let track = session.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Stereo, Some("State"));
+        let mut insert = soundcraft_model::Insert::new("clap:org.soundcraft.test.gain");
+        insert.set_state_bytes(&state(1.0));
+        session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
+        let source = soundcraft_engine::io::add_source(
+            session,
+            "DC",
+            soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![1.0; 4_800]; 2] },
+            None,
+            soundcraft_audio_io::FileFormat::Wav,
+        );
+        let clip = session.new_clip_id();
+        session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::audio(clip, "DC", source, 0, 0, 4_800));
+        let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
+        let mut app = SoundApp::new(engine, Some(player), crate::Services::default());
+        for _ in 0..4 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+        }
+        let player = app.player.as_ref().unwrap();
+        // This fixture's floating GUI has no native window. Showing it edits gain internally.
+        player.open_editor(track, 0).unwrap();
+        player.step_device_free();
+        assert_eq!(player.capture_states(&app.engine.session_arc()).unwrap()[0].2, state(0.25));
+        assert_eq!(app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap(), state(1.0));
+        let result = app.run(alias, serde_json::json!({"tracks": [track.0]})).unwrap();
+        let id = soundcraft_model::TrackId(result["tracks"][0].as_u64().unwrap());
+        let source = app.engine.session().track(id).unwrap().clips()[0].source().unwrap();
+        let sample = app.engine.session().pool.get(source).unwrap().channel(0).unwrap()[200];
+        assert!((sample - 0.25).abs() < 1e-5, "{alias} rendered stale saved plugin state: {sample}");
+    }
+    #[test]
+    fn track_commit_captures_live_state_before_rendering() {
+        run_alias("track.commit");
+    }
+    #[test]
+    fn track_bounce_captures_live_state_before_rendering() {
+        run_alias("track.bounce");
+    }
+}

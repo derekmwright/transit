@@ -1,18 +1,18 @@
 //! Device facade for the prepared runtime. All factories, editors and reclamation
-//! belong to this creating-thread owner; the device borrows only its audio holder.
+//! belong to this creating-thread owner; the device borrows its anchored audio state.
 use super::audio::{ActionResult, Audio, Command};
 use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputCallback, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
 use soundcraft_mix::{Arrival, DeviceGeneration, Due, EngineEpoch, InstrumentEvent, Message, NoteId, PlanLimits, RenderTarget, Source};
 use soundcraft_model::{Session, TrackId};
+use soundcraft_rt::handoff::{Anchor, AudioAccess};
 use soundcraft_time::{Range, Samples};
 use std::cell::{Cell, RefCell, RefMut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex};
 
 type Owner = RuntimeControl<Command, ActionResult>;
-type Holder = Arc<Mutex<Option<Audio>>>;
 pub type PlayerNotice = Notice<Command, ActionResult>;
 
 /// Main-thread facade. RuntimeControl deliberately makes this type !Send/!Sync.
@@ -23,8 +23,14 @@ pub struct Player {
     fault: Arc<Fault>,
     failure_signal: Option<plan_bridge::RuntimeIdentity>,
     owner: RefCell<Option<Owner>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    midi: RefCell<Option<super::native::Native>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    midi_error: Option<String>,
     record_start: RefCell<Option<record::start::Control>>,
-    state: Holder,
+    state: Option<Anchor<Audio>>,
+    #[cfg(feature = "test-hooks")]
+    test_output: RefCell<Option<DeviceOutput>>,
     stream: Option<cpal::Stream>,
     input: RefCell<HeldInput>,
     clock: RefCell<Option<device_clock::MaintainedClock>>,
@@ -63,6 +69,30 @@ impl Player {
         }
     }
 
+    /// Prepare the real Player without discovering or opening any device.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn prepare_device_free(session: Arc<Session>) -> Result<Self, String> {
+        let rate = session.sample_rate.hz();
+        Self::prepare(session, rate).map(|(mut player, access, _clock)| {
+            let output = DeviceOutput::new(access, &player, 2, rate);
+            *player.test_output.get_mut() = Some(output);
+            player
+        })
+    }
+
+    /// Consume one complete stereo block for device-free caller integration tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn step_device_free(&self) {
+        crate::mark_audio_thread();
+        if let Ok(mut output) = self.test_output.try_borrow_mut()
+            && let Some(output) = output.as_mut()
+        {
+            output.fill(&mut [0.0f32; 1024]);
+        }
+    }
+
     fn shared() -> Arc<Shared> {
         Arc::new(Shared {
             position: AtomicI64::new(0),
@@ -79,8 +109,14 @@ impl Player {
             fault: Arc::default(),
             failure_signal: None,
             owner: RefCell::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            midi: RefCell::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            midi_error: None,
             record_start: RefCell::new(None),
-            state: Arc::new(Mutex::new(None)),
+            state: None,
+            #[cfg(feature = "test-hooks")]
+            test_output: RefCell::new(None),
             stream: None,
             input: RefCell::new(HeldInput::No),
             clock: RefCell::new(None),
@@ -105,7 +141,7 @@ impl Player {
 
     /// The stream clock is allocated BEFORE the engine; its exact generation is
     /// shared by the target, event identity, and consumed-output timeline.
-    fn prepare(session: Arc<Session>, device_rate: u32) -> Result<(Self, device_clock::CallbackClock), String> {
+    fn prepare(session: Arc<Session>, device_rate: u32) -> Result<(Self, AudioAccess<Audio>, device_clock::CallbackClock), String> {
         let (callback_clock, reader) = device_clock::stream_clock(device_clock::Direction::Output, device_rate)?;
         let key = reader.key();
         let target = RenderTarget { device: DeviceGeneration(key.generation), sample_rate: session.sample_rate.hz(), max_block: 512 };
@@ -137,12 +173,24 @@ impl Player {
             device_clock::MaintainedClock::start(reader).map_err(|error| log::warn!("output clock maintenance unavailable: {error}")).ok();
         #[cfg(not(target_arch = "wasm32"))]
         audio.set_clock(player.clock.get_mut().as_mut().and_then(device_clock::MaintainedClock::take_audio_reader), player.origin);
+        #[cfg(not(target_arch = "wasm32"))]
+        match owner.midi_lane() {
+            Ok((control, endpoint)) => match super::native::Native::new(control, player.origin) {
+                Ok(native) => {
+                    audio.set_midi(endpoint);
+                    *player.midi.get_mut() = Some(native);
+                }
+                Err(error) => player.midi_error = Some(error.to_string()),
+            },
+            Err(error) => player.midi_error = Some(error.to_string()),
+        }
         *player.record_start.get_mut() = Some(record_start);
-        *player.state.lock().unwrap_or_else(PoisonError::into_inner) = Some(audio);
+        let (anchor, access) = Anchor::new(audio);
+        player.state = Some(anchor);
         player.failure_signal = Some(owner.failure_signal());
         *player.owner.get_mut() = Some(owner);
         player.audition = Some(audition);
-        Ok((player, callback_clock))
+        Ok((player, access, callback_clock))
     }
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
@@ -156,7 +204,7 @@ impl Player {
         }
         let mut error = "no usable output stream".to_owned();
         for config in attempts {
-            let (mut player, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0)?;
+            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0)?;
             *player.input.get_mut() = if duplex {
                 match record::Recorder::build_on(&device, config.sample_rate.0, config.buffer_size) {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
@@ -168,17 +216,17 @@ impl Player {
                 HeldInput::No
             };
             let built = match format {
-                cpal::SampleFormat::I8 => build_output::<i8>(&device, &config, &player, clock),
-                cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &player, clock),
-                cpal::SampleFormat::I24 => build_output::<cpal::I24>(&device, &config, &player, clock),
-                cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &player, clock),
-                cpal::SampleFormat::I64 => build_output::<i64>(&device, &config, &player, clock),
-                cpal::SampleFormat::U8 => build_output::<u8>(&device, &config, &player, clock),
-                cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &player, clock),
-                cpal::SampleFormat::U32 => build_output::<u32>(&device, &config, &player, clock),
-                cpal::SampleFormat::U64 => build_output::<u64>(&device, &config, &player, clock),
-                cpal::SampleFormat::F32 => build_output::<f32>(&device, &config, &player, clock),
-                cpal::SampleFormat::F64 => build_output::<f64>(&device, &config, &player, clock),
+                cpal::SampleFormat::I8 => build_output::<i8>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::I24 => build_output::<cpal::I24>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::I64 => build_output::<i64>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::U8 => build_output::<u8>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::U32 => build_output::<u32>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::U64 => build_output::<u64>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::F32 => build_output::<f32>(&device, &config, &player, access, clock),
+                cpal::SampleFormat::F64 => build_output::<f64>(&device, &config, &player, access, clock),
                 _ => return Err(format!("unsupported device sample format: {format}")),
             };
             let stream = match built {
@@ -210,6 +258,10 @@ impl Player {
                 cpal::BufferSize::Default => None,
             };
             player.silent = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(midi) = player.midi.get_mut() {
+                midi.enable(soundcraft_midi_io::MidiIo::new("transitDAW"));
+            }
             return Ok(player);
         }
         Err(error)
@@ -217,7 +269,7 @@ impl Player {
 
     fn silent_runtime(session: Arc<Session>, error: String) -> Self {
         let rate = session.sample_rate.hz();
-        let (mut player, _clock) = match Self::prepare(session, rate) {
+        let (mut player, access, _clock) = match Self::prepare(session, rate) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let mut player = Self::empty(rate);
@@ -230,52 +282,59 @@ impl Player {
         *player.clock.get_mut() = None;
         player.initial_error = Some(error);
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            let (holder, shared, fault, stop) =
-                (Arc::clone(&player.state), Arc::clone(&player.shared), Arc::clone(&player.fault), Arc::clone(&player.silent_stop));
-            let failure_signal = player.failure_signal.clone();
-            let spawn = std::thread::Builder::new().name("soundcraft-silent-clock".into()).spawn(move || {
-                let mut callback = OutputCallback::new(2, rate);
-                let mut data = vec![0.0f32; 16_384];
-                let mut last = std::time::Instant::now();
-                let mut pacer = SilentPacer::default();
-                while !stop.load(Ordering::Acquire) {
-                    std::thread::park_timeout(std::time::Duration::from_millis(10));
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let now = std::time::Instant::now();
-                    let frames = pacer.advance(now - last, rate, data.len() / 2);
-                    last = now;
-                    let Some(frames) = frames else {
-                        if let Some(signal) = &failure_signal {
-                            signal.fault();
-                        }
-                        fault.failed.store(true, Ordering::Release);
-                        shared.playing.store(false, Ordering::Release);
-                        break;
-                    };
-                    let len = frames * 2;
-                    fault.beats.fetch_add(1, Ordering::Relaxed);
-                    if let Some(data) = data.get_mut(..len) {
-                        callback.fill_with(data, |buffer, plans, actions| {
-                            render_held(&holder, &fault, &shared, buffer, 2, plans, actions);
-                        });
-                    }
+        player.start_silent(access, |task| std::thread::Builder::new().name("soundcraft-silent-clock".into()).spawn(task));
+        #[cfg(target_arch = "wasm32")]
+        drop(access);
+        player
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_silent(
+        &mut self,
+        access: AudioAccess<Audio>,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) {
+        let rate = self.device_rate;
+        let mut callback = DeviceOutput::new(access, self, 2, rate);
+        let (shared, fault, stop) = (Arc::clone(&self.shared), Arc::clone(&self.fault), Arc::clone(&self.silent_stop));
+        let failure_signal = self.failure_signal.clone();
+        let spawn = spawn(Box::new(move || {
+            let mut data = vec![0.0f32; 16_384];
+            let mut last = std::time::Instant::now();
+            let mut pacer = SilentPacer::default();
+            while !stop.load(Ordering::Acquire) {
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
+                if stop.load(Ordering::Acquire) {
+                    break;
                 }
-            });
-            match spawn {
-                Ok(worker) => player.silent_worker = Some(worker),
-                Err(error) => {
-                    player.fault.failed.store(true, Ordering::Release);
-                    if let Some(owner) = player.owner.get_mut() {
-                        owner.fault();
+                let now = std::time::Instant::now();
+                let frames = pacer.advance(now - last, rate, data.len() / 2);
+                last = now;
+                let Some(frames) = frames else {
+                    if let Some(signal) = &failure_signal {
+                        signal.fault();
                     }
-                    player.initial_error = Some(format!("silent clock did not start: {error}"));
+                    fault.failed.store(true, Ordering::Release);
+                    shared.playing.store(false, Ordering::Release);
+                    break;
+                };
+                let len = frames * 2;
+                fault.beats.fetch_add(1, Ordering::Relaxed);
+                if let Some(data) = data.get_mut(..len) {
+                    callback.fill(data);
                 }
             }
+        }));
+        match spawn {
+            Ok(worker) => self.silent_worker = Some(worker),
+            Err(error) => {
+                self.fault.failed.store(true, Ordering::Release);
+                if let Some(owner) = self.owner.get_mut() {
+                    owner.fault();
+                }
+                self.initial_error = Some(format!("silent clock did not start: {error}"));
+            }
         }
-        player
     }
 
     fn owner(&self) -> Result<RefMut<'_, Owner>, PlayerError> {
@@ -291,6 +350,14 @@ impl Player {
     }
     pub fn update_session(&self, session: Arc<Session>) -> Result<SessionRequestId, PlayerError> {
         self.owner()?.update_session(session)
+    }
+    /// Restore an explicitly replaced document without reopening a same-rate device.
+    pub fn replace_session(&self, session: Arc<Session>) -> Result<SessionRequestId, PlayerError> {
+        self.owner()?.replace_session(session)
+    }
+    /// Includes view-only copy-on-write changes that do not advance Engine::revision.
+    pub fn has_requested_session(&self, session: &Arc<Session>) -> bool {
+        self.owner().is_ok_and(|owner| Arc::ptr_eq(owner.requested_session(), session))
     }
     pub fn set_input(&self, input: Arc<record::InputRing>) -> Result<SessionRequestId, PlayerError> {
         self.owner()?.set_input(Some(input))
@@ -347,10 +414,20 @@ impl Player {
     }
     pub fn stop(&self) -> Result<action_lane::Sequence, PlayerError> {
         self.cancel_record_start()?;
-        self.owner()?.stop()
+        let mut owner = self.owner()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(midi) = &*self.midi.try_borrow().map_err(|_| PlayerError::Busy)? {
+            midi.cutoff(&mut owner)?;
+        }
+        owner.stop()
     }
     pub fn all_notes_off(&self) -> Result<action_lane::Sequence, PlayerError> {
-        self.owner()?.all_notes_off()
+        let mut owner = self.owner()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(midi) = &*self.midi.try_borrow().map_err(|_| PlayerError::Busy)? {
+            midi.cutoff(&mut owner)?;
+        }
+        owner.all_notes_off()
     }
     pub fn note(&self, track: TrackId, pitch: u8, velocity: u8) -> Result<action_lane::Sequence, PlayerError> {
         if pitch > 127 || velocity > 127 {
@@ -395,7 +472,23 @@ impl Player {
         if self.fault.failed.load(Ordering::Acquire) || self.fault.gone.load(Ordering::Acquire) {
             owner.fault();
         }
-        Ok(owner.service())
+        let report = owner.service();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(midi) = &mut *self.midi.try_borrow_mut().map_err(|_| PlayerError::Busy)? {
+            midi.service(&mut owner, self.epoch);
+        }
+        Ok(report)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn midi_status(&self) -> Result<super::MidiStatus, PlayerError> {
+        let midi = self.midi.try_borrow().map_err(|_| PlayerError::Busy)?;
+        let mut status =
+            midi.as_ref().map_or_else(|| super::MidiStatus { error: self.midi_error.clone(), ..Default::default() }, super::native::Native::status);
+        status.timing_quality = self.clock_report().and_then(|report| report.map).map(|map| map.quality);
+        if status.routes != 0 && status.timing_quality.is_none() && status.error.is_none() {
+            status.error = Some("MIDI input is waiting for a valid audio clock".into());
+        }
+        Ok(status)
     }
     pub fn idle(&self) -> Result<Vec<EditorEdit>, PlayerError> {
         self.service()?;
@@ -514,6 +607,11 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         use cpal::traits::StreamTrait;
+        if let Some(anchor) = &self.state {
+            anchor.close();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        drop(self.midi.get_mut().take());
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.silent_stop.store(true, Ordering::Release);
@@ -524,14 +622,13 @@ impl Drop for Player {
         if let Some(stream) = &self.stream {
             let _ = stream.pause();
         }
-        // This retains the existing synchronous quiescence barrier until G6's
-        // lifecycle owner is wired. A pause alone is never treated as quiescence.
-        let audio = self.state.lock().unwrap_or_else(PoisonError::into_inner).take();
-        if let (Some(owner), Some(audio)) = (self.owner.get_mut().take(), audio) {
-            owner.retire(audio.into_ports());
+        // Admission, not the backend's pause semantics, establishes quiescence.
+        if let Some(anchor) = &self.state {
+            anchor.quiesce();
         }
-        // Callback closures now hold only an empty holder. Driver teardown cannot
-        // become the last owner of plug-ins, plans or retained panic payloads.
+        // Retain the anchor through ordinary stream/worker teardown. A backend
+        // may retain its callback even after a failed build, so endpoint loss is
+        // not a prerequisite for reclaiming Audio on Main after quiescence.
         let input = std::mem::replace(self.input.get_mut(), HeldInput::No);
         drop(input);
         drop(self.stream.take());
@@ -539,11 +636,18 @@ impl Drop for Player {
         if let Some(worker) = self.silent_worker.take() {
             let _ = worker.join();
         }
+        // Retained endpoints can only produce silence. Their eventual teardown
+        // may free the empty handoff allocation, outside timed rendering; it
+        // cannot destroy Audio, plug-ins or retained panic payloads.
+        let audio = self.state.take().map(Anchor::take);
+        if let (Some(owner), Some(audio)) = (self.owner.get_mut().take(), audio) {
+            owner.retire(audio.into_ports());
+        }
     }
 }
 
 fn render_held(
-    holder: &Mutex<Option<Audio>>,
+    access: &mut AudioAccess<Audio>,
     fault: &Fault,
     shared: &Shared,
     out: &mut [f32],
@@ -551,19 +655,7 @@ fn render_held(
     plans: &mut plan_bridge::CallbackBudget,
     actions: &mut action_lane::Budget,
 ) -> bool {
-    let mut held = match holder.try_lock() {
-        Ok(held) => held,
-        Err(TryLockError::Poisoned(poison)) => {
-            fault.failed.store(true, Ordering::Release);
-            poison.into_inner()
-        }
-        Err(TryLockError::WouldBlock) => {
-            fault.telemetry.contention_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
-            out.fill(0.0);
-            return true;
-        }
-    };
-    let Some(audio) = held.as_mut() else {
+    let Some(mut audio) = access.enter() else {
         fault.telemetry.unavailable_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
         out.fill(0.0);
         return false;
@@ -581,10 +673,33 @@ fn render_held(
     true
 }
 
+/// The real backend and silent worker share this preallocated render adapter.
+/// Its sole endpoint borrows Audio; the Player's anchor remains its final owner.
+struct DeviceOutput {
+    access: AudioAccess<Audio>,
+    output: OutputCallback,
+    shared: Arc<Shared>,
+    fault: Arc<Fault>,
+}
+
+impl DeviceOutput {
+    fn new(access: AudioAccess<Audio>, player: &Player, channels: usize, rate: u32) -> Self {
+        Self { access, output: OutputCallback::new(channels, rate), shared: Arc::clone(&player.shared), fault: Arc::clone(&player.fault) }
+    }
+
+    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T]) {
+        let channels = self.output.channels;
+        self.output.fill_with(data, |buffer, plans, actions| {
+            render_held(&mut self.access, &self.fault, &self.shared, buffer, channels, plans, actions);
+        });
+    }
+}
+
 fn build_output<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     player: &Player,
+    access: AudioAccess<Audio>,
     mut clock: device_clock::CallbackClock,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -593,8 +708,8 @@ where
     use cpal::traits::DeviceTrait;
     let channels = usize::from(config.channels).max(1);
     let rate = config.sample_rate.0;
-    let mut output = OutputCallback::new(channels, rate);
-    let (holder, shared, fault) = (Arc::clone(&player.state), Arc::clone(&player.shared), Arc::clone(&player.fault));
+    let mut output = DeviceOutput::new(access, player, channels, rate);
+    let fault = Arc::clone(&player.fault);
     let error = error_callback(Arc::clone(&player.fault), Arc::clone(&player.shared), player.failure_signal.clone());
     device.build_output_stream(
         config,
@@ -604,10 +719,8 @@ where
             let frames = data.len() / channels;
             clock.cpal.output(frames, info, clock.origin.now_ns());
             fault.beats.fetch_add(1, Ordering::Relaxed);
-            output.fill_with(data, |buffer, plans, actions| {
-                render_held(&holder, &fault, &shared, buffer, channels, plans, actions);
-            });
-            output.timing.record(&fault.telemetry, frames, rate, started.elapsed());
+            output.fill(data);
+            output.output.timing.record(&fault.telemetry, frames, rate, started.elapsed());
         },
         error,
         None,

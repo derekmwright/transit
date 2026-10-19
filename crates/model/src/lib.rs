@@ -10,6 +10,7 @@ pub mod b64;
 mod clip;
 mod ids;
 mod markers;
+mod midi_input;
 mod mixer;
 mod route_graph;
 mod session;
@@ -20,6 +21,7 @@ pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint}
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};
+pub use midi_input::{MidiInput, MidiPort};
 pub use mixer::{
     Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
 };

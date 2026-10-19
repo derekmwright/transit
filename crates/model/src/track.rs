@@ -216,6 +216,9 @@ pub struct Track {
     pub playlists: Vec<Playlist>,
     pub active_playlist: usize,
     pub mixer: Mixer,
+    /// MIDI hardware input and channel filter (old documents accept every input).
+    #[serde(default)]
+    pub midi_input: crate::MidiInput,
     pub automation: Vec<AutomationLane>,
     /// Which lane the track shows: `waveform`/`blocks`/`notes`/`regions` or an automation param id.
     pub view: String,
@@ -271,6 +274,7 @@ impl Track {
             height: TrackHeight::Medium,
             active_playlist: 0,
             mixer: Mixer::new(format),
+            midi_input: crate::MidiInput::default(),
             automation: Vec::new(),
             view: view.into(),
             hidden: false,

@@ -28,6 +28,8 @@
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod handoff;
+
 /// Test support: counts OS promotion attempts and heap allocations ([`testing::CountingAlloc`]).
 /// Not in release builds (feature `testing`).
 #[cfg(any(test, feature = "testing"))]

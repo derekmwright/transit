@@ -140,6 +140,10 @@ impl Rig {
     }
 
     fn publish(&mut self, s: &Session) {
+        self.publish_with_mode(s, soundcraft_mix::CompileMode::Update);
+    }
+
+    fn publish_with_mode(&mut self, s: &Session, mode: soundcraft_mix::CompileMode) {
         self.generation = self.generation.checked_next().unwrap();
         let (heard, made, fail) = (Arc::clone(&self.heard), Arc::clone(&self.made), Arc::clone(&self.fail));
         let (refuse_releases, refuse_downs) = (Arc::clone(&self.refuse_releases), Arc::clone(&self.refuse_downs));
@@ -160,7 +164,7 @@ impl Rig {
             });
             Some(NewInstance { plugin, refused_state: false })
         };
-        let mut env = self.comp.compile(Arc::new(s.clone()), self.comp.active(), self.generation, &mut make).unwrap();
+        let mut env = self.comp.compile_with_mode(Arc::new(s.clone()), self.comp.active(), self.generation, mode, &mut make).unwrap();
         assert_eq!(self.mix.adopt_plan(&mut env), Adoption::Adopted);
         self.comp.reclaim(env);
     }
@@ -201,6 +205,19 @@ impl Rig {
 
 fn port(port: u16, channel: u8) -> Source {
     Source { port, channel, generation: 1 }
+}
+
+#[test]
+fn a_new_document_refuses_old_slot_events_and_drops_queued_notes() {
+    let mut rig = Rig::new();
+    let old = rig.binding();
+    let event = rig.event(port(1, 0), Due::Next, on(60));
+    assert_eq!(rig.mix.queue_event(&event), EventOutcome::Queued);
+    rig.publish_with_mode(&rig.session.clone(), soundcraft_mix::CompileMode::NewDocument);
+    assert_ne!(rig.binding(), old);
+    assert_eq!(rig.mix.queue_event(&event), EventOutcome::StaleBinding);
+    rig.render(2);
+    assert!(!rig.heard_by(2).iter().any(|(_, e)| matches!(e.message, Message::NoteOn { .. })), "old queued notes cannot reach the new document");
 }
 
 fn on(key: u8) -> Message {

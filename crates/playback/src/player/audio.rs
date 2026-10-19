@@ -11,6 +11,11 @@ use soundcraft_time::{MAX_POSITION, Range, Samples};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+mod phase;
+use phase::Phase;
+#[cfg(not(target_arch = "wasm32"))]
+mod midi;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
     Play { from: Samples, end: Option<Samples>, looped: Option<Range> },
@@ -27,6 +32,10 @@ pub enum ActionResult {
     RecordingClock(device_clock::Unavailable),
     RecordingNotPlaying,
     RecordingCancelled,
+    MidiClock(device_clock::Unavailable),
+    MidiTimeline(timeline_map::MapError),
+    MidiBuffered,
+    MidiFull,
     InvalidPosition,
     Timeline(timeline_map::MapError),
     Event(soundcraft_mix::EventOutcome),
@@ -212,10 +221,14 @@ pub(super) struct Audio {
     pub(super) plans: plan_bridge::Audio,
     pub(super) actions: action_lane::Audio<Command, ActionResult>,
     pub(super) sources: sources::Audio,
+    #[cfg(not(target_arch = "wasm32"))]
+    midi: Option<action_lane::Audio<super::ingress::Packet, ActionResult>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    midi_inbox: midi::Inbox,
     transport: Transport,
     shared: Arc<Shared>,
     pending: usize,
-    read: f64,
+    read: Phase,
     sample_rate: u32,
     device_rate: u32,
     speed: u32,
@@ -275,6 +288,10 @@ impl Audio {
         self.plans.fault();
         self.actions.fault();
         self.sources.fault();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(midi) = &mut self.midi {
+            midi.fault();
+        }
         self.shared.playing.store(false, Ordering::Relaxed);
     }
     /// Construct on main from the owner's exact endpoint bundle, before starting
@@ -292,9 +309,9 @@ impl Audio {
             }
             let rate = timeline_map::Rate::new(u64::from(target.sample_rate), u64::from(device_rate))?;
             let timeline = timeline_map::Timeline::new(key, 0, 0, 0, rate)?;
-            Ok::<_, timeline_map::MapError>((rate, timeline))
+            Ok::<_, timeline_map::MapError>((rate, timeline, Phase::new(device_rate)?))
         };
-        let (rate, timeline) = match init() {
+        let (rate, timeline, read) = match init() {
             Ok(value) => value,
             Err(error) => return Err(InitError { error, ports: Box::new(ports) }),
         };
@@ -304,9 +321,13 @@ impl Audio {
                 plans: ports.plans,
                 actions: ports.actions,
                 sources: ports.sources,
+                #[cfg(not(target_arch = "wasm32"))]
+                midi: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                midi_inbox: midi::Inbox::new(),
                 shared,
                 pending: 0,
-                read: 0.0,
+                read,
                 sample_rate: target.sample_rate,
                 device_rate,
                 speed: 1000,
@@ -345,6 +366,11 @@ impl Audio {
         self.clock_origin = origin;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn set_midi(&mut self, midi: action_lane::Audio<super::ingress::Packet, ActionResult>) {
+        self.midi = Some(midi);
+    }
+
     /// Main only, after callback quiescence. Retained panic payloads are dropped
     /// here; plugin and session owners travel back through RuntimeControl::retire.
     pub(super) fn into_ports(self) -> AudioPorts<Command, ActionResult> {
@@ -361,7 +387,7 @@ impl Audio {
             self.transport.end = None;
             self.transport.render_position = end;
             self.pending = 0;
-            self.read = 0.0;
+            self.read.reset();
             self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(self.transport.epoch));
             self.plans.reset();
             self.shared.position.store(end, Ordering::Relaxed);
@@ -392,12 +418,48 @@ impl Audio {
         self.faulted |= report.faulted || self.transport.timeline_fault.is_some();
         if std::mem::take(&mut self.transport.discard_pending) {
             self.pending = 0;
-            self.read = 0.0;
+            self.read.reset();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.service_midi(budget);
         self.shared.playing.store(self.transport.playing && !self.faulted, Ordering::Relaxed);
     }
 
-    fn render_next(&mut self, quantum: usize) -> Result<(), timeline_map::MapError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn service_midi(&mut self, budget: &mut action_lane::Budget) {
+        let Some(midi) = &mut self.midi else { return };
+        let sources = &self.sources;
+        let state = &self.transport;
+        let inbox = &mut self.midi_inbox;
+        let report = midi.service(budget, &mut self.plans, &mut |event, live| {
+            let action_lane::Event::Action { payload: packet, .. } = event else {
+                live.all_notes_off();
+                return ActionResult::Applied;
+            };
+            // Worker admission is provisional: Stop can capture raw input after
+            // the worker popped it and before this final dispatch.
+            if !sources.permits_sequence(packet.source.port, packet.source.generation, packet.raw.seq) {
+                return ActionResult::Event(soundcraft_mix::EventOutcome::RevokedSource);
+            }
+            let Some(map) = state.clock_map else {
+                return ActionResult::MidiClock(device_clock::Unavailable::WarmingUp);
+            };
+            let Some(now) = state.clock_now else {
+                return ActionResult::MidiClock(device_clock::Unavailable::Stale);
+            };
+            let output = match map.host_to_frame(state.clock_key, packet.raw.host_arrival_ns, now) {
+                Ok(frame) => frame,
+                Err(error) => return ActionResult::MidiClock(error),
+            };
+            let Some(output) = output.checked_add(u64::from(packet.lookahead)) else {
+                return ActionResult::MidiTimeline(timeline_map::MapError::Arithmetic);
+            };
+            inbox.admit(packet, output)
+        });
+        self.faulted |= report.faulted;
+    }
+
+    fn render_next(&mut self, quantum: usize, actions: &mut action_lane::Budget) -> Result<(), timeline_map::MapError> {
         let state = &mut self.transport;
         if state.playing
             && state.loop_engaged
@@ -430,6 +492,18 @@ impl Audio {
             }
         }
         self.plans.set_processing(!state.playing, state.recording, self.shared.editors_open.load(Ordering::Relaxed));
+        #[cfg(not(target_arch = "wasm32"))]
+        self.midi_inbox.dispatch(
+            self.read,
+            state.timeline.next_output(),
+            u64::from(self.sample_rate) * u64::from(self.speed),
+            frames,
+            actions,
+            &self.sources,
+            &mut self.plans,
+        )?;
+        #[cfg(target_arch = "wasm32")]
+        let _ = actions;
         // The mixer owns each processor's suspension rules. A completed note
         // release does not prove that its envelope or any downstream tail ended.
         self.plans.render(state.render_position, frames);
@@ -474,6 +548,11 @@ impl Audio {
             self.plans.fault();
             self.actions.fault();
             self.sources.fault();
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(midi) = &mut self.midi {
+                midi.fault();
+                midi.service(actions, &mut self.plans, &mut |_, _| ActionResult::Timeline(timeline_map::MapError::Invalid));
+            }
             // Keep returning work under the SAME callback budgets. No plugin calls
             // or successful urgent acknowledgments are fabricated after failure.
             self.actions.service(actions, &mut self.plans, &mut |_, _| ActionResult::Timeline(timeline_map::MapError::Invalid));
@@ -518,25 +597,24 @@ impl Audio {
             self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(epoch));
             self.speed = speed;
         }
-        let step = f64::from(self.sample_rate) / f64::from(self.device_rate) * f64::from(speed) / 1000.0;
-        let quantum = ((out.len() / channels) as f64 * step).ceil().clamp(1.0, self.plans.engine().max_block() as f64) as usize;
+        let step = u64::from(self.sample_rate) * u64::from(speed);
+        let quantum = self.read.quantum(out.len() / channels, step, self.plans.engine().max_block());
         let mut consumed = 0;
         'frames: for frame in out.chunks_exact_mut(channels) {
-            while self.read >= self.pending as f64 {
+            while self.read.covers(self.pending) {
                 self.consumed(consumed)?;
                 consumed = 0;
-                self.read -= self.pending as f64;
+                self.read.remove(self.pending)?;
                 self.pending = 0;
                 self.plans.service(plans, true);
                 self.service_actions(actions);
                 if self.faulted {
                     break 'frames;
                 }
-                self.render_next(quantum)?;
+                self.render_next(quantum, actions)?;
             }
             let output = self.plans.output();
-            let index = self.read.floor() as usize;
-            let fraction = (self.read - index as f64) as f32;
+            let (index, fraction) = self.read.index()?;
             let sample = |channel: usize| {
                 let buffer = output.get(channel);
                 let a = buffer.and_then(|v| v.get(index)).copied().unwrap_or(0.0);
@@ -563,7 +641,7 @@ impl Audio {
                     }
                 }
             }
-            self.read += step;
+            self.read.advance(step)?;
             consumed += 1;
         }
         if self.faulted {

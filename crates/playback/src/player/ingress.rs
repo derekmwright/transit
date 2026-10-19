@@ -61,6 +61,12 @@ pub struct Port {
     boundary: InputBoundary,
 }
 impl Port {
+    pub(super) fn new(permit: sources::Permit, boundary: InputBoundary) -> Self {
+        Self { permit, boundary }
+    }
+    pub(super) fn permit(&self) -> sources::Permit {
+        self.permit.clone()
+    }
     pub fn token(&self) -> sources::Token {
         self.permit.token()
     }
@@ -82,7 +88,7 @@ impl Drop for Port {
 
 /// A route is bound to one instrument incarnation. A replacement needs a new
 /// binding; stale queued packets are refused by the mixer, never retargeted.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub engine: EngineEpoch,
     pub target: SlotBinding,
@@ -91,14 +97,13 @@ pub struct Route {
 }
 
 struct Input {
+    id: u64,
     consumer: InputConsumer,
-    permit: sources::Permit,
-    route: Route,
+    routes: Vec<(sources::Permit, Route)>,
 }
 impl Input {
     fn healthy(&self) -> bool {
-        self.permit.admits()
-            && !self.consumer.is_closed()
+        !self.consumer.is_closed()
             && !self.consumer.is_disconnected()
             && !self.consumer.is_exhausted()
             && self.consumer.counters().dropped_releases == 0
@@ -106,15 +111,23 @@ impl Input {
 }
 impl Drop for Input {
     fn drop(&mut self) {
-        self.permit.invalidate();
+        for (permit, _) in &self.routes {
+            permit.invalidate();
+        }
     }
+}
+
+enum Update {
+    Input(Input),
+    Routes { id: u64, routes: Vec<(sources::Permit, Route)>, applied: Arc<AtomicBool> },
 }
 
 /// Control-side handle. Drop closes admission immediately and wakes the worker;
 /// it does not join or move an input-device destructor onto the audio thread.
 pub struct Worker {
-    attach: SyncSender<Input>,
+    attach: SyncSender<Update>,
     permits: Vec<sources::Permit>,
+    next_input: u64,
     shared: Arc<Shared>,
     thread: std::thread::JoinHandle<()>,
 }
@@ -129,7 +142,7 @@ impl Worker {
                 std::thread::park_timeout(PERIOD);
             }
         })?;
-        Ok(Self { attach, permits: Vec::with_capacity(sources::PORTS), shared, thread })
+        Ok(Self { attach, permits: Vec::with_capacity(sources::PORTS), next_input: 0, shared, thread })
     }
 
     /// Open the input with this runtime's HostOrigin before attaching. The caller
@@ -148,10 +161,48 @@ impl Worker {
             return Err("MIDI source already attached");
         }
         let port = Port { boundary: consumer.boundary(), permit: permit.clone() };
-        self.attach.try_send(Input { consumer, permit: permit.clone(), route }).map_err(|_| "MIDI worker attachment queue unavailable")?;
+        let id = self.next_input.checked_add(1).ok_or("MIDI input identities exhausted")?;
+        self.next_input = id;
+        self.attach
+            .try_send(Update::Input(Input { id, consumer, routes: vec![(permit.clone(), route)] }))
+            .map_err(|_| "MIDI worker attachment queue unavailable")?;
         self.permits.push(permit);
         self.thread.thread().unpark();
         Ok(port)
+    }
+
+    /// One consumer per physical open; routing edits never reopen the device.
+    pub(super) fn attach_input(&mut self, consumer: InputConsumer) -> Result<u64, &'static str> {
+        if self.shared.finished.load(Ordering::Acquire) {
+            return Err("MIDI worker unavailable");
+        }
+        let id = self.next_input.checked_add(1).ok_or("MIDI input identities exhausted")?;
+        self.next_input = id;
+        self.attach.try_send(Update::Input(Input { id, consumer, routes: Vec::new() })).map_err(|_| "MIDI attachment queue unavailable")?;
+        self.thread.thread().unpark();
+        Ok(id)
+    }
+
+    pub(super) fn set_routes(&mut self, id: u64, routes: Vec<(sources::Permit, Route)>) -> Result<Arc<AtomicBool>, &'static str> {
+        self.permits.retain(sources::Permit::admits);
+        if self.shared.finished.load(Ordering::Acquire)
+            || routes.len() > sources::PORTS
+            || routes.iter().any(|(permit, route)| !permit.admits() || route.channels == 0 || route.lookahead > 8192)
+        {
+            return Err("MIDI route unavailable or invalid");
+        }
+        for (permit, _) in &routes {
+            if !self.permits.iter().any(|old| old.token() == permit.token()) {
+                if self.permits.len() == sources::PORTS {
+                    return Err("MIDI source capacity exhausted");
+                }
+                self.permits.push(permit.clone());
+            }
+        }
+        let applied = Arc::new(AtomicBool::new(false));
+        self.attach.try_send(Update::Routes { id, routes, applied: Arc::clone(&applied) }).map_err(|_| "MIDI route queue unavailable")?;
+        self.thread.thread().unpark();
+        Ok(applied)
     }
 
     /// Independent diagnostic counters, not a coherent cancellation frontier.
@@ -180,7 +231,7 @@ impl Drop for Worker {
 
 struct Pump {
     lane: action_lane::Control<Packet, ActionResult>,
-    receive: Receiver<Input>,
+    receive: Receiver<Update>,
     inputs: Vec<Input>,
     cursor: usize,
     shared: Arc<Shared>,
@@ -196,9 +247,28 @@ impl Pump {
             keep
         });
         for _ in 0..sources::PORTS {
-            let Ok(input) = self.receive.try_recv() else { break };
-            if self.inputs.len() < sources::PORTS && input.healthy() {
-                self.inputs.push(input);
+            match self.receive.try_recv() {
+                Ok(Update::Input(input)) => {
+                    if self.inputs.len() < sources::PORTS && input.healthy() {
+                        self.inputs.push(input);
+                    }
+                }
+                Ok(Update::Routes { id, routes, applied }) => {
+                    if let Some(input) = self.inputs.iter_mut().find(|input| input.id == id) {
+                        for (old, _) in &input.routes {
+                            if !routes.iter().any(|(new, _)| old.token() == new.token()) {
+                                old.invalidate();
+                            }
+                        }
+                        input.routes = routes;
+                        applied.store(true, Ordering::Release);
+                    } else {
+                        for (permit, _) in routes {
+                            permit.invalidate();
+                        }
+                    }
+                }
+                Err(_) => break,
             }
         }
         for _ in 0..action_lane::NOTE_CAPACITY {
@@ -206,21 +276,26 @@ impl Pump {
             let accepted = receipt.outcome == Outcome::Applied
                 && matches!(
                     receipt.handler_result,
-                    Some(ActionResult::Event(
-                        EventOutcome::Queued | EventOutcome::QueuedLate { .. } | EventOutcome::ReleaseAdvanced { .. } | EventOutcome::Coalesced
-                    ))
+                    Some(ActionResult::MidiBuffered)
+                        | Some(ActionResult::Event(
+                            EventOutcome::Queued
+                                | EventOutcome::QueuedLate { .. }
+                                | EventOutcome::ReleaseAdvanced { .. }
+                                | EventOutcome::Coalesced
+                                | EventOutcome::Unmatched
+                        ))
                 );
             if !accepted {
                 self.shared.refused.fetch_add(1, Ordering::Relaxed);
                 if receipt.payload.raw.is_release() {
-                    for input in &self.inputs {
-                        let token = input.permit.token();
+                    for (permit, _) in self.inputs.iter().flat_map(|input| &input.routes) {
+                        let token = permit.token();
                         if token.port() == receipt.payload.source.port
                             && token.generation() == receipt.payload.source.generation
-                            && input.permit.admits_sequence(receipt.payload.raw.seq)
+                            && permit.admits_sequence(receipt.payload.raw.seq)
                             && !matches!(receipt.outcome, Outcome::Stopped | Outcome::NotesReleased)
                         {
-                            input.permit.invalidate();
+                            permit.invalidate();
                         }
                     }
                 }
@@ -236,46 +311,56 @@ impl Pump {
             let Some(input) = self.inputs.get_mut(self.cursor) else { break };
             self.cursor += 1;
             if !input.healthy() {
-                input.permit.invalidate();
+                for (permit, _) in &input.routes {
+                    permit.invalidate();
+                }
+                continue;
+            }
+            // An input can attach before its initial routing update arrives.
+            // Preserve that backlog; each new route's raw cutoff rejects older
+            // offers once the worker applies it. Admission is not application.
+            if !input.routes.iter().any(|(permit, _)| permit.admits()) {
                 continue;
             }
             let Some(raw) = input.consumer.pop() else { continue };
             self.shared.offered.fetch_add(1, Ordering::Relaxed);
-            if !input.permit.admits_sequence(raw.seq) {
-                self.shared.cancelled.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             let Some((channel, message)) = decode(raw) else {
                 self.shared.filtered.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            if input.route.channels & (1 << channel) == 0 {
-                self.shared.filtered.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            let release = raw.is_release();
-            let credits = self.lane.note_credits();
-            if credits == 0 || (!release && credits <= RELEASE_RESERVE) {
-                self.shared.shed.fetch_add(1, Ordering::Relaxed);
-                if release {
-                    input.permit.invalidate();
+            for (permit, route) in &input.routes {
+                if !permit.admits_sequence(raw.seq) {
+                    self.shared.cancelled.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                continue;
-            }
-            let token = input.permit.token();
-            let packet = Packet {
-                engine: input.route.engine,
-                target: input.route.target,
-                source: Source { port: token.port(), channel, generation: token.generation() },
-                message,
-                raw,
-                lookahead: input.route.lookahead,
-            };
-            if self.lane.send_note(packet, if release { NoteKind::Off } else { NoteKind::On }).is_ok() {
-                self.shared.admitted.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.shared.shed.fetch_add(1, Ordering::Relaxed);
-                input.permit.invalidate();
+                if route.channels & (1 << channel) == 0 {
+                    self.shared.filtered.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let release = raw.is_release();
+                let credits = self.lane.note_credits();
+                if credits == 0 || (!release && credits <= RELEASE_RESERVE) {
+                    self.shared.shed.fetch_add(1, Ordering::Relaxed);
+                    if release {
+                        permit.invalidate();
+                    }
+                    continue;
+                }
+                let token = permit.token();
+                let packet = Packet {
+                    engine: route.engine,
+                    target: route.target,
+                    source: Source { port: token.port(), channel, generation: token.generation() },
+                    message,
+                    raw,
+                    lookahead: route.lookahead,
+                };
+                if self.lane.send_note(packet, if release { NoteKind::Off } else { NoteKind::On }).is_ok() {
+                    self.shared.admitted.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.shared.shed.fetch_add(1, Ordering::Relaxed);
+                    permit.invalidate();
+                }
             }
         }
     }
@@ -284,8 +369,19 @@ impl Drop for Pump {
     fn drop(&mut self) {
         self.shared.finished.store(true, Ordering::Release);
         // Close admission for every input before reclaiming any worker storage.
-        for input in &self.inputs {
-            input.permit.invalidate();
+        for (permit, _) in self.inputs.iter().flat_map(|input| &input.routes) {
+            permit.invalidate();
+        }
+        for _ in 0..sources::PORTS {
+            match self.receive.try_recv() {
+                Ok(Update::Input(input)) => drop(input),
+                Ok(Update::Routes { routes, .. }) => {
+                    for (permit, _) in routes {
+                        permit.invalidate();
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 }

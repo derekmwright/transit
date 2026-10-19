@@ -488,3 +488,77 @@ fn stop_clears_staging_before_later_compilation_and_keeps_admission_healthy() {
     assert!(got_next);
     control.retire(plans, actions);
 }
+
+#[test]
+fn restoration_survives_coalescing_rejection_and_an_older_in_flight_adoption() {
+    let (mut control, mut audio) = session_pair(target(), PlanLimits::default());
+    let mut s = Session::default();
+    let track = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+    let s = Arc::new(s);
+    control.request(Arc::clone(&s), None).unwrap();
+    control.service(&mut factory);
+    adopt(&mut audio);
+    control.service(&mut factory);
+    let original = control.active_bindings();
+
+    control.replace_session(Arc::clone(&s), None).unwrap();
+    control.request(Arc::clone(&s), None).unwrap(); // Ordinary edit coalesces the restore.
+    control.service(&mut factory);
+    let first = control.bridge.pending_bindings().unwrap();
+    assert_ne!(first, original);
+    audio.return_pending(&mut plan_bridge::callback_scope());
+    control.service(&mut factory);
+    assert_eq!(control.active_bindings(), original);
+    // Retry via ordinary update retains the unresolved document boundary.
+    control.request(Arc::clone(&s), None).unwrap();
+    control.service(&mut factory);
+    let retry = control.bridge.pending_bindings().unwrap();
+    assert_ne!(retry, first);
+    assert_ne!(retry, original);
+
+    // Another project arrives before the first restoration is confirmed.
+    control.replace_session(Arc::clone(&s), None).unwrap();
+    control.request(Arc::clone(&s), None).unwrap();
+    adopt(&mut audio);
+    control.service(&mut factory);
+    assert_eq!(control.active_bindings(), retry);
+    let latest = control.bridge.pending_bindings().unwrap();
+    assert_ne!(latest, retry, "an older adoption must not clear the latest restore");
+    adopt(&mut audio);
+    control.service(&mut factory);
+    assert_eq!(control.active_bindings(), latest);
+    assert_eq!(audio.engine().active().target, target());
+
+    control.request(Arc::clone(&s), None).unwrap();
+    control.service(&mut |_, _| panic!("Save snapshot recreated an active instance"));
+    adopt(&mut audio);
+    control.service(&mut factory);
+    assert_eq!(control.active_bindings(), latest);
+    control.retire(audio);
+}
+
+#[test]
+fn failed_restore_compile_keeps_its_boundary_for_a_corrected_update() {
+    let (mut control, mut audio) = session_pair(target(), PlanLimits { tracks: 1, ..PlanLimits::default() });
+    let mut s = Session::default();
+    let track = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+    let s = Arc::new(s);
+    control.request(Arc::clone(&s), None).unwrap();
+    control.service(&mut factory);
+    adopt(&mut audio);
+    control.service(&mut factory);
+    let original = control.active_bindings();
+    let mut invalid = (*s).clone();
+    invalid.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    let request = control.replace_session(Arc::new(invalid), None).unwrap();
+    control.service(&mut factory);
+    assert!(matches!(control.state(request), RequestState::Finished(SessionOutcome::Rejected(SessionFailure::Compile(_)))));
+    control.request(s, None).unwrap();
+    control.service(&mut factory);
+    adopt(&mut audio);
+    control.service(&mut factory);
+    assert_ne!(control.active_bindings(), original);
+    control.retire(audio);
+}
