@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
-    IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
-    IHostApplicationTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
+    IAttributeListTrait, IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
+    IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
 };
 use vst3::Steinberg::{self as sb};
 use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
@@ -671,13 +671,30 @@ impl IHostApplicationTrait for HostContext {
         }
     }
 
-    unsafe fn createInstance(&self, _cid: *mut sb::TUID, _iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
-        // IMessage / IAttributeList are not provided yet; plugins must cope with that.
+    /// Host-side `IMessage` and `IAttributeList` objects, which plug-ins whose component and
+    /// controller talk through `IConnectionPoint` allocate here (the SDK's `allocateMessage`).
+    /// A host must provide them; some plug-ins (iZotope Ozone 11) use the result unchecked.
+    unsafe fn createInstance(&self, cid: *mut sb::TUID, iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
         // SAFETY: `obj` is the plugin's out-pointer (or null, handled).
-        if let Some(o) = unsafe { obj.as_mut() } {
-            *o = std::ptr::null_mut();
+        let Some(out) = (unsafe { obj.as_mut() }) else { return sb::kInvalidArgument };
+        *out = std::ptr::null_mut();
+        // SAFETY: the plugin passes two readable 16-byte TUIDs (or null, handled).
+        let (Some(cid), Some(iid)) = (unsafe { cid.as_ref() }, unsafe { iid.as_ref() }) else { return sb::kInvalidArgument };
+        let (cid, iid) = (tuid_bytes(cid), tuid_bytes(iid));
+        let raw = if cid == sv::IMessage::IID {
+            query::<sv::IMessage, _>(&ComWrapper::new(HostMessage::default()), &iid)
+        } else if cid == sv::IAttributeList::IID {
+            query::<sv::IAttributeList, _>(&ComWrapper::new(HostAttributeList::default()), &iid)
+        } else {
+            None
+        };
+        match raw {
+            Some(p) => {
+                *out = p;
+                sb::kResultOk
+            }
+            None => sb::kResultFalse,
         }
-        sb::kResultFalse
     }
 }
 
@@ -728,6 +745,184 @@ impl IComponentHandlerTrait for HostContext {
         self.other_flags.fetch_or(flags as u32 & !handled, Ordering::Relaxed);
         self.restart_requested.store(true, Ordering::Release);
         sb::kResultOk
+    }
+}
+
+/// `obj` as its interface `I` (requested as `I` or `FUnknown`), with one reference owned by the
+/// caller; `None` for any other interface id.
+fn query<I: Interface, C: Class>(obj: &ComWrapper<C>, iid: &[u8; 16]) -> Option<*mut c_void> {
+    if *iid == I::IID {
+        Some(obj.to_com_ptr::<I>()?.into_raw().cast())
+    } else if *iid == FUnknown::IID {
+        Some(obj.to_com_ptr::<FUnknown>()?.into_raw().cast())
+    } else {
+        None
+    }
+}
+
+/// One `IAttributeList` value.
+enum Attr {
+    Int(i64),
+    Float(f64),
+    /// UTF-16 without the terminator.
+    String(Vec<u16>),
+    Binary(Vec<u8>),
+}
+
+/// A host `IAttributeList` (created through `IHostApplication::createInstance`, or owned by a
+/// [`HostMessage`]). Binary values handed out by `getBinary` stay valid until that attribute is
+/// set again or the list is released, as with the SDK's own host classes.
+#[derive(Default)]
+pub(crate) struct HostAttributeList {
+    attrs: Mutex<std::collections::HashMap<Vec<u8>, Attr>>,
+}
+
+impl Class for HostAttributeList {
+    type Interfaces = (sv::IAttributeList,);
+}
+
+/// An attribute id's bytes (a NUL-terminated C string; null is refused).
+fn attr_key(id: sv::IAttributeList_::AttrID) -> Option<Vec<u8>> {
+    // SAFETY: the plugin passes a NUL-terminated string (or null, handled).
+    (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes().to_vec())
+}
+
+impl HostAttributeList {
+    fn set(&self, id: sv::IAttributeList_::AttrID, v: Attr) -> sb::tresult {
+        let Some(k) = attr_key(id) else { return sb::kInvalidArgument };
+        self.attrs.lock().unwrap_or_else(PoisonError::into_inner).insert(k, v);
+        sb::kResultOk
+    }
+
+    fn get<T>(&self, id: sv::IAttributeList_::AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Option<T> {
+        let k = attr_key(id)?;
+        f(self.attrs.lock().unwrap_or_else(PoisonError::into_inner).get(&k)?)
+    }
+}
+
+/// Longest string attribute read, in UTF-16 units (a guard against unterminated input).
+const ATTR_STRING_MAX: usize = 1 << 20;
+
+impl IAttributeListTrait for HostAttributeList {
+    unsafe fn setInt(&self, id: sv::IAttributeList_::AttrID, value: i64) -> sb::tresult {
+        self.set(id, Attr::Int(value))
+    }
+    unsafe fn getInt(&self, id: sv::IAttributeList_::AttrID, value: *mut i64) -> sb::tresult {
+        // SAFETY: the plugin's out-pointer (or null, handled).
+        let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
+        match self.get(id, |a| if let Attr::Int(v) = a { Some(*v) } else { None }) {
+            Some(v) => {
+                *out = v;
+                sb::kResultOk
+            }
+            None => sb::kResultFalse,
+        }
+    }
+    unsafe fn setFloat(&self, id: sv::IAttributeList_::AttrID, value: f64) -> sb::tresult {
+        self.set(id, Attr::Float(value))
+    }
+    unsafe fn getFloat(&self, id: sv::IAttributeList_::AttrID, value: *mut f64) -> sb::tresult {
+        // SAFETY: the plugin's out-pointer (or null, handled).
+        let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
+        match self.get(id, |a| if let Attr::Float(v) = a { Some(*v) } else { None }) {
+            Some(v) => {
+                *out = v;
+                sb::kResultOk
+            }
+            None => sb::kResultFalse,
+        }
+    }
+    unsafe fn setString(&self, id: sv::IAttributeList_::AttrID, string: *const sv::TChar) -> sb::tresult {
+        if string.is_null() {
+            return sb::kInvalidArgument;
+        }
+        let mut v = Vec::new();
+        while v.len() < ATTR_STRING_MAX {
+            // SAFETY: the plugin passes a NUL-terminated UTF-16 string; reading stops at the
+            // terminator.
+            let c = unsafe { *string.add(v.len()) };
+            if c == 0 {
+                break;
+            }
+            v.push(c);
+        }
+        self.set(id, Attr::String(v))
+    }
+    unsafe fn getString(&self, id: sv::IAttributeList_::AttrID, string: *mut sv::TChar, size_in_bytes: u32) -> sb::tresult {
+        let units = size_in_bytes as usize / 2;
+        if string.is_null() || units == 0 {
+            return sb::kInvalidArgument;
+        }
+        let Some(s) = self.get(id, |a| if let Attr::String(s) = a { Some(s.clone()) } else { None }) else { return sb::kResultFalse };
+        // SAFETY: the plugin's buffer of `size_in_bytes` writable bytes.
+        let dst = unsafe { std::slice::from_raw_parts_mut(string, units) };
+        write_c16_units(&s, dst);
+        sb::kResultOk
+    }
+    unsafe fn setBinary(&self, id: sv::IAttributeList_::AttrID, data: *const c_void, size_in_bytes: u32) -> sb::tresult {
+        let bytes = if size_in_bytes == 0 {
+            Vec::new()
+        } else if data.is_null() {
+            return sb::kInvalidArgument;
+        } else {
+            // SAFETY: the plugin passes `size_in_bytes` readable bytes.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size_in_bytes as usize) }.to_vec()
+        };
+        self.set(id, Attr::Binary(bytes))
+    }
+    unsafe fn getBinary(&self, id: sv::IAttributeList_::AttrID, data: *mut *const c_void, size_in_bytes: *mut u32) -> sb::tresult {
+        // SAFETY: the plugin's out-pointers (or null, handled).
+        let (Some(d), Some(n)) = (unsafe { data.as_mut() }, unsafe { size_in_bytes.as_mut() }) else { return sb::kInvalidArgument };
+        // The pointer stays valid after the lock is released: the vector is untouched until the
+        // attribute is replaced or the list is released (the SDK's contract).
+        match self.get(id, |a| if let Attr::Binary(b) = a { Some((b.as_ptr().cast::<c_void>(), b.len())) } else { None }) {
+            Some((p, len)) => {
+                *d = p;
+                *n = u32::try_from(len).unwrap_or(u32::MAX);
+                sb::kResultOk
+            }
+            None => sb::kResultFalse,
+        }
+    }
+}
+
+/// Copies UTF-16 `src` into `dst` with a terminator, truncating to fit.
+fn write_c16_units(src: &[u16], dst: &mut [u16]) {
+    let Some(room) = dst.len().checked_sub(1) else { return };
+    let n = src.len().min(room);
+    dst[..n].copy_from_slice(&src[..n]);
+    dst[n] = 0;
+}
+
+/// A host `IMessage`: an id plus its own attribute list.
+pub(crate) struct HostMessage {
+    /// Valid until the next `setMessageID` (when the SDK's own host message frees it too).
+    id: Mutex<Option<std::ffi::CString>>,
+    attrs: ComWrapper<HostAttributeList>,
+}
+
+impl Default for HostMessage {
+    fn default() -> Self {
+        HostMessage { id: Mutex::new(None), attrs: ComWrapper::new(HostAttributeList::default()) }
+    }
+}
+
+impl Class for HostMessage {
+    type Interfaces = (sv::IMessage,);
+}
+
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> sb::FIDString {
+        self.id.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+    }
+    unsafe fn setMessageID(&self, id: sb::FIDString) {
+        // SAFETY: the plugin passes a NUL-terminated string (or null, which clears the id).
+        let new = (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_owned());
+        *self.id.lock().unwrap_or_else(PoisonError::into_inner) = new;
+    }
+    unsafe fn getAttributes(&self) -> *mut sv::IAttributeList {
+        // Not add-ref'd: the list lives as long as the message (the SDK's contract).
+        self.attrs.as_com_ref::<sv::IAttributeList>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
     }
 }
 
@@ -2185,6 +2380,58 @@ mod window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `IHostApplication::createInstance` as a plug-in calls it (class id = interface id).
+    fn create_host_object(host: &ComWrapper<HostContext>, cid: [u8; 16], iid: [u8; 16]) -> (sb::tresult, *mut c_void) {
+        let (mut cid, mut iid) = (cid.map(|b| b as c_char), iid.map(|b| b as c_char));
+        let mut obj = std::ptr::dangling_mut::<c_void>();
+        // SAFETY: valid TUIDs and out-pointer.
+        let r = unsafe { host.createInstance(&mut cid, &mut iid, &mut obj) };
+        (r, obj)
+    }
+
+    #[test]
+    fn host_creates_messages_and_attribute_lists() {
+        let host = ComWrapper::new(HostContext::default());
+        let (r, obj) = create_host_object(&host, sv::IMessage::IID, sv::IMessage::IID);
+        assert_eq!(r, sb::kResultOk);
+        // SAFETY: an IMessage with one reference owned here.
+        let msg = unsafe { ComPtr::from_raw(obj.cast::<sv::IMessage>()) }.expect("message");
+        // SAFETY: valid message; static NUL-terminated id; the attribute list lives with it.
+        unsafe {
+            assert!(msg.getMessageID().is_null());
+            msg.setMessageID(c"Hello".as_ptr());
+            assert_eq!(std::ffi::CStr::from_ptr(msg.getMessageID()), c"Hello");
+            let attrs = vst3::ComRef::from_raw(msg.getAttributes()).expect("attributes");
+            let text: Vec<u16> = "abcdef".encode_utf16().chain(Some(0)).collect();
+            assert_eq!(attrs.setString(c"s".as_ptr(), text.as_ptr()), sb::kResultOk);
+            let mut out = [0xffffu16; 4];
+            assert_eq!(attrs.getString(c"s".as_ptr(), out.as_mut_ptr(), 8), sb::kResultOk);
+            assert_eq!(out, [u16::from(b'a'), u16::from(b'b'), u16::from(b'c'), 0], "truncated and terminated");
+            assert_eq!(attrs.setBinary(c"b".as_ptr(), [1u8, 2, 3].as_ptr().cast(), 3), sb::kResultOk);
+            let (mut p, mut n) = (std::ptr::null(), 0u32);
+            assert_eq!(attrs.getBinary(c"b".as_ptr(), &mut p, &mut n), sb::kResultOk);
+            assert_eq!(std::slice::from_raw_parts(p.cast::<u8>(), n as usize), [1, 2, 3]);
+            let mut i = 0i64;
+            assert_eq!(attrs.getInt(c"b".as_ptr(), &mut i), sb::kResultFalse, "wrong type");
+            assert_eq!(attrs.getInt(std::ptr::null(), &mut i), sb::kResultFalse, "no id, no value");
+        }
+        let (r, obj) = create_host_object(&host, sv::IAttributeList::IID, FUnknown::IID);
+        assert_eq!(r, sb::kResultOk);
+        // SAFETY: an FUnknown with one reference owned here.
+        let list = unsafe { ComPtr::from_raw(obj.cast::<FUnknown>()) }.and_then(|u| u.cast::<sv::IAttributeList>()).expect("list");
+        // SAFETY: valid list.
+        unsafe {
+            assert_eq!(list.setFloat(c"f".as_ptr(), 0.5), sb::kResultOk);
+            let mut f = 0.0;
+            assert_eq!(list.getFloat(c"f".as_ptr(), &mut f), sb::kResultOk);
+            assert_eq!(f, 0.5);
+        }
+        // Unknown classes and interfaces the class lacks: refused, with a null object.
+        for (cid, iid) in [(sv::IComponentHandler::IID, sv::IComponentHandler::IID), (sv::IMessage::IID, sv::IAttributeList::IID)] {
+            assert_eq!(create_host_object(&host, cid, iid), (sb::kResultFalse, std::ptr::null_mut()));
+        }
+    }
 
     #[test]
     fn silence_flags_set_one_bit_per_channel() {

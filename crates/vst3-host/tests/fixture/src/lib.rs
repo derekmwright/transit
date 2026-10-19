@@ -22,6 +22,13 @@
 //!   the `getState` call (`me=`) and the threads that ran `getMidiControllerAssignment`,
 //!   `setActive`, `process` and `getLatencySamples`.
 //!
+//! Gain's component talks to its controller the way iZotope's plug-ins do (and the SDK's
+//! `ComponentBase::allocateMessage`): when connected it allocates an `IMessage` through the host
+//! context's `IHostApplication::createInstance`, fills its attribute list, and `notify`s the
+//! controller, which checks every value; it also allocates a bare `IAttributeList` there. A host
+//! that cannot create them, or a controller that never got the message by the time the host sets
+//! its component handler, is a host contract violation.
+//!
 //! Probe mode (`VST3_FIXTURE_PROBES` set; see "probe mode" below) checks VST3's edit-controller
 //! threading rule and reports the Freq values Gain's processor receives.
 //!
@@ -77,10 +84,76 @@ unsafe fn channels<'a>(bus: &AudioBusBuffers, frames: usize) -> Vec<&'a mut [f32
 
 // ---- gain ----------------------------------------------------------------------------------
 
+const HELLO_ID: &std::ffi::CStr = c"FixtureHello";
+const HELLO_BLOB: [u8; 5] = [0, 1, 2, 0xfe, 0xff];
+
+/// A host object of class (and interface) `I`, as `IHostApplication::createInstance` makes it.
+fn host_create<I: vst3::Interface>(host: &ComRef<'_, IHostApplication>) -> Option<vst3::ComPtr<I>> {
+    let mut iid = I::IID.map(|b| b as c_char);
+    let mut obj: *mut c_void = std::ptr::null_mut();
+    let r = unsafe { host.createInstance(&mut iid, &mut iid, &mut obj) };
+    if r != kResultOk && r != kResultTrue {
+        return None;
+    }
+    unsafe { vst3::ComPtr::from_raw(obj.cast::<I>()) }
+}
+
+/// The component's greeting to its controller (see the module docs).
+fn say_hello(host: &vst3::ComPtr<IHostApplication>, peer: &ComRef<'_, IConnectionPoint>) {
+    let host = host.as_com_ref();
+    let Some(list) = host_create::<IAttributeList>(&host) else { violation("host createInstance made no IAttributeList") };
+    unsafe {
+        assert_eq!(list.setInt(c"n".as_ptr(), -7), kResultOk);
+        let mut n = 0i64;
+        assert_eq!(list.getInt(c"n".as_ptr(), &mut n), kResultOk);
+        assert_eq!(n, -7, "host attribute list int");
+        assert_ne!(list.getInt(c"missing".as_ptr(), &mut n), kResultOk, "host attribute list: no such int");
+    }
+    let Some(msg) = host_create::<IMessage>(&host) else { violation("host createInstance made no IMessage for IConnectionPoint::notify") };
+    unsafe {
+        msg.setMessageID(HELLO_ID.as_ptr());
+        let Some(attrs) = ComRef::from_raw(msg.getAttributes()) else { violation("host IMessage without attributes") };
+        let name: Vec<TChar> = "Fixture".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(attrs.setInt(c"int".as_ptr(), 42), kResultOk);
+        assert_eq!(attrs.setFloat(c"float".as_ptr(), 0.25), kResultOk);
+        assert_eq!(attrs.setString(c"string".as_ptr(), name.as_ptr()), kResultOk);
+        assert_eq!(attrs.setBinary(c"binary".as_ptr(), HELLO_BLOB.as_ptr().cast(), HELLO_BLOB.len() as u32), kResultOk);
+        peer.notify(msg.as_ptr());
+    }
+}
+
+/// Checks the component's greeting (see the module docs).
+fn hello_ok(message: *mut IMessage) -> bool {
+    let Some(msg) = (unsafe { ComRef::from_raw(message) }) else { return false };
+    unsafe {
+        let id = msg.getMessageID();
+        if id.is_null() || std::ffi::CStr::from_ptr(id) != HELLO_ID {
+            return false;
+        }
+        let Some(attrs) = ComRef::from_raw(msg.getAttributes()) else { return false };
+        let (mut i, mut f) = (0i64, 0f64);
+        let mut s = [0 as TChar; 4];
+        let (mut data, mut size): (*const c_void, u32) = (std::ptr::null(), 0);
+        attrs.getInt(c"int".as_ptr(), &mut i) == kResultOk
+            && i == 42
+            && attrs.getFloat(c"float".as_ptr(), &mut f) == kResultOk
+            && f == 0.25
+            // A 4-unit buffer truncates "Fixture" to "Fix" plus the terminator.
+            && attrs.getString(c"string".as_ptr(), s.as_mut_ptr(), std::mem::size_of_val(&s) as u32) == kResultOk
+            && s == [b'F' as TChar, b'i' as TChar, b'x' as TChar, 0]
+            && attrs.getBinary(c"binary".as_ptr(), &mut data, &mut size) == kResultOk
+            && size as usize == HELLO_BLOB.len()
+            && std::slice::from_raw_parts(data.cast::<u8>(), size as usize) == HELLO_BLOB
+            && attrs.getFloat(c"int".as_ptr(), &mut f) != kResultOk
+    }
+}
+
 struct GainProcessor {
     /// Normalized gain (plain = 2 × normalized).
     gain: AtomicU64,
     arrangement: AtomicU64,
+    /// The host context from `initialize` (alive while the component is initialized).
+    host: AtomicPtr<FUnknown>,
     _live: Live,
 }
 
@@ -91,6 +164,7 @@ impl Class for GainProcessor {
 impl IPluginBaseTrait for GainProcessor {
     unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
         assert!(!context.is_null(), "host context");
+        self.host.store(context, Ordering::SeqCst);
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -100,7 +174,11 @@ impl IPluginBaseTrait for GainProcessor {
 
 impl IConnectionPointTrait for GainProcessor {
     unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
-        if other.is_null() { kInvalidArgument } else { kResultOk }
+        let Some(peer) = (unsafe { ComRef::from_raw(other) }) else { return kInvalidArgument };
+        let host = unsafe { ComRef::from_raw(self.host.load(Ordering::SeqCst)) }.and_then(|h| h.cast::<IHostApplication>());
+        let Some(host) = host else { violation("the host context has no IHostApplication") };
+        say_hello(&host, &peer);
+        kResultOk
     }
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
         kResultOk
@@ -263,6 +341,8 @@ struct GainController {
     preset: AtomicU64,
     /// The host's component handler for this controller.
     handler: AtomicPtr<IComponentHandler>,
+    /// The component's greeting arrived (see the module docs).
+    hello: AtomicBool,
     _live: Live,
 }
 
@@ -342,7 +422,11 @@ impl IConnectionPointTrait for GainController {
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
         kResultOk
     }
-    unsafe fn notify(&self, _message: *mut IMessage) -> tresult {
+    unsafe fn notify(&self, message: *mut IMessage) -> tresult {
+        if !hello_ok(message) {
+            violation("the component's IMessage reached the controller garbled");
+        }
+        self.hello.store(true, Ordering::SeqCst);
         kResultOk
     }
 }
@@ -532,6 +616,9 @@ impl IEditControllerTrait for GainController {
     }
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         ctrl_call("setComponentHandler");
+        if !self.hello.load(Ordering::SeqCst) {
+            violation("the controller got no IMessage from its connected component");
+        }
         HANDLER.store(handler, Ordering::SeqCst);
         self.handler.store(handler, Ordering::SeqCst);
         // Exercise the host's handler: an edit from the "plugin GUI" must be accepted.
@@ -923,6 +1010,7 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainProcessor {
                 gain: AtomicU64::new(0.25f64.to_bits()),
                 arrangement: AtomicU64::new(SpeakerArr::kStereo),
+                host: AtomicPtr::new(std::ptr::null_mut()),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()
@@ -932,6 +1020,7 @@ impl IPluginFactoryTrait for Factory {
                 freq: AtomicU64::new(0.5f64.to_bits()),
                 preset: AtomicU64::new(u64::MAX),
                 handler: AtomicPtr::new(std::ptr::null_mut()),
+                hello: AtomicBool::new(false),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()

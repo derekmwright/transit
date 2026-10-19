@@ -147,6 +147,23 @@ fn synth_plays_notes_at_their_offsets() {
     assert!(mono[0].iter().all(|&x| (x - 1.0).abs() < 1e-6), "the note is still held");
 }
 
+/// Regression (iZotope Ozone 11 crashed the host on insert): a component connected to its
+/// controller allocates an `IMessage` (and an `IAttributeList`) through the host's
+/// `IHostApplication::createInstance` and sends it with `IConnectionPoint::notify`. Ozone uses the
+/// result unchecked, so a host returning none crashed inside `connect`. The fixture's Gain does
+/// the same and ends the process (status 3) if the host cannot, or if the message arrives garbled
+/// or never.
+#[test]
+fn connected_component_messages_its_controller_through_host_objects() {
+    let id = id_of("Fixture Gain");
+    for _ in 0..3 {
+        let mut p = soundcraft_vst3_host::create(&id).expect("instantiate");
+        p.prepare(48_000.0, 1024, 2);
+        let mut io = vec![vec![0.5f32; 1024]; 2];
+        p.process(&mut io, 1024);
+    }
+}
+
 #[test]
 fn many_instances_create_and_drop_cleanly() {
     let (g, s) = (id_of("Fixture Gain"), id_of("Fixture Synth"));
