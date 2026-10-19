@@ -176,12 +176,42 @@ fn many_instances_create_and_drop_cleanly() {
     }
 }
 
+// Windows standard roots can all be redirected in the child without changing this process's
+// environment. The synthetic smoke must find the fixture even when test-hooks is enabled.
+#[cfg(windows)]
+#[test]
+fn smoke_honors_vst3_path_with_test_hooks() {
+    let fixture = fixture_dir();
+    let empty = fixture.join("empty-default-roots");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "installed_plugins_smoke", "--nocapture"])
+        .env_clear()
+        .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+        .env("SOUNDCRAFT_VST3_SMOKE", "1")
+        .env("SOUNDCRAFT_VST3_SMOKE_ROOT", fixture)
+        .env("VST3_PATH", fixture)
+        .env("CommonProgramFiles", &empty)
+        .env("LOCALAPPDATA", &empty)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("found Fixture Gain"), "VST3_PATH was not scanned: {stderr}");
+    assert!(stderr.contains("found Fixture Synth"), "VST3_PATH was not scanned: {stderr}");
+}
+
 /// Smoke test against whatever real VST3 plugins are installed (none are required): scan, then
 /// instantiate, prepare and process each one briefly. Set `SOUNDCRAFT_VST3_SMOKE=1` to run it.
 #[test]
 fn installed_plugins_smoke() {
     if std::env::var_os("SOUNDCRAFT_VST3_SMOKE").is_none() {
         return;
+    }
+    if let Some(root) = std::env::var_os("SOUNDCRAFT_VST3_SMOKE_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        let (defaults, extra) = soundcraft_vst3_host::search_dirs();
+        assert!(extra.is_empty());
+        assert!(defaults.iter().all(|p| p.starts_with(&root)), "unexpected smoke roots: {defaults:?}");
     }
     for d in soundcraft_vst3_host::scan() {
         eprintln!("found {} ({}) {:?} [{}] at {}", d.name, d.vendor, d.category, d.sub_categories.join("|"), d.path.display());

@@ -21,6 +21,8 @@ struct Registry {
     /// can be created without waiting for the scan.
     remembered: Vec<Vst3Descriptor>,
     extra_dirs: Vec<PathBuf>,
+    /// Folders whose add_search_dir completed while a scan had not published yet.
+    refresh_dirs: HashSet<PathBuf>,
     /// Where scans are remembered across runs (see [`scan_cache`]); `None` keeps them in memory only.
     cache_file: Option<PathBuf>,
     /// The program that loads files for scans in a child process (see [`set_scanner`]).
@@ -109,15 +111,19 @@ fn merge(files: Vec<scan_cache::Entry<Vst3Descriptor>>) -> Vec<Vst3Descriptor> {
 /// not loaded again unless they changed; either way the cache file is rewritten.
 fn scan_now(reuse: bool) -> Vec<Vst3Descriptor> {
     let (dirs, mut taken, cache_file, scanner) = {
-        let r = lock();
-        // Unit tests never scan the machine's plug-in folders: that loads every installed plug-in
-        // in-process, and some never unload, which hangs the test binary at exit (CI has none).
-        // Nor do the integration tests with the scan hook (the registry race test calls `scan`).
-        #[cfg(any(test, feature = "test-hooks"))]
+        let mut r = lock();
+        // Unit tests do not load installed plugins; integration tests use an explicit opt-in.
+        #[cfg(test)]
         let mut dirs = Vec::new();
-        #[cfg(not(any(test, feature = "test-hooks")))]
+        #[cfg(not(test))]
         let mut dirs = paths::default_search_paths();
+        #[cfg(feature = "test-hooks")]
+        if EXTRA_DIRS_ONLY.load(Ordering::Acquire) {
+            dirs.clear();
+        }
         dirs.extend(r.extra_dirs.iter().cloned());
+        // Anything added before this snapshot is covered by the initial scan.
+        r.refresh_dirs.clear();
         (dirs, r.extra_dirs.clone(), r.cache_file.clone(), r.scanner.clone())
     };
     let load = |p: &Path| match &scanner {
@@ -137,37 +143,67 @@ fn scan_now(reuse: bool) -> Vec<Vst3Descriptor> {
         *loading() = Some((i, n, p.to_path_buf()));
         !SKIP.load(Ordering::Acquire)
     };
-    let files = scan_cache::scan(paths::find_bundles(&dirs), &known, paths::bundle_binary, load, ahead);
-    *loading() = None;
-    if let Some(f) = &cache_file {
-        scan_cache::write(f, &files);
-    }
-    let problems = files.iter().filter_map(|f| Some((f.path.clone(), f.error.clone()?))).collect();
-    let mut list = merge(files);
-    #[cfg(feature = "test-hooks")]
-    run_after_load_hook();
-    // Folders added while this scan loaded are not in `list` (and `add_search_dir` leaves it to
-    // the scan to publish them): scan them here, until none is new at the moment of publishing.
+    let mut files = scan_cache::scan(paths::find_bundles(&dirs), &known, paths::bundle_binary, load, ahead);
+    let mut rounds = 0;
+    // Every round uses the same loader, cancellation, progress and file-level cache entries.
+    // Publish after at most four late rounds even if additions continue. Remaining folders stay
+    // registered and are covered by the next explicit rescan (scan() returns this publication).
     loop {
+        *loading() = None;
+        #[cfg(feature = "test-hooks")]
+        run_after_load_hook();
         let mut r = lock();
-        let late: Vec<PathBuf> = r.extra_dirs.iter().filter(|d| !taken.contains(d)).cloned().collect();
-        if late.is_empty() {
+        let mut late: Vec<PathBuf> = r.extra_dirs.iter().filter(|d| !taken.contains(d) || r.refresh_dirs.contains(*d)).cloned().collect();
+        if late.is_empty() || rounds == MAX_LATE_SCAN_ROUNDS {
+            let problems = files.iter().filter_map(|f| Some((f.path.clone(), f.error.clone()?))).collect();
+            let list = merge(files.clone());
             r.scanned = Some(list.clone());
             r.problems = problems;
+            // The check and publication share the registry lock: a later add merges into scanned.
+            drop(r);
+            if let Some(f) = &cache_file {
+                scan_cache::write(f, &files);
+            }
             return list;
         }
+        for dir in &late {
+            r.refresh_dirs.remove(dir);
+        }
         drop(r);
-        for d in scan_paths(&late) {
-            if !list.iter().any(|o| o.id == d.id) {
-                list.push(d);
+        late.sort();
+        late.dedup();
+        // Reuse this scan's entries first, then the previous cache, including failed files.
+        let mut late_known = files.clone();
+        late_known.extend(known.iter().cloned());
+        let bundles = paths::find_bundles(&late);
+        let added = scan_cache::scan(bundles.clone(), &late_known, paths::bundle_binary, load, ahead);
+        // Replace file entries, including failures and skipped files, rather than just merging
+        // descriptors: otherwise an updated file can leave stale plugins or duplicate cache rows.
+        files.retain(|f| !bundles.contains(&f.path) || added.iter().any(|e| e.path == f.path));
+        for entry in added {
+            if let Some(previous) = files.iter_mut().find(|f| f.path == entry.path) {
+                *previous = entry;
+            } else {
+                files.push(entry);
             }
         }
-        list.sort_by_key(|d| d.name.to_lowercase());
         taken.extend(late);
+        rounds += 1;
     }
 }
 
-/// Test hook: runs after a scan loaded its files and before it publishes them.
+/// A stream of folder additions must not keep the scan lock forever.
+const MAX_LATE_SCAN_ROUNDS: usize = 4;
+
+#[cfg(feature = "test-hooks")]
+static EXTRA_DIRS_ONLY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-hooks")]
+pub fn set_scan_extra_dirs_only(only: bool) {
+    EXTRA_DIRS_ONLY.store(only, Ordering::Release);
+}
+
+/// Test hook: runs after each scan round loads its files and before publication.
 #[cfg(feature = "test-hooks")]
 static AFTER_LOAD: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
 
@@ -294,6 +330,9 @@ pub fn add_search_dir(dir: &Path) -> usize {
     // Not scanned yet: the next scan covers the folder along with the others. Meanwhile the
     // plug-ins are remembered, so that creating one by id does not scan every machine folder.
     let mut r = lock();
+    if r.scanned.is_none() {
+        r.refresh_dirs.insert(dir.to_path_buf());
+    }
     let list = match r.scanned.as_mut() {
         Some(list) => list,
         None => &mut r.remembered,

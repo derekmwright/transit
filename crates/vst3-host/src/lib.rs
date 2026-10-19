@@ -259,6 +259,8 @@ pub struct Serviced {
 /// [`add_search_dir`]. Scanned on first call (loads each binary and reads its factory, but
 /// creates no plugin instances), then cached in memory; with a [`set_cache_file`], only files that
 /// are new or changed since an earlier run are loaded. Waits for a scan that is running.
+/// Includes at most four rounds of folders added during the scan; any remaining additions stay
+/// registered for the next explicit rescan. This bounds publication under continuous additions.
 pub fn scan() -> Vec<Vst3Descriptor> {
     api::scan()
 }
@@ -350,12 +352,19 @@ pub fn add_search_dir(dir: &Path) -> usize {
     api::add_search_dir(dir)
 }
 
-/// Runs `hook` in every scan after its files loaded and before it publishes them. Only for the
-/// registry race test.
+/// Runs `hook` after each scan round loads its files, before publication. Only for registry tests.
 #[cfg(all(feature = "test-hooks", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub fn set_scan_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
     registry::set_after_load_hook(hook)
+}
+
+/// Restricts scans to extra folders for deterministic registry tests. Defaults to false;
+/// enabling test hooks alone does not change normal search paths or installed-plugin smoke tests.
+#[cfg(all(feature = "test-hooks", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub fn set_scan_extra_dirs_only(only: bool) {
+    registry::set_scan_extra_dirs_only(only)
 }
 
 /// Scans the given folders without touching the cache.
