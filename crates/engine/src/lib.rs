@@ -307,6 +307,25 @@ impl Engine {
         }
     }
 
+    /// Fold the last `n` undo steps into one labeled `label`, for a composite built from several
+    /// commands (the oldest step's snapshot is kept, so one undo returns to before all of them).
+    /// Clears redo as any new edit would; the document is unchanged.
+    pub fn squash_undo(&mut self, n: usize, label: &str) -> Result<()> {
+        let bad = |m: String| EngineError::BadParams("edit.squash_undo".into(), m);
+        if n == 0 {
+            return Err(bad("n must be at least 1".into()));
+        }
+        if n > self.undo.len() {
+            return Err(bad(format!("n is {n} but the history holds {} step(s)", self.undo.len())));
+        }
+        let keep = self.undo.len() - n;
+        self.undo.truncate(keep + 1);
+        self.undo[keep].label = label.to_string();
+        self.redo.clear();
+        self.merge_key = None;
+        Ok(())
+    }
+
     /// Whether command `id` must wait for the take being recorded: nothing may replace the
     /// session or quit under it.
     pub fn blocked_while_recording(&self, id: &str) -> bool {
@@ -480,6 +499,46 @@ mod merge_tests {
         assert_eq!(e.undo_history().len(), 1);
         e.undo();
         assert_eq!(e.session().track(t).unwrap().mixer.volume_db, 0.0);
+    }
+
+    #[test]
+    fn squash_undo_folds_the_last_steps_into_one_labeled_step() {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        e.execute("mix.pan", &json!({"track": t.0, "pan": 0.5})).unwrap();
+        for db in [-1.0, -2.0, -3.0] {
+            e.execute("mix.volume", &json!({"track": t.0, "db": db})).unwrap();
+        }
+        assert_eq!(e.undo_history().len(), 4);
+        e.execute("edit.squash_undo", &json!({"n": 3, "label": "Take"})).unwrap();
+        assert_eq!((e.undo_history().len(), e.undo_label()), (2, Some("Take")));
+        assert_eq!(e.journal.last().map(|j| j.0.as_str()), Some("edit.squash_undo"));
+        e.undo();
+        let m = &e.session().track(t).unwrap().mixer;
+        assert_eq!((m.volume_db, m.pan.clone()), (0.0, vec![0.5]));
+        assert!(e.redo_label() == Some("Take"));
+        e.redo();
+        assert_eq!(e.session().track(t).unwrap().mixer.volume_db, -3.0);
+        e.undo();
+        e.execute("mix.pan", &json!({"track": t.0, "pan": 0.1})).unwrap();
+        assert!(!e.can_redo(), "squashing or editing clears redo");
+    }
+
+    #[test]
+    fn squash_undo_clears_redo_and_rejects_bad_counts() {
+        let mut e = Engine::default();
+        let t = e.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        assert!(e.squash_undo(1, "x").is_err());
+        e.execute("mix.volume", &json!({"track": t.0, "db": -1.0})).unwrap();
+        e.execute("mix.volume", &json!({"track": t.0, "db": -2.0})).unwrap();
+        e.undo();
+        assert!(e.can_redo());
+        assert!(e.squash_undo(0, "x").is_err());
+        assert!(e.squash_undo(2, "x").is_err());
+        assert!(e.execute("edit.squash_undo", &json!({"n": 9, "label": "x"})).is_err());
+        assert!(e.can_redo(), "a rejected squash changes nothing");
+        e.squash_undo(1, "Solo").unwrap();
+        assert_eq!((e.undo_label(), e.can_redo()), (Some("Solo"), false));
     }
 
     #[test]

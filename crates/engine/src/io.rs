@@ -1412,16 +1412,59 @@ pub fn place_recording(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, Pa
     ids
 }
 
+/// `place_recording` that is always exactly one undo step labeled "Record", whatever it does:
+/// with `new_take`, a track that already has clips under the take (within the punch range)
+/// first gets a duplicate of its playlist, so the old clips stay as the previous take; the punch
+/// trim is folded in too. Loop recordings never duplicate.
+pub fn place_recording_take(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>, new_take: bool) -> Vec<soundcraft_model::ClipId> {
+    let n0 = e.undo_history().len();
+    let ids = add_recording_take(e, plan.start, takes, plan.pass, new_take, plan.punch);
+    if !ids.is_empty() {
+        if let Some(p) = plan.punch {
+            let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
+            let _ = e.execute("edit.trim_to_fill_selection", &json!({"clips": clips, "start": p.start, "end": p.end}));
+        }
+        let added = e.undo_history().len().saturating_sub(n0);
+        if added > 1 {
+            let _ = e.squash_undo(added, "Record");
+        }
+    }
+    ids
+}
+
 /// Turn recorded take files into clips at `start`, as one undo step ("Record"); each file is the
 /// source of its clips. With `pass` (loop recording), a take becomes one clip per pass (at most
 /// 1000), each pass after the first on a new playlist.
 pub fn add_recording(e: &mut Engine, start: Samples, takes: Vec<(TrackId, PathBuf)>, pass: Option<Samples>) -> Vec<soundcraft_model::ClipId> {
+    add_recording_take(e, start, takes, pass, false, None)
+}
+
+/// `add_recording` with `new_take`: a track with clips under the take (clipped to `punch`) gets a
+/// duplicate of its active playlist first, inside the same "Record" step.
+pub fn add_recording_take(
+    e: &mut Engine,
+    start: Samples,
+    takes: Vec<(TrackId, PathBuf)>,
+    pass: Option<Samples>,
+    new_take: bool,
+    punch: Option<Range>,
+) -> Vec<soundcraft_model::ClipId> {
     let before = e.session_arc();
+    let n0 = e.undo_history().len();
     let mut out = Vec::new();
     for (tid, path) in takes {
         let read =
             read_file(&path).and_then(|b| soundcraft_audio_io::decode(&b, None).map_err(|err| EngineError::Io(format!("{}: {err}", path.display()))));
         let Ok((_, buf)) = read.inspect_err(|err| e.message(err.to_string())) else { continue };
+        if new_take && pass.is_none() {
+            let frames = i64::try_from(buf.frames()).unwrap_or(0);
+            let from = punch.map_or(start, |p| p.start.max(start));
+            let to = punch.map_or(start + frames, |p| p.end.min(start + frames));
+            let over = to > from && e.session().track(tid).is_some_and(|t| t.clips().iter().any(|c| c.start < to && c.end() > from));
+            if over {
+                let _ = e.execute("track.playlist_duplicate", &json!({"track": tid.0}));
+            }
+        }
         let s = e.session_mut();
         if s.track(tid).is_none() {
             continue;
@@ -1451,6 +1494,10 @@ pub fn add_recording(e: &mut Engine, start: Samples, takes: Vec<(TrackId, PathBu
     }
     if !out.is_empty() {
         e.push_undo("Record", before);
+        let added = e.undo_history().len().saturating_sub(n0);
+        if new_take && added > 1 {
+            let _ = e.squash_undo(added, "Record");
+        }
     }
     out
 }
@@ -1525,6 +1572,58 @@ mod record_tests {
         e.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn over_a_clip(tag: &str) -> (Engine, TrackId, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("soundcraft-newtake-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (first, second) = (dir.join("Audio Files/Vox_01.wav"), dir.join("Audio Files/Vox_02.wav"));
+        write_take(&first, 4_800);
+        write_take(&second, 4_800);
+        let mut e = Engine::default();
+        let vox = armed(&mut e, "Vox", "mono", "In 1");
+        add_recording(&mut e, 1_000, vec![(vox, first.clone())], None);
+        (e, vox, first, second)
+    }
+
+    #[test]
+    fn new_take_recording_over_a_clip_is_one_record_step() {
+        let (mut e, vox, _, second) = over_a_clip("one");
+        let before = e.undo_history();
+        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new() };
+        let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
+        assert_eq!(ids.len(), 1);
+        let h = e.undo_history();
+        assert_eq!((h.len(), h.last().map(String::as_str)), (before.len() + 1, Some("Record")));
+        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 2);
+        e.execute("edit.undo", &json!({})).unwrap();
+        let t = e.session().track(vox).unwrap();
+        assert_eq!((t.playlists.len(), t.clips().len(), t.clips()[0].start), (1, 1, 1_000));
+        e.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 2);
+    }
+
+    #[test]
+    fn new_take_with_punch_folds_the_trim_into_the_record_step() {
+        let (mut e, vox, _, second) = over_a_clip("punch");
+        let n = e.undo_history().len();
+        let plan = Recording { start: 1_000, pass: None, punch: Some(Range::new(2_000, 3_000)), rate: 48_000, takes: Vec::new() };
+        let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
+        let h = e.undo_history();
+        assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
+        let c = e.session().find_clip(ids[0]).unwrap().1.clone();
+        assert_eq!((c.start, c.length), (2_000, 1_000));
+        e.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
+    }
+
+    #[test]
+    fn recording_without_new_take_keeps_the_old_steps() {
+        let (mut e, vox, _, second) = over_a_clip("old");
+        let n = e.undo_history().len();
+        let plan = Recording { start: 1_000, pass: None, punch: Some(Range::new(2_000, 3_000)), rate: 48_000, takes: Vec::new() };
+        place_recording(&mut e, &plan, vec![(vox, second)]);
+        assert_eq!(e.undo_history().len(), n + 2);
     }
 
     #[test]

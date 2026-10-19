@@ -11,6 +11,13 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, |e, _| Ok(json!({"undone": e.undo()}))),
         cmd!(noundo "edit.redo", "Redo", ["Edit"], Some("Cmd+Shift+Z"), "{}", can_redo, |e, _| Ok(json!({"redone": e.redo()}))),
+        cmd!(noundo "edit.squash_undo", "Squash Undo", [], None, "{n, label}", always, |e, p| {
+            let bad = |m: &str| EngineError::BadParams("edit.squash_undo".into(), m.into());
+            let n = p.get("n").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad("n (count) is required"))?;
+            let label = p.get("label").and_then(Value::as_str).ok_or_else(|| bad("label is required"))?;
+            e.squash_undo(n, label)?;
+            Ok(json!({"squashed": n}))
+        }),
         cmd!(noundo "edit.restore_last_selection", "Restore Last Selection", ["Edit"], Some("Cmd+Alt+Z"), "{}", has_last_selection, restore_selection),
         cmd!("edit.cut", "Cut", ["Edit"], Some("Cmd+X"), "{tracks?, start?, end?}", has_range, |e, p| cut_copy(e, p, true, "edit.cut")),
         cmd!(noundo "edit.copy", "Copy", ["Edit"], Some("Cmd+C"), "{tracks?, start?, end?}", has_range, |e, p| cut_copy(e, p, false, "edit.copy")),
