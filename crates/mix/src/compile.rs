@@ -291,7 +291,10 @@ fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>) {
     let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
     let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
     let mut order = Vec::new();
-    let loops = processing_order(s, &mut order);
+    let mut route = RouteScratch::new();
+    route.reserve(s);
+    processing_order(s, &mut route, &mut order);
+    let loops = if route.has_loops() { s.route_graph().layering().loops } else { Vec::new() };
     let track = |i: &usize| s.tracks.get(*i);
     let mut rows: Vec<usize> = order.iter().copied().filter(|i| track(i).is_some_and(|t| live(t) && !is_aux(t))).collect();
     let phase1 = rows.len();

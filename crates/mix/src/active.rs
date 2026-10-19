@@ -311,7 +311,8 @@ impl MixEngine {
     /// What the audio thread noticed since the last adoption, in fixed storage.
     #[must_use]
     pub fn status(&self) -> PlanStatus {
-        let Some(p) = self.plan.as_deref() else { return PlanStatus::default() };
+        // A legacy engine reports its delay lines' clamps (until `ensure_synced` grows them).
+        let Some(p) = self.plan.as_deref() else { return self.legacy_status };
         let mismatch = p.tables.plugins().fold(0u32, |n, s| n.saturating_add(s.applied.mismatch));
         PlanStatus { applied_mismatch: mismatch, ..p.status }
     }
@@ -406,12 +407,13 @@ impl MixEngine {
         let mut main_arrival = 0usize;
         for (at, st) in p1.iter_mut().enumerate() {
             if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                pdc_visit(t, st, at, busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, true, busses, &mut main_arrival, pdc);
             }
         }
+        // Inactive auxes still mark the bus they read (see `pdc_visit`).
         for (k, st) in auxes.iter_mut().enumerate() {
-            if let Some(t) = track(st).filter(|t| live(t)) {
-                pdc_visit(t, st, phase1.saturating_add(k), busses, &mut main_arrival, pdc);
+            if let Some(t) = track(st) {
+                pdc_visit(t, st, phase1.saturating_add(k), live(t), busses, &mut main_arrival, pdc);
             }
         }
         self.main_arrival = main_arrival;

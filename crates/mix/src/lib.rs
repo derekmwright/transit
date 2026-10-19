@@ -68,7 +68,8 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, ProcessStatus, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, RouteScratch, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId,
+    TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
@@ -521,21 +522,28 @@ impl DelayLine {
         self.bufs.first().map_or(0, Vec::len)
     }
 
-    /// Makes the line serve delays up to `need` for `ch` channels in blocks up to `block`. A
-    /// legacy line grows (never shrinks); a plan-mode line keeps its storage. Returns the delay
-    /// asked for when a plan-mode line has to clamp it to its capacity, else 0.
-    fn reserve(&mut self, need: usize, ch: usize, block: usize) -> usize {
+    /// Audio side: whether the line holds a delay of `need`. Never allocates: a longer delay is
+    /// read clamped to the line's capacity, and the delay asked for is returned (else 0) so the
+    /// shortfall can be reported and the line grown off the audio thread.
+    fn fit(&self, need: usize) -> usize {
         let need = need.min(MAX_LATENCY);
-        if let Some(cap) = self.cap {
-            return if need > cap { need } else { 0 };
+        if need > self.len { need } else { 0 }
+    }
+
+    /// Control side (legacy engines; a plan-mode line keeps the storage its plan prepared): makes
+    /// the line hold delays up to `need` for `ch` channels in blocks up to `block`, sized as a
+    /// plan sizes its lines. It grows (never shrinks) keeping the history it holds, so a delay
+    /// change reads the same samples in both paths.
+    fn grow(&mut self, need: usize, ch: usize, block: usize) {
+        if self.cap.is_some() {
+            return;
         }
         if self.bufs.len() != ch || self.ring() < self.len.saturating_add(block) {
             *self = DelayLine::default();
         }
-        if need > self.len {
-            // Sized as a plan sizes its lines, and grown keeping the history it holds, so a
-            // delay change reads the same samples in both paths.
-            let len = need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY);
+        let need = need.min(MAX_LATENCY);
+        if need > self.len || self.bufs.is_empty() {
+            let len = need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY).max(self.len);
             let size = len.saturating_add(block);
             let old = self.ring();
             for ring in self.bufs.iter_mut() {
@@ -554,7 +562,6 @@ impl DelayLine {
             self.len = len;
             self.idx = 0;
         }
-        0
     }
 
     /// Appends one block. A line that was idle is zeroed first, so no stale audio comes back.
@@ -729,6 +736,14 @@ pub struct MixEngine {
     main_arrival: usize,
     /// Fingerprint of the routing the order was computed for.
     route_key: Option<usize>,
+    /// The route graph's working storage, reserved at sync: a routing change re-orders the
+    /// strips and finds a loop's dropped edges without allocating.
+    route: RouteScratch,
+    /// Per bus (route-graph index): arrival and read flag, for sizing delay lines at sync.
+    bus_need: Vec<(usize, bool)>,
+    /// Legacy engines: delay lines that had to clamp since they were last grown (the plan path
+    /// keeps this in its plan). [`MixEngine::ensure_synced`] grows them.
+    legacy_status: PlanStatus,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
     /// Transport stopped: only monitored inputs sound (no clips).
@@ -852,6 +867,9 @@ impl MixEngine {
             latency: 0,
             main_arrival: 0,
             route_key: None,
+            route: RouteScratch::new(),
+            bus_need: Vec::new(),
+            legacy_status: PlanStatus::default(),
             input: Vec::new(),
             monitor_only: false,
             recording: false,
@@ -1137,19 +1155,52 @@ impl MixEngine {
     /// Re-syncs plugin instances and the routing order when the session's structure changed
     /// since the last sync (or instances were adopted). `render` calls it; a realtime host may
     /// also call it right after swapping sessions so slots are filled before playback starts.
+    ///
+    /// It is also the control-side step of delay compensation in a legacy engine: delay lines a
+    /// render had to clamp (a plug-in's latency rose past their capacity, see
+    /// [`MixEngine::status`]) grow here, keeping their history. A render never grows them on a
+    /// thread marked as the audio thread.
     pub fn ensure_synced(&mut self, s: &Session) {
+        self.sync_if_changed(s);
+        if self.plan.is_none() && self.legacy_status.capacity_exceeded > 0 {
+            self.size_lines(s);
+        }
+    }
+
+    /// Re-syncs when the structure changed. Reorders (without allocating once the route storage
+    /// holds the session) only when the routing changed, and sizes the delay lines for the
+    /// slowest path (growing only when that rose).
+    fn sync_if_changed(&mut self, s: &Session) {
         let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
         if key != self.synced {
             self.sync(s);
-            // The order changes only with the routing: an insert edit keeps it (and allocates nothing).
             let route = route_fingerprint(s);
             if self.route_key != Some(route) {
-                let loops = processing_order(s, &mut self.order);
-                log_loops(s, &loops);
+                self.route.reserve(s);
+                self.order.clear();
+                self.order.reserve(s.tracks.len());
+                processing_order(s, &mut self.route, &mut self.order);
                 self.route_key = Some(route);
             }
+            self.size_lines(s);
             self.synced = key;
         }
+    }
+
+    /// Sizes every strip's delay lines for the slowest path of `s` with its instances' current
+    /// latency, or for the delay a render last had to clamp if that is more, and clears the
+    /// clamp report. Allocates only to grow a line.
+    fn size_lines(&mut self, s: &Session) {
+        let strips = &self.strips;
+        let latency = |t: &Track| strips.get(&t.id).map_or(0, |st| strip_latency(t, st));
+        let need = path_need_with(s, &self.route, &mut self.bus_need, &latency).max(self.legacy_status.required_latency as usize);
+        let mb = self.max_block;
+        for st in self.strips.values_mut() {
+            let ch = st.buf.len();
+            st.tap.grow(need, ch, mb);
+            st.tap_pre.grow(need, ch, mb);
+        }
+        self.legacy_status = PlanStatus::default();
     }
 
     /// Put the strips taken out for processing back into the engine, every one of them so none is
@@ -1177,7 +1228,12 @@ impl MixEngine {
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
-        self.ensure_synced(s);
+        self.sync_if_changed(s);
+        // An offline render grows clamped lines right away; on the audio thread they wait for
+        // the control side (`ensure_synced`).
+        if self.legacy_status.capacity_exceeded > 0 && !on_audio_thread() {
+            self.size_lines(s);
+        }
         for b in self.busses.values_mut() {
             b.clear(frames);
         }
@@ -1247,13 +1303,13 @@ impl MixEngine {
         let mut main_arrival = 0usize;
         for (at, (i, st)) in work.iter_mut().enumerate() {
             if let Some(t) = s.tracks.get(*i) {
-                pdc_visit(t, st, at, &mut self.busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, true, &mut self.busses, &mut main_arrival, pdc);
             }
         }
-        let auxes = order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| live(t) && is_aux(t));
+        let auxes = order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| is_aux(t));
         for (at, t) in (work.len()..).zip(auxes) {
             if let Some(st) = self.strips.get_mut(&t.id) {
-                pdc_visit(t, st, at, &mut self.busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, live(t), &mut self.busses, &mut main_arrival, pdc);
             }
         }
         self.main_arrival = main_arrival;
@@ -1347,7 +1403,13 @@ impl MixEngine {
         m.plugin_failures = strip.failures;
         let mix =
             MixOut { busses: &mut self.busses, main: &mut self.main, main_fmt: self.main_fmt, law: self.pan_law, main_arrival: self.main_arrival };
-        route_into(t, strip, pos, frames, mix);
+        let need = route_into(t, strip, pos, frames, mix);
+        if need > 0 {
+            let st = &mut self.legacy_status;
+            st.capacity_exceeded = st.capacity_exceeded.saturating_add(1);
+            st.required_latency = st.required_latency.max(u32::try_from(need).unwrap_or(u32::MAX));
+            st.affected = Some((t.id, strip.generation));
+        }
     }
 }
 
@@ -1365,8 +1427,10 @@ struct MixOut<'a, B: Busses + ?Sized> {
 /// every strip before it. The strip's input arrives with the latency of the bus it reads; its
 /// output adds its own latency (when `pdc`); every bus and the main mix it feeds then waits for
 /// the slowest of its sources. A strip writing a bus already read this block (a routing loop's
-/// feedback, from an older session) does not count: [`route_into`] drops that edge.
-fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, busses: &mut B, main_arrival: &mut usize, pdc: bool) {
+/// feedback, from an older session) does not count: [`route_into`] drops that edge. An inactive
+/// aux (`live` false) still marks the bus it reads, so the edges dropped are exactly the route
+/// graph's [`RouteScratch::dropped`] (render order is the graph's, inactive tracks included).
+fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut B, main_arrival: &mut usize, pdc: bool) {
     let mut arrive = 0usize;
     if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
         && let Route::Bus(b) = &t.mixer.input
@@ -1374,6 +1438,9 @@ fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, busses: &
     {
         x.reader = x.reader.min(at);
         arrive = x.arrival;
+    }
+    if !live {
+        return;
     }
     let out = arrive.saturating_add(if pdc { st.latency } else { 0 });
     st.pdc_out = out;
@@ -1424,16 +1491,15 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
     if let Some(d) = delay_of(busses, &t.mixer.output) {
         post = post.max(d);
     }
-    let block = buf.first().map_or(0, Vec::len);
     let mut clamped = 0usize;
     if post > 0 {
-        clamped = clamped.max(tap.reserve(post, buf.len(), block));
+        clamped = clamped.max(tap.fit(post));
         tap.write(buf, frames);
     } else {
         tap.idle();
     }
     if pre_max > 0 {
-        clamped = clamped.max(tap_pre.reserve(pre_max, pre.len(), block));
+        clamped = clamped.max(tap_pre.fit(pre_max));
         tap_pre.write(pre, frames);
     } else {
         tap_pre.idle();
@@ -2204,20 +2270,41 @@ fn strip_format(t: &Track, n: usize) -> ChannelFormat {
 /// order, then the auxes and folders in routing order (each after every strip feeding it, at any
 /// depth: by the depth of the session's route graph, then track order). Returns the loops the
 /// graph had to break (a session from an older file): the render drops their feedback edges.
-fn processing_order(s: &Session, order: &mut Vec<usize>) -> Vec<RouteCycle> {
+///
+/// `route` is the session's route graph storage: when it was reserved for `s` (and `order` holds
+/// the track count), this allocates nothing. Loops a session was loaded with are broken by the
+/// graph; the render drops exactly `route.dropped()`. Nothing is logged here (it can run on the
+/// audio thread): the engine logs loaded loops when it opens a session, the plan compiler when it
+/// compiles one.
+fn processing_order(s: &Session, route: &mut RouteScratch, order: &mut Vec<usize>) {
     let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
-    let layers = s.route_graph().layering();
+    route.layer(s);
     order.clear();
     order.extend(s.tracks.iter().enumerate().filter(|(_, t)| !is_aux(t)).map(|(i, _)| i));
-    order.extend(layers.order().into_iter().filter(|&i| s.tracks.get(i).is_some_and(is_aux)));
-    layers.loops
+    order.extend(route.order().iter().copied().filter(|&i| s.tracks.get(i).is_some_and(is_aux)));
 }
 
-/// Logs the routing loops a session was loaded with (once per routing change).
+/// Logs the routing loops of a session (control side only).
 fn log_loops(s: &Session, loops: &[RouteCycle]) {
     for l in loops {
         log::warn!("mix: routing loop {} in the session; rendering without its feedback edge", l.describe(s));
     }
+}
+
+/// A track's own latency with its strip's instances: the instrument and the active inserts that
+/// have not failed (as [`process_strip`] counts it).
+fn strip_latency(t: &Track, st: &Strip) -> usize {
+    let mut l = st.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
+    for (ins, slot) in t.mixer.inserts.iter().zip(st.plugins.iter()) {
+        if let (Some(ins), Some(slot)) = (ins, slot)
+            && ins.active
+            && !ins.bypass
+            && !slot.failed
+        {
+            l = l.saturating_add(slot.plugin.latency());
+        }
+    }
+    l.min(MAX_LATENCY)
 }
 
 /// Hash of the routing (`processing_order` depends on nothing else).
@@ -2243,29 +2330,38 @@ fn route_fingerprint(s: &Session) -> usize {
 /// the main mix, with `latency` giving each track's own (instrument and inserts). Control thread
 /// (it allocates): plans size their delay lines with it.
 fn path_need(s: &Session, latency: &dyn Fn(&Track) -> usize) -> usize {
-    let layers = s.route_graph().layering();
-    let mut bus_at: HashMap<BusId, usize> = HashMap::new();
-    let mut read: Vec<BusId> = Vec::new();
+    let mut route = RouteScratch::new();
+    route.reserve(s);
+    route.layer(s);
+    path_need_with(s, &route, &mut Vec::new(), latency)
+}
+
+/// [`path_need`] over a solved route graph of `s`, with `bus` as per-bus scratch: allocates
+/// nothing once `bus` holds the bus count. Same rule as the render: tracks in the graph's order,
+/// a write into a bus already read does not count.
+fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)>, latency: &dyn Fn(&Track) -> usize) -> usize {
+    bus.clear();
+    bus.resize(s.busses.len(), (0, false));
     let mut need = 0usize;
-    let live = |t: &Track| !(t.kind == TrackKind::Master || t.kind == TrackKind::Vca);
-    for i in layers.order() {
-        let Some(t) = s.tracks.get(i).filter(|t| live(t)) else { continue };
+    for &i in route.order() {
+        let Some(t) = s.tracks.get(i).filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) else { continue };
         let mut arrive = 0;
         if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
             && let Route::Bus(b) = &t.mixer.input
+            && let Some(x) = route.bus_slot(*b).and_then(|k| bus.get_mut(k))
         {
-            read.push(*b);
-            arrive = bus_at.get(b).copied().unwrap_or(0);
+            x.1 = true;
+            arrive = x.0;
         }
         let out = arrive.saturating_add(latency(t));
         need = need.max(out);
         let targets = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target));
         for r in targets {
             if let Route::Bus(b) = r
-                && !read.contains(b)
+                && let Some(x) = route.bus_slot(*b).and_then(|k| bus.get_mut(k))
+                && !x.1
             {
-                let e = bus_at.entry(*b).or_default();
-                *e = (*e).max(out);
+                x.0 = x.0.max(out);
             }
         }
     }
@@ -2583,7 +2679,8 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
     let mut latency = 0usize;
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
-        if !ins.active || ins.bypass {
+        // As `process_strip`: a failed insert is skipped, so its latency no longer counts.
+        if !ins.active || ins.bypass || slot.failed {
             continue;
         }
         apply_params(slot, ins, t, i, pos);
@@ -4975,5 +5072,40 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
+    }
+
+    /// A legacy delay line grown mid-render (the control side, after a clamp) keeps its history in
+    /// order: a tap at the same delay continues the signal without a jump.
+    #[test]
+    fn a_grown_delay_line_keeps_its_history_in_order() {
+        let block = 16;
+        let mut line = DelayLine::default();
+        line.grow(100, 1, block);
+        let cap = line.len;
+        let mut n = 0usize;
+        let mut out = vec![Vec::with_capacity(block)];
+        let mut got = Vec::new();
+        let mut step = |line: &mut DelayLine, got: &mut Vec<f32>| {
+            let src = vec![(0..block).map(|i| (n + i) as f32).collect::<Vec<f32>>()];
+            line.write(&src, block);
+            line.read(50, &mut out, block);
+            got.extend_from_slice(&out[0]);
+            n += block;
+        };
+        for _ in 0..(cap / block + 3) {
+            step(&mut line, &mut got);
+        }
+        line.grow(cap * 4, 1, block);
+        assert!(line.len >= cap * 4);
+        for _ in 0..8 {
+            step(&mut line, &mut got);
+        }
+        // Past the first 50 samples, every sample is the input 50 samples earlier.
+        for (k, x) in got.iter().enumerate().skip(50) {
+            assert_eq!(*x, (k - 50) as f32, "sample {k}");
+        }
+        // A tap reaching back past the old ring finds silence there, not stale samples.
+        line.read(line.len, &mut out, block);
+        assert!(out[0].iter().all(|x| *x == 0.0));
     }
 }
