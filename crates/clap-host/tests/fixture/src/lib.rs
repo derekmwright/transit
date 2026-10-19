@@ -540,6 +540,8 @@ fn write_name(dst: &mut [c_char], s: &CStr) {
 }
 
 unsafe extern "C" fn params_get_info(p: *const clap_plugin, index: u32, info: *mut clap_param_info) -> bool {
+    // SAFETY: The CLAP params callback receives this live plug-in; its plugin_data points to
+    // our Fx for the callback's lifetime, and get_info runs on the main thread.
     let events = unsafe { fx(p) }.events;
     // SAFETY: The CLAP extension caller supplies writable parameter-info storage.
     let info = unsafe { &mut *info };

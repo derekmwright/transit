@@ -775,6 +775,7 @@ impl IMidiMappingTrait for Synth {
             unsafe { *id = VOLUME_PARAM };
             kResultOk
         } else if self.events && bus == 0 && ctrl == 64 && (0..16).contains(&channel) {
+            // SAFETY: IMidiMapping's caller supplies a valid, writable ParamID output pointer.
             unsafe { *id = 100 + channel as u32 };
             kResultOk
         } else {
@@ -1050,6 +1051,8 @@ impl IEditControllerTrait for Synth {
         if !self.events || index != 0 {
             return kInvalidArgument;
         }
+        // SAFETY: IEditController::getParameterInfo supplies exclusive, aligned, writable
+        // ParameterInfo storage valid for this call; the reference does not escape it.
         let i = unsafe { &mut *info };
         i.id = PROBE_PARAM;
         copy_c16("Probe", &mut i.title);
