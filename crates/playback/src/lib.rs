@@ -398,7 +398,7 @@ impl AudioState {
 
     fn send_garbage(&mut self) {
         let g = self.mix.take_retired();
-        if !g.is_empty() {
+        if g.capacity() > 0 {
             let _ = self.garbage.send(g);
         }
     }
@@ -1116,7 +1116,7 @@ impl Side {
         Ok(())
     }
 
-    /// Creates the third-party instances `s` needs that the audio thread does not have yet.
+    /// Creates the plug-in instances (built-in and third-party) `s` needs that the audio thread does not have yet.
     fn prepare(&mut self, s: &Session) -> Vec<PreparedInstance> {
         self.collect_garbage();
         let sr = s.sample_rate.as_f64() as f32;
@@ -1128,7 +1128,7 @@ impl Side {
             }
             self.rate = sr;
         }
-        let specs = soundcraft_mix::instance_specs(s);
+        let specs = soundcraft_mix::realtime_instance_specs(s);
         let stale: Vec<(TrackId, usize)> = self.shadow.keys().filter(|k| !specs.iter().any(|x| (x.track, x.slot) == **k)).copied().collect();
         for k in stale {
             self.forget(k);
@@ -2267,13 +2267,13 @@ mod tests {
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
         s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("gain"));
-        assert!(side.prepare(&s).is_empty(), "the plugin is not installed; built-ins stay with the engine");
+        assert_eq!(side.prepare(&s).len(), 1, "the plugin is not installed; the built-in is made here too");
         assert_eq!(side.shadow.get(&(t, 0)), Some(&("clap:does.not.exist".to_string(), 1, false)));
         assert!(side.prepare(&s).is_empty());
-        assert_eq!(side.shadow.len(), 1, "failures are remembered, not retried every update");
+        assert_eq!(side.shadow.len(), 2, "failures are remembered, not retried every update");
         s.track_mut(t).unwrap().mixer.inserts[0] = None;
         side.prepare(&s);
-        assert!(side.shadow.is_empty());
+        assert_eq!(side.shadow.len(), 1, "only the built-in is left");
     }
 
     #[test]
