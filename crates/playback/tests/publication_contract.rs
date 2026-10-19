@@ -14,6 +14,14 @@ static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::Co
 
 const WATCHDOG: Duration = Duration::from_secs(5);
 
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 struct Trace {
     owner: ThreadId,
     local: AtomicUsize,
@@ -223,6 +231,8 @@ fn concurrent_publication_and_reclamation_preserve_credit_fifo_and_drop_affinity
             });
             (audio, applied, stats)
         });
+        // An assertion failure on control must not leave a detached worker spinning.
+        let _stop_on_unwind = StopOnDrop(Arc::clone(&done));
         let (mut submitted, mut reclaimed) = (0, 0);
         let mut random = 0x1234_5678_u64;
         let mut waiting = None;
