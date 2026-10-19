@@ -196,8 +196,7 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
         }
         "audio.fake_devices" => match crate::audio_devices::fake_from_json(p) {
             Ok(fake) => {
-                app.audio_devices.fake = fake;
-                app.audio_devices.forget_listing();
+                app.audio_devices.set_fake(fake);
                 ok(json!({}))
             }
             Err(e) => err(e),

@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod arrange;
+mod audio_connection;
 pub mod audio_devices;
 pub mod automation;
 pub mod browser;
@@ -427,6 +428,12 @@ impl StudioApp {
         let mut cur = serde_json::to_value(&self.ui).map_err(|e| e.to_string())?;
         if let (Some(obj), Some(patch)) = (cur.as_object_mut(), p.as_object()) {
             for (k, v) in patch {
+                if k == "audio"
+                    && let (Some(current), Some(fields)) = (obj.get_mut(k).and_then(Value::as_object_mut), v.as_object())
+                {
+                    current.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    continue;
+                }
                 obj.insert(k.clone(), v.clone());
             }
         }
@@ -441,6 +448,7 @@ impl StudioApp {
             },
         };
         let ns: UiState = serde_json::from_value(cur).map_err(|e| format!("bad ui state: {e}"))?;
+        audio_devices::validate(&ns.audio)?;
         if ns.plugin_dirs != self.ui.plugin_dirs {
             return Err("plugin folders can't be changed over the control channel".into());
         }
@@ -509,7 +517,11 @@ impl StudioApp {
     /// Open the editors asked for once their plug-ins are loaded; forget the ones the user closed.
     fn drive_editors(&mut self) {
         let now = self.last_frame.unwrap_or_default();
-        let Some(p) = &self.player else {
+        let p: &dyn audio_connection::Editors = if let Some(fake) = self.audio_devices.fake.as_ref().and_then(|f| f.connection.as_ref()) {
+            fake
+        } else if let Some(p) = &self.player {
+            p
+        } else {
             self.editors.clear();
             return;
         };
@@ -586,6 +598,7 @@ impl StudioApp {
         }
         self.watch_output();
         self.watch_input();
+        self.save_good_audio();
         finish::step_bounce(self, ctx);
         import::step(self, ctx);
         // Stop the old playback before sending a replacement session to the audio thread.

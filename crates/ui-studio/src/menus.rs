@@ -233,8 +233,13 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         app.open_audio_devices();
                         ui.close();
                     }
-                    if ui.add_enabled(app.player.is_some(), egui::Button::new("Reconnect Device")).clicked() {
-                        app.reconnect_audio();
+                    let b = ui.add_enabled(
+                        !app.engine.transport.recording && (app.player.is_some() || app.audio_devices.fake.is_some()),
+                        egui::Button::new("Reconnect Device"),
+                    );
+                    audio_items.push(crate::mixer::MenuItem::at(ui, "Reconnect Device".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.reconnect_audio_devices();
                         ui.close();
                     }
                     if ui.button("Scan Plug-ins").clicked() {

@@ -328,13 +328,21 @@ impl StudioApp {
     /// Take the input once (for recording and input monitoring) from the player and feed the
     /// player: on ASIO the one it opened with the output, elsewhere a newly opened device.
     pub(crate) fn ensure_input(&mut self) {
+        use crate::audio_connection::Connection;
+        if let Some(f) = &mut self.audio_devices.fake {
+            if f.input.is_none()
+                && let Some(p) = &f.connection
+            {
+                f.input = p.monitored_input(&self.ui.audio).ok();
+            }
+            return;
+        }
         if self.recorder.is_some() || self.recorder_failed {
             return;
         }
         let Some(p) = &self.player else { return };
-        match p.open_input(&self.ui.audio) {
+        match p.monitored_input(&self.ui.audio) {
             Ok(r) => {
-                p.set_input(std::sync::Arc::clone(&r.monitor));
                 self.recorder = Some(r);
             }
             Err(e) => {
@@ -397,20 +405,41 @@ impl StudioApp {
         };
     }
 
-    /// Reopen the audio devices, keeping a take in progress.
+    /// Reopen audio with editors closed before teardown. Never interrupt a recording.
     pub fn reconnect_audio(&mut self) {
-        if self.is_playing() || self.engine.transport.recording {
+        if self.engine.transport.recording {
+            self.status = crate::audio_devices::REFUSED_RECORDING.into();
+            return;
+        }
+        if self.player.is_none() && self.audio_devices.fake.is_none() {
+            return;
+        }
+        if self.is_playing() {
             self.stop_play();
         }
-        if let Some(p) = &self.player {
-            // Its plugin editors go with it; closed here, on the main thread.
-            p.close_editors();
+        // A device reopen closes native editors deliberately; they remain wanted. Give the new
+        // instances a fresh loading deadline instead of treating their missing windows as user closes.
+        self.editors.clear();
+        for key in self.ui.plugin_windows.clone() {
+            self.want_editor(key);
         }
-        self.close_input();
         self.recorder_failed = false;
-        // The old device closes first: an ASIO driver is process-wide.
-        self.player = None;
-        self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        let cfg = self.ui.audio.clone();
+        if let Some(f) = &mut self.audio_devices.fake {
+            let trace = std::rc::Rc::clone(&f.trace);
+            crate::audio_connection::replace(&mut f.connection, &mut f.input, || crate::audio_connection::FakeConnection::new(cfg.clone(), trace));
+            f.reopened.push(cfg);
+        } else {
+            let session = self.engine.session_arc();
+            crate::audio_connection::replace(&mut self.player, &mut self.recorder, || {
+                soundcraft_playback::devices::release_asio_device_cache();
+                Player::with_config(session, &cfg)
+            });
+        }
+        if self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm) {
+            self.ensure_input();
+        }
+        self.audio_devices.begin_verification();
     }
 
     fn finish_recording(&mut self) {

@@ -47,12 +47,16 @@ pub struct AudioDevicesLayout {
 }
 
 /// Devices standing in for the machine's (the control channel's `audio.fake_devices`, tests):
-/// listed instead of enumerating, and "reopened" without touching a player.
-#[derive(Debug, Clone, Default)]
+/// listed instead of enumerating, with device operations injected into the real reconnect path.
+#[derive(Debug, Default)]
 pub struct FakeDevices {
     pub systems: Vec<AudioSystem>,
     /// Every configuration a reopen was asked with, in order.
     pub reopened: Vec<AudioConfig>,
+    pub(crate) connection: Option<crate::audio_connection::FakeConnection>,
+    pub(crate) input: Option<crate::audio_connection::FakeInput>,
+    pub(crate) trace: crate::audio_connection::Trace,
+    pub(crate) enumerations: usize,
 }
 
 impl FakeDevices {
@@ -79,13 +83,126 @@ pub struct AudioDevicesState {
     /// The (wanted, opened) input already reported, so it is said once.
     input_reported: Option<(String, String)>,
     pub layout: AudioDevicesLayout,
+    verification: Option<Verification>,
 }
 
 impl AudioDevicesState {
+    pub(crate) fn set_fake(&mut self, fake: Option<FakeDevices>) {
+        self.systems = fake.as_ref().map(|f| f.systems.clone());
+        self.fake = fake;
+    }
+    pub(crate) fn begin_verification(&mut self) {
+        self.verification = Some(Verification::default());
+    }
     /// List the devices again on the next frame the window is drawn (Rescan, a new fake).
     pub fn forget_listing(&mut self) {
         self.systems = None;
     }
+}
+
+pub(crate) fn validate(cfg: &AudioConfig) -> Result<(), String> {
+    if cfg.sample_rate == Some(0) || cfg.buffer_size == Some(0) {
+        return Err("Audio sample rate and buffer size must be greater than zero (or null for default).".into());
+    }
+    Ok(())
+}
+
+/// A new stream must deliver two seconds of audio AND remain healthy for two seconds of UI
+/// time. A silent clock, a callback burst followed by a stall, or any error cannot qualify.
+#[derive(Default)]
+struct Verification {
+    first: Option<(f64, u64)>,
+    last_progress: Option<(f64, u64)>,
+}
+
+impl Verification {
+    fn ready(&mut self, now: f64, rate: u32, t: soundcraft_playback::telemetry::CallbackTelemetry) -> bool {
+        if rate == 0 || t.callbacks == 0 || !now.is_finite() {
+            return false;
+        }
+        let progressed = self.last_progress.is_none_or(|(_, callbacks)| t.callbacks > callbacks);
+        if self.last_progress.is_some_and(|(at, _)| now - at > 2.0) {
+            self.first = None;
+        }
+        if progressed {
+            self.last_progress = Some((now, t.callbacks));
+        }
+        let (at, frames) = *self.first.get_or_insert((now, t.frames));
+        progressed && now - at >= 2.0 && t.frames.saturating_sub(frames) >= u64::from(rate) * 2
+    }
+}
+
+impl StudioApp {
+    pub(crate) fn save_good_audio(&mut self) {
+        if self.audio_devices.verification.is_none() {
+            return;
+        }
+        let (rate, telemetry, failed) = if let Some(p) = self.audio_devices.fake.as_ref().and_then(|f| f.connection.as_ref()) {
+            (p.config.sample_rate.unwrap_or(48_000), p.telemetry, p.failed)
+        } else if let Some(p) = &self.player {
+            (p.device_rate, p.callback_telemetry(), p.silent || p.trouble().is_some() || self.recorder_failed)
+        } else {
+            return;
+        };
+        if failed || telemetry.backend_errors != 0 || telemetry.device_lost_errors != 0 || telemetry.fault_silence_frames != 0 {
+            self.audio_devices.verification = None;
+            return;
+        }
+        let now = self.last_frame.unwrap_or_default();
+        if !self.audio_devices.verification.as_mut().is_some_and(|v| v.ready(now, rate, telemetry)) {
+            return;
+        }
+        self.audio_devices.verification = None;
+        // The desktop host supplies the settings directory through its Autosave sibling. Tests
+        // without that service never write preferences. Honor the host's no-preferences switches.
+        if std::env::var_os("TRANSIT_NO_PREFS").is_some() || std::env::var_os("SOUNDCRAFT_NO_PREFS").is_some() {
+            return;
+        }
+        let Some(dir) = self.autosave_dir.as_deref().and_then(std::path::Path::parent) else { return };
+        if let Err(e) = persist_audio(&dir.join("ui.json"), &self.ui) {
+            self.status = format!("Audio is running, but its settings could not be saved: {e}");
+        }
+    }
+}
+
+/// Preserve the other saved preferences and atomically replace only the known-good audio block.
+fn persist_audio(path: &std::path::Path, ui: &crate::UiState) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut value = match std::fs::File::open(path) {
+        Ok(f) => {
+            let mut bytes = Vec::new();
+            f.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                return Err("Settings file exceeds the 4 MiB limit".into());
+            }
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut saved = ui.clone();
+            saved.plugin_windows.clear();
+            serde_json::to_value(saved).map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let obj = value.as_object_mut().ok_or("Settings must be an object")?;
+    obj.insert("audio".into(), serde_json::to_value(&ui.audio).map_err(|e| e.to_string())?);
+    let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let tmp = path.with_extension(format!("audio.{}.{nonce}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| e.to_string())
 }
 
 /// The chosen system in `systems`, else the default one.
@@ -159,6 +276,7 @@ impl StudioApp {
     /// The window's Apply: keep `cfg` as `ui.audio` and reopen the devices with it. Playback stops
     /// first; refused while recording (the take would be cut), leaving `ui.audio` as it was.
     pub fn apply_audio(&mut self, cfg: AudioConfig) -> Result<(), String> {
+        validate(&cfg)?;
         if self.engine.transport.recording {
             self.status = REFUSED_RECORDING.into();
             return Err(REFUSED_RECORDING.into());
@@ -179,10 +297,7 @@ impl StudioApp {
         }
         let cfg = self.ui.audio.clone();
         self.audio_devices.input_reported = None;
-        let opened = if let Some(fake) = &mut self.audio_devices.fake {
-            fake.reopened.push(cfg.clone());
-            Opened { output: fake.output_for(&cfg), rate: cfg.sample_rate, buffer: cfg.buffer_size }
-        } else if self.player.is_some() {
+        let opened = if self.player.is_some() || self.audio_devices.fake.is_some() {
             self.reconnect_audio();
             self.opened()
         } else {
@@ -190,9 +305,7 @@ impl StudioApp {
             self.status = "Audio devices saved. Audio is off in this run (--no-audio); they open at the next start.".into();
             return;
         };
-        // Listing is only needed to check the system and the input.
-        let listed = if cfg.system.is_some() || cfg.input.is_some() { Some(self.listing()) } else { None };
-        let notes = fallback_notes(&cfg, listed.as_deref(), &opened);
+        let notes = fallback_notes(&cfg, self.audio_devices.systems.as_deref(), &opened);
         let stopped = if was_playing { "Playback stopped to change devices. " } else { "" };
         self.status = if notes.is_empty() {
             let name = opened.output.unwrap_or_else(|| "no audio device".into());
@@ -213,6 +326,11 @@ impl StudioApp {
     }
 
     fn opened(&self) -> Opened {
+        if let Some(f) = &self.audio_devices.fake
+            && let Some(p) = &f.connection
+        {
+            return Opened { output: f.output_for(&p.config), rate: Some(p.config.sample_rate.unwrap_or(48_000)), buffer: p.config.buffer_size };
+        }
         match &self.player {
             Some(p) if !p.silent => Opened { output: Some(p.device_name.clone()), rate: Some(p.device_rate), buffer: p.device_buffer },
             _ => Opened::default(),
@@ -220,12 +338,20 @@ impl StudioApp {
     }
 
     /// The devices to offer: the fake's, else the machine's (only with a player).
-    fn listing(&self) -> Vec<AudioSystem> {
-        match (&self.audio_devices.fake, &self.player) {
-            (Some(f), _) => f.systems.clone(),
+    fn listing(&mut self) -> Vec<AudioSystem> {
+        match (&mut self.audio_devices.fake, &self.player) {
+            (Some(f), _) => {
+                f.enumerations += 1;
+                f.systems.clone()
+            }
             (None, Some(_)) => devices::audio_systems(),
             (None, None) => Vec::new(),
         }
+    }
+
+    fn running_asio(&self) -> bool {
+        let cfg = self.audio_devices.fake.as_ref().and_then(|f| f.connection.as_ref()).map_or(&self.ui.audio, |p| &p.config);
+        self.opened().output.is_some() && cfg.system.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(devices::ASIO_SYSTEM))
     }
 }
 
@@ -406,7 +532,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let b = ui.add_enabled(audio_on, egui::Button::new("Rescan Devices"));
                 controls.push(("Rescan Devices".into(), "rescan", b.rect));
                 rescan = b.clicked();
-                if asio && devices::ASIO_CONTROL_PANEL && app.player.is_some() {
+                if app.running_asio() && (devices::ASIO_CONTROL_PANEL || app.audio_devices.fake.is_some()) {
                     let b = ui.button("Driver Control Panel");
                     controls.push(("Driver Control Panel".into(), "panel", b.rect));
                     panel = b.on_hover_text("The open ASIO driver's own settings. Reconnect afterwards.").clicked();
@@ -430,7 +556,10 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     if rescan {
         app.audio_devices.forget_listing();
     }
-    if panel && let Err(e) = devices::asio_control_panel() {
+    if panel
+        && app.audio_devices.fake.is_none()
+        && let Err(e) = devices::asio_control_panel()
+    {
         app.status = format!("ASIO control panel: {e}");
     }
     if !open {
@@ -501,5 +630,7 @@ pub fn fake_from_json(p: &serde_json::Value) -> Result<Option<FakeDevices>, Stri
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(Some(FakeDevices { systems, reopened: Vec::new() }))
+    let mut fake = FakeDevices { systems, ..Default::default() };
+    fake.connection = Some(crate::audio_connection::FakeConnection::new(AudioConfig::default(), std::rc::Rc::clone(&fake.trace)));
+    Ok(Some(fake))
 }
