@@ -23,6 +23,8 @@ pub enum Icon {
     ChevronDown,
     Plus,
     Remove,
+    /// Lucide minus: a step down (the meter popup's numerator).
+    Minus,
     Check,
     Power,
     OpenEditor,
@@ -38,7 +40,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 20] = [
+    pub const ALL: [Icon; 21] = [
         Icon::Rewind,
         Icon::Stop,
         Icon::Play,
@@ -48,6 +50,7 @@ impl Icon {
         Icon::ChevronDown,
         Icon::Plus,
         Icon::Remove,
+        Icon::Minus,
         Icon::Check,
         Icon::Power,
         Icon::OpenEditor,
@@ -73,6 +76,7 @@ impl Icon {
             Icon::ChevronDown => "chevron-down",
             Icon::Plus => "plus",
             Icon::Remove => "x",
+            Icon::Minus => "minus",
             Icon::Check => "check",
             Icon::Power => "power",
             Icon::OpenEditor => "external-link",
@@ -98,6 +102,7 @@ impl Icon {
             Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Icon::Plus => include_bytes!("../assets/icons/plus.svg"),
             Icon::Remove => include_bytes!("../assets/icons/x.svg"),
+            Icon::Minus => include_bytes!("../assets/icons/minus.svg"),
             Icon::Check => include_bytes!("../assets/icons/check.svg"),
             Icon::Power => include_bytes!("../assets/icons/power.svg"),
             Icon::OpenEditor => include_bytes!("../assets/icons/external-link.svg"),

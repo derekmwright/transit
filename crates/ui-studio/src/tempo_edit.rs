@@ -5,6 +5,7 @@
 //! wheel gesture is one undo step; a value that does not change touches nothing.
 
 use crate::StudioApp;
+use crate::icons::Icon;
 use crate::theme::{RADIUS, TOKENS};
 use egui::{Align2, Rect, Sense, Ui, pos2, vec2};
 use serde_json::json;
@@ -21,6 +22,8 @@ pub const NUMERATOR_MAX: u32 = 32;
 #[derive(Debug, Clone)]
 pub struct Edit {
     pub text: String,
+    /// The tempo event it edits: the one in effect when the field opened.
+    tick: i64,
     fresh: bool,
 }
 
@@ -28,6 +31,9 @@ pub struct Edit {
 struct Drag {
     tick: i64,
     raw: f64,
+    /// The tempo and the undo length when the gesture began.
+    start: f64,
+    undo_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +47,8 @@ struct Wheel {
 #[derive(Debug, Clone)]
 pub struct MeterPopup {
     pub text: String,
+    /// The meter event it edits: the one in effect when the popup opened.
+    tick: i64,
     fresh: bool,
 }
 
@@ -130,10 +138,10 @@ impl StudioApp {
         }
     }
 
-    /// Set the meter at the event in effect at the playhead, as one undo step.
-    pub fn set_meter_here(&mut self, num: u32, den: u32) -> bool {
-        let (tick, n, d) = governing_meter(self);
-        if (n, d) == (num, den) {
+    /// Set the meter of the event at `tick`, as one undo step.
+    pub fn set_meter_at(&mut self, tick: i64, num: u32, den: u32) -> bool {
+        let m = self.engine.session().tempo.meter_at_tick(tick);
+        if (m.numerator, m.denominator) == (num, den) {
             return false;
         }
         let params = json!({"numerator": num, "denominator": den, "at": self.tick_at(tick)});
@@ -189,7 +197,7 @@ pub fn tempo_field(app: &mut StudioApp, ui: &mut Ui) {
     let (r, resp) = ui.allocate_exact_size(vec2(92.0, 26.0), sense);
     register(app, "tempo", r);
     if editing {
-        edit_field(app, ui, r, g);
+        edit_field(app, ui, r);
         return;
     }
     let hot = resp.hovered() || resp.dragged();
@@ -200,7 +208,7 @@ pub fn tempo_field(app: &mut StudioApp, ui: &mut Ui) {
     if resp.drag_started() {
         app.engine.end_merge();
         app.tempo_ui.wheel = None;
-        app.tempo_ui.drag = Some(Drag { tick: g.tick, raw: g.bpm });
+        app.tempo_ui.drag = Some(Drag { tick: g.tick, raw: g.bpm, start: g.bpm, undo_len: app.engine.undo_history().len() });
     }
     if resp.dragged()
         && let Some(mut d) = app.tempo_ui.drag
@@ -218,12 +226,19 @@ pub fn tempo_field(app: &mut StudioApp, ui: &mut Ui) {
         let v = if mods.shift { round2(d.raw) } else { d.raw.round() };
         app.set_tempo_at(d.tick, v, Some(&format!("tempo:drag:{}", d.tick)));
     }
-    if resp.drag_stopped() {
-        app.tempo_ui.drag = None;
+    if resp.drag_stopped()
+        && let Some(d) = app.tempo_ui.drag.take()
+    {
+        // A drag that ends where it began is no edit: take its step back.
+        let now = app.engine.session().tempo.tempo_at_tick(d.tick);
+        if (now - d.start).abs() < 0.005 && app.engine.undo_history().len() == d.undo_len + 1 {
+            app.engine.undo();
+        }
+        app.engine.end_merge();
     }
     if resp.double_clicked() {
         app.engine.end_merge();
-        app.tempo_ui.edit = Some(Edit { text: format!("{:.2}", g.bpm), fresh: true });
+        app.tempo_ui.edit = Some(Edit { text: format!("{:.2}", g.bpm), tick: g.tick, fresh: true });
     }
     if resp.hovered() && app.tempo_ui.drag.is_none() {
         let (notches, shift) = ui.input(|i| {
@@ -250,7 +265,7 @@ pub fn tempo_field(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 /// The in-place field: Enter applies, Escape and losing focus cancel.
-fn edit_field(app: &mut StudioApp, ui: &mut Ui, r: Rect, g: Governing) {
+fn edit_field(app: &mut StudioApp, ui: &mut Ui, r: Rect) {
     let Some(mut e) = app.tempo_ui.edit.take() else { return };
     let id = egui::Id::new("tempo_edit");
     let (esc, enter) = std::mem::take(&mut app.tempo_ui.keys);
@@ -271,7 +286,7 @@ fn edit_field(app: &mut StudioApp, ui: &mut Ui, r: Rect, g: Governing) {
     if enter {
         match parse_bpm(&e.text) {
             Some(v) => {
-                app.set_tempo_at(g.tick, v, None);
+                app.set_tempo_at(e.tick, v, None);
             }
             None => app.status = format!("\"{}\" is not a tempo", e.text.trim()),
         }
@@ -293,7 +308,7 @@ fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
 }
 
 pub fn meter_field(app: &mut StudioApp, ui: &mut Ui) {
-    let (_, n, d) = governing_meter(app);
+    let (mtick, n, d) = governing_meter(app);
     let (r, resp) = ui.allocate_exact_size(vec2(40.0, 26.0), Sense::click());
     register(app, "meter", r);
     let open = app.tempo_ui.meter.is_some();
@@ -302,15 +317,16 @@ pub fn meter_field(app: &mut StudioApp, ui: &mut Ui) {
     let color = if hot { TOKENS.accent } else { TOKENS.text };
     ui.painter().text(r.center(), Align2::CENTER_CENTER, format!("{n}/{d}"), crate::theme::mono(ui.ctx(), 13.0), color);
     if resp.clicked() {
-        app.tempo_ui.meter = if open { None } else { Some(MeterPopup { text: format!("{n}/{d}"), fresh: true }) };
+        app.tempo_ui.meter = if open { None } else { Some(MeterPopup { text: format!("{n}/{d}"), tick: mtick, fresh: true }) };
     }
     resp.on_hover_text("Meter. Click to change");
     if app.tempo_ui.meter.is_some() {
-        popup(app, ui.ctx(), r, (n, d));
+        popup(app, ui.ctx(), r);
     }
 }
 
-fn small_button(ui: &mut Ui, label: &str, w: f32, on: bool) -> (Rect, bool) {
+/// A popup button: its label as text, or an icon when `icon` is given.
+fn small_button(ui: &mut Ui, label: &str, icon: Option<Icon>, w: f32, on: bool) -> (Rect, bool) {
     let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
     let bg = if on {
         TOKENS.accent.gamma_multiply(0.35)
@@ -320,16 +336,25 @@ fn small_button(ui: &mut Ui, label: &str, w: f32, on: bool) -> (Rect, bool) {
         TOKENS.button
     };
     ui.painter().rect_filled(r, RADIUS, bg);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, crate::theme::mono(ui.ctx(), 13.0), TOKENS.text);
+    match icon {
+        Some(i) => crate::icons::paint_in(ui.painter(), r, i, TOKENS.text),
+        None => {
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, crate::theme::mono(ui.ctx(), 13.0), TOKENS.text);
+        }
+    }
     (r, resp.clicked())
 }
 
-fn popup(app: &mut StudioApp, ctx: &egui::Context, field: Rect, current: (u32, u32)) {
+fn popup(app: &mut StudioApp, ctx: &egui::Context, field: Rect) {
     let Some(mut m) = app.tempo_ui.meter.take() else { return };
     let (esc, enter) = std::mem::take(&mut app.tempo_ui.keys);
     if esc {
         return;
     }
+    let current = {
+        let e = app.engine.session().tempo.meter_at_tick(m.tick);
+        (e.numerator, e.denominator)
+    };
     let draft = parse_meter(&m.text).unwrap_or(current);
     let id = egui::Id::new("meter_edit");
     let mut apply = enter && parse_meter(&m.text).is_some();
@@ -351,12 +376,12 @@ fn popup(app: &mut StudioApp, ctx: &egui::Context, field: Rect, current: (u32, u
                     }
                     rects.push(("meter_text".into(), resp.rect));
                     bad = enter && parse_meter(&m.text).is_none();
-                    let (r, hit) = small_button(ui, "-", 24.0, false);
+                    let (r, hit) = small_button(ui, "", Some(Icon::Minus), 24.0, false);
                     rects.push(("meter_dec".into(), r));
                     if hit {
                         m.text = format!("{}/{}", draft.0.saturating_sub(1).max(1), draft.1);
                     }
-                    let (r, hit) = small_button(ui, "+", 24.0, false);
+                    let (r, hit) = small_button(ui, "", Some(Icon::Plus), 24.0, false);
                     rects.push(("meter_inc".into(), r));
                     if hit {
                         m.text = format!("{}/{}", (draft.0 + 1).min(NUMERATOR_MAX), draft.1);
@@ -364,13 +389,13 @@ fn popup(app: &mut StudioApp, ctx: &egui::Context, field: Rect, current: (u32, u
                 });
                 ui.horizontal(|ui| {
                     for den in DENOMINATORS {
-                        let (r, hit) = small_button(ui, &format!("/{den}"), 32.0, draft.1 == den);
+                        let (r, hit) = small_button(ui, &format!("/{den}"), None, 32.0, draft.1 == den);
                         rects.push((format!("meter_den_{den}"), r));
                         if hit {
                             m.text = format!("{}/{den}", draft.0);
                         }
                     }
-                    let (r, hit) = small_button(ui, "Set", 36.0, false);
+                    let (r, hit) = small_button(ui, "Set", None, 36.0, false);
                     rects.push(("meter_set".into(), r));
                     apply |= hit && parse_meter(&m.text).is_some();
                 });
@@ -385,7 +410,7 @@ fn popup(app: &mut StudioApp, ctx: &egui::Context, field: Rect, current: (u32, u
     }
     if apply {
         if let Some((n, d)) = parse_meter(&m.text) {
-            app.set_meter_here(n, d);
+            app.set_meter_at(m.tick, n, d);
         }
         return;
     }

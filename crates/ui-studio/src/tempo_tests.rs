@@ -360,3 +360,94 @@ fn silent_wav(frames: u32) -> Vec<u8> {
     b.extend((0..frames).flat_map(|i| (((i % 200) as i16 - 100) * 100).to_le_bytes()));
     b
 }
+
+/// Press on `at`, move through `path` a frame at a time, release.
+fn drag_path(t: &mut T, at: (f32, f32), path: &[(f32, f32)]) {
+    use egui::{Event, PointerButton, pos2};
+    let m = egui::Modifiers::NONE;
+    let a = pos2(at.0, at.1);
+    t.app.synthetic.push(Event::PointerMoved(a));
+    t.app.synthetic.push(Event::PointerButton { pos: a, button: PointerButton::Primary, pressed: true, modifiers: m });
+    t.frames(3);
+    for p in path {
+        t.app.synthetic.push(Event::PointerMoved(pos2(p.0, p.1)));
+        t.frames(3);
+    }
+    let end = path.last().map_or(a, |p| pos2(p.0, p.1));
+    t.app.synthetic.push(Event::PointerButton { pos: end, button: PointerButton::Primary, pressed: false, modifiers: m });
+    t.frames(5);
+}
+
+#[test]
+fn a_drag_that_ends_where_it_began_leaves_no_undo_step() {
+    let mut t = T::new();
+    let doc = t.doc();
+    let at = t.rect("tempo");
+    drag_path(&mut t, at, &[(at.0, at.1 - 15.0), (at.0, at.1 - 30.0), (at.0, at.1 - 15.0), (at.0, at.1)]);
+    assert_eq!(t.bpm(), 120.0);
+    assert_eq!(t.undo_len(), 0, "120 -> 130 -> 120 is no edit");
+    assert!(!t.doc().0, "and the document is clean: {:?} from {doc:?}", t.doc());
+    // A drag that does end elsewhere is still one step.
+    drag_path(&mut t, at, &[(at.0, at.1 - 15.0), (at.0, at.1 - 30.0)]);
+    assert!(t.bpm() > 120.0);
+    assert_eq!(t.undo_len(), 1);
+}
+
+#[test]
+fn a_field_opened_before_a_tempo_change_edits_the_event_it_opened_on() {
+    let mut t = T::new();
+    t.app.run("event.tempo", json!({"bpm": 100.0, "at": 192_000})).unwrap();
+    t.frames(3);
+    let at = t.rect("tempo");
+    t.double(at);
+    assert!(t.app.tempo_ui.edit.is_some());
+    // Playback crosses into bar 4 while the field is open.
+    let s = t.app.engine.session();
+    t.app.ui.cursor = s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: 4, beat: 1, tick: 0 }, s.sample_rate);
+    t.frames(3);
+    assert_eq!(crate::tempo_edit::governing_tempo(&t.app).bpm, 100.0);
+    t.typed("90");
+    t.key("Enter");
+    let tempos = t.app.engine.session().tempo.tempos().to_vec();
+    assert_eq!((tempos[0].bpm, tempos[1].bpm), (90.0, 100.0), "the event under the playhead when it opened is the one edited");
+}
+
+#[test]
+fn a_popup_opened_before_a_meter_change_edits_the_event_it_opened_on() {
+    let mut t = T::new();
+    t.app.run("event.meter", json!({"numerator": 6, "denominator": 8, "at": 192_000})).unwrap();
+    t.frames(3);
+    let m = t.rect("meter");
+    t.click(m);
+    let s = t.app.engine.session();
+    t.app.ui.cursor = s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: 4, beat: 1, tick: 0 }, s.sample_rate);
+    t.frames(3);
+    t.typed("3/4");
+    t.key("Enter");
+    let meters = t.app.engine.session().tempo.meters().to_vec();
+    assert_eq!(((meters[0].numerator, meters[0].denominator), (meters[1].numerator, meters[1].denominator)), ((3, 4), (6, 8)));
+}
+
+#[test]
+fn a_mid_song_meter_edit_changes_that_meter_and_later_ones_keep_their_bars() {
+    let mut t = T::new();
+    // 4/4 from bar 1, 6/8 from bar 3, 5/4 from bar 5.
+    t.app.run("event.meter", json!({"numerator": 6, "denominator": 8, "at": 192_000})).unwrap();
+    t.app.run("event.meter", json!({"numerator": 5, "denominator": 4, "at": 384_000})).unwrap();
+    let bars = |t: &T| {
+        let s = t.app.engine.session();
+        s.tempo.meters().iter().map(|m| (s.tempo.bar_beat_at_tick(m.tick).bar, m.numerator, m.denominator)).collect::<Vec<_>>()
+    };
+    assert_eq!(bars(&t), [(1, 4, 4), (3, 6, 8), (5, 5, 4)]);
+    // The playhead in bar 3: the popup edits the 6/8 event.
+    let s = t.app.engine.session();
+    t.app.ui.cursor = s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: 3, beat: 2, tick: 0 }, s.sample_rate);
+    t.frames(3);
+    let before = t.undo_len();
+    let m = t.rect("meter");
+    t.click(m);
+    t.typed("3/4");
+    t.key("Enter");
+    assert_eq!(bars(&t), [(1, 4, 4), (3, 3, 4), (5, 5, 4)], "the edited event stays at bar 3 and the later one at bar 5");
+    assert_eq!(t.undo_len(), before + 1);
+}
