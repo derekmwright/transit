@@ -246,6 +246,7 @@ fn tempo_curve(e: &mut Engine, p: &Value, curve: Curve, id: &str) -> Result<Valu
     let curvature = f64_or(p, "curvature", 0.5).clamp(-1.0, 1.0);
     let after = s.tempo.tempo_at_tick(t1);
     let had_end = s.tempo.tempos().iter().any(|x| x.tick == t1);
+    let old = s.tempo.clone();
     let inside: Vec<i64> = s.tempo.tempos().iter().map(|x| x.tick).filter(|t| *t > t0 && *t < t1).collect();
     for t in inside {
         s.tempo.remove_tempo(t);
@@ -266,6 +267,7 @@ fn tempo_curve(e: &mut Engine, p: &Value, curve: Curve, id: &str) -> Result<Valu
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
+    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"events": n, "start_tick": t0, "end_tick": t1}))
 }
 
@@ -284,12 +286,14 @@ fn tempo_stretch(e: &mut Engine, p: &Value) -> Result<Value> {
     let had_end = s.tempo.tempos().iter().any(|x| x.tick == t1);
     let mut events: Vec<(i64, f64)> = s.tempo.tempos().iter().filter(|x| x.tick > t0 && x.tick < t1).map(|x| (x.tick, x.bpm)).collect();
     events.push((t0, s.tempo.tempo_at_tick(t0)));
+    let old = s.tempo.clone();
     for (tick, bpm) in &events {
         s.tempo.set_tempo(*tick, bpm / factor).map_err(|err| bad(id, err.to_string()))?;
     }
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
+    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"factor": factor, "events": events.len()}))
 }
 
@@ -697,7 +701,9 @@ fn beat_detective(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     if set_tempo && let Some(b) = bpm {
         let tick = s.tempo.samples_to_ticks(r.start, sr);
+        let old = s.tempo.clone();
         s.tempo.set_tempo(tick, b).map_err(|err| bad(id, err.to_string()))?;
+        crate::edit::retime_to_tempo(s, &old);
     }
     let shown: Vec<Samples> = beats.iter().take(2000).copied().collect();
     Ok(json!({"beats": shown, "count": beats.len(), "bpm": bpm, "separated": separated}))
@@ -718,7 +724,9 @@ fn identify_beat(e: &mut Engine, p: &Value) -> Result<Value> {
     let secs = s.sample_rate.seconds(r.len());
     let bpm = quarters * 60.0 / secs;
     let s = e.session_mut();
+    let old = s.tempo.clone();
     s.tempo.set_tempo(t0, bpm).map_err(|err| bad(id, err.to_string()))?;
+    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"bpm": bpm, "tick": t0}))
 }
 

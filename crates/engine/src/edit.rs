@@ -842,6 +842,111 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
     n
 }
 
+/// Samples at a fractional tick under `map`: [`TempoMap::tick_to_samples`] without rounding the
+/// tick, so a position between ticks keeps its place within the tick.
+fn samples_at_ticks_f(map: &TempoMap, tick: f64, sr: SampleRate) -> f64 {
+    let per_tick = |bpm: f64| sr.as_f64() * 60.0 / (bpm * soundcraft_time::TICKS_PER_QUARTER as f64);
+    let tempos = map.tempos();
+    let mut acc = 0.0;
+    let mut seg = 0.0;
+    let mut bpm = tempos.first().map_or(120.0, |e| e.bpm);
+    for e in tempos.iter().skip(1) {
+        let t = e.tick as f64;
+        if t >= tick {
+            break;
+        }
+        acc += (t - seg) * per_tick(bpm);
+        seg = t;
+        bpm = e.bpm;
+    }
+    acc + (tick - seg) * per_tick(bpm)
+}
+
+/// Keep musical-time material on its bars after the tempo map changed from `old` to the
+/// session's current map.
+///
+/// Every position below is a sample count; each is read as a musical position under `old` and
+/// written back as the sample where that position falls now. A conversion is always from the
+/// sample under the map it was placed with, so repeated edits round once each and do not compound
+/// (an unchanged stretch of the map converts every position to itself).
+///
+/// What follows the bars:
+/// - On ticks-timebase tracks (every playlist, not only the active one): clip starts; MIDI clips'
+///   ends, fades, gain breakpoints and sync points (their notes are already in ticks); automation.
+///   Audio and video clips keep their length, file offset, fades and gain envelope, because the
+///   audio is not stretched; when a faster tempo would run one under the next clip, its tail is
+///   trimmed at the next clip (plus any crossfade overlap they already had).
+/// - Markers and memory-location ranges, key changes, and the edit and timeline selections (the
+///   loop range), as the bar-based ruler, key and cycle range they are.
+///
+/// Samples-timebase tracks, the playhead, the song start, and pre- and post-roll do not move.
+pub fn retime_to_tempo(s: &mut Session, old: &TempoMap) {
+    if old.tempos() == s.tempo.tempos() {
+        return;
+    }
+    let (new, sr) = (s.tempo.clone(), s.sample_rate);
+    let at = |x: Samples| soundcraft_time::to_samples(samples_at_ticks_f(&new, old.samples_to_ticks_f(x, sr), sr));
+    for tr in s.tracks.iter_mut().filter(|t| t.ticks_timebase) {
+        for pl in &mut tr.playlists {
+            let before: Vec<Range> = pl.clips.iter().map(Clip::range).collect();
+            for c in &mut pl.clips {
+                retime_clip(c, &at);
+            }
+            // Audio keeps its length, so a faster tempo can run a clip under the next one.
+            for i in 1..pl.clips.len() {
+                let (Some(was_a), Some(was_b)) = (before.get(i - 1), before.get(i)) else { continue };
+                let had = (was_a.end - was_b.start).max(0);
+                let next = pl.clips.get(i).map_or(Samples::MAX, |c| c.start);
+                if let Some(a) = pl.clips.get_mut(i - 1)
+                    && !matches!(a.content, ClipContent::Midi { .. })
+                    && a.end() > next.saturating_add(had)
+                {
+                    a.trim_end_to(next.saturating_add(had));
+                }
+            }
+            pl.sort();
+        }
+        for lane in &mut tr.automation {
+            for p in &mut lane.points {
+                p.at = at(p.at);
+            }
+            lane.points.sort_by_key(|p| p.at);
+        }
+    }
+    for m in &mut s.markers {
+        (m.start, m.end) = (at(m.start), at(m.end));
+    }
+    for (k, _) in &mut s.key_signatures {
+        *k = at(*k);
+    }
+    s.key_signatures.sort_by_key(|k| k.0);
+    for r in [&mut s.edit.selection, &mut s.edit.timeline_selection] {
+        *r = Range::new(at(r.start), at(r.end));
+    }
+}
+
+fn retime_clip(c: &mut Clip, at: &impl Fn(Samples) -> Samples) {
+    let start = at(c.start);
+    if !matches!(c.content, ClipContent::Midi { .. }) {
+        c.start = start;
+        return;
+    }
+    // A MIDI clip is musical from end to end: re-place every edge and offset as a musical position.
+    let old = c.start;
+    let rel = |off: Samples| at(old.saturating_add(off)) - start;
+    let end = rel(c.length).max(1);
+    c.fade_in.len = rel(c.fade_in.len);
+    c.fade_out.len = end - rel(c.length - c.fade_out.len);
+    for (t, _) in &mut c.gain_env {
+        *t = rel(*t);
+    }
+    if c.sync_point != 0 {
+        c.sync_point = rel(c.sync_point);
+    }
+    c.start = start;
+    c.trim_end_to(start + end);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

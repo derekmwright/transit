@@ -406,6 +406,7 @@ pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: b
     let smf = soundcraft_midi::read_smf(bytes).map_err(|err| EngineError::Io(err.to_string()))?;
     let s = e.session_mut();
     if tempo_map {
+        let old = s.tempo.clone();
         // Each meter is placed by walking the ones before it.
         if smf.meters.len() > MAX_MIDI_METERS {
             return Err(EngineError::Io(format!("MIDI file: more than {MAX_MIDI_METERS} meter changes")));
@@ -416,6 +417,8 @@ pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: b
         for (tick, n, d) in &smf.meters {
             let _ = s.tempo.set_meter(*tick, u32::from(*n), u32::from(*d));
         }
+        // The file's tempo map replaces the session's: material already on ticks tracks keeps its bars.
+        crate::edit::retime_to_tempo(s, &old);
     }
     let base_tick = s.tempo.samples_to_ticks(at, s.sample_rate);
     let mut out = Vec::new();

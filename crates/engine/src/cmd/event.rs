@@ -14,12 +14,18 @@ pub fn specs() -> Vec<CommandSpec> {
             let at = position_param(e, "event.tempo_remove", p, "at")?.unwrap_or(0);
             let s = e.session_mut();
             let tick = s.tempo.samples_to_ticks(at, s.sample_rate);
-            Ok(json!({"removed": s.tempo.remove_tempo(tick)}))
+            let old = s.tempo.clone();
+            let removed = s.tempo.remove_tempo(tick);
+            crate::edit::retime_to_tempo(s, &old);
+            Ok(json!({"removed": removed}))
         }),
         cmd!("event.meter", "Change Meter...", ["Event", "Time Operations"], None, "{numerator, denominator, at?: position}", always, meter),
         cmd!("event.tempo_scale", "Scale...", ["Event", "Tempo Operations"], None, "{factor}", always, |e, p| {
             let f = f64_or(p, "factor", 1.0);
-            e.session_mut().tempo.scale_tempos(f).map_err(|err| bad("event.tempo_scale", err.to_string()))?;
+            let s = e.session_mut();
+            let old = s.tempo.clone();
+            s.tempo.scale_tempos(f).map_err(|err| bad("event.tempo_scale", err.to_string()))?;
+            crate::edit::retime_to_tempo(s, &old);
             Ok(json!({}))
         }),
         cmd!("event.tempo_constant", "Constant...", ["Event", "Tempo Operations"], None, "{bpm, start?, end?}", always, tempo_constant),
@@ -106,7 +112,9 @@ fn tempo(e: &mut Engine, p: &Value) -> Result<Value> {
     let at = position_param(e, "event.tempo", p, "at")?.or(position_param(e, "event.tempo", p, "start")?).unwrap_or(0);
     let s = e.session_mut();
     let tick = s.tempo.samples_to_ticks(at, s.sample_rate);
+    let old = s.tempo.clone();
     s.tempo.set_tempo(tick, bpm).map_err(|err| bad("event.tempo", err.to_string()))?;
+    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"tick": tick, "bpm": bpm}))
 }
 
@@ -123,6 +131,7 @@ fn tempo_constant(e: &mut Engine, p: &Value) -> Result<Value> {
     // Read before the edit: the end is a musical position, and the new tempo moves it in samples.
     let after = s.tempo.tempo_at_tick(t1);
     let had_end = s.tempo.tempos().iter().any(|x| x.tick == t1);
+    let old = s.tempo.clone();
     s.tempo.set_tempo(t0, bpm).map_err(|err| bad(id, err.to_string()))?;
     let inside: Vec<i64> = s.tempo.tempos().iter().map(|x| x.tick).filter(|t| *t > t0 && *t < t1).collect();
     for t in inside {
@@ -131,6 +140,7 @@ fn tempo_constant(e: &mut Engine, p: &Value) -> Result<Value> {
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
+    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"tick": t0, "end_tick": t1, "bpm": bpm}))
 }
 
