@@ -1059,13 +1059,21 @@ pub(crate) struct EngineEvents {
     pub(crate) transport: Option<TransportEpoch>,
     pub(crate) status: EventStatus,
     tap: Vec<TapRecord>,
-    /// Per port slot (see [`MAX_PORTS`]): one past the highest revoked generation (0: none).
-    revoked: [u64; MAX_PORTS + 2],
+    /// Per port slot (see [`MAX_PORTS`]): the highest revoked generation.
+    revoked: [Option<u64>; MAX_PORTS + 2],
 }
 
 impl EngineEvents {
     pub(crate) fn new(epoch: Option<EngineEpoch>, limits: EventLimits) -> Self {
-        EngineEvents { epoch, limits, next_frame: 0, transport: None, status: EventStatus::default(), tap: Vec::new(), revoked: [0; MAX_PORTS + 2] }
+        EngineEvents {
+            epoch,
+            limits,
+            next_frame: 0,
+            transport: None,
+            status: EventStatus::default(),
+            tap: Vec::new(),
+            revoked: [None; MAX_PORTS + 2],
+        }
     }
 }
 
@@ -1151,7 +1159,7 @@ impl MixEngine {
         }
         // Port generations only increase: one at or below the revoked one is gone for good.
         let Some(port) = Source::port_slot(ev.source.port) else { return (EventOutcome::PortOutOfRange, None) };
-        if self.events.revoked.get(port).is_some_and(|&r| ev.source.generation < r) {
+        if self.events.revoked.get(port).copied().flatten().is_some_and(|r| ev.source.generation <= r) {
             return (EventOutcome::RevokedSource, None);
         }
         let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::StaleEngine, None) };
@@ -1239,7 +1247,7 @@ impl MixEngine {
         }
         self.events.status.revoked = self.events.status.revoked.saturating_add(done);
         if let Some(r) = Source::port_slot(port).and_then(|i| self.events.revoked.get_mut(i)) {
-            *r = (*r).max(generation.saturating_add(1));
+            *r = Some(r.map_or(generation, |r| r.max(generation)));
         }
     }
 

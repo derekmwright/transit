@@ -747,3 +747,17 @@ fn two_holders_give_the_plug_in_their_maximum() {
     assert!(!rig.mix.has_pending_events());
 }
 
+/// Review F10-4a: revoking generation MAX refuses generation MAX.
+#[test]
+fn revoking_the_last_generation_refuses_it() {
+    let mut rig = Rig::new();
+    let now = rig.mix.next_frame().0;
+    let last = Source { port: 2, channel: 0, generation: u64::MAX };
+    rig.mix.revoke_source(2, u64::MAX);
+    assert_eq!(rig.send(last, now, on(60)), EventOutcome::RevokedSource);
+    assert_eq!(rig.send(Source { generation: u64::MAX - 1, ..last }, now, on(60)), EventOutcome::RevokedSource);
+    rig.mix.revoke_source(3, 5);
+    assert_eq!(rig.send(Source { port: 3, generation: 5, ..last }, now, on(60)), EventOutcome::RevokedSource);
+    assert_eq!(rig.send(Source { port: 3, generation: 6, ..last }, now, on(60)), EventOutcome::Queued);
+}
+
