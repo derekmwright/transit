@@ -268,4 +268,56 @@ mod track_render_state {
     fn track_bounce_captures_live_state_before_rendering() {
         run_alias("track.bounce");
     }
+    #[test]
+    fn audio_reopen_preserves_live_state_and_refuses_pending_document_without_teardown() {
+        fixture();
+        let mut engine = soundcraft_engine::Engine::default();
+        let session = engine.session_mut();
+        let track = session.add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Stereo, Some("State"));
+        let mut insert = soundcraft_model::Insert::new("clap:org.soundcraft.test.gain");
+        insert.set_state_bytes(&state(1.0));
+        session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
+        let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
+        let mut app = SoundApp::new(engine, Some(player), crate::Services::default());
+        for _ in 0..4 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+        }
+        let player = app.player.as_ref().unwrap();
+        player.open_editor(track, 0).unwrap(); // fixture's window-free GUI edits gain
+        player.step_device_free();
+        let before = player.capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+        assert_eq!(before, state(0.25));
+        assert_eq!(app.engine.session().track(track).unwrap().mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap(), state(1.0));
+        app.apply_audio_config_using(soundcraft_playback::AudioConfig::default(), |session, _| {
+            soundcraft_playback::Player::prepare_device_free(session).unwrap()
+        })
+        .unwrap();
+        for _ in 0..4 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+        }
+        let after = app.player.as_ref().unwrap().capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+        assert_eq!(after, before, "Apply audio discarded unsaved native plug-in state");
+        assert!(app.reconnect_audio_using(true, |session, _| soundcraft_playback::Player::prepare_device_free(session).unwrap()).unwrap());
+        for _ in 0..4 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+        }
+        let confirmed = app.engine.session_arc();
+        assert_eq!(app.player.as_ref().unwrap().capture_states(&confirmed).unwrap()[0].2, before);
+        app.engine.session_mut().track_mut(track).unwrap().name = "Pending".into();
+        let old_config = app.ui.audio.clone();
+        let changed = soundcraft_playback::AudioConfig { buffer_size: Some(128), ..old_config.clone() };
+        assert!(app.apply_audio_config_using(changed, |_, _| panic!("pending document must not open a device")).is_err());
+        assert_eq!(app.ui.audio, old_config);
+        assert!(app.reconnect_audio_using(true, |_, _| panic!("pending document must not tear down the player")).is_err());
+        assert!(app.player.as_ref().unwrap().has_requested_session(&confirmed));
+    }
 }

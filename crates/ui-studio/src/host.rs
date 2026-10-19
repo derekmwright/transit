@@ -237,7 +237,10 @@ impl StudioApp {
         }
         let result = if self.restore_pending { p.replace_session(session) } else { p.update_session(session) };
         if matches!(result, Err(soundcraft_playback::PlayerError::NeedsReopen { .. })) {
-            self.reconnect_audio();
+            if let Err(error) = self.reconnect_audio_using(false, Player::with_config) {
+                self.player_requests.fail(&mut self.status, error);
+                return false;
+            }
             if self.player.as_ref().is_some_and(|p| p.has_requested_session(&self.engine.session_arc())) {
                 self.restore_pending = false;
                 self.last_rev = self.engine.revision;
@@ -265,6 +268,15 @@ impl StudioApp {
         let Some(p) = &self.player else { return Ok(()) };
         let states = p.capture_states(&self.engine.session_arc());
         self.store_plugin_states(states)
+    }
+
+    fn preserve_audio_state(&mut self) -> Result<bool, String> {
+        let Some(player) = &self.player else { return Ok(true) };
+        let states = player.capture_states_for_reopen(&self.engine.session_arc());
+        let states = self.player_requests.result(&mut self.status, states).ok_or_else(|| self.status.clone())?;
+        let Some(states) = states else { return Ok(false) };
+        self.store_plugin_states(Ok(states))?;
+        Ok(true)
     }
 
     fn store_plugin_states(&mut self, states: Result<soundcraft_playback::PluginStates, soundcraft_playback::PlayerError>) -> Result<(), String> {
@@ -555,13 +567,25 @@ impl StudioApp {
 
     /// Reopen audio with editors closed before teardown. Never interrupt a recording.
     pub fn reconnect_audio(&mut self) {
+        match self.reconnect_audio_using(true, Player::with_config) {
+            Ok(false) => self.status = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.".into(),
+            Ok(true) => {}
+            Err(error) => self.player_requests.fail(&mut self.status, error),
+        }
+    }
+
+    pub(crate) fn reconnect_audio_using(
+        &mut self,
+        preserve: bool,
+        open: impl FnOnce(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player,
+    ) -> Result<bool, String> {
         if self.recording_active() {
-            self.status = crate::audio_devices::REFUSED_RECORDING.into();
-            return;
+            return Err(crate::audio_devices::REFUSED_RECORDING.into());
         }
         if self.player.is_none() && self.audio_devices.fake.is_none() {
-            return;
+            return Ok(true);
         }
+        let captured = !preserve || self.preserve_audio_state()?;
         if self.is_playing() {
             self.stop_play();
         }
@@ -575,28 +599,21 @@ impl StudioApp {
         let cfg = self.ui.audio.clone();
         if let Some(f) = &mut self.audio_devices.fake {
             let trace = std::rc::Rc::clone(&f.trace);
-            if let Err(error) =
-                crate::audio_connection::replace(&mut f.connection, &mut f.input, || crate::audio_connection::FakeConnection::new(cfg.clone(), trace))
-            {
-                self.player_requests.fail(&mut self.status, error);
-                return;
-            }
+            crate::audio_connection::replace(&mut f.connection, &mut f.input, || crate::audio_connection::FakeConnection::new(cfg.clone(), trace))?;
             f.reopened.push(cfg);
         } else {
             let session = self.engine.session_arc();
-            if let Err(error) = crate::audio_connection::replace(&mut self.player, &mut self.recorder, || {
+            crate::audio_connection::replace(&mut self.player, &mut self.recorder, || {
                 soundcraft_playback::devices::release_asio_device_cache();
-                Player::with_config(session, &cfg)
-            }) {
-                self.player_requests.fail(&mut self.status, error);
-                return;
-            }
+                open(session, &cfg)
+            })?;
             self.player_requests.reset();
         }
         if self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm) {
             self.ensure_input();
         }
         self.audio_devices.begin_verification();
+        Ok(captured)
     }
 
     fn finish_recording(&mut self) {

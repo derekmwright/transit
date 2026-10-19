@@ -696,7 +696,10 @@ impl SoundApp {
         }
         let result = if self.restore_pending { p.replace_session(session) } else { p.update_session(session) };
         if matches!(result, Err(soundcraft_playback::PlayerError::NeedsReopen { .. })) {
-            self.reconnect_audio();
+            if let Err(error) = self.reconnect_audio_using(false, Player::with_config) {
+                self.player_requests.fail(&mut self.ui.status, error);
+                return false;
+            }
             if self.player.as_ref().is_some_and(|p| p.has_requested_session(&self.engine.session_arc())) {
                 self.restore_pending = false;
                 self.last_rev = self.engine.revision;
@@ -724,6 +727,15 @@ impl SoundApp {
         let Some(p) = &self.player else { return Ok(()) };
         let states = p.capture_states(&self.engine.session_arc());
         self.store_plugin_states(states)
+    }
+
+    fn preserve_audio_state(&mut self) -> Result<bool, String> {
+        let Some(player) = &self.player else { return Ok(true) };
+        let states = player.capture_states_for_reopen(&self.engine.session_arc());
+        let states = self.player_requests.result(&mut self.ui.status, states).ok_or_else(|| self.ui.status.clone())?;
+        let Some(states) = states else { return Ok(false) };
+        self.store_plugin_states(Ok(states))?;
+        Ok(true)
     }
 
     fn store_plugin_states(&mut self, states: Result<soundcraft_playback::PluginStates, soundcraft_playback::PlayerError>) -> Result<(), String> {
@@ -906,9 +918,18 @@ impl SoundApp {
     /// recreated with the new player. Refused while recording, which would lose the take; `ui.audio`
     /// then stays the configuration of the open device.
     pub fn apply_audio_config(&mut self, cfg: soundcraft_playback::AudioConfig) -> Result<(), String> {
+        self.apply_audio_config_using(cfg, Player::with_config)
+    }
+
+    fn apply_audio_config_using(
+        &mut self,
+        cfg: soundcraft_playback::AudioConfig,
+        open: impl FnOnce(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player,
+    ) -> Result<(), String> {
         if self.recording_active() {
             return Err("stop recording before changing the audio device".into());
         }
+        let captured = self.preserve_audio_state()?;
         self.ui.audio = cfg;
         let at = self.position();
         if let Some(p) = &self.player {
@@ -930,7 +951,7 @@ impl SoundApp {
         // Close the old device before opening the new one: an ASIO driver is process-wide, and
         // dropping the old stream after the new one opened unloaded the driver from under it.
         self.player = None;
-        let player = soundcraft_playback::Player::with_config(self.engine.session_arc(), &self.ui.audio);
+        let player = open(self.engine.session_arc(), &self.ui.audio);
         if let Some(sequence) = self.player_requests.result(&mut self.ui.status, player.locate(at)) {
             self.player_requests.locate = Some(sequence);
         }
@@ -939,6 +960,9 @@ impl SoundApp {
         self.player_requests.stop = None;
         self.player_requests.recording = None;
         self.player_requests.release = None;
+        if !captured {
+            self.ui.status = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.".into();
+        }
         Ok(())
     }
 
@@ -1075,24 +1099,38 @@ impl SoundApp {
 
     /// Reopen the audio devices, keeping a take in progress.
     pub fn reconnect_audio(&mut self) {
+        match self.reconnect_audio_using(true, Player::with_config) {
+            Ok(false) => self.ui.status = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.".into(),
+            Ok(true) => {}
+            Err(error) => self.player_requests.fail(&mut self.ui.status, error),
+        }
+    }
+
+    pub(crate) fn reconnect_audio_using(
+        &mut self,
+        preserve: bool,
+        open: impl FnOnce(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player,
+    ) -> Result<bool, String> {
+        let captured = !preserve || self.preserve_audio_state()?;
         if self.is_playing() || self.engine.transport.recording {
             self.stop_play();
         }
         if let Some(p) = &self.player {
             // Its plugin editors go with it; closed here, on the main thread (see `apply_audio_config`).
             if self.player_requests.result(&mut self.ui.status, p.close_editors()).is_none() {
-                return;
+                return Err(self.ui.status.clone());
             }
         }
         self.close_input();
         if self.recorder.is_some() {
-            return;
+            return Err(self.ui.status.clone());
         }
         self.recorder_failed = false;
         // The old device closes first (see `apply_audio_config`: an ASIO driver is process-wide).
         self.player = None;
-        self.player = Some(Player::with_config(self.engine.session_arc(), &self.ui.audio));
+        self.player = Some(open(self.engine.session_arc(), &self.ui.audio));
         self.player_requests.reset();
+        Ok(captured)
     }
 
     fn finish_recording(&mut self) {

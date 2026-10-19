@@ -499,8 +499,9 @@ impl StudioApp {
             self.want_editor(key);
         }
         // A new device choice takes effect now, as the window's Apply does.
-        if audio_changed {
-            self.reopen_audio();
+        if audio_changed && let Err(error) = self.reopen_audio() {
+            self.ui.audio = before.audio;
+            return Err(error);
         }
         Ok(json!({"ui": self.ui}))
     }

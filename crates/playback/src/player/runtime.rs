@@ -323,6 +323,19 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         Ok(self.handles.capture_states())
     }
+    /// Final Main-thread capture before recreating the device. Faults close audio
+    /// admission but leave these handles owned until retirement. Never use them
+    /// for a different or unconfirmed document. None means a terminal fault made
+    /// that lineage unavailable; the caller must disclose document-only recovery.
+    pub fn capture_states_for_reopen(&mut self, expected: &Arc<Session>) -> Result<Option<PluginStates>, PlayerError> {
+        if Arc::ptr_eq(expected, &self.requested) && self.confirmed == Some(self.control.sessions.bridge.active()) {
+            return Ok(Some(self.handles.capture_states()));
+        }
+        if self.faulted() {
+            return Ok(None);
+        }
+        Err(PlayerError::SessionPending)
+    }
     pub fn idle_editors(&mut self) -> Vec<EditorEdit> {
         // Service and drain the old editors, but do not apply their parameter edits
         // to a replacement document before its instances have been adopted.

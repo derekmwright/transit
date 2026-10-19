@@ -287,29 +287,35 @@ impl StudioApp {
             self.status = REFUSED_RECORDING.into();
             return Err(REFUSED_RECORDING.into());
         }
-        self.ui.audio = cfg;
+        let old = std::mem::replace(&mut self.ui.audio, cfg);
+        if let Err(error) = self.reopen_audio() {
+            self.ui.audio = old;
+            return Err(error);
+        }
         self.audio_devices.base = Some(self.ui.audio.clone());
         self.audio_devices.draft = self.ui.audio.clone();
-        self.reopen_audio();
         Ok(())
     }
 
     /// Reopen the devices with `ui.audio` (Apply, `ui.set {audio}`). Without a player
     /// (`--no-audio`) the choice is only saved.
-    pub(crate) fn reopen_audio(&mut self) {
+    pub(crate) fn reopen_audio(&mut self) -> Result<(), String> {
         let was_playing = self.is_playing();
-        if was_playing {
-            self.stop_play();
-        }
         let cfg = self.ui.audio.clone();
         self.audio_devices.input_reported = None;
-        let opened = if self.player.is_some() || self.audio_devices.fake.is_some() {
-            self.reconnect_audio();
-            self.opened()
+        let (opened, captured) = if self.player.is_some() || self.audio_devices.fake.is_some() {
+            let captured = match self.reconnect_audio_using(true, soundcraft_playback::Player::with_config) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    self.player_requests.fail(&mut self.status, error.clone());
+                    return Err(error);
+                }
+            };
+            (self.opened(), captured)
         } else {
             self.audio_devices.notes.clear();
             self.status = "Audio devices saved. Audio is off in this run (--no-audio); they open at the next start.".into();
-            return;
+            return Ok(());
         };
         let notes = fallback_notes(&cfg, self.audio_devices.systems.as_deref(), &opened);
         let stopped = if was_playing { "Playback stopped to change devices. " } else { "" };
@@ -319,7 +325,11 @@ impl StudioApp {
         } else {
             format!("{stopped}{} {CHOOSE_ANOTHER}", notes.join(" "))
         };
+        if !captured {
+            self.status.push_str(" Audio recovered from the document state; live plug-in state was unavailable after the audio fault.");
+        }
         self.audio_devices.notes = notes;
+        Ok(())
     }
 
     /// The window's Reconnect: reopen the same choices (a device came back, a driver changed).
@@ -328,7 +338,7 @@ impl StudioApp {
             self.status = REFUSED_RECORDING.into();
             return;
         }
-        self.reopen_audio();
+        let _ = self.reopen_audio();
     }
 
     fn opened(&self) -> Opened {

@@ -578,3 +578,24 @@ fn explicit_same_topology_restore_changes_capture_lineage_but_cow_update_keeps_i
     assert_eq!(runtime.capture_states(&original), Err(PlayerError::SessionPending));
     runtime.retire(ports);
 }
+
+#[test]
+fn reopen_capture_preserves_confirmed_fault_state_without_aliasing_pending_documents() {
+    let (mut runtime, ports, _) = setup(PlanLimits::default());
+    let original = Arc::clone(runtime.requested_session());
+    let other = Arc::new((*original).clone());
+    assert_eq!(runtime.capture_states_for_reopen(&other), Err(PlayerError::SessionPending));
+    runtime.fault();
+    assert_eq!(runtime.capture_states(&original), Err(PlayerError::Faulted));
+    assert_eq!(runtime.capture_states_for_reopen(&original).unwrap().unwrap()[0].2, [0xa1]);
+    assert_eq!(runtime.capture_states_for_reopen(&other).unwrap(), None);
+    runtime.retire(ports);
+
+    let (mut runtime, ports, _) = setup(PlanLimits::default());
+    let replacement = Arc::new((**runtime.requested_session()).clone());
+    runtime.replace_session(Arc::clone(&replacement)).unwrap();
+    assert_eq!(runtime.capture_states_for_reopen(&replacement), Err(PlayerError::SessionPending));
+    runtime.fault();
+    assert_eq!(runtime.capture_states_for_reopen(&replacement).unwrap(), None);
+    runtime.retire(ports);
+}
