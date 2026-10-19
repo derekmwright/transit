@@ -17,9 +17,16 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// How many files are prepared at once; more wait in a queue.
 pub const MAX_PREPARES: usize = 4;
+
+/// How long a finished or failed job may wait uncommitted before it is dropped.
+pub const FINISHED_TTL: Duration = Duration::from_secs(600);
+
+/// How many finished or failed jobs may wait uncommitted; past that the oldest are dropped.
+pub const MAX_FINISHED: usize = 32;
 
 /// Where a job is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,14 +59,42 @@ struct Job {
     progress: f32,
     error: Option<String>,
     prepared: Option<PreparedAudio>,
+    /// When it became done or failed.
+    finished: Option<Instant>,
 }
 
-#[derive(Default)]
 struct Staging {
     jobs: BTreeMap<u64, Job>,
     queue: VecDeque<u64>,
     /// Worker threads alive.
     running: usize,
+    ttl: Duration,
+    max_finished: usize,
+}
+
+impl Default for Staging {
+    fn default() -> Self {
+        Staging { jobs: BTreeMap::new(), queue: VecDeque::new(), running: 0, ttl: FINISHED_TTL, max_finished: MAX_FINISHED }
+    }
+}
+
+impl Staging {
+    /// Drop finished or failed jobs nobody committed: those older than the time limit, then the
+    /// oldest past the count limit. A caller that cancels what it refuses never gets here.
+    fn expire(&mut self) {
+        let now = Instant::now();
+        let mut done: Vec<(Instant, u64)> = self.jobs.iter().filter_map(|(id, j)| j.finished.map(|t| (t, *id))).collect();
+        done.sort();
+        let over = done.len().saturating_sub(self.max_finished);
+        for (i, (t, id)) in done.into_iter().enumerate() {
+            let stale = now.saturating_duration_since(t) >= self.ttl;
+            if (stale || i < over)
+                && let Some(j) = self.jobs.remove(&id)
+            {
+                log::info!("import {id} ({}) dropped: left uncommitted ({})", j.name, if stale { "too long" } else { "too many waiting" });
+            }
+        }
+    }
 }
 
 /// The engine's staging map of imports being prepared or ready to commit.
@@ -105,9 +140,11 @@ impl Imports {
             progress: 0.0,
             error: None,
             prepared: None,
+            finished: None,
         };
         let spawn = {
             let mut g = lock(&self.shared);
+            g.expire();
             g.jobs.insert(id, job);
             g.queue.push_back(id);
             let spawn = g.running < MAX_PREPARES;
@@ -131,13 +168,15 @@ impl Imports {
     /// A job's state as JSON: `{id, name, state, progress (0-100), error?, frames?, channels?,
     /// duration?}`; `None` when there is no such job.
     pub fn progress(&self, id: u64) -> Option<Value> {
-        let g = lock(&self.shared);
+        let mut g = lock(&self.shared);
+        g.expire();
         g.jobs.get(&id).map(|j| describe(id, j))
     }
 
     /// Every job, oldest first.
     pub fn all(&self) -> Vec<Value> {
-        let g = lock(&self.shared);
+        let mut g = lock(&self.shared);
+        g.expire();
         g.jobs.iter().map(|(id, j)| describe(*id, j)).collect()
     }
 
@@ -166,13 +205,26 @@ impl Imports {
 
     /// Check a finished job is there, without taking it.
     pub fn ready(&self, id: u64) -> Result<()> {
-        let g = lock(&self.shared);
+        let mut g = lock(&self.shared);
+        g.expire();
         let j = g.jobs.get(&id).ok_or_else(|| gone(id))?;
         match j.state {
             JobState::Done => Ok(()),
             JobState::Failed => Err(EngineError::Io(j.error.clone().unwrap_or_else(|| format!("{}: failed", j.name)))),
             s => Err(EngineError::BadParams("file.commit_import".into(), format!("import {id} ({}) is still {}", j.name, s.as_str()))),
         }
+    }
+
+    /// The rate a finished job's audio was prepared at.
+    pub fn prepared_rate(&self, id: u64) -> Option<u32> {
+        lock(&self.shared).jobs.get(&id).and_then(|j| j.prepared.as_ref()).map(PreparedAudio::rate)
+    }
+
+    /// Change the limits on finished jobs left uncommitted (tests use short ones).
+    pub fn set_limits(&mut self, ttl: Duration, max_finished: usize) {
+        let mut g = lock(&self.shared);
+        g.ttl = ttl;
+        g.max_finished = max_finished;
     }
 
     /// Take a finished job's audio out of the map.
@@ -252,16 +304,20 @@ fn work(shared: &Arc<Mutex<Staging>>) {
                     j.state = JobState::Done;
                     j.progress = 1.0;
                     j.prepared = Some(p);
+                    j.finished = Some(Instant::now());
                 }
                 Ok(Err(e)) => {
                     j.state = JobState::Failed;
                     j.error = Some(e.to_string());
+                    j.finished = Some(Instant::now());
                 }
                 Err(_) => {
                     j.state = JobState::Failed;
                     j.error = Some(format!("{name}: internal error while decoding"));
+                    j.finished = Some(Instant::now());
                 }
             }
         }
+        g.expire();
     }
 }

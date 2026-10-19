@@ -71,7 +71,8 @@ pub fn specs() -> Vec<CommandSpec> {
             let id = p.get("id").and_then(Value::as_u64).ok_or_else(|| bad("file.import_cancel", "`id` required"))?;
             Ok(json!({"canceled": e.imports.cancel(id)}))
         }),
-        cmd!(noundo "file.commit_import", "Commit Audio Import", [], None, "{id, track?: audio track (default: a new track), at?: position, name?}", always, commit_import),
+        // Journaled by hand as the equivalent `file.import_audio`: a prepare id cannot be replayed.
+        cmd!(@spec false, false, false; "file.commit_import", "Commit Audio Import", [], None, "{id, track?: audio track (default: a new track), at?: position, name?}", always, commit_import),
         cmd!("file.import_midi", "MIDI...", ["File", "Import"], Some("Cmd+Alt+I"), "{path, at?}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.import_midi", "`path` required"))?.to_string();
             let at = position_param(e, "file.import_midi", p, "at")?.unwrap_or(0);
@@ -294,13 +295,29 @@ fn commit_import(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     let at = position_param(e, CMD, p, "at")?.unwrap_or(0).max(0);
     let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
+    let session_rate = e.session().sample_rate.hz();
+    if let Some(rate) = e.imports.prepared_rate(id).filter(|r| *r != session_rate) {
+        return Err(bad(CMD, format!("prepared at {rate} Hz; the session is now {session_rate} Hz: re-import")));
+    }
     let before = e.session_arc();
     let prepared = e.imports.take(id)?;
     let file = prepared.name.clone();
+    let path = prepared.path.clone();
     let r = crate::io::place_prepared(e, prepared, track, at, name)?;
     let shown = name.unwrap_or(&file);
     let stem = std::path::Path::new(shown).file_stem().and_then(|x| x.to_str()).unwrap_or(shown);
     e.push_undo(&format!("Import {stem}"), before);
+    // Journal what a replay can run: the same import by path, onto the track it landed on.
+    if let Some(path) = path {
+        let mut j = json!({"path": path, "at": at});
+        if let Some(t) = r.get("track") {
+            j["track"] = t.clone();
+        }
+        if let Some(n) = name {
+            j["name"] = json!(n);
+        }
+        e.journal.push(("file.import_audio".into(), j));
+    }
     Ok(r)
 }
 

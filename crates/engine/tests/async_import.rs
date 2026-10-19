@@ -103,7 +103,10 @@ fn prepare_reaches_100_then_commit_places_the_clip_with_its_length_in_one_undo_s
     assert_eq!(clips(&e, track), vec![(96_000, 24_000, "tone".to_string())]);
     assert_eq!(e.undo_history().len(), undo + 1);
     assert_eq!(e.undo_label(), Some("Import tone"));
-    assert_eq!(e.journal.last().map(|j| j.0.as_str()), Some("file.commit_import"));
+    assert_eq!(e.journal.iter().filter(|j| j.0 == "file.commit_import").count(), 0, "a prepare id cannot be replayed");
+    let j = e.journal.last().expect("a journal entry");
+    assert_eq!(j.0, "file.import_audio");
+    assert_eq!((j.1["path"].as_str(), j.1["track"].as_u64(), j.1["at"].as_i64()), (Some(path.as_str()), Some(track), Some(96_000)));
     assert!(e.session().pool.get(e.session().sources[0].id).is_some(), "the media is in the pool");
     assert!(e.execute("file.commit_import", &json!({"id": id, "track": track})).is_err(), "a commit takes the item");
     e.undo();
@@ -205,4 +208,58 @@ fn more_files_than_workers_all_finish_and_a_missing_track_keeps_the_item() {
     let r = e.execute("file.commit_import", &json!({"id": id, "name": "Late Kick"})).unwrap();
     let t = e.session().track(soundcraft_engine::model::TrackId(r["track"].as_u64().unwrap())).unwrap();
     assert_eq!(t.name, "Late Kick", "no track: a new one, named as asked");
+}
+
+#[test]
+fn the_journaled_commit_replays_to_the_same_clip() {
+    let d = Dir::new("replay");
+    let (mut e, track) = engine_with_track();
+    let path = d.file("tone.wav", &wav(2, 48_000, 24_000));
+    let id = prepare(&mut e, &path);
+    wait(&mut e, id);
+    e.execute("file.commit_import", &json!({"id": id, "track": track, "at": 1_000})).unwrap();
+    let (cmd, params) = e.journal.last().cloned().unwrap();
+    let (mut f, track2) = engine_with_track();
+    assert_eq!(track, track2);
+    f.execute(&cmd, &params).unwrap();
+    assert_eq!(clips(&f, track), clips(&e, track));
+}
+
+#[test]
+fn finished_items_left_uncommitted_expire_by_age_and_by_count() {
+    let d = Dir::new("expire");
+    let (mut e, _) = engine_with_track();
+    let path = d.file("tone.wav", &wav(1, 48_000, 480));
+    e.imports.set_limits(Duration::from_secs(600), 3);
+    let ids: Vec<u64> = (0..5).map(|_| prepare(&mut e, &path)).collect();
+    for id in &ids {
+        // Finished jobs may already be dropped by the count limit: ignore those.
+        let t0 = Instant::now();
+        while e.imports.progress(*id).is_some_and(|v| !matches!(v["state"].as_str(), Some("done" | "failed")))
+            && t0.elapsed() < Duration::from_secs(20)
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let left: Vec<u64> = e.imports.all().iter().map(|v| v["id"].as_u64().unwrap()).collect();
+    assert_eq!(left.len(), 3, "{left:?}");
+    // A short time limit: everything finished goes.
+    e.imports.set_limits(Duration::from_millis(1), 32);
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(e.execute("file.import_progress", &json!({})).unwrap()["imports"].as_array().unwrap().is_empty());
+    assert!(e.imports.is_empty());
+}
+
+#[test]
+fn a_commit_after_a_session_rate_change_asks_for_a_re_import() {
+    let d = Dir::new("rate-change");
+    let (mut e, track) = engine_with_track();
+    let path = d.file("kick.wav", &wav(1, 44_100, 22_050));
+    let id = prepare(&mut e, &path);
+    wait(&mut e, id);
+    e.session_mut().sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
+    let err = e.execute("file.commit_import", &json!({"id": id, "track": track})).unwrap_err().to_string();
+    assert!(err.contains("prepared at 48000 Hz; the session is now 44100 Hz: re-import"), "{err}");
+    assert!(e.session().sources.is_empty() && clips(&e, track).is_empty());
+    assert_eq!(e.execute("file.import_progress", &json!({"id": id})).unwrap()["state"], "done", "the item stays");
 }
