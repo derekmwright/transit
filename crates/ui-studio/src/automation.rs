@@ -442,6 +442,10 @@ pub struct AutoState {
     pub points_written: usize,
     /// The tracks the running pass wrote to (thinned when the pass or their Write ends).
     passed: Vec<TrackId>,
+    /// Per written lane, the time spans the pass wrote (a locate starts a new span), and the undo
+    /// counter after the pass's latest write: if it still holds at the end, the pass is the newest step.
+    spans: HashMap<(TrackId, String), Vec<(Samples, Samples)>>,
+    pass_mark: u64,
     /// What the last thinning removed, for `ui.inspect`.
     pub thinned: usize,
 }
@@ -465,6 +469,9 @@ impl StudioApp {
             return None;
         }
         if self.mixer.gesture.is_some_and(|g| Lane::of_target(g.target) == (t.id, lane.clone())) {
+            return None;
+        }
+        if *lane == Lane::Volume && matches!(&self.arrange.gesture, Some(crate::arrange::Gesture::Volume { track, .. }) if *track == t.id) {
             return None;
         }
         lane.params(t).first().and_then(|p| t.lane(p)).filter(|l| !l.points.is_empty())?;
@@ -522,7 +529,16 @@ impl StudioApp {
 
     /// The track's automation mode (`mix.automation_mode`: a document change, one undo step).
     pub fn set_automation_mode(&mut self, t: TrackId, mode: AutomationMode) -> Result<Value, String> {
-        self.run("mix.automation_mode", json!({"tracks": [t.0], "mode": mode.label()}))
+        let params = json!({"tracks": [t.0], "mode": mode.label()});
+        let writes =
+            |m: AutomationMode| matches!(m, AutomationMode::Write | AutomationMode::Touch | AutomationMode::Latch | AutomationMode::TouchLatch);
+        if self.auto.writing && self.auto.passed.contains(&t) && !writes(mode) {
+            // Leaving Write mid-pass: thin what it wrote, then change the mode, all in the pass's step.
+            self.auto.passed.retain(|x| *x != t);
+            thin_after_pass(self, &[t], false);
+            return self.engine.execute_merged("mix.automation_mode", &params, PASS).map_err(|e| e.to_string());
+        }
+        self.run("mix.automation_mode", params)
     }
 
     /// Commands as one undo step of their own, or as part of the gesture `key`.
@@ -1123,10 +1139,11 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         if app.auto.writing {
             app.auto.writing = false;
             let tracks = std::mem::take(&mut app.auto.passed);
-            thin_after_pass(app, &tracks);
+            thin_after_pass(app, &tracks, true);
             app.engine.end_merge();
         }
         app.auto.passed.clear();
+        app.auto.spans.clear();
         app.auto.last.clear();
         app.auto.last_v.clear();
         app.auto.skipped.clear();
@@ -1146,7 +1163,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         .collect();
     if !done.is_empty() {
         app.auto.passed.retain(|id| !done.contains(id));
-        thin_after_pass(app, &done);
+        thin_after_pass(app, &done, true);
     }
     let pos = app.engine.transport.position;
     let step = app.engine.session().sample_rate.samples(WRITE_STEP_S);
@@ -1196,6 +1213,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             _ => {}
         }
     }
+    let mut wrote = false;
     for (id, lane) in writes {
         let Some(t) = s.track(id) else { continue };
         if !lane.valid(t) {
@@ -1203,6 +1221,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         }
         let key = (id, lane.id());
         let mut from = app.auto.last.get(&key).copied();
+        let started = from.is_none();
         let v = lane.static_value(t);
         let held_lane = touched.as_ref().is_some_and(|(i, l)| *i == id && *l == lane);
         let mut ok = true;
@@ -1227,6 +1246,12 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         if ok {
             app.auto.last_v.insert(key.clone(), v);
             app.auto.writing = true;
+            let segs = app.auto.spans.entry(key.clone()).or_default();
+            match segs.last_mut() {
+                Some(seg) if !started => seg.1 = pos,
+                _ => segs.push((pos, pos)),
+            }
+            wrote = true;
             if !app.auto.passed.contains(&id) {
                 app.auto.passed.push(id);
             }
@@ -1234,25 +1259,70 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             app.auto.last.insert(key, pos);
         }
     }
+    if wrote {
+        app.auto.pass_mark = app.engine.undo_pushes();
+    }
 }
 
-/// `automation.thin` with the default tolerance on the tracks a pass wrote, under the pass's merge
-/// key so it is part of the pass's undo step. The engine thins every lane of a track (L42).
-fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId]) {
-    if !app.ui.thin_after_write || tracks.is_empty() {
+/// `automation.thin` with the default tolerance on exactly what a pass wrote: per lane, per written
+/// time span, so hand-drawn points outside it and the track's other lanes stay as they are. It runs
+/// under the pass's merge key; when an edit or a mode change has already closed the pass's undo step
+/// it would be a step of its own, so (with `squash`) it is folded into the pass if the pass is the
+/// newest step, and otherwise left as a separate step named "Thin".
+fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
+    let s = app.engine.session_arc();
+    let alive: Vec<TrackId> = tracks.iter().copied().filter(|id| s.track(*id).is_some()).collect();
+    let mut work: Vec<((TrackId, String), Vec<(Samples, Samples)>)> = Vec::new();
+    for id in tracks {
+        let keys: Vec<(TrackId, String)> = app.auto.spans.keys().filter(|k| k.0 == *id).cloned().collect();
+        for k in keys {
+            if let Some(v) = app.auto.spans.remove(&k) {
+                work.push((k, v));
+            }
+        }
+    }
+    if !app.ui.thin_after_write || alive.is_empty() {
         return;
     }
-    let ids: Vec<u64> = tracks.iter().map(|t| t.0).collect();
-    if let Ok(r) = app.engine.execute_merged("automation.thin", &json!({"tracks": ids}), PASS) {
-        app.auto.thinned = r["removed"].as_u64().unwrap_or(0) as usize;
-        app.status = format!("Thinned the write pass: {} point{} removed", app.auto.thinned, if app.auto.thinned == 1 { "" } else { "s" });
+    let contiguous = app.engine.undo_pushes() == app.auto.pass_mark;
+    let n0 = app.engine.undo_history().len();
+    let mut removed = 0;
+    for ((id, lane), segs) in work {
+        let (Some(t), Some(lane)) = (s.track(id), Lane::parse(&lane)) else { continue };
+        for (start, end) in segs.into_iter().filter(|(a, b)| b > a) {
+            for param in lane.param_ids(t) {
+                let p = json!({"tracks": [id.0], "param": param, "start": start, "end": end});
+                if let Ok(r) = app.engine.execute_merged("automation.thin", &p, PASS) {
+                    removed += r["removed"].as_u64().unwrap_or(0) as usize;
+                }
+            }
+        }
+    }
+    app.auto.thinned = removed;
+    let added = app.engine.undo_history().len().saturating_sub(n0);
+    let plural = if removed == 1 { "" } else { "s" };
+    if squash && contiguous {
+        let _ = app.engine.squash_undo(added + 1, "Write Automation");
+        app.status = format!("Thinned the write pass: {removed} point{plural} removed");
+    } else if added > 0 {
+        app.status = format!("Thinned the write pass as its own step (Thin), because an edit came after it: {removed} point{plural} removed");
+    } else {
+        app.status = format!("Thinned the write pass: {removed} point{plural} removed");
     }
 }
 
 impl StudioApp {
+    /// A write pass is recording on `t` (Thin Focused Track waits for it).
+    pub fn pass_on(&self, t: TrackId) -> bool {
+        self.auto.writing && self.auto.passed.contains(&t)
+    }
+
     /// Automation > Thin Focused Track: thin the focused track's lanes now, one undo step.
     pub fn thin_focused(&mut self) -> Result<usize, String> {
         let Some(t) = self.focus_track() else { return Err("No focused track".into()) };
+        if self.pass_on(t) {
+            return Err("A write pass is running on this track; stop it first".into());
+        }
         let r = self.run("automation.thin", json!({"tracks": [t.0]}))?;
         let n = r["removed"].as_u64().unwrap_or(0) as usize;
         self.status = format!("Thinned the automation: {n} point{} removed", if n == 1 { "" } else { "s" });

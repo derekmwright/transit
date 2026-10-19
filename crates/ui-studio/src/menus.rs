@@ -157,7 +157,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         app.ui.thin_after_write = !on;
                         ui.close();
                     }
-                    let b = ui.add_enabled(app.focus_track().is_some(), egui::Button::new("Thin Focused Track"));
+                    let b = ui.add_enabled(app.focus_track().is_some_and(|t| !app.pass_on(t)), egui::Button::new("Thin Focused Track"));
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin Focused Track".into(), String::new(), b.rect));
                     if b.clicked() {
                         let _ = app.thin_focused();

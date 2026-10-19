@@ -608,7 +608,6 @@ fn write_mode(t: &mut T) -> TrackId {
 #[test]
 fn a_forward_locate_during_write_keeps_the_points_it_skips() {
     let mut t = T::new();
-    t.app.ui.thin_after_write = false;
     let a = write_mode(&mut t);
     let ahead = [400_000_i64, 450_000, 500_000, 550_000];
     for &at in &ahead {
@@ -630,7 +629,6 @@ fn a_forward_locate_during_write_keeps_the_points_it_skips() {
 #[test]
 fn a_still_fader_writes_no_points_after_the_first() {
     let mut t = T::new();
-    t.app.ui.thin_after_write = false;
     let a = write_mode(&mut t);
     t.key("Space");
     t.frames(60);
@@ -857,4 +855,134 @@ fn leaving_write_mid_pass_thins_that_track_and_a_toggle_survives_ui_json() {
     assert!(json.contains("\"thin_after_write\":true"));
     let old: crate::UiState = serde_json::from_str("{}").unwrap();
     assert!(old.thin_after_write, "an older ui.json thins by default");
+}
+
+// ---- Review fixes: thin only what the pass wrote, one undo step, follow suspended by the header ----
+
+/// A second audio track in Write mode, without a lane open.
+fn write_track(t: &mut T, name: &str) -> TrackId {
+    let b = t.track("audio", name);
+    t.app.set_automation_mode(b, AutomationMode::Write).unwrap();
+    t.frames(3);
+    b
+}
+
+#[test]
+fn a_default_on_pass_keeps_the_curve_shape() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    assert!(t.app.ui.thin_after_write);
+    let (written, _) = write_pass_with_ramp(&mut t, a);
+    let pts = t.points(a, &AutoParam::Volume);
+    assert!(pts.len() >= 2 && pts.len() < written / 3);
+    // The pass starts at the static 0 dB, then the ramp runs -30 .. -18; both ends of it survive.
+    assert!(pts[0].1.abs() < 0.2, "the first point survives: {}", pts[0].1);
+    assert!((pts.last().unwrap().1 - -18.1).abs() < 0.5, "the last point survives: {}", pts.last().unwrap().1);
+    assert!(pts.iter().any(|p| (p.1 - -30.0).abs() < 0.2), "the ramp's start survives: {pts:?}");
+    assert!(pts.iter().all(|p| p.1 >= -30.2 && p.1 <= 0.2), "values stay inside the pass's range: {pts:?}");
+}
+
+#[test]
+fn thinning_leaves_hand_points_outside_the_pass_and_other_lanes_alone() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    // Collinear hand points a whole-lane thin would drop: later on the Volume lane, and on Pan.
+    for at in [8_000_000_i64, 8_500_000, 9_000_000] {
+        set_point(&mut t, a, at, -12.0);
+        t.app.run("automation.set_point", json!({"track": a.0, "param": "pan", "at": at, "value": 0.25})).unwrap();
+    }
+    t.frames(3);
+    write_pass_with_ramp(&mut t, a);
+    let vol = t.points(a, &AutoParam::Volume);
+    for at in [8_000_000_i64, 8_500_000, 9_000_000] {
+        assert!(vol.iter().any(|p| p.0 == at), "hand point {at} on the written lane survives: {vol:?}");
+    }
+    let pan = t.points(a, &AutoParam::Pan(0));
+    assert_eq!(pan.len(), 3, "the Pan lane was not written, so it is not thinned: {pan:?}");
+}
+
+#[test]
+fn leaving_write_through_the_ui_mid_pass_is_still_one_undo_step() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    let before = t.undo_len();
+    t.key("Space");
+    ramp(&mut t, a, 120);
+    let dense = t.points(a, &AutoParam::Volume).len();
+    t.app.set_automation_mode(a, AutomationMode::Read).unwrap();
+    t.frames(5);
+    t.key("Space");
+    t.frames(3);
+    assert!(t.points(a, &AutoParam::Volume).len() < dense / 3, "thinned");
+    assert_eq!(t.undo_len(), before + 1, "pass, mode change and thinning are one step: {:?}", t.app.engine.undo_history());
+}
+
+#[test]
+fn an_unrelated_edit_before_stop_leaves_the_thin_as_its_own_labeled_step() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    let before = t.undo_len();
+    t.key("Space");
+    ramp(&mut t, a, 120);
+    let dense = t.points(a, &AutoParam::Volume).len();
+    t.app.run("track.rename", json!({"track": a.0, "name": "Lead"})).unwrap();
+    t.key("Space");
+    t.frames(3);
+    let h = t.app.engine.undo_history();
+    assert_eq!(h.len(), before + 3, "pass, rename, thin: {h:?}");
+    assert!(h.last().unwrap().contains("Thin"), "the thin step is labeled: {h:?}");
+    assert!(t.app.status.contains("own step"), "{}", t.app.status);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume).len(), dense, "undoing the thin restores the dense pass");
+}
+
+#[test]
+fn stop_after_a_pass_is_one_step_even_with_the_pass_labeled() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    let (_, steps) = write_pass_with_ramp(&mut t, a);
+    assert_eq!(steps, 1);
+    assert_eq!(t.app.engine.undo_history().last().unwrap(), "Write Automation");
+}
+
+#[test]
+fn a_header_volume_drag_suspends_the_follow() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    set_point(&mut t, a, 0, -20.0);
+    set_point(&mut t, a, 100_000, 0.0);
+    t.app.set_cursor(50_000, Some(a));
+    let tr = t.app.engine.session_arc().track(a).unwrap().clone();
+    assert!(t.app.followed(&tr, &Lane::Volume).is_some());
+    t.app.arrange.gesture = Some(crate::arrange::Gesture::Volume { track: a, start_db: 0.0 });
+    assert!(t.app.followed(&tr, &Lane::Volume).is_none(), "the header drag shows the value it sets");
+}
+
+#[test]
+fn a_track_deleted_as_the_pass_ends_does_not_stop_the_others_thinning() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    let b = write_track(&mut t, "Gone");
+    t.key("Space");
+    ramp(&mut t, a, 120);
+    let dense = t.points(a, &AutoParam::Volume).len();
+    assert!(!t.points(b, &AutoParam::Volume).is_empty(), "the second track was written too");
+    t.app.run("track.delete", json!({"tracks": [b.0]})).unwrap();
+    t.key("Space");
+    t.frames(3);
+    assert!(t.points(a, &AutoParam::Volume).len() < dense / 3, "track a still thinned");
+}
+
+#[test]
+fn thin_focused_track_waits_while_a_pass_is_running_on_it() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    t.app.focus(a);
+    t.key("Space");
+    ramp(&mut t, a, 40);
+    let n = t.points(a, &AutoParam::Volume).len();
+    assert!(t.app.thin_focused().is_err(), "refused while the pass writes to the track");
+    assert_eq!(t.points(a, &AutoParam::Volume).len(), n);
+    t.key("Space");
+    t.frames(3);
 }
