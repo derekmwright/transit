@@ -74,3 +74,25 @@ fn a_note_off_survives_an_overfull_queue() {
     assert_eq!(ons, admitted.iter().map(|&i| i64::from(i)).collect::<Vec<_>>());
     assert_eq!(offs, ons, "every admitted note-on got its off");
 }
+
+/// What `MixEngine::reset` does at Stop: the mix hands over the pedal-up and the note-off, then
+/// `all_notes_off` and `reset`. The plug-in must still get both on the next block (review
+/// F10-1: the reset cleared every controller point, so CC 64 0 was dropped and sustain stuck).
+#[test]
+fn a_reset_keeps_the_pedal_up_and_the_note_off() {
+    let mut p = synth(256);
+    let n = NoteId::NONE;
+    assert!(p.event(0, &ev(0, -1, Message::Control { cc: 64, value: 127 })));
+    assert!(p.event(0, &ev(0, 5, Message::NoteOn { key: 60, velocity: 100, id: n })));
+    let r = records(&mut p, 256);
+    assert!(r.contains(&(4, 0, 100, 1_000_000)) && r.contains(&(1, 0, 60, 5)), "down and on reached: {r:?}");
+    assert!(p.event(0, &ev(0, -1, Message::Control { cc: 64, value: 0 })));
+    assert!(p.event(0, &ev(0, 5, Message::NoteOff { key: 60, velocity: 0, id: n })));
+    assert!(p.event(0, &ev(1, -1, Message::Control { cc: 64, value: 127 })), "a non-release, dropped by the reset");
+    p.all_notes_off();
+    p.reset();
+    let r = records(&mut p, 256);
+    assert!(r.contains(&(4, 0, 100, 0)), "the pedal-up survives the reset: {r:?}");
+    assert!(r.contains(&(2, 0, 60, 5)), "the note-off survives the reset: {r:?}");
+    assert!(!r.iter().any(|x| x.0 == 4 && x.2 == 101), "non-releases do not: {r:?}");
+}

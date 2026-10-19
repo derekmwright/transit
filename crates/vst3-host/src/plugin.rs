@@ -733,7 +733,10 @@ impl Vst3Plugin {
     /// A MIDI controller (`ctrl`: a CC, [`AFTERTOUCH`] or [`PITCH_BEND`]) on `channel`: a point on
     /// the parameter the plug-in maps it to. An unmapped controller has nothing to drive (true);
     /// false when the controller queue refused it (non-releases stop at the release reserve).
-    fn control(&mut self, time: u32, channel: u8, ctrl: usize, value: f64, release: bool) -> bool {
+    /// `message` decides the class: a release may take the reserve, and a point that must reach
+    /// the plug-in ([`Message::survives_reset`]) is kept through a reset.
+    fn control(&mut self, time: u32, channel: u8, ctrl: usize, value: f64, message: &Message) -> bool {
+        let release = message.is_release();
         // A table re-read on the main thread (`kMidiCCAssignmentChanged`) applies from this
         // controller on.
         self.refresh_midi_map();
@@ -743,7 +746,7 @@ impl Vst3Plugin {
             return false;
         }
         self.seq = self.seq.wrapping_add(1);
-        self.controls.push(ParamPoint { time, id, class: 1, seq: self.seq, value });
+        self.controls.push(ParamPoint { time, id, class: 1, seq: self.seq, value, release: message.survives_reset() });
         true
     }
 
@@ -783,7 +786,9 @@ impl Plugin for Vst3Plugin {
 
     fn reset(&mut self) {
         keep_releases_on_reset(&mut self.notes, &mut self.held);
-        self.controls.clear();
+        // A pedal-up or reset controller is a release too: the mix has already freed the pedal,
+        // so dropping its point here would leave sustain on (review F10-1).
+        self.controls.retain(|c| c.release);
         self.timed.clear();
     }
 
@@ -818,7 +823,7 @@ impl Plugin for Vst3Plugin {
         let Some(n) = self.host_value(i) else { return true };
         if self.timed.len() < self.timed.capacity() {
             self.seq = self.seq.wrapping_add(1);
-            self.timed.push(ParamPoint { time: offset, id: pid, class: 0, seq: self.seq, value: n });
+            self.timed.push(ParamPoint { time: offset, id: pid, class: 0, seq: self.seq, value: n, release: false });
         } else {
             // Out of timed points this block: the value still arrives, at the block start.
             self.pending.set(i, n);
@@ -900,7 +905,7 @@ impl Plugin for Vst3Plugin {
             self.pending.take_into(&self.ids, &mut self.batch, PARAM_QUEUE_CAP.saturating_sub(timed));
             self.points.clear();
             for (seq, &(id, value)) in (0u32..).zip(&self.batch) {
-                self.points.push(ParamPoint { time: offset, id, class: 0, seq, value });
+                self.points.push(ParamPoint { time: offset, id, class: 0, seq, value, release: false });
             }
             self.batch.clear();
             let room = self.points.capacity();
@@ -1021,12 +1026,12 @@ impl Plugin for Vst3Plugin {
             Message::PolyPressure { key, value, .. } if key <= 127 => {
                 !notes_in || self.push_note(NoteEvent::Pressure { time: offset, key, pressure: unit(value), channel: ch, id: ev.note_id }, release)
             }
-            Message::Control { cc, value } if cc <= 127 => self.control(offset, ch, usize::from(cc), f64::from(value.min(127)) / 127.0, release),
+            Message::Control { cc, value } if cc <= 127 => self.control(offset, ch, usize::from(cc), f64::from(value.min(127)) / 127.0, &ev.message),
             Message::Control14 { msb, value } if msb < 32 => {
-                self.control(offset, ch, usize::from(msb), f64::from(value.min(16383)) / 16383.0, release)
+                self.control(offset, ch, usize::from(msb), f64::from(value.min(16383)) / 16383.0, &ev.message)
             }
-            Message::ChannelPressure { value } => self.control(offset, ch, AFTERTOUCH, f64::from(value.min(127)) / 127.0, release),
-            Message::PitchBend { value } => self.control(offset, ch, PITCH_BEND, f64::from(value.min(16383)) / 16383.0, release),
+            Message::ChannelPressure { value } => self.control(offset, ch, AFTERTOUCH, f64::from(value.min(127)) / 127.0, &ev.message),
+            Message::PitchBend { value } => self.control(offset, ch, PITCH_BEND, f64::from(value.min(16383)) / 16383.0, &ev.message),
             _ => true,
         }
     }
@@ -1207,7 +1212,11 @@ fn resend_indices(host_set: &[bool], cap: usize) -> impl Iterator<Item = usize> 
 /// owed. Each held key gets an off at time 0 on its channel and any off already queued survives,
 /// so a note that was sounding when the transport stopped is still released on the next block.
 fn keep_releases_on_reset(notes: &mut Vec<NoteEvent>, held: &mut [[bool; 128]; MIDI_CHANNELS]) {
-    notes.retain(|e| matches!(e, NoteEvent::Off { .. }));
+    notes.retain(|e| match *e {
+        NoteEvent::Off { .. } => true,
+        NoteEvent::On { velocity, .. } => velocity <= 0.0,
+        NoteEvent::Pressure { .. } => false,
+    });
     for (channel, keys) in (0u8..).zip(held.iter_mut()) {
         for (key, h) in (0u8..).zip(keys.iter_mut()) {
             if std::mem::take(h) && notes.len() < notes.capacity() {
@@ -1259,10 +1268,14 @@ mod tests {
         let mut notes = Vec::with_capacity(EVENT_CAP);
         notes.push(NoteEvent::On { time: 3, key: 72, velocity: 1.0, channel: 0, id: -1 });
         notes.push(NoteEvent::Off { time: 5, key: 67, velocity: 0.0, channel: 0, id: -1 });
+        notes.push(NoteEvent::Pressure { time: 6, key: 67, pressure: 0.5, channel: 0, id: -1 });
+        notes.push(NoteEvent::On { time: 7, key: 50, velocity: 0.0, channel: 2, id: 4 });
         let mut held = [[false; 128]; MIDI_CHANNELS];
         held[0][60] = true;
         held[9][64] = true;
         keep_releases_on_reset(&mut notes, &mut held);
+        assert!(notes.contains(&NoteEvent::On { time: 7, key: 50, velocity: 0.0, channel: 2, id: 4 }), "a velocity-0 note-on is a release");
+        notes.retain(|e| !matches!(e, NoteEvent::On { velocity: 0.0, .. }));
         let mut keys: Vec<u8> = notes.iter().filter_map(|e| if let NoteEvent::Off { key, .. } = e { Some(*key) } else { None }).collect();
         assert_eq!(keys.len(), notes.len(), "reset left a non-release queued");
         keys.sort_unstable();

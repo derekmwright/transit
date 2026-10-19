@@ -1186,7 +1186,9 @@ impl IMessageTrait for HostMessage {
 
 /// One parameter point the host sends: its time in the block, the parameter, its class
 /// (0: automation and host values, 1: a mapped MIDI controller, which follows automation at the
-/// same offset), the order it was set in, and the normalized value.
+/// same offset), the order it was set in, and the normalized value. `release`: a controller
+/// from a release-class message ([`Message::survives_reset`](soundcraft_dsp::event::Message)),
+/// which the host keeps through a plug-in reset.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ParamPoint {
     pub time: u32,
@@ -1194,6 +1196,7 @@ pub(crate) struct ParamPoint {
     pub class: u8,
     pub seq: u32,
     pub value: f64,
+    pub release: bool,
 }
 
 /// A queue's points live inline (one point a plug-in wrote), not in the slab.
@@ -2863,7 +2866,7 @@ mod tests {
     #[test]
     fn parameter_points_keep_every_offset_in_order() {
         let pc = ParamChanges::new(8, 6);
-        let pt = |time, id, class, seq, value| ParamPoint { time, id, class, seq, value };
+        let pt = |time, id, class, seq, value| ParamPoint { time, id, class, seq, value, release: false };
         // Two parameters, several offsets; at offset 32 of parameter 1 a controller follows automation.
         let mut points =
             [pt(40, 1, 0, 4, 0.8), pt(0, 1, 1, 0, 1.0), pt(32, 1, 1, 3, 0.0), pt(5, 1, 0, 1, 0.2), pt(32, 1, 0, 2, 0.6), pt(9, 2, 0, 5, 0.3)];
@@ -2886,7 +2889,7 @@ mod tests {
     #[test]
     fn host_objects_behave() {
         let pc = ParamChanges::new(2, 16);
-        let pt = |time, id, seq, value| ParamPoint { time, id, class: 0, seq, value };
+        let pt = |time, id, seq, value| ParamPoint { time, id, class: 0, seq, value, release: false };
         let mut points = [pt(2, 5, 0, 0.25), pt(2, 5, 1, 0.5), pt(2, 6, 2, 1.0), pt(2, 7, 3, 1.0)];
         assert_eq!(pc.fill(&mut points, 2), 1, "the third parameter finds no queue");
         // SAFETY: test calls through our own implementation.

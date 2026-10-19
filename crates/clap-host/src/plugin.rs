@@ -918,15 +918,18 @@ impl PluginEditor for ClapEditor {
     }
 }
 
-/// Reset's share of the event queue: keep parameter changes and the releases the plug-in is owed,
-/// drop the rest. Each held key gets an off at time 0 (a CLAP note-off, or a MIDI 0x80 message for
-/// MIDI-only ports) and any off already queued survives, so a note that was sounding when the
-/// transport stopped is still released on the next block.
+/// Reset's share of the event queue: keep parameter changes and every release the plug-in is owed
+/// ([`Message::survives_reset`]: note-offs in either dialect, a MIDI note-on with velocity 0,
+/// pedals going up, CC 120, 121 and 123), drop the rest. The mix frees a pedal or note once it
+/// has handed its release over, so a release dropped here would hang at the plug-in. Each held
+/// key also gets an off at time 0 (a CLAP note-off, or a MIDI 0x80 message for MIDI-only ports),
+/// so a note that was sounding when the transport stopped is still released on the next block.
 fn keep_releases_on_reset(queue: &mut Vec<Event>, held: &mut [[bool; 128]; 16], notes: NoteMode) {
-    queue.retain(|e| match e {
+    queue.retain(|e| match *e {
         Event::Param { .. } | Event::NoteOff { .. } => true,
-        Event::Midi { data, .. } => data[0] & 0xF0 == 0x80,
-        Event::NoteOn { .. } | Event::Pressure { .. } => false,
+        Event::NoteOn { velocity, .. } => velocity <= 0.0,
+        Event::Midi { data, .. } => Message::midi1_survives_reset(data),
+        Event::Pressure { .. } => false,
     });
     for (channel, keys) in (0u8..).zip(held.iter_mut()) {
         for (key, h) in (0u8..).zip(keys.iter_mut()) {
@@ -1030,5 +1033,35 @@ mod tests {
         msgs.sort_unstable();
         assert_eq!(msgs, [[0x80, 60, 0], [0x80, 64, 0]]);
         assert!(held.iter().flatten().all(|h| !h), "reset must clear held");
+    }
+
+    /// Every release survives a reset in both dialects, not only 0x80: pedals going up (64, 66,
+    /// 67, 69), CC 120, 121 and 123, and note-ons with velocity 0 (review F10-1).
+    #[test]
+    fn reset_keeps_every_release_in_both_dialects() {
+        let releases: [[u8; 3]; 9] = [
+            [0xB0, 64, 0],
+            [0xB1, 66, 0],
+            [0xB2, 67, 0],
+            [0xB3, 69, 10],
+            [0xB4, 120, 0],
+            [0xB5, 121, 0],
+            [0xB6, 123, 0],
+            [0x97, 60, 0],
+            [0x88, 61, 0],
+        ];
+        let others: [[u8; 3]; 5] = [[0xB0, 64, 127], [0xB0, 1, 0], [0x90, 62, 100], [0xE0, 0, 64], [0xA0, 60, 3]];
+        let mut queue = Vec::with_capacity(EVENT_CAP);
+        for (t, data) in (0u32..).zip(others.iter().chain(&releases)) {
+            queue.push(Event::Midi { time: t, data: *data });
+        }
+        queue.push(Event::NoteOn { time: 20, key: 70, velocity: 0.0, channel: 2, id: 9 });
+        queue.push(Event::NoteOn { time: 21, key: 71, velocity: 0.5, channel: 2, id: 10 });
+        let mut held = [[false; 128]; 16];
+        keep_releases_on_reset(&mut queue, &mut held, NoteMode::Midi);
+        let kept: Vec<[u8; 3]> = queue.iter().filter_map(|e| if let Event::Midi { data, .. } = e { Some(*data) } else { None }).collect();
+        assert_eq!(kept, releases, "every MIDI release survives, in order, and nothing else");
+        assert_eq!(queue.last(), Some(&Event::NoteOn { time: 20, key: 70, velocity: 0.0, channel: 2, id: 9 }), "a velocity-0 note-on is a release");
+        assert_eq!(queue.len(), releases.len() + 1);
     }
 }

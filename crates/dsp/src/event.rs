@@ -18,6 +18,8 @@ impl NoteId {
 pub const CC_SUSTAIN: u8 = 64;
 /// The sostenuto pedal (CC 66).
 pub const CC_SOSTENUTO: u8 = 66;
+/// The soft pedal (CC 67): not tracked per source, but its release survives a host reset.
+pub const CC_SOFT: u8 = 67;
 /// Hold 2 (CC 69).
 pub const CC_HOLD2: u8 = 69;
 /// All sound off (CC 120).
@@ -87,6 +89,32 @@ impl Message {
         }
     }
 
+    /// What a plug-in host keeps through its own `reset` (and delivers on the next `process`):
+    /// the release class, a note-on with velocity 0, and the soft pedal (CC 67) going up. A reset
+    /// that dropped these would leave a sustain or note hanging at the plug-in, since the mix has
+    /// already freed what it held.
+    #[must_use]
+    pub const fn survives_reset(&self) -> bool {
+        match *self {
+            Message::NoteOn { velocity: 0, .. } => true,
+            Message::Control { cc: CC_SOFT, value } => value < 64,
+            _ => self.is_release(),
+        }
+    }
+
+    /// [`Message::survives_reset`] for raw MIDI 1.0 bytes (any status byte; non-channel
+    /// messages do not survive).
+    #[must_use]
+    pub const fn midi1_survives_reset(msg: [u8; 3]) -> bool {
+        let [status, d1, d2] = msg;
+        match status & 0xF0 {
+            0x80 => true,
+            0x90 => d2 & 0x7F == 0,
+            0xB0 => Message::Control { cc: d1 & 0x7F, value: d2 & 0x7F }.survives_reset(),
+            _ => false,
+        }
+    }
+
     /// The MIDI 1.0 bytes of this message on `channel` (0..=15): one message, or two for a
     /// 14-bit controller (MSB, then LSB). Unused entries are `None`.
     #[must_use]
@@ -152,6 +180,29 @@ mod tests {
         }
         assert!(!Message::Control { cc: 1, value: 0 }.is_release());
         assert!(!Message::PitchBend { value: 0 }.is_release());
+    }
+
+    #[test]
+    fn what_survives_a_host_reset() {
+        let n = NoteId::NONE;
+        assert!(Message::NoteOff { key: 60, velocity: 0, id: n }.survives_reset());
+        assert!(Message::NoteOn { key: 60, velocity: 0, id: n }.survives_reset());
+        assert!(!Message::NoteOn { key: 60, velocity: 1, id: n }.survives_reset());
+        for cc in [64, 66, 67, 69] {
+            assert!(Message::Control { cc, value: 0 }.survives_reset(), "pedal {cc} up");
+            assert!(!Message::Control { cc, value: 64 }.survives_reset(), "pedal {cc} down");
+        }
+        for cc in [120, 121, 123] {
+            assert!(Message::Control { cc, value: 0 }.survives_reset());
+        }
+        assert!(!Message::Control { cc: 1, value: 0 }.survives_reset());
+        assert!(Message::midi1_survives_reset([0x83, 60, 0]));
+        assert!(Message::midi1_survives_reset([0x93, 60, 0]));
+        assert!(!Message::midi1_survives_reset([0x93, 60, 1]));
+        assert!(Message::midi1_survives_reset([0xB5, 67, 0]));
+        assert!(Message::midi1_survives_reset([0xB5, 123, 0]));
+        assert!(!Message::midi1_survives_reset([0xB5, 64, 127]));
+        assert!(!Message::midi1_survives_reset([0xE0, 0, 64]));
     }
 
     #[test]
