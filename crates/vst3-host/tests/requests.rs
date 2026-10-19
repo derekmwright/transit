@@ -299,3 +299,63 @@ fn a_block_skipped_during_a_reactivation_is_a_fade_to_silence() {
     assert!(skipped.load(Ordering::SeqCst) >= 5, "the audio side met the main thread at work");
     assert_eq!(bad, None, "a skipped block passed something other than a fade");
 }
+
+/// Review N1 (and mutant V4): a values re-read must not undo a host edit the controller has not
+/// seen yet. The host moves the gain (as the mixer or automation would, through the processor);
+/// later the plug-in, from a thread of its own and outside any host call, says its values changed
+/// with nothing changed. The host first gives the controller its values
+/// (`setParamNormalized`), so nothing differs: nothing is reported. A value the host loaded
+/// itself (Freq 0.3) is known as well.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_values_re_read_does_not_undo_a_host_edit_the_controller_has_not_seen() {
+    let found = soundcraft_vst3_host::scan_paths(&[common::fixture_dir().to_path_buf()]);
+    let id = found.into_iter().find(|d| d.name == "Fixture Gain").expect("fixture gain").id;
+    let mut p = soundcraft_vst3_host::create(&id).expect("instantiate");
+    p.prepare(48_000.0, BLOCK, 2);
+    let mut ed = p.editor().expect("editor handle");
+    let _ = ed.idle();
+    // Component gain 0.25; controller Freq 0.3, preset 0.25 (only acts in getState, never
+    // called here), and a spontaneous kParamValuesChanged 300 ms from now.
+    let ctrl: Vec<u8> = [0.3f64.to_le_bytes(), 0.25f64.to_le_bytes(), 300f64.to_le_bytes()].concat();
+    let mut blob = b"SCV3".to_vec();
+    blob.extend_from_slice(&8u32.to_le_bytes());
+    blob.extend_from_slice(&0.25f64.to_le_bytes());
+    blob.extend_from_slice(&(ctrl.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&ctrl);
+    assert!(p.load_state(&blob));
+    assert!(ed.idle().is_empty());
+    assert!(p.set_param("7", 1.5));
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    std::thread::sleep(Duration::from_millis(600));
+    let edits = ed.idle();
+    assert!(edits.is_empty(), "the host's 1.5 and its loaded Freq stand: {edits:?}");
+    // The controller now holds the host's value.
+    assert!(ed.idle().is_empty());
+}
+
+/// Review N2: a reactivation the plug-in refuses mid-session is faded silence from the last
+/// output, not whatever the buffer held, with no latency reported.
+#[test]
+fn a_refused_reactivation_is_faded_silence() {
+    let (mut p, _reader) = synth();
+    p.note_on(0, 60, 127);
+    let mut io = vec![vec![0.5f32; BLOCK]; 2];
+    p.process(&mut io, BLOCK);
+    assert_eq!(io[0][BLOCK - 1], 1.0);
+    assert!(p.load_state(b"REFUSE"));
+    assert!(p.load_state(b"RESTART:8"));
+    assert_eq!(soundcraft_vst3_host::service_requests().failed, 1);
+    assert_eq!(p.latency(), 0);
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        let mut io = vec![vec![0.5f32; BLOCK]; 2];
+        p.process(&mut io, BLOCK);
+        out.extend(io[0].iter().copied());
+    }
+    let fade = 96;
+    for (i, &x) in out.iter().enumerate() {
+        let want = if i < fade { 1.0 - i as f32 / fade as f32 } else { 0.0 };
+        assert!((x - want).abs() < 1e-6, "sample {i}: {x}, want {want}");
+    }
+}

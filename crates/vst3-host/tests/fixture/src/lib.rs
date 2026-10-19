@@ -248,6 +248,11 @@ impl IAudioProcessorTrait for GainProcessor {
     }
 }
 
+/// The host's component handler, carried to a plug-in thread (the test keeps the plug-in alive).
+#[derive(Clone, Copy)]
+struct HandlerPtr(*mut IComponentHandler);
+unsafe impl Send for HandlerPtr {}
+
 struct GainController {
     gain: AtomicU64,
     freq: AtomicU64,
@@ -429,6 +434,19 @@ impl IEditControllerTrait for GainController {
         }
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
             self.preset.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
+        // A third f64: after that many ms, a thread of the plug-in's own tells the host its values
+        // changed (with nothing changed), outside any host call.
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
+            let ms = f64::from_le_bytes(bytes).clamp(0.0, 10_000.0) as u64;
+            let h = HandlerPtr(self.handler.load(Ordering::SeqCst));
+            std::thread::spawn(move || {
+                let h = h;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                if let Some(h) = unsafe { ComRef::from_raw(h.0) } {
+                    unsafe { h.restartComponent(RestartFlags_::kParamValuesChanged as i32) };
+                }
+            });
         }
         // Like many plug-ins, it tells the host its values changed while it loads a state.
         if let Some(h) = unsafe { ComRef::from_raw(self.handler.load(Ordering::SeqCst)) } {

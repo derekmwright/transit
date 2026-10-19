@@ -61,6 +61,8 @@ const CURVE_BUDGET_TIME: Duration = Duration::from_millis(2);
 const MAP_LEN: usize = PITCH_BEND + 1;
 /// VST3's `kNoParamId`: no parameter.
 const NO_PARAM: u32 = u32::MAX;
+/// Host values one service call hands to the controller.
+const SYNC_CHUNK: usize = 64;
 /// Parameter values one service call re-reads for `kParamValuesChanged`: it holds the instance
 /// (the audio side skips a block it would start meanwhile), so the hold stays short.
 const VALUES_CHUNK: usize = 64;
@@ -202,6 +204,15 @@ pub(crate) struct Shared {
     /// The host's view of each parameter (normalized, `f64` bits; same order as `ids`): what it
     /// last sent or was told. A values re-read reports what differs from it.
     view: Box<[AtomicU64]>,
+    /// Parameters whose host value the controller has not been given yet (review N1): set by
+    /// `set_param` (any thread, often the audio thread), cleared on the main thread when the
+    /// service hands the value over with `setParamNormalized`, as VST3 has hosts inform the
+    /// controller. A values re-read runs only once none is left, and never reports over one.
+    /// Shared with the state reader, which hands values over too.
+    to_controller: Arc<[AtomicBool]>,
+    /// The editor/state link, for `setParamNormalized` on the main thread (under its own lock,
+    /// never the instance's, so the audio side is not held up).
+    link: Arc<EditorLink>,
 }
 
 fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
@@ -306,7 +317,10 @@ impl Shared {
             self.map.publish(&map);
             out.midi_maps += 1;
         }
-        if self.rescan_values() {
+        // The controller learns the host's values first, so a re-read cannot mistake what it has
+        // not seen yet for a change of the plug-in's (review N1).
+        let synced = self.sync_controller();
+        if synced && self.rescan_values() {
             out.value_rescans += 1;
         }
         if h.latency_changed.load(Ordering::Acquire) || h.io_changed.load(Ordering::Acquire) {
@@ -316,7 +330,7 @@ impl Shared {
                 None => out.restarts_waiting += 1,
             }
         }
-        let rescanning = lock(&self.values).active;
+        let rescanning = lock(&self.values).active || !synced;
         if h.midi_cc_changed.load(Ordering::Relaxed)
             || h.values_changed.load(Ordering::Relaxed)
             || h.latency_changed.load(Ordering::Relaxed)
@@ -346,6 +360,9 @@ impl Shared {
         // Only what differs from the host's view is news to it (review R3).
         let mut changed = Vec::new();
         for (i, v) in read {
+            if self.to_controller.get(i).is_some_and(|f| f.load(Ordering::Acquire)) {
+                continue; // the host's newer value is on its way to the controller: it stands
+            }
             if let (Some(view), Some(&id)) = (self.view.get(i), self.ids.get(i))
                 && differs(f64::from_bits(view.load(Ordering::Relaxed)), v)
             {
@@ -369,6 +386,26 @@ impl Shared {
             return false;
         }
         st.active = false;
+        true
+    }
+
+    /// Hands up to `SYNC_CHUNK` host values the controller has not seen to it
+    /// (`setParamNormalized`, main thread). True when none is left.
+    fn sync_controller(&self) -> bool {
+        let mut sent = 0;
+        for (i, flag) in self.to_controller.iter().enumerate() {
+            if !flag.load(Ordering::Acquire) {
+                continue;
+            }
+            if sent == SYNC_CHUNK {
+                return false;
+            }
+            flag.store(false, Ordering::Relaxed);
+            if let (Some(&id), Some(view)) = (self.ids.get(i), self.view.get(i)) {
+                self.link.sync_param(id, f64::from_bits(view.load(Ordering::Acquire)));
+                sent += 1;
+            }
+        }
         true
     }
 
@@ -463,6 +500,7 @@ impl Vst3Plugin {
         let curves = Arc::new(ParamCurves::new(&ids, &plain));
         let view: Box<[AtomicU64]> = ids.iter().map(|&id| AtomicU64::new(inst.normalized_value(id).unwrap_or(f64::NAN).to_bits())).collect();
         let host = inst.host_ref();
+        let link = inst.state_link();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 inst,
@@ -487,6 +525,8 @@ impl Vst3Plugin {
             ids: ids.clone(),
             values: Mutex::new(Values { next: 0, active: false }),
             view,
+            to_controller: ids.iter().map(|_| AtomicBool::new(false)).collect::<Vec<_>>().into(),
+            link,
         });
         lock(live()).push(Arc::downgrade(&shared));
         let mut p = Vst3Plugin {
@@ -586,8 +626,13 @@ impl Vst3Plugin {
     fn queue(&mut self, i: usize) {
         let Some(&v) = self.values.get(i) else { return };
         let Some(n) = self.normalized_from_plain(i, v) else { return };
-        if let Some(view) = self.shared.view.get(i) {
-            view.store(n.to_bits(), Ordering::Relaxed);
+        // A value re-sent unchanged (after a reactivation or a curve re-sample) is nothing new
+        // for the controller.
+        if let Some(view) = self.shared.view.get(i)
+            && view.swap(n.to_bits(), Ordering::AcqRel) != n.to_bits()
+            && let Some(f) = self.shared.to_controller.get(i)
+        {
+            f.store(true, Ordering::Release);
         }
         if let Some(u) = self.unsynced.get(i) {
             u.store(f64::from(v).to_bits(), Ordering::Relaxed);
@@ -732,6 +777,12 @@ impl Plugin for Vst3Plugin {
         };
         let core = &mut *guard;
         if !core.inst.is_active() || core.max_block == 0 {
+            if core.block > 0 {
+                // Prepared, but its (re)activation failed: silent, not the buffer as it was
+                // (review N2).
+                drop(guard);
+                self.gate.skip(io, ch, frames);
+            }
             return;
         }
         core.inputs.set_silent(self.silent);
@@ -918,6 +969,7 @@ impl Plugin for Vst3Plugin {
         let link = lock(&self.shared.core).inst.state_link();
         let conv = self.converter(link);
         let unsynced = Arc::clone(&self.unsynced);
+        let to_controller = Arc::clone(&self.shared.to_controller);
         Some(Box::new(move || {
             // A parameter only the controller stores (no processor state) would otherwise be
             // saved with the controller's stale value. The host's plain value converts through
@@ -929,6 +981,10 @@ impl Plugin for Vst3Plugin {
                     && let (Some(&id), Some(n)) = (conv.ids.get(i), conv.normalized(i, f64::from_bits(bits) as f32))
                 {
                     conv.link.sync_param(id, n);
+                    // Handed over: the service need not send it again (review N1).
+                    if let Some(f) = to_controller.get(i) {
+                        f.store(false, Ordering::Release);
+                    }
                 }
             }
             conv.link.save_state()
