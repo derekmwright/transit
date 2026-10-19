@@ -186,6 +186,8 @@ pub struct DeviceCard {
     pub remove_button: R4,
     pub editor_button: R4,
     pub editor_enabled: bool,
+    /// The plug-in's editor window is open or wanted (the button then reads "Close editor").
+    pub editor_open: bool,
     /// The instrument card's name (or "Choose…" when there is none): opens the instrument menu.
     pub pick_button: R4,
 }
@@ -228,6 +230,8 @@ pub struct MixerState {
     pub(crate) names: std::collections::HashMap<String, String>,
     /// The instrument menu's filter text (shown when the list is long).
     pub instrument_filter: String,
+    /// The "+" effects menu's filter text.
+    pub effect_filter: String,
     /// Where the instrument menu's filter box was last drawn (for `ui.inspect`).
     pub filter_rect: R4,
     /// Gestures started, to give each composite its own merge key.
@@ -761,6 +765,7 @@ impl StudioApp {
 pub fn panes(app: &mut StudioApp, ui: &mut Ui) {
     app.mixer.layout.menu.clear();
     app.mixer.devices.menu.clear();
+    app.mixer.filter_rect = Default::default();
     app.mixer.hover = None;
     app.mixer.wheel_taken = false;
     if app.mixer.edit.is_none() {

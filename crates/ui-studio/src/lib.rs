@@ -391,6 +391,24 @@ impl StudioApp {
         Ok(json!({"ui": self.ui}))
     }
 
+    /// The device card's editor button: closes the editor when it is open (or wanted), else asks for it.
+    pub fn toggle_editor(&mut self, key: (TrackId, usize)) {
+        if self.ui.plugin_windows.contains(&key) {
+            self.close_editor(key);
+        } else {
+            self.want_editor(key);
+        }
+    }
+
+    /// Close a plug-in editor window (or stop waiting for it to open).
+    pub fn close_editor(&mut self, key: (TrackId, usize)) {
+        if let Some(p) = &self.player {
+            p.close_editor(key.0, key.1);
+        }
+        self.editors.retain(|e| e.key != key);
+        self.ui.plugin_windows.retain(|k| *k != key);
+    }
+
     /// Ask for a plug-in editor window; it opens as soon as the plug-in is loaded.
     pub fn want_editor(&mut self, key: (TrackId, usize)) {
         if !self.ui.plugin_windows.contains(&key) {

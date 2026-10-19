@@ -96,63 +96,23 @@ pub fn hosted_label(id: &str, instrument: bool, cached_name: Option<&str>, scann
     format!("{format} {}", if instrument { "instrument" } else { "effect" })
 }
 
-/// The "+" menu's hosted effects: `(id, label)`, from the background scan's results only (listing
-/// never starts a scan or loads a plug-in; `engine.vst3_plugins` would block on one).
-fn hosted_effects() -> (Option<Vec<(String, String)>>, Option<Vec<(String, String)>>) {
-    let label = |name: &str, vendor: &str| if vendor.is_empty() { name.to_string() } else { format!("{name} — {vendor}") };
-    let vst3 = soundcraft_vst3_host::cached()
-        .map(|l| l.into_iter().filter(|d| !d.is_instrument).map(|d| (d.id.clone(), label(&d.name, &d.vendor))).collect());
-    let clap = soundcraft_clap_host::cached()
-        .map(|l| l.into_iter().filter(|d| !d.is_instrument).map(|d| (d.id.clone(), label(&d.name, &d.vendor))).collect());
-    (vst3, clap)
-}
-
-/// The "+" menu of a device list, on `resp`: built-in effects, then the scanned VST3 and CLAP
-/// effects. A pick adds the device to the end of `tid`'s chain. Shared by the device chain and
-/// the mixer strips, so a strip adds to its own track whichever one is focused.
+/// The "+" menu of a device list, on `resp`: the same shape as the instrument menu, with
+/// built-in effects, then the scanned VST3 and CLAP effects grouped by vendor, a filter box above
+/// [`FILTER_OVER`] entries, and every row and the filter rect published for `ui.inspect`. A pick
+/// adds the device to the end of `tid`'s chain. Shared by the device chain and the mixer strips,
+/// so a strip adds to its own track whichever one is focused.
 pub(crate) fn add_device_menu(app: &mut StudioApp, resp: &egui::Response, tid: TrackId, menu: &mut Vec<MenuItem>) {
-    let builtin: Vec<PluginEntry> = app.builtin_plugins().into_iter().filter(|p| !p.instrument).collect();
     let mut picked: Option<String> = None;
-    egui::Popup::menu(resp).width(220.0).show(|ui| {
-        ui.label(egui::RichText::new("Built-in").color(TOKENS.text_dim).size(10.5));
-        for e in &builtin {
-            let b = ui.add(egui::Button::new(e.name.as_str()).right_text(egui::RichText::new(&e.category).color(TOKENS.text_dim).size(10.0)));
-            menu.push(MenuItem::at(ui, e.name.clone(), e.id.clone(), b.rect));
-            if b.clicked() {
-                picked = Some(e.id.clone());
-                ui.close();
-            }
-        }
-        let (vst3, clap) = hosted_effects();
-        for (format, list) in [("VST3", vst3), ("CLAP", clap)] {
-            ui.separator();
-            ui.menu_button(format, |ui| match list {
-                None => match crate::plugin_scan::scanning_label() {
-                    Some(text) => {
-                        ui.weak(text);
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
-                    }
-                    None => {
-                        ui.weak("Not scanned yet (Audio › Scan Plug-ins)");
-                    }
-                },
-                Some(l) if l.is_empty() => {
-                    ui.weak(format!("No {format} effects found"));
-                }
-                Some(l) => {
-                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                        for (id, label) in l {
-                            if ui.button(&label).clicked() {
-                                picked = Some(id.clone());
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-            });
-        }
+    let mut filter = std::mem::take(&mut app.mixer.effect_filter);
+    let mut filter_rect = app.mixer.filter_rect;
+    egui::Popup::menu(resp).width(260.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        let lists = app.effect_lists();
+        picked = plugin_menu(ui, &lists, "effects", None, &mut filter, &mut filter_rect, menu);
     });
+    app.mixer.effect_filter = filter;
+    app.mixer.filter_rect = filter_rect;
     if let Some(id) = picked {
+        app.mixer.effect_filter.clear();
         let _ = app.add_device(tid, &id);
     }
 }
@@ -339,18 +299,25 @@ fn card(
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
     pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
-    let label = if open { "Editor open" } else { "Open editor" };
+    let label = if open { "Close editor" } else { "Open editor" };
     let ink = if enabled { TOKENS.text } else { TOKENS.text_dim.gamma_multiply(0.6) };
     let font = FontId::proportional(10.5);
     let w = pc.layout_no_wrap(label.into(), font.clone(), ink).size().x + 12.0 + 4.0;
     let x0 = eb.center().x - w / 2.0;
     crate::icons::paint(&pc, pos2(x0 + 6.0, eb.center().y), Icon::OpenEditor, 12.0, ink);
     pc.text(pos2(x0 + 16.0, eb.center().y), Align2::LEFT_CENTER, label, font, ink);
-    let tip = if enabled { "Open the plug-in's window" } else { "No editor window (built-in, or no audio device)" };
+    let tip = if !enabled {
+        "No editor window (built-in, or no audio device)"
+    } else if open {
+        "Close the plug-in's window"
+    } else {
+        "Open the plug-in's window"
+    };
     if resp.on_hover_text(tip).clicked() && enabled {
-        app.want_editor((t, key_slot));
+        app.toggle_editor((t, key_slot));
     }
     c.editor_button = r4(eb);
+    c.editor_open = open;
     c.editor_enabled = enabled;
     c
 }
@@ -373,7 +340,7 @@ pub struct InstrumentLists {
 }
 
 /// More entries than this and the instrument menu gets a filter box.
-const FILTER_OVER: usize = 15;
+pub(crate) const FILTER_OVER: usize = 15;
 
 impl StudioApp {
     /// The instruments to offer, read from `engine.plugins` and the scan caches (never a scan).
@@ -391,12 +358,43 @@ impl StudioApp {
     }
 }
 
-/// The instrument menu's contents: a filter box when the list is long, built-in instruments,
-/// then VST3 and CLAP instruments grouped by vendor. Returns the id picked (the caller runs
-/// `mix.instrument` through [`StudioApp::set_instrument`]). Entries go to `menu` for `ui.inspect`.
+impl StudioApp {
+    /// The effects to offer in a "+" menu: the same lists as [`Self::instrument_lists`] but with
+    /// the non-instruments (hosted names come from `cached()`, never a scan).
+    pub fn effect_lists(&mut self) -> InstrumentLists {
+        let hosted = |list: Vec<(String, String, String, bool)>| -> Vec<HostedEntry> {
+            let mut v: Vec<HostedEntry> = list.into_iter().filter(|d| !d.3).map(|(id, name, vendor, _)| HostedEntry { id, name, vendor }).collect();
+            v.sort_by_key(|e| (e.vendor.to_lowercase(), e.name.to_lowercase()));
+            v
+        };
+        InstrumentLists {
+            builtin: self.builtin_plugins().into_iter().filter(|p| !p.instrument).collect(),
+            vst3: soundcraft_vst3_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+            clap: soundcraft_clap_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+        }
+    }
+}
+
+/// The instrument menu's contents (see [`plugin_menu`]). The caller runs `mix.instrument` through
+/// [`StudioApp::set_instrument`] for the id picked.
 pub fn instrument_menu(
     ui: &mut Ui,
     lists: &InstrumentLists,
+    current: Option<&str>,
+    filter: &mut String,
+    filter_rect: &mut crate::arrange::R4,
+    menu: &mut Vec<MenuItem>,
+) -> Option<String> {
+    plugin_menu(ui, lists, "instruments", current, filter, filter_rect, menu)
+}
+
+/// A plug-in menu's contents: a filter box when the list is long, built-in entries, then VST3 and
+/// CLAP entries grouped by vendor. Returns the id picked. Entries (with `visible` flags) and the
+/// filter rect go to `menu` and `filter_rect` for `ui.inspect`; `noun` words the empty lists.
+pub fn plugin_menu(
+    ui: &mut Ui,
+    lists: &InstrumentLists,
+    noun: &str,
     current: Option<&str>,
     filter: &mut String,
     filter_rect: &mut crate::arrange::R4,
@@ -446,7 +444,7 @@ pub fn instrument_menu(
                     }
                 },
                 Some(l) if l.is_empty() => {
-                    ui.weak(format!("No {format} instruments found"));
+                    ui.weak(format!("No {format} {noun} found"));
                 }
                 Some(l) => {
                     let mut vendor: Option<&str> = None;

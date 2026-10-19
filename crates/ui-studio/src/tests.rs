@@ -345,6 +345,8 @@ fn plus_inserts_a_built_in_device_and_bypass_and_remove_round_trip() {
     let at = mid(app.mixer.devices.add);
     click(&mut app, at);
     frames(&mut app, &ctx, 6, &mut time);
+    app.mixer.effect_filter = "gain".into();
+    frames(&mut app, &ctx, 3, &mut time);
     let item = app.mixer.devices.menu.iter().find(|m| m.value == "gain").cloned().expect("the + menu lists the built-in Gain");
     assert!(app.mixer.devices.menu.iter().all(|m| !m.value.contains(':')), "no hosted plug-ins in a hermetic test");
     click(&mut app, mid(item.rect));
@@ -1282,6 +1284,8 @@ fn a_strip_plus_adds_an_insert_to_that_track_whatever_is_focused() {
     let plus = mid(strip(&app, b).add_insert);
     click(&mut app, plus);
     frames(&mut app, &ctx, 6, &mut time);
+    app.mixer.effect_filter = "gain".into();
+    frames(&mut app, &ctx, 3, &mut time);
     let item = app.mixer.layout.menu.iter().find(|m| m.value == "gain").cloned().expect("the strip + menu lists Gain");
     click(&mut app, mid(item.rect));
     frames(&mut app, &ctx, 6, &mut time);
@@ -1366,6 +1370,8 @@ fn adding_through_a_strip_plus_focuses_that_strip() {
     let plus = mid(strip(&app, b).add_insert);
     click(&mut app, plus);
     frames(&mut app, &ctx, 6, &mut time);
+    app.mixer.effect_filter = "gain".into();
+    frames(&mut app, &ctx, 3, &mut time);
     let item = app.mixer.layout.menu.iter().find(|m| m.value == "gain").cloned().unwrap();
     click(&mut app, mid(item.rect));
     frames(&mut app, &ctx, 6, &mut time);
@@ -1809,4 +1815,109 @@ fn remove_unused_buses_says_what_it_cleared() {
     app.remove_unused_busses().unwrap();
     assert!(app.status.starts_with("Removed 2 unused buses"), "{}", app.status);
     assert!(app.status.contains("cleared"), "{}", app.status);
+}
+
+#[test]
+fn the_plus_menu_is_shaped_like_the_instrument_menu_and_publishes_its_rows() {
+    use crate::devices::{HostedEntry, InstrumentLists, plugin_menu};
+    let hosted =
+        |v: &'static str, n: usize| (0..n).map(move |i| HostedEntry { id: format!("vst3:{v}{i}"), name: format!("{v} Amp {i}"), vendor: v.into() });
+    let builtin = |id: &str| crate::mixer::PluginEntry { id: id.into(), name: id.into(), category: String::new(), instrument: false };
+    let lists = InstrumentLists {
+        builtin: vec![builtin("gain"), builtin("dither")],
+        vst3: Some(hosted("Native", 8).chain(hosted("Arturia", 8)).collect()),
+        clap: Some(hosted("Clapper", 2).collect()),
+    };
+    let ctx = egui::Context::default();
+    let run = |filter: &mut String, rect: &mut [f32; 4], items: &mut Vec<crate::mixer::MenuItem>| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            plugin_menu(ui, &lists, "effects", None, filter, rect, items);
+        });
+        out.textures_delta.clear();
+    };
+    let (mut items, mut rect, mut filter) = (Vec::new(), [0.0; 4], String::new());
+    run(&mut filter, &mut rect, &mut items);
+    assert_ne!(rect, [0.0; 4], "a filter box above 15 entries");
+    assert_eq!(items.len(), 20, "built-in and hosted rows are all published");
+    assert!(items.iter().any(|m| m.value == "vst3:Native3" && m.label == "Native Amp 3"), "hosted names come from the scan");
+    assert!(items.iter().all(|m| m.rect != [0.0; 4]));
+    filter = "guitar".into();
+    items.clear();
+    run(&mut filter, &mut rect, &mut items);
+    assert!(items.is_empty());
+    filter = "clapper".into();
+    items.clear();
+    run(&mut filter, &mut rect, &mut items);
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|m| m.value.starts_with("vst3:Clapper")));
+    // A short list has no filter box.
+    let short = InstrumentLists { builtin: vec![builtin("gain")], vst3: Some(Vec::new()), clap: None };
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        plugin_menu(ui, &short, "effects", None, &mut String::new(), &mut rect, &mut items);
+    });
+    out.textures_delta.clear();
+    assert_eq!(rect, [0.0; 4]);
+}
+
+#[test]
+fn the_device_chain_and_strip_plus_menus_list_effects_only_and_both_add() {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    app.focus(t);
+    frames(&mut app, &ctx, 3, &mut time);
+    let at = mid(app.mixer.devices.add);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let menu = app.mixer.devices.menu.clone();
+    assert!(menu.iter().any(|m| m.value == "dither" && !m.visible), "rows scrolled out of the menu are flagged: {menu:?}");
+    assert!(menu.iter().any(|m| m.value == "gain"), "{menu:?}");
+    assert_ne!(app.mixer.filter_rect, [0.0; 4], "the filter box is published");
+    assert!(menu.iter().all(|m| m.value != "sampler" && m.value != "subtractive_synth"), "instruments are refused in an effects menu");
+    let fr = mid(app.mixer.filter_rect);
+    click(&mut app, fr);
+    frames(&mut app, &ctx, 3, &mut time);
+    app.mixer.effect_filter = "gain".into();
+    frames(&mut app, &ctx, 3, &mut time);
+    let menu = app.mixer.devices.menu.clone();
+    assert_eq!(menu.len(), 1, "the filter narrows the rows: {menu:?}");
+    assert!(menu[0].visible);
+    // The chain menu's rows are reachable by UI input, like the instrument menu's.
+    let item = menu[0].clone();
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().plugin, "gain");
+    // The strip's "+" is the same menu.
+    let at = mid(strip(&app, t).add_insert);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_ne!(app.mixer.filter_rect, [0.0; 4]);
+    app.mixer.effect_filter = "dither".into();
+    frames(&mut app, &ctx, 3, &mut time);
+    let strip_menu = app.mixer.layout.menu.clone();
+    assert!(strip_menu.iter().any(|m| m.value == "dither"));
+    assert!(strip_menu.iter().all(|m| m.value != "sampler"));
+    let item = strip_menu.iter().find(|m| m.value == "dither").cloned().expect("Dither in the strip menu");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    let ins = app.engine.session().track(t).unwrap().mixer.inserts.clone();
+    assert_eq!(ins.iter().flatten().map(|i| i.plugin.as_str()).collect::<Vec<_>>(), vec!["gain", "dither"]);
+    // The card publishes its buttons.
+    let card = app.mixer.devices.cards[0].clone();
+    assert!(card.editor_button != [0.0; 4] && card.bypass_button != [0.0; 4] && card.remove_button != [0.0; 4]);
+    assert!(!card.editor_open);
+}
+
+#[test]
+fn the_card_editor_button_toggles_the_editor_window() {
+    let mut app = app();
+    let t = new_track(&mut app, json!({"kind": "audio"}));
+    let key = (t, 0usize);
+    assert!(app.ui.plugin_windows.is_empty());
+    app.toggle_editor(key);
+    assert_eq!(app.ui.plugin_windows, vec![key], "first click opens");
+    assert_eq!(app.editors.len(), 1);
+    app.toggle_editor(key);
+    assert!(app.ui.plugin_windows.is_empty(), "second click closes");
+    assert!(app.editors.is_empty());
+    app.toggle_editor(key);
+    assert_eq!(app.ui.plugin_windows, vec![key], "and again opens");
 }
