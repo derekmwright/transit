@@ -604,3 +604,46 @@ fn retiming_a_large_session_is_fast() {
     assert_playlists_valid(&s);
     assert!(took.as_millis() < 20, "took {took:?}");
 }
+
+/// Locked audio at bars 3 and 4 with a short clip at bar 5 on a second ticks track: at 200 BPM
+/// bar 5 falls inside the locked clip, so that step is refused.
+fn refusing_fixture() -> (Engine, ClipId) {
+    let mut e = Engine::default();
+    let (_, d) = audio_track(&mut e, true, &[(0, 2 * BAR), (bar(3), BAR)]);
+    let (_, l) = audio_track(&mut e, true, &[(bar(3), BAR), (bar(5), 24_000)]);
+    e.session_mut().find_clip_mut(l[0]).unwrap().time_locked = true;
+    (e, d[0])
+}
+
+#[test]
+fn a_refused_step_mid_drag_is_invisible_to_the_gesture() {
+    let (mut e, d) = refusing_fixture();
+    let before = positions(e.session());
+    let (undo, journal) = (e.undo_history().len(), e.journal.len());
+    e.execute_merged("event.tempo", &json!({"bpm": 130, "at": 0}), "tempo_drag").unwrap();
+    assert!(e.execute_merged("event.tempo", &json!({"bpm": 200, "at": 0}), "tempo_drag").is_err());
+    e.execute_merged("event.tempo", &json!({"bpm": 130, "at": 0}), "tempo_drag").unwrap();
+    e.execute_merged("event.tempo", &json!({"bpm": 120, "at": 0}), "tempo_drag").unwrap();
+    e.end_merge();
+    assert_eq!(clip(&e, d).range(), soundcraft_time::Range::new(0, 2 * BAR), "no truncation from the refused step");
+    assert_eq!(positions(e.session()), before);
+    assert_eq!(e.undo_history().len(), undo + 1, "one undo step");
+    assert_eq!(e.journal.len(), journal + 1, "one journal line: {:?}", &e.journal[journal..]);
+}
+
+#[test]
+fn a_tempo_drag_during_an_automation_pass_still_converts_from_the_gestures_start() {
+    let (mut e, ids) = adjacent_audio();
+    let samples_track = new_track(&mut e, "audio");
+    let before = positions(e.session());
+    e.hold_merge(Some("pass"));
+    e.execute_merged("event.tempo", &json!({"bpm": 240, "at": 0}), "tempo_drag").unwrap();
+    e.execute_merged("automation.set_point", &json!({"track": samples_track.0, "param": "volume", "at": 1_000, "value": -3.0}), "write").unwrap();
+    e.execute_merged("event.tempo", &json!({"bpm": 120, "at": 0}), "tempo_drag").unwrap();
+    e.hold_merge(None);
+    e.end_merge();
+    assert_eq!(clip(&e, ids[0]).length, 2 * BAR, "A keeps its length");
+    let (clips, autos, marks, keys) = positions(e.session());
+    assert_eq!((clips, marks, keys), (before.0, before.2, before.3));
+    assert_eq!(autos.iter().flatten().copied().collect::<Vec<_>>(), vec![1_000]);
+}

@@ -395,13 +395,14 @@ impl Engine {
                 return Err(EngineError::Internal(id.to_string(), panic_message(&*p)));
             }
         };
-        if !Arc::ptr_eq(&before, &self.doc) {
-            // Only a change to the document ends a gesture, so Stop doesn't split the pass it ends.
-            self.merge_key = None;
-            self.tempo_gesture = None;
-        }
         match result {
             Ok(v) => {
+                if !Arc::ptr_eq(&before, &self.doc) {
+                    // Only a change to the document ends a gesture, so Stop doesn't split the pass
+                    // it ends. A refused command is rolled back below and ends nothing.
+                    self.merge_key = None;
+                    self.tempo_gesture = None;
+                }
                 cmd::remember_selection(self, &before);
                 if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
                     self.push_undo(spec.label, before);
@@ -474,6 +475,10 @@ impl Engine {
             }
             let source = gesture.map_or(before, |g| g.source);
             self.tempo_gesture = Some(TempoGesture { key: key.clone(), source, result: Arc::clone(&self.doc), journal_len: self.journal.len() });
+        } else if let Some(g) = gesture.filter(|g| retime::same_material(&g.result, &self.doc)) {
+            // A step that left the musical material alone (an automation write on a
+            // samples-timebase track during a pass, say) keeps the tempo gesture going.
+            self.tempo_gesture = Some(TempoGesture { result: Arc::clone(&self.doc), ..g });
         }
         // Whether a step was pushed comes from the push counter, which still moves at the cap
         // where the stack length stays put.

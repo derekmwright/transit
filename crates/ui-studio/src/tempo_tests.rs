@@ -293,11 +293,12 @@ fn past_a_tempo_change_the_field_edits_that_change_and_says_so() {
     assert_eq!(t.undo_len(), before + 1);
 }
 
-/// What a tempo change does to existing material (recorded, not assumed): clip placements and
-/// automation points are sample positions and stay put; MIDI notes are ticks inside their clip,
-/// so they follow the new tempo; audio plays at its recorded rate, with no stretch.
+/// What a tempo change does to existing material: on a ticks-timebase track (instrument tracks
+/// by default) the MIDI clip and the automation stay on their bars, so their sample positions
+/// follow the new tempo, and the notes are ticks inside the clip; audio on a samples-timebase
+/// track (the audio default) keeps its sample placement and plays at its recorded rate.
 #[test]
-fn a_tempo_change_leaves_clips_and_automation_in_place_and_midi_notes_follow() {
+fn a_tempo_change_moves_ticks_material_with_the_bars_and_leaves_samples_audio_in_place() {
     let mut t = T::new();
     let inst = t.track(json!({"kind": "instrument"}));
     let clip = t.app.run("midi.new_clip", json!({"tracks": [inst.0], "start": 96_000, "end": 384_000})).unwrap()["clip"].as_u64().unwrap();
@@ -334,10 +335,11 @@ fn a_tempo_change_leaves_clips_and_automation_in_place_and_midi_notes_follow() {
     t.typed("60");
     t.key("Enter");
     let (m2, a2, n2, p2, ns2) = snap(&t);
-    assert_eq!(m1, m2, "a MIDI clip keeps its sample placement");
+    assert_eq!(m1, vec![(96_000, 288_000)]);
+    assert_eq!(m2, vec![(192_000, 576_000)], "the MIDI clip stays on bars 2 to 4 at half the tempo");
     assert_eq!(a1, a2, "an audio clip keeps its sample placement and length (no time-stretch)");
     assert_eq!(n1, n2, "notes are ticks inside the clip");
-    assert_eq!(p1, p2, "automation points are sample positions");
+    assert_eq!(p2, p1.iter().map(|p| p * 2).collect::<Vec<_>>(), "automation on the instrument track stays on its bars");
     assert_eq!(ns2, ns1 * 2, "so the same note sounds later in the song at half the tempo");
     let _ = std::fs::remove_dir_all(dir);
 }
