@@ -63,6 +63,15 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             import_audio
         ),
+        // Asynchronous import (L30). Prepare, progress and cancel never touch the document, so
+        // they are not journaled; the commit is one undo step, "Import <name>".
+        cmd!(query "file.prepare_import", "Prepare Audio Import", [], None, "{path, rate?: session rate} -> {id}: decode and resample on a worker thread", always, prepare_import),
+        cmd!(query "file.import_progress", "Audio Import Progress", [], None, "{id?} -> {id, name, state: queued|running|done|failed, progress: 0-100, error?, frames?, channels?, duration?} (no id: {imports: [..]})", always, import_progress),
+        cmd!(query "file.import_cancel", "Cancel Audio Import", [], None, "{id} -> {canceled}", always, |e, p| {
+            let id = p.get("id").and_then(Value::as_u64).ok_or_else(|| bad("file.import_cancel", "`id` required"))?;
+            Ok(json!({"canceled": e.imports.cancel(id)}))
+        }),
+        cmd!(noundo "file.commit_import", "Commit Audio Import", [], None, "{id, track?: audio track (default: a new track), at?: position, name?}", always, commit_import),
         cmd!("file.import_midi", "MIDI...", ["File", "Import"], Some("Cmd+Alt+I"), "{path, at?}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.import_midi", "`path` required"))?.to_string();
             let at = position_param(e, "file.import_midi", p, "at")?.unwrap_or(0);
@@ -243,6 +252,56 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
         out.push(r);
     }
     Ok(json!({"imported": out}))
+}
+
+fn prepare_import(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "file.prepare_import";
+    let path = str_param(p, "path").filter(|x| !x.is_empty()).ok_or_else(|| bad(CMD, "`path` required"))?;
+    let rate = match p.get("rate") {
+        None => e.session().sample_rate.hz(),
+        Some(v) => v
+            .as_u64()
+            .and_then(|r| u32::try_from(r).ok())
+            .filter(|r| (1_000..=768_000).contains(r))
+            .ok_or_else(|| bad(CMD, "`rate` must be 1000-768000 Hz"))?,
+    };
+    // The roots are checked here too, so a refusal comes back now rather than as a failed job.
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    let id = e.imports.prepare(path, rate);
+    Ok(json!({"id": id}))
+}
+
+fn import_progress(e: &mut Engine, p: &Value) -> Result<Value> {
+    match p.get("id") {
+        None => Ok(json!({"imports": e.imports.all()})),
+        Some(v) => {
+            let id = v.as_u64().ok_or_else(|| bad("file.import_progress", "`id` must be a number"))?;
+            e.imports.progress(id).ok_or_else(|| bad("file.import_progress", format!("no import {id}")))
+        }
+    }
+}
+
+/// Place a prepared import: a new source and a clip, as one undo step "Import <name>". The
+/// staging entry stays when the commit is refused (a missing or non-audio track), so it can be
+/// committed elsewhere or canceled.
+fn commit_import(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "file.commit_import";
+    let id = p.get("id").and_then(Value::as_u64).ok_or_else(|| bad(CMD, "`id` required (from file.prepare_import)"))?;
+    e.imports.ready(id)?;
+    let track = track_param(e, CMD, p, "track")?;
+    if let Some(t) = track.and_then(|t| e.session().track(t)).filter(|t| t.kind != TrackKind::Audio) {
+        return Err(bad(CMD, format!("{} is not an audio track", t.name)));
+    }
+    let at = position_param(e, CMD, p, "at")?.unwrap_or(0).max(0);
+    let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
+    let before = e.session_arc();
+    let prepared = e.imports.take(id)?;
+    let file = prepared.name.clone();
+    let r = crate::io::place_prepared(e, prepared, track, at, name)?;
+    let shown = name.unwrap_or(&file);
+    let stem = std::path::Path::new(shown).file_stem().and_then(|x| x.to_str()).unwrap_or(shown);
+    e.push_undo(&format!("Import {stem}"), before);
+    Ok(r)
 }
 
 /// Destination for `file.import_audio`: an explicit `track` wins; otherwise `new_tracks`

@@ -13,6 +13,7 @@ pub mod cmd;
 pub mod demo;
 pub mod edit;
 pub mod file_access;
+pub mod import;
 pub mod inspect;
 pub mod io;
 pub mod score;
@@ -141,6 +142,8 @@ pub struct Engine {
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
     /// Kept out of the document so selecting never marks the session modified.
     pub last_selection: Option<(soundcraft_time::Range, Vec<TrackId>)>,
+    /// Audio imports being prepared on worker threads (L30); emptied when the session is replaced.
+    pub imports: import::Imports,
 }
 
 impl Default for Engine {
@@ -172,6 +175,7 @@ impl Engine {
             merge_hold: None,
             messages: Vec::new(),
             last_selection: None,
+            imports: import::Imports::default(),
         }
     }
 
@@ -206,6 +210,7 @@ impl Engine {
         self.undo.clear();
         self.redo.clear();
         self.last_selection = None;
+        self.imports.clear();
         self.revision = self.revision.wrapping_add(1);
         self.dirty = false;
     }

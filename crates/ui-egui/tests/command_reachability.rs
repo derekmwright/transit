@@ -17,6 +17,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "edit.squash_undo", // studio UI composite helper; old UI has no composite steps
     "event.midi_note",
     "file.bounce_stems",
+    "file.commit_import", // studio UI only (async import, L30); the old UI imports synchronously
     "markers.next",
     "markers.previous",
     "mix.clear_mutes",

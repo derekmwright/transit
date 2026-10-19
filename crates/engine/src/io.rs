@@ -47,6 +47,34 @@ pub fn read_file(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(err)
 }
 
+/// [`read_file`] in 1 MB pieces, calling `progress(read, total)` after each; when it returns
+/// `false` the read stops with an error (a canceled import).
+pub fn read_file_with_progress(path: impl AsRef<Path>, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let path = path.as_ref();
+    crate::file_access::check_read(path).map_err(EngineError::Io)?;
+    let err = |err: std::io::Error| EngineError::Io(format!("{}: {err}", path.display()));
+    let meta = std::fs::metadata(path).map_err(err)?;
+    if !meta.is_file() {
+        return Err(EngineError::Io(format!("{}: not a regular file", path.display())));
+    }
+    let total = meta.len();
+    let mut file = std::fs::File::open(path).map_err(err)?;
+    let mut out = Vec::with_capacity(usize::try_from(total).unwrap_or(0).min(MAX_IMPORT_SAMPLES));
+    let mut chunk = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut chunk).map_err(err)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+        if !progress(out.len() as u64, total) {
+            return Err(EngineError::Io(format!("{}: canceled", path.display())));
+        }
+    }
+    Ok(out)
+}
+
 /// [`read_file`] as UTF-8 text.
 pub fn read_text(path: impl AsRef<Path>) -> Result<String> {
     let path = path.as_ref();
@@ -119,6 +147,13 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         buf.channels = soundcraft_dsp::offline::resample(&buf.channels, buf.sample_rate, sr);
         buf.sample_rate = sr;
     }
+    add_source_audio(s, name, Arc::new(SourceAudio::new(buf)), path, format)
+}
+
+/// Register audio already at the session rate, with its peaks built (see [`prepare_audio_bytes`]).
+pub fn add_source_audio(s: &mut Session, name: &str, audio: Arc<SourceAudio>, path: Option<&str>, format: FileFormat) -> SourceId {
+    let sr = s.sample_rate.hz();
+    let buf = &audio.buffer;
     let id = SourceId(s.alloc());
     let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).unwrap_or(name).to_string();
     let stored = match path {
@@ -136,7 +171,7 @@ pub fn add_source(s: &mut Session, name: &str, mut buf: AudioBuffer, path: Optio
         time_reference: 0,
         unsaved: true,
     });
-    s.pool.insert(id, Arc::new(SourceAudio::new(buf)));
+    s.pool.insert(id, audio);
     id
 }
 
@@ -149,35 +184,111 @@ fn stamp_at_rate(stamp: u64, file_rate: u32, session_rate: u32) -> u64 {
     u64::try_from((u128::from(stamp) * to + from / 2) / from).unwrap_or(u64::MAX)
 }
 
-/// Decode and place an audio file. With no target track, a new track of matching width is made.
-pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>, target: Option<TrackId>, at: Samples) -> Result<Value> {
+/// An audio file decoded, resampled to the session rate and with its peaks built, ready to place:
+/// the slow part of an import, done by [`prepare_audio_bytes`] on any thread.
+pub struct PreparedAudio {
+    /// The file name, `Kick 01.wav`.
+    pub name: String,
+    pub path: Option<String>,
+    pub audio: Arc<SourceAudio>,
+    pub format: FileFormat,
+    /// The file's own rate, and its BWF time stamp at that rate.
+    pub file_rate: u32,
+    pub time_reference: Option<u64>,
+}
+
+impl PreparedAudio {
+    pub fn frames(&self) -> usize {
+        self.audio.frames()
+    }
+    pub fn channels(&self) -> usize {
+        self.audio.buffer.num_channels()
+    }
+    pub fn rate(&self) -> u32 {
+        self.audio.buffer.sample_rate
+    }
+}
+
+/// Decode `bytes` and resample them to `rate`, building the waveform peaks: everything an import
+/// does but touch the session. `progress(fraction)` (0 to 1 for this step) runs between stages
+/// and after each resampled channel; when it returns `false` the work stops with an error.
+pub fn prepare_audio_bytes(name: &str, bytes: &[u8], path: Option<&str>, rate: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<PreparedAudio> {
+    let canceled = || EngineError::Io(format!("{name}: canceled"));
+    let too_large = || EngineError::Io(format!("{name}: file is too large to import"));
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-    let (info, buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
-    let buf = at_rate(buf, e.session().sample_rate.hz(), MAX_IMPORT_SAMPLES)
-        .ok_or_else(|| EngineError::Io(format!("{name}: file is too large to import")))?;
+    let (info, mut buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
+    if !progress(0.4) {
+        return Err(canceled());
+    }
+    let from = buf.sample_rate.max(1);
+    let n = buf.num_channels();
+    // The same limit as `at_rate`: a file with a tiny sample rate grows by orders of magnitude.
+    if buf.frames() as f64 * n as f64 * f64::from(rate) / f64::from(from) > MAX_IMPORT_SAMPLES as f64 {
+        return Err(too_large());
+    }
+    if from != rate {
+        // One channel at a time (as `at_rate` does), so the work can report and stop in between.
+        let mut out = Vec::with_capacity(n);
+        for (i, ch) in std::mem::take(&mut buf.channels).into_iter().enumerate() {
+            out.extend(soundcraft_dsp::offline::resample(&[ch], from, rate));
+            if !progress(0.4 + 0.45 * (i + 1) as f32 / n as f32) {
+                return Err(canceled());
+            }
+        }
+        buf.channels = out;
+        buf.sample_rate = rate;
+    }
     if buf.frames() == 0 {
         return Err(EngineError::Io(format!("{name}: no audio")));
     }
-    let channels = buf.num_channels();
-    let file_rate = info.sample_rate;
+    let audio = Arc::new(SourceAudio::new(buf));
+    if !progress(1.0) {
+        return Err(canceled());
+    }
+    Ok(PreparedAudio {
+        name: name.to_string(),
+        path: path.map(str::to_string),
+        audio,
+        format: info.format,
+        file_rate: info.sample_rate,
+        time_reference: info.bwf.as_ref().map(|b| b.time_reference),
+    })
+}
+
+/// Place prepared audio: a new source, and a clip at `at` on `target` (or on a new track of
+/// matching width). `name` replaces the file name as the source, clip and new track name. Audio
+/// prepared at another rate than the session's is resampled here.
+pub fn place_prepared(e: &mut Engine, prepared: PreparedAudio, target: Option<TrackId>, at: Samples, name: Option<&str>) -> Result<Value> {
+    let PreparedAudio { name: file, path, audio, format, file_rate, time_reference } = prepared;
+    let label = name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&file).to_string();
+    let channels = audio.buffer.num_channels();
     let s = e.session_mut();
     let session_rate = s.sample_rate.hz();
-    let src = add_source(s, name, buf, path, info.format);
-    if let (Some(bwf), Some(sx)) = (info.bwf.as_ref(), s.sources.last_mut()) {
-        sx.time_reference = stamp_at_rate(bwf.time_reference, file_rate, session_rate);
+    let src = if audio.buffer.sample_rate == session_rate {
+        add_source_audio(s, &label, audio, path.as_deref(), format)
+    } else {
+        let buf = Arc::try_unwrap(audio).map_or_else(|a| a.buffer.clone(), |a| a.buffer);
+        add_source(s, &label, buf, path.as_deref(), format)
+    };
+    if let (Some(stamp), Some(sx)) = (time_reference, s.sources.last_mut()) {
+        sx.time_reference = stamp_at_rate(stamp, file_rate, session_rate);
     }
     let frames = s.source(src).map_or(0, |x| i64::try_from(x.frames).unwrap_or(0));
+    let stem = s.source(src).map(|x| x.name.clone()).unwrap_or_default();
     let track = match target {
         Some(t) => t,
-        None => {
-            let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).unwrap_or("Audio").to_string();
-            s.add_track(TrackKind::Audio, ChannelFormat::for_channels(channels), Some(&stem))
-        }
+        None => s.add_track(TrackKind::Audio, ChannelFormat::for_channels(channels), Some(if stem.is_empty() { "Audio" } else { &stem })),
     };
     let cid = s.new_clip_id();
-    let stem = s.source(src).map(|x| x.name.clone()).unwrap_or_default();
     crate::edit::place_clip(s, track, Clip::audio(cid, stem, src, 0, at, frames));
     Ok(json!({"track": track, "clip": cid, "source": src, "frames": frames, "channels": channels}))
+}
+
+/// Decode and place an audio file. With no target track, a new track of matching width is made.
+/// The synchronous import: [`prepare_audio_bytes`], then [`place_prepared`].
+pub fn import_audio_bytes(e: &mut Engine, name: &str, bytes: &[u8], path: Option<&str>, target: Option<TrackId>, at: Samples) -> Result<Value> {
+    let prepared = prepare_audio_bytes(name, bytes, path, e.session().sample_rate.hz(), &mut |_| true)?;
+    place_prepared(e, prepared, target, at, None)
 }
 
 /// Loads an audio file's bytes into an instrument track's Sampler as one undo step ("Load
