@@ -434,3 +434,57 @@ fn handle_factory_unwind_leaves_no_partial_visible_instance() {
     handles.release(released);
     assert_eq!(events.lock().unwrap().iter().filter(|(_, event, _)| *event == "drop").count(), 1);
 }
+
+#[test]
+fn an_unadopted_publication_finishes_its_action_without_any_later_plan() {
+    let (mut control, mut plans, mut actions) = endpoints::<u32, u32>(target(), PlanLimits::default());
+    control.request(session("never adopted"), None).unwrap();
+    control.service(&mut factory);
+    let play = control.send_action(1, true).unwrap();
+    let later = control.send_action(2, false).unwrap();
+    plans.return_pending(&mut plan_bridge::callback_scope());
+    control.service(&mut factory);
+    let mut ran = None;
+    let (report, heap) = measure(|| {
+        actions.service(&mut action_lane::callback_scope(), &mut plans, &mut |event, _| {
+            assert!(ran.replace(event).is_none());
+            23
+        })
+    });
+    assert!(heap.is_zero());
+    assert!(!report.waiting_for_plan);
+    assert_eq!(ran, Some(action_lane::Event::Action { sequence: later, payload: 2 }));
+    let mut notices = [None; 8];
+    assert_eq!(control.poll_notices(&mut notices), 3);
+    assert!(notices.iter().flatten().any(
+        |n| matches!(n, Notice::Action(r) if r.sequence == play && r.outcome == action_lane::Outcome::PlanRejected && r.handler_result.is_none())
+    ));
+    assert!(control.retire(plans, actions).0.is_empty());
+}
+
+#[test]
+fn stop_clears_staging_before_later_compilation_and_keeps_admission_healthy() {
+    let (mut control, mut plans, mut actions) = endpoints::<u32, u32>(target(), PlanLimits::default());
+    control.request(session("first"), None).unwrap();
+    control.service(&mut factory);
+    control.request(session("waiting"), None).unwrap();
+    control.send_action(1, true).unwrap();
+    control.send_action(2, true).unwrap();
+    control.stop().unwrap();
+    let mut notices = [None; 8];
+    control.poll_notices(&mut notices);
+    adopt(&mut plans);
+    control.service(&mut factory);
+    assert!(!control.sessions.faulted());
+    let next = control.send_action(3, true).unwrap();
+    adopt(&mut plans);
+    let mut got_next = false;
+    actions.service(&mut action_lane::callback_scope(), &mut plans, &mut |event, _| {
+        if event == (action_lane::Event::Action { sequence: next, payload: 3 }) {
+            got_next = true;
+        }
+        0
+    });
+    assert!(got_next);
+    control.retire(plans, actions);
+}

@@ -16,6 +16,11 @@ pub use control::{Control, Notice, endpoints};
 mod handles;
 pub use handles::Handles;
 
+// Integration fixture first; the device adapter switches to this implementation
+// once its event and shutdown plumbing is complete.
+#[cfg(test)]
+mod audio;
+
 pub const SESSION_REQUESTS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
