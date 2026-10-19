@@ -446,8 +446,6 @@ pub struct AutoState {
     /// counter after the pass's latest write: if it still holds at the end, the pass is the newest step.
     spans: HashMap<(TrackId, String), Vec<(Samples, Samples)>>,
     pass_mark: u64,
-    /// `undo_pushes` when the pass wrote its first point.
-    pass_p0: u64,
     /// What the last thinning removed, for `ui.inspect`.
     pub thinned: usize,
 }
@@ -1238,9 +1236,6 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             continue;
         }
         let key = (id, lane.id());
-        if !app.auto.writing {
-            app.auto.pass_p0 = app.engine.undo_pushes();
-        }
         let mut from = app.auto.last.get(&key).copied();
         let started = from.is_none();
         let v = lane.static_value(t);
@@ -1344,20 +1339,12 @@ fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
         app.auto.thinned = removed;
     }
     // The thins share the pass's merge key, so they add at most one step: a "Thin" on top of a
-    // stack that did not end in one. (The history length cannot say: at the cap it stays put.)
+    // stack that did not end in one.
     let added = usize::from(app.engine.undo_label() == Some("Thin") && top0.as_deref() != Some("Thin"));
     let plural = if removed == 1 { "" } else { "s" };
     if squash && contiguous {
         // The pass is one step labeled for what it is, thinned or not.
-        // Normally the pass is one merged step. At the history cap the engine stops merging (it
-        // looks for the history to grow), so every command of the pass is a step of its own and
-        // `undo_pushes` counts them; never fold more than the history holds.
-        let len = app.engine.undo_history().len();
-        let n = if len >= app.engine.history_limit {
-            usize::try_from(app.engine.undo_pushes().saturating_sub(app.auto.pass_p0)).unwrap_or(len).min(len)
-        } else {
-            added + 1
-        };
+        let n = (added + 1).min(app.engine.undo_history().len());
         if n > 0 {
             let _ = app.engine.squash_undo(n, "Write Automation");
         }
