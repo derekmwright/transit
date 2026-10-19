@@ -30,6 +30,8 @@ pub struct Rename {
     /// Where the field sits (the track's name, the strip's name or the clip's name strip).
     pub rect: R4,
     fresh: bool,
+    /// A refused name keeps the field open: focus it again, keeping the typed text.
+    refocus: bool,
     /// Escape or Enter this frame, taken before any other handler sees them ([`rename_keys`]).
     keys: (bool, bool),
 }
@@ -129,6 +131,42 @@ pub struct FinishState {
     pub layout: FinishLayout,
     /// The progress window's Cancel button as last drawn.
     pub cancel: R4,
+    /// A typed destination that exists is replaced only after asking.
+    pub replace: Replace,
+    /// The "Replace existing file?" question's buttons as last drawn: replace, cancel.
+    pub replace_buttons: (R4, R4),
+}
+
+/// Where the "Replace existing file?" question stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Replace {
+    #[default]
+    No,
+    Asking,
+    Yes,
+}
+
+/// The extensions of audio files a bounce can write or replace.
+const AUDIO_EXTS: [&str; 6] = ["wav", "aif", "aiff", "flac", "mp3", "ogg"];
+
+/// `path` with the extension `format` writes. A known audio extension is replaced; any other
+/// (`mix.v2`) is part of the name, so the new one is appended (`mix.v2.wav`).
+pub fn fit_extension(path: &std::path::Path, format: &str) -> std::path::PathBuf {
+    let ext = if format == "aiff" { "aif" } else { format };
+    let has = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
+    if has.as_deref().is_some_and(|h| h == ext || (ext == "aif" && h == "aiff")) {
+        return path.to_path_buf();
+    }
+    let mut out = path.to_path_buf();
+    if has.as_deref().is_some_and(|h| AUDIO_EXTS.contains(&h)) {
+        out.set_extension(ext);
+    } else {
+        let mut name = out.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+        name.push(".");
+        name.push(ext);
+        out.set_file_name(name);
+    }
+    out
 }
 
 impl std::fmt::Debug for FinishState {
@@ -148,7 +186,7 @@ impl FinishState {
     }
 }
 
-fn rect(r: R4) -> Rect {
+pub fn rect(r: R4) -> Rect {
     Rect::from_min_max(pos2(r[0], r[1]), pos2(r[2], r[3]))
 }
 
@@ -181,7 +219,7 @@ impl StudioApp {
             RenameTarget::Clip(c) => s.find_clip(c).map(|(_, c)| c.name.clone()),
         };
         let Some(text) = name else { return };
-        self.finish.rename = Some(Rename { target, text, rect, fresh: true, keys: (false, false) });
+        self.finish.rename = Some(Rename { target, text, rect, fresh: true, refocus: false, keys: (false, false) });
     }
 
     /// Ctrl+R or F2: the selected clip, unless tracks were picked by their headers; else the
@@ -265,7 +303,10 @@ impl StudioApp {
     }
 
     /// Promote take `k`: it becomes the track's only take, the others are removed. One undo step
-    /// (`track.playlist_select` then `track.playlist_delete_unused`, merged).
+    /// (`track.playlist_select` then `track.playlist_delete_unused`, merged). The undo entry keeps
+    /// the first command's label, "Select Playlist": the engine has no relabel for a merged step,
+    /// the order is forced (delete-unused keeps the active take), and `track.playlist_promote`
+    /// copies a range between playlists instead, so this is left documented (L20).
     pub fn promote_take(&mut self, t: TrackId, k: usize) -> Result<Value, String> {
         let n = self.take_count(t);
         if k >= n {
@@ -345,12 +386,13 @@ impl StudioApp {
             self.status = "Choose where to write the bounce.".into();
             return Err(self.status.clone());
         }
-        let ext = if f.format == "aiff" { "aif" } else { f.format.as_str() };
-        let has = path.extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
-        let same = has.as_deref().is_some_and(|h| h == ext || (ext == "aif" && h == "aiff"));
-        if !same {
-            path.set_extension(ext);
+        path = fit_extension(&path, &f.format);
+        if path.exists() && self.finish.replace != Replace::Yes {
+            self.finish.replace = Replace::Asking;
+            self.status = format!("{} exists", path.display());
+            return Err(self.status.clone());
         }
+        self.finish.replace = Replace::No;
         let mut p = json!({
             "path": path.to_string_lossy(),
             "format": f.format,
@@ -383,6 +425,7 @@ impl StudioApp {
             self.status = "Bounce cancelled".into();
         }
         self.finish.bounce_form = None;
+        self.finish.replace = Replace::No;
         if matches!(self.dialog, Some(Dialog::Bounce)) {
             self.dialog = None;
         }
@@ -475,6 +518,8 @@ pub fn rename_field(app: &mut StudioApp, ctx: &egui::Context) {
         st.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
         st.store(ctx, id);
         ctx.memory_mut(|m| m.request_focus(id));
+    } else if r.refocus {
+        ctx.memory_mut(|m| m.request_focus(id));
     }
     let (mut lost, mut has) = (false, false);
     egui::Area::new(egui::Id::new("rename_area")).order(egui::Order::Foreground).fixed_pos(area.min).show(ctx, |ui| {
@@ -487,9 +532,15 @@ pub fn rename_field(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if has {
         r.fresh = false;
+        r.refocus = false;
     }
-    if !r.fresh && (lost || enter) {
-        let _ = app.apply_rename(r.target, &r.text);
+    if !r.fresh && !r.refocus && (lost || enter) {
+        // A refused name (empty, or taken) keeps the field and the typed text, and the status
+        // line says why; Escape still cancels.
+        if app.apply_rename(r.target, &r.text).is_err() {
+            r.refocus = true;
+            app.finish.rename = Some(r);
+        }
         return;
     }
     app.finish.rename = Some(r);
@@ -559,6 +610,10 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
         app.finish.layout.bounce = None;
         return;
     };
+    if app.finish.replace != Replace::No {
+        replace_question(app, ctx, &f);
+        return;
+    }
     let s = app.engine.session_arc();
     let mut lay = BounceLayout::default();
     let (mut go, mut cancel, mut choose) = (false, ctx.input(|i| hit(i, A::DialogCancel)), false);
@@ -622,7 +677,8 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
     lay.window = crate::arrange::r4(resp.response.rect);
     app.finish.layout.bounce = Some(lay);
     if choose {
-        let name = std::path::Path::new(&f.path).file_name().map_or_else(|| "bounce.wav".to_string(), |n| n.to_string_lossy().into_owned());
+        let named = fit_extension(std::path::Path::new(&f.path), &f.format);
+        let name = named.file_name().map_or_else(|| "bounce.wav".to_string(), |n| n.to_string_lossy().into_owned());
         if let Some(p) = app.services.pick_save.as_ref().and_then(|pick| pick(&name)) {
             f.path = p;
         }
@@ -632,6 +688,35 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
         app.cancel_bounce();
     } else if go && app.start_bounce().is_err() {
         // The form stays open; the status line says why.
+    }
+}
+
+/// "Replace existing file?" in place of the form: Enter replaces, Escape (or Cancel) goes back to
+/// the form with nothing written.
+fn replace_question(app: &mut StudioApp, ctx: &egui::Context, f: &BounceForm) {
+    let path = fit_extension(std::path::Path::new(f.path.trim()), &f.format);
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let (mut yes, mut no) = (false, false);
+    egui::Modal::new(egui::Id::new("bounce_replace")).show(ctx, |ui| {
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new("Replace existing file?").strong());
+        ui.label(egui::RichText::new(format!("{name} already exists.")).color(TOKENS.text_dim));
+        ui.add_space(crate::theme::SPACE);
+        ui.horizontal(|ui| {
+            let r = ui.button("Replace");
+            let c = ui.button("Cancel");
+            app.finish.replace_buttons = (crate::arrange::r4(r.rect), crate::arrange::r4(c.rect));
+            yes = r.clicked() || ui.input(|i| hit(i, A::DialogConfirm));
+            no = c.clicked();
+        });
+    });
+    no |= ctx.input(|i| hit(i, A::DialogCancel));
+    if yes {
+        app.finish.replace = Replace::Yes;
+        let _ = app.start_bounce();
+    } else if no {
+        app.finish.replace = Replace::No;
+        app.status = "Bounce not started".into();
     }
 }
 

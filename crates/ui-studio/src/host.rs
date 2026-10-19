@@ -23,6 +23,9 @@ use soundcraft_playback::record::Trouble;
 use soundcraft_playback::{OutputTrouble, Player};
 use soundcraft_time::{Range, Samples};
 
+/// Said when Record is asked with the count-in on and the cursor sits at the start of the session.
+const COUNT_IN_SKIPPED: &str = "Count-in skipped: no room before bar 1";
+
 impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.clear_clip_latches();
@@ -81,8 +84,14 @@ impl StudioApp {
         if let Some(p) = &self.player {
             p.set_recording(true);
         }
-        let already_playing = self.is_playing();
         self.engine.transport.recording = true;
+        self.begin_pass(takes);
+    }
+
+    /// Start the recording pass for `takes`: on the fly at the playhead when already playing, else
+    /// from the count-in or pre-roll, or the cycle range.
+    pub(crate) fn begin_pass(&mut self, takes: Vec<soundcraft_engine::io::Take>) {
+        let already_playing = self.is_playing();
         if already_playing {
             // Punch in on the fly at the current playhead.
             self.record_start = self.position();
@@ -106,6 +115,9 @@ impl StudioApp {
             self.punch = Some(sel);
             self.start_play(self.record_start, Some(sel.end), None);
             self.plan_recording(takes, None);
+            if self.ui.count_in && self.record_start >= sel.start {
+                self.status = COUNT_IN_SKIPPED.into();
+            }
         } else {
             let at = self.cursor();
             let from = (at - self.lead_in(at)).max(0);
@@ -115,6 +127,9 @@ impl StudioApp {
             self.punch = (self.ui.count_in && from < at).then(|| Range::new(at, at.saturating_add(i64::MAX / 4)));
             self.start_play(from, None, None);
             self.plan_recording(takes, None);
+            if self.ui.count_in && from >= at {
+                self.status = COUNT_IN_SKIPPED.into();
+            }
         }
     }
 

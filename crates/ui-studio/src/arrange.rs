@@ -371,7 +371,8 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         app.click_header(t.id, m.shift, m.command || m.ctrl);
     }
     // Slice 6: double-click the name to rename the track in place.
-    if resp.double_clicked() {
+    // Only on the name itself; a double-click elsewhere on the header keeps selecting.
+    if resp.double_clicked() && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| crate::finish::rect(row.name_rect).contains(p)) {
         app.start_rename(crate::finish::RenameTarget::Track(t.id), row.name_rect);
     }
     if resp.drag_started() && t.kind != TrackKind::Master {
@@ -933,11 +934,17 @@ fn takes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, list
                 .filter(|(k, pl)| *k != t.active_playlist && pl.clips.iter().any(|o| o.start < c.end() && o.end() > c.start))
                 .count();
             let Some(cr) = layout.clips.iter().find(|r| r.id == c.id.0).map(|r| r.rect) else { continue };
-            let w = 64.0;
-            if others == 0 || cr[2] - cr[0] < w + 8.0 {
+            let wide = cr[2] - cr[0] >= 64.0 + 8.0;
+            if others == 0 {
                 continue;
             }
-            let chip = Rect::from_min_max(pos2(cr[2] - w - 2.0, cr[1] + 1.5), pos2(cr[2] - 2.0, cr[1] + CLIP_NAME_H - 0.5));
+            // Wide clips get the "2 takes" chip at their right end; narrower ones a 10 px glyph at
+            // their left edge, so the lanes stay reachable at any zoom.
+            let chip = if wide {
+                Rect::from_min_max(pos2(cr[2] - 64.0 - 2.0, cr[1] + 1.5), pos2(cr[2] - 2.0, cr[1] + CLIP_NAME_H - 0.5))
+            } else {
+                Rect::from_min_max(pos2(cr[0].max(tl.min.x) + 1.0, cr[1] + 1.5), pos2(cr[0].max(tl.min.x) + 11.0, cr[1] + CLIP_NAME_H - 0.5))
+            };
             if !tl.intersects(chip) {
                 continue;
             }
@@ -945,14 +952,18 @@ fn takes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, list
             let p = ui.painter().with_clip_rect(tl);
             p.rect_filled(chip, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
             let icon = if open { crate::icons::Icon::ChevronDown } else { crate::icons::Icon::ChevronRight };
-            crate::icons::paint(&p, pos2(chip.min.x + 8.0, chip.center().y), icon, 12.0, TOKENS.text);
-            p.text(
-                pos2(chip.min.x + 16.0, chip.center().y),
-                Align2::LEFT_CENTER,
-                format!("{} takes", others + 1),
-                FontId::proportional(10.5),
-                TOKENS.text,
-            );
+            if wide {
+                crate::icons::paint(&p, pos2(chip.min.x + 8.0, chip.center().y), icon, 12.0, TOKENS.text);
+                p.text(
+                    pos2(chip.min.x + 16.0, chip.center().y),
+                    Align2::LEFT_CENTER,
+                    format!("{} takes", others + 1),
+                    FontId::proportional(10.5),
+                    TOKENS.text,
+                );
+            } else {
+                crate::icons::paint(&p, chip.center(), icon, 10.0, TOKENS.text);
+            }
             if resp.on_hover_text(if open { "Hide the takes" } else { "Show the takes" }).clicked() {
                 app.toggle_takes(t.id);
             }
@@ -1020,7 +1031,7 @@ fn takes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, list
             let tip =
                 if can_delete { "Delete this take" } else { "Deleting one of three or more takes needs an engine command; promote a take instead" };
             if dresp.on_hover_text(tip).clicked() && can_delete {
-                let _ = app.delete_take(t.id, k);
+                app.dialog = Some(crate::Dialog::DeleteTake { track: t.id, index: k });
             }
         }
     }

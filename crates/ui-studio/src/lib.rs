@@ -94,8 +94,8 @@ pub struct UiState {
     /// range) and records from there. A preference, not part of the document.
     pub count_in: bool,
     /// Tracks whose take lanes are shown (slice 6). View state of the open session, never in the
-    /// document; shown by `ui.inspect`, never loaded.
-    #[serde(skip_deserializing)]
+    /// document; the lanes it opens are in `ui.inspect`'s slice 6 layout.
+    #[serde(skip)]
     pub takes_open: Vec<TrackId>,
     /// Edit > Undo History is open (view state, not saved).
     #[serde(skip)]
@@ -162,6 +162,8 @@ pub enum Dialog {
     DeleteTracks { tracks: Vec<TrackId>, clips: bool },
     /// File > Bounce: its form, then its progress (slice 6, `finish`).
     Bounce,
+    /// Delete one of a track's two takes (slice 6): the take lane's Delete asks first.
+    DeleteTake { track: TrackId, index: usize },
 }
 
 /// An editor asked for (by `ui.set` or a menu) and not open yet: retried until the plug-in is
@@ -673,6 +675,7 @@ impl StudioApp {
                 Dialog::SaveChanges { .. } => "save_changes",
                 Dialog::DeleteTracks { .. } => "delete_tracks",
                 Dialog::Bounce => "bounce",
+                Dialog::DeleteTake { .. } => "delete_take",
             }),
             "frame_ms": self.frame_ms,
             "audio_device": self.player.as_ref().map(|p| p.device_name.clone()),

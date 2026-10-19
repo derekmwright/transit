@@ -246,6 +246,7 @@ fn double_click_a_header_name_renames_in_place_enter_applies_escape_cancels() {
     assert_eq!(t.name(a), "Bass DI");
     assert!(t.app.status.contains("can't be empty"), "{}", t.app.status);
     assert_eq!(t.undo_len(), before + 1);
+    t.key("Escape", json!({}));
     // Accident path: Delete while typing edits the text; the track stays.
     t.double(mid(t.row(a).name_rect));
     t.key("Delete", json!({}));
@@ -436,6 +437,7 @@ fn delete_take_keeps_the_other_and_is_refused_with_three() {
     assert!(rows.iter().all(|r| r.delete_enabled));
     let take2 = t.app.engine.session().track(a).unwrap().playlists[1].clips.clone();
     t.click(mid(rows[0].delete));
+    t.key("Enter", json!({}));
     let tr = t.app.engine.session().track(a).unwrap().clone();
     assert_eq!(tr.playlists.len(), 1);
     assert_eq!(tr.clips(), take2.as_slice(), "take 2 stays");
@@ -634,6 +636,188 @@ fn undo_history_lists_the_steps_and_a_click_undoes_back_to_there() {
     assert!(t.app.engine.session().track(a).is_none());
     t.key("Z", json!({"alt": true}));
     assert!(!t.app.ui.show_history);
+}
+
+// ---- Review follow-ups ----
+
+#[test]
+fn deleting_a_take_asks_first_enter_deletes_escape_keeps_both() {
+    let dir = Dir::new("delask");
+    let mut t = T::new();
+    let a = two_takes(&mut t, &dir);
+    t.app.toggle_takes(a);
+    t.frames(3);
+    let rows = t.app.finish.layout.takes.clone();
+    let before = t.undo_len();
+    t.click(mid(rows[0].delete));
+    assert_eq!(t.inspect_dialog(), "delete_take", "the click only asks");
+    assert_eq!(t.app.engine.session().track(a).unwrap().playlists.len(), 2);
+    assert_eq!(t.undo_len(), before);
+    t.key("Escape", json!({}));
+    assert!(t.app.dialog.is_none());
+    assert_eq!(t.app.engine.session().track(a).unwrap().playlists.len(), 2, "Escape keeps both takes");
+    assert_eq!(t.undo_len(), before);
+    t.click(mid(rows[0].delete));
+    t.key("Enter", json!({}));
+    assert!(t.app.dialog.is_none());
+    assert_eq!(t.app.engine.session().track(a).unwrap().playlists.len(), 1, "Enter deletes");
+    assert!(t.app.status.contains("Deleted take 1"), "{}", t.app.status);
+}
+
+#[test]
+fn promote_is_one_undo_step_whose_label_is_documented_as_the_first_command() {
+    let dir = Dir::new("promlabel");
+    let mut t = T::new();
+    let a = two_takes(&mut t, &dir);
+    t.app.promote_take(a, 0).unwrap();
+    // The engine has no relabel and orders select before delete-unused (L20): left as is.
+    assert_eq!(t.app.engine.undo_label(), Some("Select Playlist"));
+}
+
+#[test]
+fn fit_extension_replaces_only_known_audio_extensions() {
+    use crate::finish::fit_extension;
+    use std::path::Path;
+    let f = |p: &str, fmt: &str| fit_extension(Path::new(p), fmt).to_string_lossy().into_owned();
+    assert_eq!(f("mix.v2", "wav"), "mix.v2.wav");
+    assert_eq!(f("mix", "wav"), "mix.wav");
+    assert_eq!(f("mix.wav", "flac"), "mix.flac");
+    assert_eq!(f("mix.WAV", "wav"), "mix.WAV");
+    assert_eq!(f("mix.aiff", "aiff"), "mix.aiff");
+    assert_eq!(f("mix.mp3", "aiff"), "mix.aif");
+    assert_eq!(f("take.final", "flac"), "take.final.flac");
+}
+
+#[test]
+fn bounce_to_an_existing_file_asks_and_choose_defaults_to_the_new_extension() {
+    let dir = Dir::new("replace");
+    let mut t = T::new();
+    t.midi_clip();
+    let out = dir.0.join("mix.wav");
+    std::fs::write(&out, b"old").unwrap();
+    t.app.open_bounce();
+    t.frames(3);
+    if let Some(f) = &mut t.app.finish.bounce_form {
+        f.path = out.to_string_lossy().into_owned();
+    }
+    t.frames(2);
+    let ok = t.app.finish.layout.bounce.clone().unwrap().ok;
+    t.click(mid(ok));
+    assert_eq!(t.app.finish.replace, crate::finish::Replace::Asking, "an existing destination asks");
+    assert!(t.app.finish.job.is_none());
+    assert_eq!(std::fs::read(&out).unwrap(), b"old", "nothing is overwritten yet");
+    // Escape goes back to the form, which stays open.
+    t.key("Escape", json!({}));
+    assert_eq!(t.app.finish.replace, crate::finish::Replace::No);
+    assert!(t.app.finish.bounce_form.is_some() && t.app.dialog.is_some(), "the form is still there");
+    assert_eq!(std::fs::read(&out).unwrap(), b"old");
+    // Ask again; Enter replaces.
+    let ok = t.app.finish.layout.bounce.clone().unwrap().ok;
+    t.click(mid(ok));
+    assert_eq!(t.app.finish.replace, crate::finish::Replace::Asking);
+    t.key("Enter", json!({}));
+    for _ in 0..50 {
+        if t.app.finish.job.is_none() {
+            break;
+        }
+        t.frames(5);
+    }
+    assert!(t.app.status.starts_with("Bounced to"), "{}", t.app.status);
+    assert_ne!(std::fs::read(&out).unwrap(), b"old", "Enter replaced the file");
+    // Choose... starts from the new format's extension.
+    t.app.open_bounce();
+    t.frames(3);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let sink = seen.clone();
+    t.app.services.pick_save = Some(Box::new(move |name| {
+        *sink.borrow_mut() = name.to_string();
+        None
+    }));
+    if let Some(f) = &mut t.app.finish.bounce_form {
+        f.path = dir.0.join("mix.v2").to_string_lossy().into_owned();
+    }
+    t.frames(2);
+    let lay = t.app.finish.layout.bounce.clone().unwrap();
+    t.click(mid(lay.formats.iter().find(|r| r.value == "flac").unwrap().rect));
+    let choose = t.app.finish.layout.bounce.clone().unwrap().choose;
+    t.click(mid(choose));
+    assert_eq!(*seen.borrow(), "mix.v2.flac", "Choose... starts from the new extension");
+}
+
+#[test]
+fn the_take_glyph_keeps_the_lanes_reachable_at_a_narrow_zoom() {
+    let dir = Dir::new("narrow");
+    let mut t = T::new();
+    let a = two_takes(&mut t, &dir);
+    // 4 s is 192000 samples: at 4000 samples per pixel the clip is 48 px wide, too narrow for the chip.
+    let _ = t.app.engine.execute("view.zoom_set", &json!({"samples_per_px": 4000.0}));
+    t.frames(3);
+    let chip = t.app.finish.layout.chips.first().cloned().expect("a glyph on the narrow clip");
+    assert!(chip.rect[2] - chip.rect[0] <= 12.0, "{:?}", chip.rect);
+    assert!(t.app.finish.layout.takes.is_empty());
+    t.click(mid(chip.rect));
+    assert_eq!(t.app.ui.takes_open, vec![a], "the glyph opens the lanes");
+    assert_eq!(t.app.finish.layout.takes.len(), 2);
+}
+
+#[test]
+fn count_in_at_bar_one_says_it_was_skipped() {
+    let mut t = T::new();
+    t.app.ui.count_in = true;
+    t.app.set_cursor(0, None);
+    t.app.begin_pass(Vec::new());
+    assert_eq!(t.app.status, "Count-in skipped: no room before bar 1");
+    t.app.stop_play();
+    // With room before the cursor the count-in plays and nothing is said.
+    t.app.status.clear();
+    t.app.set_cursor(10 * 48_000, None);
+    t.app.engine.transport.playing = false;
+    t.app.begin_pass(Vec::new());
+    assert!(t.app.status.is_empty(), "{}", t.app.status);
+    assert_eq!(t.app.engine.transport.position, 10 * 48_000 - 96_000);
+}
+
+#[test]
+fn a_refused_rename_keeps_the_field_and_the_typed_text() {
+    let mut t = T::new();
+    let a = t.track(json!({"kind": "audio", "name": "Audio 1"}));
+    t.track(json!({"kind": "audio", "name": "Drums"}));
+    t.double(mid(t.row(a).name_rect));
+    t.typed("Drums");
+    t.key("Enter", json!({}));
+    assert_eq!(t.name(a), "Audio 1");
+    let r = t.app.finish.rename.as_ref().expect("the field stays open");
+    assert_eq!(r.text, "Drums", "with what was typed");
+    assert!(!t.app.status.is_empty());
+    // The user corrects it and Enter applies.
+    t.typed(" 2");
+    t.key("Enter", json!({}));
+    assert!(t.app.finish.rename.is_none(), "{}", t.app.status);
+    assert_eq!(t.name(a), "Drums 2");
+    // An empty name also keeps the field; Escape cancels.
+    t.double(mid(t.row(a).name_rect));
+    t.key("Backspace", json!({}));
+    t.key("Enter", json!({}));
+    assert!(t.app.finish.rename.is_some() && t.app.status.contains("can't be empty"));
+    t.key("Escape", json!({}));
+    assert!(t.app.finish.rename.is_none());
+    assert_eq!(t.name(a), "Drums 2");
+}
+
+#[test]
+fn only_a_double_click_on_the_name_renames() {
+    let mut t = T::new();
+    let a = t.track(json!({"kind": "audio", "name": "Audio 1"}));
+    let row = t.row(a);
+    // Below the name, still inside the header's name area.
+    let (x, y) = (row.name_rect[0] + 6.0, row.name_rect[3] + 8.0);
+    assert!(y < row.header[3], "{row:?}");
+    t.double(mid(row.name_rect));
+    assert!(t.app.finish.rename.is_some(), "on the name it does");
+    t.key("Escape", json!({}));
+    t.double((x, y));
+    assert!(t.app.finish.rename.is_none(), "a double-click off the name does not rename");
+    assert_eq!(t.app.focus_track(), Some(a), "it still selects the track");
 }
 
 impl T {
