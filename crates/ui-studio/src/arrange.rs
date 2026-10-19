@@ -354,7 +354,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     row.volume = r4(vol);
     let resp = ui.interact(vol.intersect(list), ui.id().with(("vol", t.id.0)), Sense::click_and_drag());
     p.rect_filled(vol, crate::theme::RADIUS_SM, TOKENS.bg);
-    let db = m.volume_db;
+    let db = app.followed(t, &crate::automation::Lane::Volume).unwrap_or(m.volume_db);
     let text = if db <= -144.0 { "-inf dB".to_string() } else { format!("{db:+.1} dB") };
     p.text(vol.center(), Align2::CENTER_CENTER, text, crate::theme::mono(ui.ctx(), 10.5), if resp.hovered() { TOKENS.accent } else { TOKENS.text });
     if resp.hovered() {

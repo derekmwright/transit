@@ -408,6 +408,22 @@ impl StudioApp {
         self.ui.auto_lanes.iter().filter(|v| v.track == t.id && Lane::parse(&v.lane).is_some_and(|l| l.valid(t))).cloned().collect()
     }
 
+    /// The value a mixer control shows while its track reads automation: the lane's value at the
+    /// playhead. `None` when the track does not read (Off, Write, Trim), the lane has no points,
+    /// or the user holds the control. It reads the same source as the lane readout and issues
+    /// no command.
+    pub fn followed(&self, t: &Track, lane: &Lane) -> Option<f32> {
+        use AutomationMode as M;
+        if !matches!(t.mixer.automation_mode, M::Read | M::Touch | M::Latch | M::TouchLatch) {
+            return None;
+        }
+        if self.mixer.gesture.is_some_and(|g| Lane::of_target(g.target) == (t.id, lane.clone())) {
+            return None;
+        }
+        lane.params(t).first().and_then(|p| t.lane(p)).filter(|l| !l.points.is_empty())?;
+        Some(lane.value_at(t, self.position()))
+    }
+
     /// The A toggle: show or hide a track's lanes (Volume the first time). View state only.
     pub fn toggle_automation(&mut self, t: TrackId) {
         if let Some(i) = self.ui.auto_shown.iter().position(|x| *x == t) {

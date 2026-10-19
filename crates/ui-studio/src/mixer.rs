@@ -530,6 +530,13 @@ impl StudioApp {
         }
     }
 
+    /// What a control shows: the automated value at the playhead under Read, else [`Self::value_of`].
+    pub fn shown_value(&self, t: Target) -> Option<f32> {
+        let (id, lane) = crate::automation::Lane::of_target(t);
+        let s = self.engine.session_arc();
+        s.track(id).and_then(|tr| self.followed(tr, &lane)).or_else(|| self.value_of(t))
+    }
+
     /// Set a control (dB, or balance for a knob) as part of a merged gesture: `key` is the
     /// gesture's merge key, by default the control's own drag key.
     pub fn set_value_merged(&mut self, t: Target, v: f32, key: Option<&str>) -> Result<Value, String> {
@@ -573,7 +580,7 @@ impl StudioApp {
     /// A wheel notch or several on a control: 0.1 dB each (Shift: 0.01; a knob 1 %, Shift 0.1 %).
     /// The nudges of one wheel gesture are one undo step.
     fn wheel_nudge(&mut self, t: Target, notches: f32, shift: bool, rect: Rect, now: f64) {
-        let Some(cur) = self.value_of(t) else { return };
+        let Some(cur) = self.shown_value(t) else { return };
         let step = match (t.is_pan(), shift) {
             (true, false) => fine::WHEEL_PAN,
             (true, true) => fine::WHEEL_PAN_FINE,
@@ -1111,6 +1118,13 @@ pub(crate) fn send_row(
 ) -> SendRow {
     let id = t.id;
     let salt = (id.0, slot, wide);
+    // Under Read automation the row shows the lanes' values at the playhead.
+    let mut shown = snd.clone();
+    if let Ok(i) = u8::try_from(slot) {
+        shown.level_db = app.followed(t, &crate::automation::Lane::SendLevel(i)).unwrap_or(snd.level_db);
+        shown.pan = app.followed(t, &crate::automation::Lane::SendPan(i)).unwrap_or(snd.pan);
+    }
+    let snd = &shown;
     let p = ui.painter().with_clip_rect(clip);
     let target = match &snd.target {
         Route::Bus(b) => bus_label(s, *b),
@@ -1477,6 +1491,9 @@ fn strip(
 ) -> StripLayout {
     let id = t.id;
     let m = &t.mixer;
+    // Under Read automation the controls show the lane's value at the playhead (no command, no edit).
+    let vol_db = app.followed(t, &crate::automation::Lane::Volume).unwrap_or(m.volume_db);
+    let bal = app.followed(t, &crate::automation::Lane::Pan).unwrap_or_else(|| balance_of(&m.pan));
     let p = ui.painter().with_clip_rect(clip);
     p.rect_filled(r, crate::theme::RADIUS, if focused { TOKENS.header_selected } else { TOKENS.panel });
     let mut sl = StripLayout {
@@ -1484,8 +1501,8 @@ fn strip(
         name: t.name.clone(),
         kind: Some(t.kind),
         rect: r4(r),
-        volume_db: m.volume_db,
-        balance: balance_of(&m.pan),
+        volume_db: vol_db,
+        balance: bal,
         pan: m.pan.clone(),
         level: app.meters.get(&id).map_or([0.0; 2], |d| d.level),
         fx: t.kind == TrackKind::Aux,
@@ -1576,7 +1593,7 @@ fn strip(
     // Balance knob.
     let knob = Rect::from_center_size(pos2(r.center().x, y + 18.0), vec2(34.0, 34.0));
     sl.knob = r4(knob);
-    let b = balance_of(&m.pan);
+    let b = bal;
     let has_pan = !m.pan.is_empty();
     let pan = Target::Pan(id);
     let resp = ui.interact(knob.intersect(clip), ui.id().with(("knob", id.0)), Sense::click_and_drag());
@@ -1686,8 +1703,8 @@ fn strip(
         let all = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
         app.reset_meters(if all { None } else { Some(id) });
     }
-    fader_widget(app, ui, &p, clip, id, m.volume_db, fader);
-    let db = m.volume_db;
+    fader_widget(app, ui, &p, clip, id, vol_db, fader);
+    let db = vol_db;
     let text = fine::db_text(db);
     let ro = Rect::from_min_max(pos2(x0, bottom), pos2(r.max.x - 4.0, r.max.y - 4.0));
     p.rect_filled(ro, crate::theme::RADIUS_SM, TOKENS.bg);
@@ -1884,7 +1901,7 @@ fn control(app: &mut StudioApp, ui: &Ui, resp: &egui::Response, t: Target, heigh
                 app.engine.end_merge();
             }
             app.mixer.wheel = None;
-            let raw = app.value_of(t).map_or(0.0, |v| if t.is_pan() { v } else { db_to_k(v) });
+            let raw = app.shown_value(t).map_or(0.0, |v| if t.is_pan() { v } else { db_to_k(v) });
             app.mixer.gesture = Some(MixGesture { target: t, raw, height });
         }
         if resp.dragged()

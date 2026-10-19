@@ -637,3 +637,68 @@ fn a_still_fader_writes_no_points_after_the_first() {
     assert!(!pts.is_empty(), "the first point is written");
     assert!(pts.len() <= 2, "a still fader adds nothing (first point and the hold's end): {}", pts.len());
 }
+
+// ---- Follow-ups: strips follow Read, multi-point drag, thinning ----
+
+fn strip_of(t: &T, a: TrackId) -> crate::mixer::StripLayout {
+    t.app.mixer.layout.strips.iter().find(|s| s.track == a.0).cloned().unwrap()
+}
+
+#[test]
+fn strip_controls_follow_read_automation_without_commands_or_dirt() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    t.app.ui.show_mixer = true;
+    set_point(&mut t, a, 0, -20.0);
+    set_point(&mut t, a, 100_000, 0.0);
+    t.app.run("automation.set_point", json!({"track": a.0, "param": "pan", "at": 0, "value": -1.0})).unwrap();
+    t.app.run("automation.set_point", json!({"track": a.0, "param": "pan", "at": 100_000, "value": 1.0})).unwrap();
+    t.frames(3);
+    // Saved baseline: the automation edits above are the document; what follows must not add to it.
+    let dir = Dir::new("follow");
+    t.app.run("session.save_as", json!({"path": dir.0.join("f.sc").to_string_lossy()})).ok();
+    let dirty = t.app.engine.is_dirty();
+    let undo = t.undo_len();
+    let static_db = t.app.engine.session().track(a).unwrap().mixer.volume_db;
+    t.app.set_cursor(50_000, Some(a));
+    t.frames(3);
+    let want = {
+        let s = t.app.engine.session_arc();
+        Lane::Volume.value_at(s.track(a).unwrap(), 50_000)
+    };
+    assert!((want - -10.0).abs() < 0.5, "halfway between -20 and 0 dB is near -10: {want}");
+    let strip = strip_of(&t, a);
+    assert!((strip.volume_db - want).abs() < 1e-3, "the strip shows the automated value: {} vs {want}", strip.volume_db);
+    assert_eq!(strip.volume_text, crate::fine::db_text(want));
+    assert!(strip.balance.abs() < 0.05, "pan halfway between hard left and right is center: {}", strip.balance);
+    assert_eq!(t.app.engine.session().track(a).unwrap().mixer.volume_db, static_db, "the document value is untouched");
+    assert_eq!(t.app.engine.is_dirty(), dirty, "following automation does not dirty the document");
+    assert_eq!(t.undo_len(), undo, "and adds no undo step");
+    // The strip and the lane readout agree.
+    assert!((t.lane(a, "volume").value - strip.volume_db).abs() < 1e-3);
+    // Moving the playhead moves the control.
+    t.app.set_cursor(0, Some(a));
+    t.frames(3);
+    assert!((strip_of(&t, a).volume_db - -20.0).abs() < 1e-3);
+    // Off: the strip shows the static value again.
+    t.app.run("mix.automation_mode", json!({"tracks": [a.0], "mode": "off"})).unwrap();
+    t.frames(3);
+    assert_eq!(strip_of(&t, a).volume_db, static_db);
+}
+
+#[test]
+fn grabbing_a_strip_fader_in_read_writes_the_static_value_from_where_it_shows() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    t.app.ui.show_mixer = true;
+    set_point(&mut t, a, 0, -20.0);
+    set_point(&mut t, a, 100_000, 0.0);
+    t.app.set_cursor(50_000, Some(a));
+    t.frames(3);
+    let f = strip_of(&t, a).fader;
+    let before = t.undo_len();
+    t.input("ui.drag", json!({"x": (f[0] + f[2]) / 2.0, "y": (f[1] + f[3]) / 2.0, "to_x": (f[0] + f[2]) / 2.0, "to_y": (f[1] + f[3]) / 2.0 - 10.0, "steps": 5}));
+    assert_eq!(t.undo_len(), before + 1, "one manual drag, one undo step");
+    assert_eq!(t.points(a, &AutoParam::Volume).len(), 2, "Read writes no automation points");
+    assert!(t.app.engine.session().track(a).unwrap().mixer.volume_db > -144.0);
+}
