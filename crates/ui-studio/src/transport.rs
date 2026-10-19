@@ -71,12 +71,8 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 readout(ui, &bars_beats(app, at), 128.0, TOKENS.text);
                 readout(ui, &min_sec(app, at), 92.0, TOKENS.text_dim);
                 ui.add_space(2.0 * crate::theme::SPACE);
-                let s = app.engine.session();
-                let tick = s.tempo.samples_to_ticks(at.max(0), s.sample_rate);
-                let bpm = s.tempo.tempo_at_tick(tick);
-                let m = s.tempo.meter_at_tick(tick);
-                readout(ui, &format!("{bpm:.2} BPM"), 92.0, TOKENS.text);
-                readout(ui, &format!("{}/{}", m.numerator, m.denominator), 40.0, TOKENS.text);
+                crate::tempo_edit::tempo_field(app, ui);
+                crate::tempo_edit::meter_field(app, ui);
                 ui.add_space(2.0 * crate::theme::SPACE);
                 main_meter(app, ui);
                 crate::telemetry::readout(app, ui);

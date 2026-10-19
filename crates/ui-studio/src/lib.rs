@@ -24,6 +24,7 @@ pub mod mixer;
 pub mod plugin_scan;
 pub mod shortcuts;
 pub mod telemetry;
+pub mod tempo_edit;
 pub mod theme;
 pub mod transport;
 pub mod waveform;
@@ -246,6 +247,7 @@ pub struct StudioApp {
     pub copied: Vec<(TrackId, Range)>,
     /// The mixer and device chain: gesture in progress, scroll, and last frame's layout.
     pub mixer: mixer::MixerState,
+    pub tempo_ui: tempo_edit::TempoUi,
     /// The piano roll (slice 3): open clip, selection, gesture, scroll, last frame's layout.
     pub keys: keys::KeysState,
     /// The browser (slice 4): listings, selection, drag, last frame's layout.
@@ -304,6 +306,7 @@ impl StudioApp {
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
             mixer: mixer::MixerState::default(),
+            tempo_ui: tempo_edit::TempoUi::default(),
             keys: keys::KeysState::default(),
             browser: browser::BrowserState::default(),
             imports: import::ImportQueue::default(),
@@ -563,7 +566,7 @@ impl StudioApp {
         self.apply_editor_edits();
         self.drive_editors();
         theme::probe_fonts(ctx);
-        let wheeling = self.drive_wheel(ctx, now);
+        let wheeling = self.drive_wheel(ctx, now) | self.drive_tempo_wheel(ctx, now);
         // A write pass (slice 7) holds its merge until Stop.
         if !wheeling && !automation::passing(self) && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.engine.end_merge();
@@ -668,6 +671,7 @@ impl StudioApp {
         theme::follow(&ctx);
         ui.set_style(ctx.global_style());
         finish::rename_keys(self, &ctx); // slice 6: a name being typed owns Escape and Enter
+        tempo_edit::keys(self, &ctx); // the tempo and meter fields own Escape and Enter
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
         automation::shortcuts(self, &ctx); // slice 7: selected points take Delete before clips
         groups::shortcuts(self, &ctx);
@@ -770,3 +774,6 @@ mod slice5_tests;
 mod slice6_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tempo_tests;
