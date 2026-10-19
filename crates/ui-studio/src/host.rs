@@ -448,8 +448,11 @@ impl StudioApp {
             p.set_recording(false);
         }
         let plan = self.take_plan.take();
-        let Some(r) = &mut self.recorder else { return };
-        let (takes, problem) = r.finish();
+        let finished = self.recorder.as_mut().map(soundcraft_playback::record::Recorder::finish);
+        // Tests substitute only the device's finished files; placement and stop ordering stay real.
+        #[cfg(test)]
+        let finished = finished.or_else(|| self.finished_test_takes.take());
+        let Some((takes, problem)) = finished else { return };
         let tracks = takes.len().max(1);
         let plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
@@ -553,8 +556,8 @@ impl StudioApp {
     }
 
     pub(crate) fn handle_transport(&mut self, dt: f32) {
-        let reqs: Vec<TransportRequest> = std::mem::take(&mut self.engine.transport_requests);
-        for r in reqs {
+        let mut reqs: std::collections::VecDeque<TransportRequest> = std::mem::take(&mut self.engine.transport_requests).into();
+        while let Some(r) = reqs.pop_front() {
             match r {
                 TransportRequest::ResetSession => {
                     if let Some(p) = &self.player {
@@ -586,7 +589,20 @@ impl StudioApp {
                         self.play_from_cursor();
                     }
                 }
-                TransportRequest::Stop | TransportRequest::Pause => self.stop_play(),
+                TransportRequest::Stop => {
+                    let was_stopped = !self.is_playing() && !self.engine.transport.recording;
+                    self.stop_play();
+                    if was_stopped {
+                        // First Stop keeps the play-start cursor and finishes the take. A second
+                        // Stop locates through the engine, without adding an undo step. Handle
+                        // that locate before any later queued Play/Record request.
+                        let _ = self.run("transport.rtz", json!({}));
+                        for request in std::mem::take(&mut self.engine.transport_requests).into_iter().rev() {
+                            reqs.push_front(request);
+                        }
+                    }
+                }
+                TransportRequest::Pause => self.stop_play(),
                 TransportRequest::TogglePlay => {
                     if self.is_playing() {
                         self.stop_play();

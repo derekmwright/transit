@@ -202,6 +202,9 @@ pub struct StudioApp {
     pub player: Option<Player>,
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
+    /// Synthetic recorder output for tests that must not open an input device.
+    #[cfg(test)]
+    finished_test_takes: Option<soundcraft_playback::record::Takes>,
     record_start: Samples,
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
@@ -274,6 +277,8 @@ impl StudioApp {
             engine,
             player,
             recorder: None,
+            #[cfg(test)]
+            finished_test_takes: None,
             record_start: 0,
             punch: None,
             recorder_failed: false,
@@ -826,5 +831,7 @@ mod tests;
 
 #[cfg(test)]
 mod tempo_tests;
+#[cfg(test)]
+mod transport_tests;
 #[cfg(test)]
 mod width_history_tests;

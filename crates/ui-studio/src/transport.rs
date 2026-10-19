@@ -1,5 +1,8 @@
 //! The transport bar: Return to Zero, Stop, Play, Record, Cycle; the position in bars|beats and
 //! min:sec; the tempo and meter; the main meter. Icons are Lucide SVGs ([`crate::icons`]).
+//!
+//! Stop returns to the existing cursor (normally the play-start position); Stop again while
+//! stopped, or a double-click, returns to zero. Space remains Play/Stop, without this second-stop action.
 
 use crate::StudioApp;
 use crate::icons::{self, Icon};
@@ -8,8 +11,8 @@ use egui::{Align2, Color32, Rect, Sense, Ui, pos2, vec2};
 use serde_json::json;
 use soundcraft_time::Samples;
 
-/// A square transport button; returns whether it was clicked.
-fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, on_color: Color32) -> bool {
+/// A square transport button, including its click count.
+fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, on_color: Color32) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(34.0, 28.0), Sense::click());
     let p = ui.painter();
     let bg = if on {
@@ -23,7 +26,8 @@ fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, o
     icons::paint_in(p, r, which, if on { on_color } else { TOKENS.text });
     app.arrange.layout.transport.insert(name.to_string(), [r.min.x, r.min.y, r.max.x, r.max.y]);
     app.arrange.layout.transport_icons.insert(name.to_string(), which.name().to_string());
-    resp.on_hover_text(name).clicked()
+    let tooltip = if name == "stop" { "Stop: back to start position; again: to the beginning" } else { name };
+    resp.on_hover_text(tooltip)
 }
 
 /// `1. 1. 1. 000` (bar, beat, sixteenth, tick within the sixteenth).
@@ -51,19 +55,25 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 let playing = app.is_playing();
                 let recording = app.engine.transport.recording;
                 let cycle = app.engine.session().edit.loop_playback;
-                if button(app, ui, "rtz", Icon::Rewind, false, TOKENS.accent) {
+                if button(app, ui, "rtz", Icon::Rewind, false, TOKENS.accent).clicked() {
                     let _ = app.run("transport.rtz", json!({}));
                 }
-                if button(app, ui, "stop", Icon::Stop, false, TOKENS.accent) {
+                let stop = button(app, ui, "stop", Icon::Stop, false, TOKENS.accent);
+                if stop.clicked() {
                     let _ = app.run("transport.stop", json!({}));
+                    // Also works when both clicks arrive in one frame: the first Stop finishes
+                    // any take before the second Stop requests Return to Zero.
+                    if stop.double_clicked() && (playing || recording) {
+                        let _ = app.run("transport.stop", json!({}));
+                    }
                 }
-                if button(app, ui, "play", Icon::Play, playing && !recording, TOKENS.accent) {
+                if button(app, ui, "play", Icon::Play, playing && !recording, TOKENS.accent).clicked() {
                     let _ = app.run("transport.play", json!({}));
                 }
-                if button(app, ui, "record", Icon::Record, recording, TOKENS.record) {
+                if button(app, ui, "record", Icon::Record, recording, TOKENS.record).clicked() {
                     let _ = app.run("transport.record", json!({}));
                 }
-                if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.accent) {
+                if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.accent).clicked() {
                     let _ = app.run("options.loop_playback", json!({"value": !cycle}));
                 }
                 ui.add_space(2.0 * crate::theme::SPACE);
