@@ -1296,3 +1296,82 @@ fn every_instance_is_released_exactly_once_across_pool_reuse_and_teardown() {
     assert_eq!(all, seen, "every instance ever made is released exactly once");
     assert_eq!(rig.drops(), seen.len());
 }
+
+/// A sampler track with a gain insert; the next plan removes the gain and changes the sample.
+fn sampler_with_gain() -> (Session, Session) {
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    let audio = |v: f32| Arc::new(SourceAudio::new(AudioBuffer { sample_rate: SR, channels: vec![vec![v; 4_800]] }));
+    s.pool.insert(SourceId(1), audio(0.5));
+    s.pool.insert(SourceId(2), audio(0.25));
+    let mut ins = builtin("sampler");
+    ins.sample = Some(SourceId(1));
+    s.track_mut(t).unwrap().instrument = Some(ins);
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    let mut s2 = s.clone();
+    s2.track_mut(t).unwrap().mixer.inserts[0] = None;
+    s2.track_mut(t).unwrap().instrument.as_mut().unwrap().sample = Some(SourceId(2));
+    (s, s2)
+}
+
+#[test]
+fn a_torn_reclaim_never_leaves_a_released_instance_active() {
+    let (s, s2) = sampler_with_gain();
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    let before = rig.comp.active_bindings();
+    assert_eq!(before.len(), 2, "the sampler and the gain");
+    let mut env = rig.compile(&s2);
+    assert!(env.plan.attach.iter().any(|a| matches!(a, Attach::Sample { .. })));
+    // The sampler refuses its new sample during the commit, after the tables swapped.
+    rig.log.panic_on_sample.store(true, Ordering::Relaxed);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.eng.adopt_plan(&mut env)));
+    rig.log.panic_on_sample.store(false, Ordering::Relaxed);
+    assert!(r.is_err());
+    assert!(env.torn(), "the envelope says torn");
+    assert!(!rig.comp.faulted(), "nothing known yet: the envelope has not come back");
+    rig.comp.reclaim(env);
+    assert!(rig.comp.faulted(), "the compiler knows the active plan is torn, not merely pending");
+    let released = rig.comp.take_released();
+    let active = rig.comp.active_bindings();
+    assert!(!released.is_empty(), "the gain, displaced into the envelope, is destroyed");
+    assert!(active.iter().all(|b| !released.contains(b)), "released {released:?} must not be active {active:?}");
+    // What is reported active is what the faulted engine still owns.
+    let retired = std::mem::replace(&mut rig.eng, MixEngine::realtime(target())).into_retired();
+    assert_eq!(sorted(retired.instances()), active);
+    drop(retired);
+    assert_eq!(rig.drops(), before.len(), "every instance dropped once, nothing leaked or doubled");
+}
+
+#[test]
+fn a_plain_pending_return_is_not_torn() {
+    let (s, s2) = sampler_with_gain();
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    let env = rig.compile(&s2);
+    assert!(!env.torn());
+    rig.comp.reclaim(env);
+    assert!(!rig.comp.faulted());
+    assert_eq!(rig.comp.active_bindings().len(), 2);
+}
+
+#[test]
+fn after_a_torn_reclaim_at_any_commit_step_the_active_bindings_are_what_the_engine_owns() {
+    for step in 1..=4 {
+        let (mut rig, _, mut env) = rig_with_pending();
+        let _ = rig.comp.take_released();
+        FAULT_AT.set(step);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.eng.adopt_plan(&mut env)));
+        FAULT_AT.set(0);
+        assert!(r.is_err() && env.torn(), "step {step}");
+        rig.comp.reclaim(env);
+        assert!(rig.comp.faulted());
+        let released = rig.comp.take_released();
+        let active = rig.comp.active_bindings();
+        assert!(active.iter().all(|b| !released.contains(b)), "step {step}: released {released:?} active {active:?}");
+        let retired = std::mem::replace(&mut rig.eng, MixEngine::realtime(target())).into_retired();
+        assert_eq!(sorted(retired.instances()), active, "step {step}");
+        drop(retired);
+        assert_eq!(rig.drops(), rig.log.made.load(Ordering::Relaxed), "step {step}: every instance dropped once");
+    }
+}

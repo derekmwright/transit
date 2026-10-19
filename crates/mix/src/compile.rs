@@ -182,6 +182,8 @@ pub struct PlanCompiler {
     hints: HashMap<TrackId, usize>,
     /// Teardown began ([`PlanCompiler::clear_pool`]): reclaimed instances are released, not pooled.
     closing: bool,
+    /// A torn envelope came back: the engine is faulted and the active plan is what it still owns.
+    faulted: Option<Vec<SlotBinding>>,
 }
 
 /// The planned content of one slot cell.
@@ -316,6 +318,7 @@ impl PlanCompiler {
             released: Vec::new(),
             hints: HashMap::new(),
             closing: false,
+            faulted: None,
         }
     }
 
@@ -331,10 +334,23 @@ impl PlanCompiler {
         self.pending.as_ref().map(|p| p.generation)
     }
 
-    /// Every instance of the confirmed active plan, sorted.
+    /// True once a torn envelope (its commit unwound, see [`PlanEnvelope::torn`]) was reclaimed:
+    /// the engine is faulted and must be torn down. Distinguishes that from a plan that simply
+    /// came back unserviced.
+    #[must_use]
+    pub fn faulted(&self) -> bool {
+        self.faulted.is_some()
+    }
+
+    /// Every instance of the confirmed active plan, sorted. After a torn reclaim
+    /// ([`PlanCompiler::faulted`]), exactly the instances the faulted engine still owns (what
+    /// [`MixEngine::into_retired`] will hand back): never one [`PlanCompiler::take_released`] reported.
     #[must_use]
     pub fn active_bindings(&self) -> Vec<SlotBinding> {
-        self.active.bindings()
+        match &self.faulted {
+            Some(live) => live.clone(),
+            None => self.active.bindings(),
+        }
     }
 
     /// Every instance of the plan in flight (the active ones for a Session-only plan), sorted;
@@ -907,7 +923,17 @@ impl PlanCompiler {
                     }
                 }
             },
-            Some(p) if p.generation == generation => {}
+            Some(p) if p.generation == generation => {
+                // Torn: the commit unwound part way. The faulted engine owns what the old and the
+                // new plan held, less what came back here (all of it is destroyed below).
+                let back = env.plan.tables.as_ref().map(PlanTables::bindings).unwrap_or_default();
+                let mut live = self.active.bindings();
+                live.extend(p.shadow.as_ref().map(Shadow::bindings).unwrap_or_default());
+                live.retain(|b| !back.contains(b));
+                live.sort_unstable();
+                live.dedup();
+                self.faulted = Some(live);
+            }
             other => self.pending = other,
         }
         // What is still in the envelope dies here: displaced, refused beyond the pool, or torn.
