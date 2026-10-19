@@ -1214,3 +1214,23 @@ fn a_pass_with_nothing_to_thin_is_still_labeled_as_a_pass() {
     assert_eq!(t.undo_len(), before + 1);
     assert_eq!(t.app.engine.undo_history().last().unwrap(), "Write Automation");
 }
+
+#[test]
+fn a_thin_that_is_its_own_push_at_the_cap_still_folds_into_the_pass() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    for i in 0..205 {
+        set_point(&mut t, a, 1_000_000 + i * 1_000, -6.0 - (i % 7) as f32);
+    }
+    t.key("Space");
+    touch_drag(&mut t, a, 100.0, 12);
+    // The merge key is lost without a document change (nothing else ran): the thin cannot continue the pass.
+    t.app.engine.end_merge();
+    t.key("Space");
+    t.frames(3);
+    let h = t.app.engine.undo_history();
+    assert_eq!(h.last().unwrap(), "Write Automation", "{:?}", &h[h.len() - 3..]);
+    assert_ne!(h[h.len() - 2], "Thin");
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume).len(), 205, "one Undo removes the pass");
+}
