@@ -907,6 +907,63 @@ impl IAudioProcessorTrait for Synth {
             return kResultOk;
         }
         let frames = d.numSamples.max(0) as usize;
+        if self.events {
+            // Allocation-free, so hosts can measure their own audio path around it.
+            let bus = unsafe { &*d.outputs };
+            let n = bus.numChannels.max(0) as usize;
+            let table = unsafe { std::slice::from_raw_parts(bus.__field0.channelBuffers32, n) };
+            let Some(&first) = table.first() else { return kResultOk };
+            let out = unsafe { std::slice::from_raw_parts_mut(first, frames) };
+            out.fill(0.0);
+            let mut w = 0;
+            let mut put = |r: [f32; 4]| {
+                for x in r {
+                    if let Some(o) = out.get_mut(w) {
+                        *o = x;
+                    }
+                    w += 1;
+                }
+            };
+            if let Some(list) = unsafe { ComRef::from_raw(d.inputEvents) } {
+                for i in 0..unsafe { list.getEventCount() } {
+                    let mut e: Event = unsafe { std::mem::zeroed() };
+                    if unsafe { list.getEvent(i, &mut e) } != kResultOk {
+                        continue;
+                    }
+                    let ty = e.r#type;
+                    let (code, ch, pitch, id) = if ty == Event_::EventTypes_::kNoteOnEvent as u16 {
+                        let n = unsafe { e.__field0.noteOn };
+                        (1.0, n.channel, n.pitch, n.noteId)
+                    } else if ty == Event_::EventTypes_::kNoteOffEvent as u16 {
+                        let n = unsafe { e.__field0.noteOff };
+                        (2.0, n.channel, n.pitch, n.noteId)
+                    } else if ty == Event_::EventTypes_::kPolyPressureEvent as u16 {
+                        let n = unsafe { e.__field0.polyPressure };
+                        (3.0, n.channel, n.pitch, n.noteId)
+                    } else {
+                        continue;
+                    };
+                    put([code, e.sampleOffset as f32, f32::from(ch) * 1000.0 + f32::from(pitch), id as f32]);
+                }
+            }
+            if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
+                for i in 0..unsafe { changes.getParameterCount() } {
+                    let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
+                    let pid = unsafe { q.getParameterId() };
+                    for k in 0..unsafe { q.getPointCount() } {
+                        let (mut at, mut v) = (0i32, 0f64);
+                        if unsafe { q.getPoint(k, &mut at, &mut v) } == kResultOk {
+                            put([4.0, at as f32, pid as f32, (v * 1e6).round() as f32]);
+                        }
+                    }
+                }
+            }
+            for &p in table.iter().skip(1) {
+                let o = unsafe { std::slice::from_raw_parts_mut(p, frames) };
+                o.copy_from_slice(unsafe { std::slice::from_raw_parts(first, frames) });
+            }
+            return kResultOk;
+        }
         let mut events = Vec::new();
         if let Some(list) = unsafe { ComRef::from_raw(d.inputEvents) } {
             for i in 0..unsafe { list.getEventCount() } {
@@ -927,44 +984,6 @@ impl IAudioProcessorTrait for Synth {
             }
         }
         let outs = unsafe { channels(&*d.outputs, frames) };
-        if self.events {
-            let mut rec: Vec<f32> = Vec::new();
-            for e in &events {
-                let ty = e.r#type;
-                let (code, ch, pitch, id) = if ty == Event_::EventTypes_::kNoteOnEvent as u16 {
-                    let n = unsafe { e.__field0.noteOn };
-                    (1.0, n.channel, n.pitch, n.noteId)
-                } else if ty == Event_::EventTypes_::kNoteOffEvent as u16 {
-                    let n = unsafe { e.__field0.noteOff };
-                    (2.0, n.channel, n.pitch, n.noteId)
-                } else if ty == Event_::EventTypes_::kPolyPressureEvent as u16 {
-                    let n = unsafe { e.__field0.polyPressure };
-                    (3.0, n.channel, n.pitch, n.noteId)
-                } else {
-                    continue;
-                };
-                rec.extend([code, e.sampleOffset as f32, f32::from(ch) * 1000.0 + f32::from(pitch), id as f32]);
-            }
-            if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
-                for i in 0..unsafe { changes.getParameterCount() } {
-                    let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
-                    let pid = unsafe { q.getParameterId() };
-                    for k in 0..unsafe { q.getPointCount() } {
-                        let (mut at, mut v) = (0i32, 0f64);
-                        if unsafe { q.getPoint(k, &mut at, &mut v) } == kResultOk {
-                            rec.extend([4.0, at as f32, pid as f32, (v * 1e6).round() as f32]);
-                        }
-                    }
-                }
-            }
-            for ch in outs {
-                ch.fill(0.0);
-                for (o, r) in ch.iter_mut().zip(&rec) {
-                    *o = *r;
-                }
-            }
-            return kResultOk;
-        }
         let mut level = f32::from_bits(self.level.load(Ordering::Relaxed));
         let mut out = vec![0.0f32; frames];
         for (i, o) in out.iter_mut().enumerate() {

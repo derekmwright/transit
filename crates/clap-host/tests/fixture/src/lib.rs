@@ -422,7 +422,10 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         note(f, "request_restart");
     }
     if f.events {
-        let mut rec: Vec<f32> = Vec::new();
+        // Allocation-free, so hosts can measure their own audio path around it.
+        let first = unsafe { std::slice::from_raw_parts_mut(*out.data32, n) };
+        first.fill(0.0);
+        let mut w = 0;
         let mut last_time = 0u32;
         for k in 0..count {
             let h = unsafe { &*(ev.get.unwrap())(pr.in_events, k) };
@@ -452,14 +455,16 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
                 }
                 _ => continue,
             };
-            rec.extend([code, h.time as f32, a, b]);
-        }
-        for c in 0..out.channel_count as usize {
-            let o = unsafe { std::slice::from_raw_parts_mut(*out.data32.add(c), n) };
-            o.fill(0.0);
-            for (d, r) in o.iter_mut().zip(&rec) {
-                *d = *r;
+            for x in [code, h.time as f32, a, b] {
+                if let Some(o) = first.get_mut(w) {
+                    *o = x;
+                }
+                w += 1;
             }
+        }
+        for c in 1..out.channel_count as usize {
+            let o = unsafe { std::slice::from_raw_parts_mut(*out.data32.add(c), n) };
+            o.copy_from_slice(first);
         }
         return CLAP_PROCESS_CONTINUE;
     }
