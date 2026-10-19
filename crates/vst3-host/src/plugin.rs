@@ -1,10 +1,46 @@
 //! `Vst3Plugin`: a loaded VST3 instance behind the safe `soundcraft_dsp::Plugin` trait.
+//!
+//! # `restartComponent` (audit F08, ADR 0012 G7)
+//!
+//! The edit controller calls `IComponentHandler::restartComponent` on the UI thread; the host
+//! records the flags ([`HostContext`]) and services them on the instance's main thread in
+//! [`Shared::service`], called by [`crate::service_requests`] (every instance) and by each editor
+//! handle's `idle`. Nothing below runs on the audio thread:
+//!
+//! - `kMidiCCAssignmentChanged` ("the host has to rebuild the MIDI-CC => parameter mapping"):
+//!   `getMidiControllerAssignment` again, and the table is published to the audio side as one
+//!   unit ([`MidiMap`], a sequence lock). The audio side checks the table's generation before it
+//!   routes each controller, so the first controller after the publication uses the new table.
+//!   A learn during a state load (`Plugin::load_state`, which owns the instance on this thread)
+//!   is re-read before `load_state` returns.
+//! - `kLatencyChanged` ("the host has to deactivate and activate the plug-in, then afterwards
+//!   ... ask for the current latency") and `kIoChanged` ("deactivate ..., ask for its wanted new
+//!   bus configurations ... and reactivate"): `setProcessing(false)`, `setActive(false)`, bus
+//!   negotiation, `setupProcessing`, `setActive(true)` and `getLatencySamples`, all on the main
+//!   thread (VST3 allows `setProcessing` on either thread), while holding the instance so the audio
+//!   side skips its blocks meanwhile; the values the host set are sent again, as after
+//!   `prepare`. The latency reaches delay compensation through [`Plugin::latency`].
+//! - `kParamValuesChanged` ("the host invalidates all caches of parameter values and asks the
+//!   edit controller for the current values"): `getParamNormalized` for every parameter, 64 per
+//!   call; the values that differ from the last ones read are reported like editor edits (the
+//!   path a GUI edit takes into the session). A state load re-reads the values itself and
+//!   reports nothing (that is the host's own change).
+//! - `kParamTitlesChanged`: the conversion curves are invalidated (the editor handle re-samples
+//!   them). Titles, ranges and step counts in `PluginInfo` stay as read at load (`'static`).
+//! - `kReloadComponent` ("the host has to unload completely the component ... and reload it"):
+//!   not supported here (the instance would have to be created again by its owner); logged as a
+//!   warning and counted in [`Serviced::unsupported`]. Other flags need nothing from this host.
+//!
+//! The audio side only `try_lock`s the instance and the main thread only `try_lock`s it while it
+//! may be processing, so neither ever waits for the other; a busy instance is serviced by a later
+//! call. Servicing happens only on the thread that created the instance.
 
 use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
 use crate::params::{ParamCurves, PendingParams};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
+use std::thread::ThreadId;
 use std::time::Duration;
 use vst3::ComWrapper;
 
@@ -18,6 +54,13 @@ const SYNCED: u64 = u64::MAX;
 /// one when any is due).
 const CURVE_BUDGET_TABLES: usize = 64;
 const CURVE_BUDGET_TIME: Duration = Duration::from_millis(2);
+/// Entries of the MIDI controller table: CCs 0–127, aftertouch and pitch bend.
+const MAP_LEN: usize = PITCH_BEND + 1;
+/// VST3's `kNoParamId`: no parameter.
+const NO_PARAM: u32 = u32::MAX;
+/// Parameter values one service call re-reads for `kParamValuesChanged`: it holds the instance
+/// (the audio side skips a block it would start meanwhile), so the hold stays short.
+const VALUES_CHUNK: usize = 64;
 
 /// How a SoundCraft parameter value maps to the VST3 normalized value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,10 +81,276 @@ fn status_from_tail(tail: u32) -> ProcessStatus {
     if tail == u32::MAX { ProcessStatus::Continue } else { ProcessStatus::Tail }
 }
 
+/// What one [`crate::service_requests`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Serviced {
+    /// Instances deactivated and reactivated (`kLatencyChanged`, `kIoChanged`).
+    pub restarted: usize,
+    /// Reactivations waiting because the instance was busy on the audio thread.
+    pub restarts_waiting: usize,
+    /// `IMidiMapping` tables re-read and published (`kMidiCCAssignmentChanged`).
+    pub midi_maps: usize,
+    /// Parameter value re-reads finished (`kParamValuesChanged`).
+    pub value_rescans: usize,
+    /// Requests this host cannot honor (`kReloadComponent`), logged.
+    pub unsupported: usize,
+    /// Instances skipped because this is not the thread that created them.
+    pub other_thread: usize,
+}
+
+/// The MIDI controller → parameter table, written on the main thread and read on the audio
+/// thread as one unit: a sequence lock over atomics (odd sequence: a write is in progress).
+struct MidiMap {
+    seq: AtomicU64,
+    ids: [AtomicU32; MAP_LEN],
+}
+
+impl MidiMap {
+    fn new() -> MidiMap {
+        MidiMap { seq: AtomicU64::new(0), ids: std::array::from_fn(|_| AtomicU32::new(NO_PARAM)) }
+    }
+
+    /// Publishes a table (main thread only: one writer). Missing entries are unmapped.
+    fn publish(&self, map: &[Option<u32>]) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (i, slot) in self.ids.iter().enumerate() {
+            slot.store(map.get(i).copied().flatten().unwrap_or(NO_PARAM), Ordering::Relaxed);
+        }
+        self.seq.store(s.wrapping_add(2), Ordering::Release);
+    }
+
+    fn generation(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// Copies the table into `out` (no allocation). The generation read, or `None` when a write
+    /// was in progress (`out` is then partly overwritten: the caller keeps its other copy).
+    fn read(&self, out: &mut [Option<u32>; MAP_LEN]) -> Option<u64> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 & 1 == 1 {
+            return None;
+        }
+        for (o, slot) in out.iter_mut().zip(&self.ids) {
+            let v = slot.load(Ordering::Relaxed);
+            *o = (v != NO_PARAM).then_some(v);
+        }
+        fence(Ordering::Acquire);
+        (self.seq.load(Ordering::Relaxed) == s1).then_some(s1)
+    }
+}
+
+/// What the activation decides: the bus buffers, sized on the main thread.
+struct Core {
+    inst: Instance,
+    inputs: BusBuffers,
+    outputs: BusBuffers,
+    has_input: bool,
+    has_output: bool,
+    /// The block size it is set up for, and 0 while it is not (failed or never prepared).
+    max_block: usize,
+    /// What `prepare` asked for, to set it up again the same way.
+    block: usize,
+    sample_rate: f64,
+    mono: bool,
+}
+
+/// A `kParamValuesChanged` re-read (main thread only): the last values read and the next one.
+struct Values {
+    /// Normalized, per parameter (same order as `ids`; NaN: never read).
+    known: Vec<f64>,
+    next: usize,
+    active: bool,
+}
+
+/// The part of an instance both its owner (the audio thread, once in the engine) and the main
+/// thread reach (see the module docs).
+pub(crate) struct Shared {
+    core: Mutex<Core>,
+    latency: AtomicUsize,
+    tail: AtomicUsize,
+    event_input: AtomicBool,
+    /// Bumped by every (re)activation: the audio side then sends the values the host set again.
+    activation: AtomicU64,
+    map: MidiMap,
+    /// The thread that created the instance: its main (UI) thread.
+    main: ThreadId,
+    host: ComWrapper<HostContext>,
+    curves: Arc<ParamCurves>,
+    info: &'static PluginInfo,
+    ids: Vec<u32>,
+    values: Mutex<Values>,
+}
+
+fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// For callers that own the plugin (`&mut Vst3Plugin`) or main-thread-only state: nobody else
+/// can be holding it then.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every instance alive, for [`crate::service_requests`]. Weak: the list never keeps a plugin.
+fn live() -> &'static Mutex<Vec<Weak<Shared>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<Shared>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Services the `restartComponent` requests of every live instance created on this thread.
+pub(crate) fn service_requests() -> Serviced {
+    let mut out = Serviced::default();
+    let all: Vec<Arc<Shared>> = {
+        let mut l = lock(live());
+        l.retain(|w| w.strong_count() > 0);
+        l.iter().filter_map(Weak::upgrade).collect()
+    };
+    // The list lock is released before calling into plug-ins. An instance whose owner dropped it
+    // meanwhile goes here, on the main thread.
+    for s in all {
+        s.service(&mut out);
+    }
+    out
+}
+
+impl Shared {
+    /// (Re)activates on the main thread at the size `prepare` asked for, then publishes what the
+    /// audio side reads: latency, tail, event input, the MIDI table and a new activation.
+    fn activate(&self, core: &mut Core) {
+        // Cleared first: a request made while it reactivates asks again.
+        self.host.io_changed.store(false, Ordering::Relaxed);
+        self.host.midi_cc_changed.store(false, Ordering::Relaxed);
+        core.max_block = 0;
+        match core.inst.configure(core.sample_rate, core.block, core.mono) {
+            Ok(layout) => {
+                core.inputs = BusBuffers::new(&layout.inputs, core.block);
+                core.outputs = BusBuffers::new(&layout.outputs, core.block);
+                core.has_input = layout.inputs.first().is_some_and(|&c| c > 0);
+                core.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
+                core.max_block = core.block;
+                self.event_input.store(layout.event_input, Ordering::Relaxed);
+                // VST3: getLatencySamples returns the new latency after setActive(true).
+                self.latency.store(core.inst.latency() as usize, Ordering::Release);
+                self.tail.store(core.inst.tail() as usize, Ordering::Relaxed);
+                self.map.publish(&core.inst.midi_mapping());
+            }
+            Err(e) => {
+                log::warn!("{}: {e}", self.info.id);
+                self.latency.store(0, Ordering::Release);
+            }
+        }
+        self.activation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Main-thread service of this instance's `restartComponent` flags (see the module docs).
+    pub(crate) fn service(&self, out: &mut Serviced) {
+        if std::thread::current().id() != self.main {
+            out.other_thread += 1;
+            return;
+        }
+        let h = &self.host;
+        h.restart_requested.store(false, Ordering::Relaxed);
+        if h.titles_changed.swap(false, Ordering::Relaxed) {
+            self.curves.invalidate();
+        }
+        if h.reload_requested.swap(false, Ordering::Relaxed) {
+            log::warn!(
+                "{}: the plug-in asked to be reloaded (kReloadComponent); not supported, remove and re-add it (or reopen the session)",
+                self.info.id
+            );
+            out.unsupported += 1;
+        }
+        let other = h.other_flags.swap(0, Ordering::Relaxed);
+        if other != 0 {
+            log::debug!("{}: restartComponent flags {other:#x} need nothing from this host", self.info.id);
+        }
+        if h.midi_cc_changed.load(Ordering::Acquire)
+            && let Some(core) = try_lock(&self.core)
+        {
+            h.midi_cc_changed.store(false, Ordering::Relaxed);
+            let map = core.inst.midi_mapping();
+            drop(core);
+            self.map.publish(&map);
+            out.midi_maps += 1;
+        }
+        if self.rescan_values() {
+            out.value_rescans += 1;
+        }
+        if h.latency_changed.load(Ordering::Acquire) || h.io_changed.load(Ordering::Acquire) {
+            match try_lock(&self.core) {
+                Some(mut core) => {
+                    self.activate(&mut core);
+                    out.restarted += 1;
+                }
+                None => out.restarts_waiting += 1,
+            }
+        }
+    }
+
+    /// `kParamValuesChanged`. True when a re-read finished in this call; a busy instance is
+    /// retried by the next call.
+    fn rescan_values(&self) -> bool {
+        let mut st = lock(&self.values);
+        if !st.active {
+            if !self.host.values_changed.swap(false, Ordering::Acquire) {
+                return false;
+            }
+            st.active = true;
+            st.next = 0;
+        }
+        let Some(core) = try_lock(&self.core) else { return false };
+        let start = st.next.min(self.ids.len());
+        let end = (start + VALUES_CHUNK).min(self.ids.len());
+        let read: Vec<(usize, f64)> = (start..end).filter_map(|i| core.inst.normalized_value(*self.ids.get(i)?).map(|v| (i, v))).collect();
+        drop(core);
+        let mut changed = Vec::new();
+        for (i, v) in read {
+            if let (Some(k), Some(&id)) = (st.known.get_mut(i), self.ids.get(i))
+                && k.to_bits() != v.to_bits()
+            {
+                *k = v;
+                changed.push((id, v));
+            }
+        }
+        if !changed.is_empty() {
+            // The values go where GUI edits go (the editor handle reports them to the session).
+            let mut edits = lock(&self.host.edits);
+            for (id, v) in changed {
+                if let Some(e) = edits.iter_mut().find(|(i, _)| *i == id) {
+                    e.1 = v;
+                } else if edits.len() < edits.capacity() {
+                    edits.push((id, v));
+                }
+            }
+        }
+        st.next = end;
+        if end < self.ids.len() {
+            return false;
+        }
+        st.active = false;
+        true
+    }
+
+    /// The controller's values become the known ones (after a load the host made itself).
+    fn remember_values(&self, inst: &Instance) {
+        let mut st = lock(&self.values);
+        for (k, &id) in st.known.iter_mut().zip(&self.ids) {
+            *k = inst.normalized_value(id).unwrap_or(f64::NAN);
+        }
+        st.active = false;
+    }
+}
+
 /// A hosted VST3 plugin. Parameter ids are VST3 `ParamID`s as decimal strings ("0", "17", …);
 /// values are plain (display) values with their names and ranges in `info().params`.
 pub struct Vst3Plugin {
-    inst: Instance,
+    shared: Arc<Shared>,
     info: &'static PluginInfo,
     /// VST3 id of each `info.params` entry (same order).
     ids: Vec<u32>,
@@ -66,20 +375,20 @@ pub struct Vst3Plugin {
     unsynced: Arc<[AtomicU64]>,
     /// Pending notes, kept sorted by time. Never grows past `EVENT_CAP`.
     notes: Vec<NoteEvent>,
-    /// The parameter each MIDI controller drives (see `Instance::midi_mapping`).
-    midi_map: Vec<Option<u32>>,
+    /// The parameter each MIDI controller drives (a copy of [`Shared::map`], see
+    /// `Instance::midi_mapping`), and a second table to copy into.
+    midi_map: [Option<u32>; MAP_LEN],
+    map_scratch: [Option<u32>; MAP_LEN],
+    /// The [`MidiMap`] generation `midi_map` holds.
+    map_seen: u64,
+    /// The [`Shared::activation`] whose values were last re-sent.
+    activation_seen: u64,
     /// Controller points for the next block: (time, param id, normalized value). Bounded.
     controls: Vec<(u32, u32, f64)>,
-    inputs: BusBuffers,
-    outputs: BusBuffers,
-    has_input: bool,
-    has_output: bool,
-    event_input: bool,
     held: [bool; 128],
     channels: usize,
-    max_block: usize,
-    latency: usize,
-    tail: usize,
+    /// Every audio input of the next block is silent (VST3 silence flags).
+    silent: bool,
     position: i64,
     transport: Option<Transport>,
 }
@@ -113,6 +422,33 @@ impl Vst3Plugin {
         // thousands of parameters): the editor handle's idle samples them lazily and on demand.
         let plain: Vec<bool> = maps.iter().map(|m| *m == Mapping::Plain).collect();
         let curves = Arc::new(ParamCurves::new(&ids, &plain));
+        let known: Vec<f64> = ids.iter().map(|&id| inst.normalized_value(id).unwrap_or(f64::NAN)).collect();
+        let host = inst.host_ref();
+        let shared = Arc::new(Shared {
+            core: Mutex::new(Core {
+                inst,
+                inputs: BusBuffers::new(&[], 0),
+                outputs: BusBuffers::new(&[], 0),
+                has_input: false,
+                has_output: false,
+                max_block: 0,
+                block: 0,
+                sample_rate: 48_000.0,
+                mono: false,
+            }),
+            latency: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            event_input: AtomicBool::new(false),
+            activation: AtomicU64::new(0),
+            map: MidiMap::new(),
+            main: std::thread::current().id(),
+            host,
+            curves: Arc::clone(&curves),
+            info,
+            ids: ids.clone(),
+            values: Mutex::new(Values { known, next: 0, active: false }),
+        });
+        lock(live()).push(Arc::downgrade(&shared));
         let mut p = Vst3Plugin {
             info,
             values: Vec::with_capacity(ids.len()),
@@ -123,30 +459,29 @@ impl Vst3Plugin {
             batch: Vec::with_capacity(PARAM_QUEUE_CAP),
             unsynced: ids.iter().map(|_| AtomicU64::new(SYNCED)).collect(),
             notes: Vec::with_capacity(EVENT_CAP),
-            midi_map: Vec::new(),
+            midi_map: [None; MAP_LEN],
+            map_scratch: [None; MAP_LEN],
+            map_seen: u64::MAX,
+            activation_seen: 0,
             controls: Vec::with_capacity(EVENT_CAP),
-            inputs: BusBuffers::new(&[], 0),
-            outputs: BusBuffers::new(&[], 0),
-            has_input: false,
-            has_output: false,
-            event_input: false,
             held: [false; 128],
             channels: 2,
-            max_block: 0,
-            latency: 0,
-            tail: 0,
+            silent: false,
             position: 0,
             transport: None,
             ids,
             maps,
-            inst,
+            shared,
         };
+        let shared = Arc::clone(&p.shared);
+        let core = lock(&shared.core);
         let values: Vec<f32> = (0..p.ids.len())
             .map(|i| {
                 let (Some(pi), Some(&id)) = (p.info.params.get(i), p.ids.get(i)) else { return 0.0 };
-                p.inst.normalized_value(id).and_then(|n| p.plain_via_controller(i, n)).map_or(pi.default, |v| pi.clamp(v))
+                core.inst.normalized_value(id).and_then(|n| p.plain_via_controller(&core.inst, i, n)).map_or(pi.default, |v| pi.clamp(v))
             })
             .collect();
+        drop(core);
         p.values = values;
         p
     }
@@ -154,11 +489,11 @@ impl Vst3Plugin {
     /// Normalized → plain through the controller (UI thread only: creation and state loads; the
     /// audio thread never converts this way, it only needs plain → normalized),
     /// so a value read from the plug-in is exact before its curve is sampled.
-    fn plain_via_controller(&self, i: usize, n: f64) -> Option<f32> {
+    fn plain_via_controller(&self, inst: &Instance, i: usize, n: f64) -> Option<f32> {
         let pi = self.info.params.get(i)?;
         let v = match self.maps.get(i)? {
             Mapping::Stepped(steps) => (n * steps).round(),
-            Mapping::Plain => self.inst.to_plain(*self.ids.get(i)?, n).unwrap_or(f64::from(pi.min) + n * f64::from(pi.max - pi.min)),
+            Mapping::Plain => inst.to_plain(*self.ids.get(i)?, n).unwrap_or(f64::from(pi.min) + n * f64::from(pi.max - pi.min)),
             Mapping::Linear => f64::from(pi.min) + n * f64::from(pi.max - pi.min),
         };
         v.is_finite().then_some(v as f32)
@@ -183,7 +518,8 @@ impl Vst3Plugin {
     /// thread that is rendering this instance. Not real-time. Hosts that render offline get it for
     /// free on every instance created inside an [`crate::offline_scope`].
     pub fn sample_all_curves_now(&self) {
-        self.curves.step(usize::MAX, Duration::MAX, |id, n| self.inst.to_plain(id, n));
+        let core = lock(&self.shared.core);
+        self.curves.step(usize::MAX, Duration::MAX, |id, n| core.inst.to_plain(id, n));
     }
 
     /// Plain → normalized without calling the controller (safe on the audio thread).
@@ -215,18 +551,29 @@ impl Vst3Plugin {
         self.pending.set(i, n);
     }
 
+    /// Queues every value the host set again (after a (re)activation).
+    fn resend_host_set(&mut self) {
+        for i in 0..self.ids.len() {
+            if self.host_set.get(i).copied().unwrap_or(false) {
+                self.queue(i);
+            }
+        }
+    }
+
     /// The editor's size in pixels without opening it (creates and releases a view). For
     /// diagnostics and tests; real plugins expect this on the main thread.
     pub fn editor_size(&self) -> Result<(u32, u32), String> {
-        self.inst.editor().ok_or_else(|| "this plugin has no edit controller".to_string())?.probe()
+        let link = lock(&self.shared.core).inst.editor();
+        link.ok_or_else(|| "this plugin has no edit controller".to_string())?.probe()
     }
 
     /// Re-reads every parameter value from the controller (after a state load) and drops
     /// changes still queued from before it.
-    fn refresh_values(&mut self) {
+    fn refresh_values(&mut self, inst: &Instance) {
         for i in 0..self.ids.len() {
             let (Some(pi), Some(&id)) = (self.info.params.get(i), self.ids.get(i)) else { continue };
-            if let Some(v) = self.inst.normalized_value(id).and_then(|n| self.plain_via_controller(i, n))
+            let v = inst.normalized_value(id).and_then(|n| self.plain_via_controller(inst, i, n));
+            if let Some(v) = v
                 && let Some(slot) = self.values.get_mut(i)
             {
                 *slot = pi.clamp(v);
@@ -237,6 +584,16 @@ impl Vst3Plugin {
             u.store(SYNCED, Ordering::Relaxed);
         }
         self.host_set.fill(false);
+    }
+
+    /// Takes a newer MIDI table from the main thread, if one is published (no allocation).
+    fn refresh_midi_map(&mut self) {
+        if self.shared.map.generation() != self.map_seen
+            && let Some(generation) = self.shared.map.read(&mut self.map_scratch)
+        {
+            std::mem::swap(&mut self.midi_map, &mut self.map_scratch);
+            self.map_seen = generation;
+        }
     }
 
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
@@ -259,24 +616,14 @@ impl Plugin for Vst3Plugin {
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
         let mb = max_block.clamp(1, MAX_BLOCK);
         self.channels = channels.clamp(1, MAX_CHANNELS);
-        self.max_block = 0;
-        match self.inst.configure(sr, mb, self.channels == 1) {
-            Ok(layout) => {
-                self.inputs = BusBuffers::new(&layout.inputs, mb);
-                self.outputs = BusBuffers::new(&layout.outputs, mb);
-                self.has_input = layout.inputs.first().is_some_and(|&c| c > 0);
-                self.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
-                self.event_input = layout.event_input;
-                self.max_block = mb;
-                self.latency = self.inst.latency() as usize;
-                self.tail = self.inst.tail() as usize;
-                self.midi_map = self.inst.midi_mapping();
-            }
-            Err(e) => {
-                log::warn!("{}: {e}", self.info.id);
-                self.latency = 0;
-            }
-        }
+        let shared = Arc::clone(&self.shared);
+        let mut core = lock(&shared.core);
+        core.sample_rate = sr;
+        core.block = mb;
+        core.mono = self.channels == 1;
+        shared.activate(&mut core);
+        drop(core);
+        self.activation_seen = shared.activation.load(Ordering::Acquire);
         // Re-send the values the host set, so a re-activated plugin matches the session. Values only
         // read from the plugin are left alone: some plugins report 0 for everything until they load
         // their own preset (Rhapsody), and sending those readings back set its volume and pan to
@@ -314,7 +661,24 @@ impl Plugin for Vst3Plugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        if !self.inst.is_active() || self.max_block == 0 {
+        // The main thread reactivated it (`kLatencyChanged`, `kIoChanged`): send the values the
+        // host set again, as after `prepare`.
+        let activation = self.shared.activation.load(Ordering::Acquire);
+        if activation != self.activation_seen {
+            self.activation_seen = activation;
+            self.resend_host_set();
+        }
+        // The UI thread re-sampled the curves: the host's plain values may now map elsewhere.
+        let generation = self.curves.generation();
+        if generation != self.curves_seen {
+            self.curves_seen = generation;
+            self.resend_host_set();
+        }
+        let shared: &Shared = &self.shared;
+        // Held by the main thread only while it services the instance: skip the block.
+        let Some(mut guard) = try_lock(&shared.core) else { return };
+        let core = &mut *guard;
+        if !core.inst.is_active() || core.max_block == 0 {
             return;
         }
         let ch = self.channels.min(io.len());
@@ -322,19 +686,7 @@ impl Plugin for Vst3Plugin {
         if frames == 0 || ch == 0 {
             return;
         }
-        if self.inst.host().latency_changed.swap(false, Ordering::Relaxed) {
-            self.latency = self.inst.latency() as usize;
-        }
-        // The UI thread re-sampled the curves: the host's plain values may now map elsewhere.
-        let generation = self.curves.generation();
-        if generation != self.curves_seen {
-            self.curves_seen = generation;
-            for i in 0..self.ids.len() {
-                if self.host_set.get(i).copied().unwrap_or(false) {
-                    self.queue(i);
-                }
-            }
-        }
+        core.inputs.set_silent(self.silent);
         let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
         for e in &mut self.notes {
             if e.time() > last {
@@ -346,13 +698,13 @@ impl Plugin for Vst3Plugin {
         }
         let mut start = 0usize;
         while start < frames {
-            let n = (frames - start).min(self.max_block);
+            let n = (frames - start).min(core.max_block);
             let end = u32::try_from(start + n).unwrap_or(u32::MAX);
             // Feed the main input bus (mono sources fill every bus channel).
-            if self.has_input {
-                for c in 0..self.inputs.channels(0) {
+            if core.has_input {
+                for c in 0..core.inputs.channels(0) {
                     let src = io.get(c.min(ch - 1)).and_then(|s| s.get(start..start + n));
-                    if let (Some(src), Some(dst)) = (src, self.inputs.channel_mut(0, c).and_then(|d| d.get_mut(..n))) {
+                    if let (Some(src), Some(dst)) = (src, core.inputs.channel_mut(0, c).and_then(|d| d.get_mut(..n))) {
                         dst.copy_from_slice(src);
                     }
                 }
@@ -363,10 +715,10 @@ impl Plugin for Vst3Plugin {
             // Leave room in the pool for this block's controller points; the rest waits.
             self.batch.clear();
             self.pending.take_into(&self.ids, &mut self.batch, PARAM_QUEUE_CAP.saturating_sub(self.controls.len()));
-            let r = self.inst.process(
+            let r = core.inst.process(
                 n,
-                &mut self.inputs,
-                &mut self.outputs,
+                &mut core.inputs,
+                &mut core.outputs,
                 &self.batch,
                 &self.controls,
                 notes,
@@ -378,17 +730,17 @@ impl Plugin for Vst3Plugin {
             self.notes.drain(..k);
             self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
             match r {
-                Ok(()) if self.has_output => {
-                    let oc = self.outputs.channels(0);
+                Ok(()) if core.has_output => {
+                    let oc = core.outputs.channels(0);
                     for (c, dst) in io.iter_mut().take(ch).enumerate() {
                         let Some(dst) = dst.get_mut(start..start + n) else { continue };
                         if ch == 1 && oc >= 2 {
-                            if let (Some(l), Some(r)) = (self.outputs.channel(0, 0), self.outputs.channel(0, 1)) {
+                            if let (Some(l), Some(r)) = (core.outputs.channel(0, 0), core.outputs.channel(0, 1)) {
                                 for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
                                     *d = 0.5 * (a + b);
                                 }
                             }
-                        } else if let Some(src) = self.outputs.channel(0, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
+                        } else if let Some(src) = core.outputs.channel(0, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
                             dst.copy_from_slice(src);
                         }
                     }
@@ -402,7 +754,7 @@ impl Plugin for Vst3Plugin {
     }
 
     fn latency(&self) -> usize {
-        self.latency
+        self.shared.latency.load(Ordering::Acquire)
     }
 
     fn set_transport(&mut self, transport: &Transport) {
@@ -410,19 +762,19 @@ impl Plugin for Vst3Plugin {
     }
 
     fn tail_samples(&self) -> usize {
-        self.tail
+        self.shared.tail.load(Ordering::Relaxed)
     }
 
     fn process_status(&self) -> ProcessStatus {
-        status_from_tail(u32::try_from(self.tail).unwrap_or(u32::MAX))
+        status_from_tail(u32::try_from(self.tail_samples()).unwrap_or(u32::MAX))
     }
 
     fn set_input_silent(&mut self, silent: bool) {
-        self.inputs.set_silent(silent);
+        self.silent = silent;
     }
 
     fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
-        if note > 127 || !self.event_input {
+        if note > 127 || !self.shared.event_input.load(Ordering::Relaxed) {
             return;
         }
         let time = u32::try_from(offset).unwrap_or(u32::MAX);
@@ -433,7 +785,7 @@ impl Plugin for Vst3Plugin {
     }
 
     fn note_off(&mut self, offset: usize, note: u8) {
-        if note > 127 || !self.event_input {
+        if note > 127 || !self.shared.event_input.load(Ordering::Relaxed) {
             return;
         }
         let time = u32::try_from(offset).unwrap_or(u32::MAX);
@@ -450,12 +802,15 @@ impl Plugin for Vst3Plugin {
             0xB0 => (usize::from(d1), f64::from(d2) / 127.0),
             0xD0 => (AFTERTOUCH, f64::from(d1) / 127.0),
             0xE0 => (PITCH_BEND, f64::from(u16::from(d2) << 7 | u16::from(d1)) / 16383.0),
-            0xA0 if self.event_input => {
+            0xA0 if self.shared.event_input.load(Ordering::Relaxed) => {
                 self.push_note(NoteEvent::Pressure { time, key: d1, pressure: f32::from(d2) / 127.0 });
                 return;
             }
             _ => return,
         };
+        // A table re-read on the main thread (`kMidiCCAssignmentChanged`) applies from this
+        // controller on.
+        self.refresh_midi_map();
         if let Some(&Some(id)) = self.midi_map.get(ctrl)
             && self.controls.len() < self.controls.capacity()
         {
@@ -472,30 +827,46 @@ impl Plugin for Vst3Plugin {
     }
 
     fn load_state(&mut self, data: &[u8]) -> bool {
-        let ok = self.inst.load_state(data);
+        let shared = Arc::clone(&self.shared);
+        let core = lock(&shared.core);
+        let ok = core.inst.load_state(data);
         if ok {
-            self.refresh_values();
+            self.refresh_values(&core.inst);
         }
+        // This thread owns the instance: a plug-in that remapped its controllers while loading
+        // (`kMidiCCAssignmentChanged`) gets its table re-read before the next controller, and the
+        // values just loaded are the known ones (the host's own change, not edits to report).
+        if shared.host.midi_cc_changed.swap(false, Ordering::Acquire) {
+            shared.map.publish(&core.inst.midi_mapping());
+        }
+        shared.host.values_changed.store(false, Ordering::Relaxed);
+        shared.remember_values(&core.inst);
         ok
     }
 
     fn open_editor(&mut self) -> Result<(), String> {
-        self.inst.editor().ok_or_else(|| "this plugin has no editor".to_string())?.open(self.info.name)
+        let link = lock(&self.shared.core).inst.editor();
+        link.ok_or_else(|| "this plugin has no editor".to_string())?.open(self.info.name)
     }
 
     fn close_editor(&mut self) {
-        if let Some(e) = self.inst.editor() {
+        let link = lock(&self.shared.core).inst.editor();
+        if let Some(e) = link {
             e.close();
         }
     }
 
     fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
-        let link = self.inst.editor()?;
-        Some(Box::new(Vst3Editor { conv: self.converter(link), host: self.inst.host_ref(), curves: Arc::clone(&self.curves) }))
+        let (link, host) = {
+            let core = lock(&self.shared.core);
+            (core.inst.editor()?, core.inst.host_ref())
+        };
+        Some(Box::new(Vst3Editor { conv: self.converter(link), host, curves: Arc::clone(&self.curves), shared: Arc::downgrade(&self.shared) }))
     }
 
     fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
-        let conv = self.converter(self.inst.state_link());
+        let link = lock(&self.shared.core).inst.state_link();
+        let conv = self.converter(link);
         let unsynced = Arc::clone(&self.unsynced);
         Some(Box::new(move || {
             // A parameter only the controller stores (no processor state) would otherwise be
@@ -559,6 +930,8 @@ struct Vst3Editor {
     /// The instance's sampled curves, sampled lazily here (UI thread) and re-sampled on a title
     /// restart.
     curves: Arc<ParamCurves>,
+    /// The instance's `restartComponent` requests, serviced on each `idle`.
+    shared: Weak<Shared>,
 }
 
 impl PluginEditor for Vst3Editor {
@@ -577,16 +950,13 @@ impl PluginEditor for Vst3Editor {
     }
 
     /// Also the UI-thread hook for the lazy curve sampling (at most `CURVE_BUDGET_TABLES` curves or
-    /// `CURVE_BUDGET_TIME` per call) and for `restartComponent(kParamTitlesChanged)`:
-    /// the host polls every editor handle each UI frame, open or not.
+    /// `CURVE_BUDGET_TIME` per call) and for `restartComponent` (see the module docs): the host
+    /// polls every editor handle each UI frame, open or not.
     fn idle(&mut self) -> Vec<(String, f32)> {
-        self.conv.link.idle();
-        // Only a title change can reshape a curve; a values change leaves them (many plug-ins send
-        // it on every preset load) and is recorded for re-reading the values (audit F08).
-        if self.host.titles_changed.swap(false, Ordering::Relaxed) {
-            self.curves.invalidate();
+        if let Some(s) = self.shared.upgrade() {
+            s.service(&mut Serviced::default());
         }
-        let _ = self.host.values_changed.swap(false, Ordering::Relaxed);
+        self.conv.link.idle();
         self.curves.step(CURVE_BUDGET_TABLES, CURVE_BUDGET_TIME, |id, n| self.conv.link.to_plain(id, n));
         let mut out = Vec::new();
         for (vid, n) in self.host.take_edits() {

@@ -56,7 +56,7 @@ mod registry;
 mod scan_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use plugin::Vst3Plugin;
+pub use plugin::{Serviced, Vst3Plugin};
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
@@ -180,6 +180,9 @@ mod api {
     pub fn shutdown() {
         ffi::exit_modules();
     }
+    pub fn service_requests() -> Serviced {
+        plugin::service_requests()
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -232,6 +235,21 @@ mod api {
         None
     }
     pub fn shutdown() {}
+    pub fn service_requests() -> Serviced {
+        Serviced::default()
+    }
+}
+
+/// What one [`service_requests`] call did (no plug-ins on this platform).
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Serviced {
+    pub restarted: usize,
+    pub restarts_waiting: usize,
+    pub midi_maps: usize,
+    pub value_rescans: usize,
+    pub unsupported: usize,
+    pub other_thread: usize,
 }
 
 /// Every plugin in the standard VST3 folders, `VST3_PATH` and folders added with
@@ -404,6 +422,19 @@ pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
             None
         }
     }
+}
+
+/// Services what live VST3 plug-ins asked through `IComponentHandler::restartComponent` (audit
+/// F08, ADR 0012 G7): `kMidiCCAssignmentChanged` re-reads the `IMidiMapping` table, which the
+/// audio side uses from the next controller on; `kLatencyChanged` and `kIoChanged` deactivate and
+/// reactivate the component and report the new latency; `kParamValuesChanged` re-reads the values
+/// and reports the changed ones like editor edits; `kParamTitlesChanged` re-samples the curves;
+/// `kReloadComponent` is logged as unsupported. Call it on the main thread every UI frame (the
+/// thread that created the instances; calls on other threads leave their requests alone). Never
+/// blocks on the audio thread: a busy instance is serviced by a later call. Editor handles'
+/// `idle` services their own instance as well.
+pub fn service_requests() -> Serviced {
+    api::service_requests()
 }
 
 /// The description of a `vst3:<class id>` plugin. The first call for a type instantiates it once

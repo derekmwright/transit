@@ -603,16 +603,28 @@ pub(crate) fn hex(cid: &[u8; 16]) -> String {
 /// The host context handed to `initialize` (`IHostApplication`) and to the controller
 /// (`IComponentHandler`: parameter edits made in the plugin's editor are queued for the UI, which
 /// writes them into the session, from where they reach the processor).
+///
+/// `restartComponent` (a UI-thread call) only records its flags here; the main-thread service
+/// (`plugin::Shared::service`) acts on them (audit F08, ADR 0012 G7).
 pub(crate) struct HostContext {
+    /// `kLatencyChanged`: deactivate, reactivate, then read the latency (main thread).
     pub latency_changed: AtomicBool,
     pub restart_requested: AtomicBool,
-    /// `restartComponent` carried `kParamTitlesChanged` (curve shapes can change): the editor handle
-    /// re-samples the conversion curves on the UI thread (`Vst3Editor::idle`).
+    /// `restartComponent` carried `kParamTitlesChanged` (curve shapes can change): the service
+    /// invalidates the conversion curves, which the editor handle re-samples on the UI thread.
     pub titles_changed: AtomicBool,
     /// `restartComponent` carried `kParamValuesChanged` (values changed, curves did not; many
     /// plug-ins send it on every preset load): the host re-reads the values (audit F08), and the
     /// curves stay.
     pub values_changed: AtomicBool,
+    /// `kMidiCCAssignmentChanged`: re-read the `IMidiMapping` table (main thread).
+    pub midi_cc_changed: AtomicBool,
+    /// `kIoChanged`: deactivate, renegotiate the buses, reactivate (main thread).
+    pub io_changed: AtomicBool,
+    /// `kReloadComponent`: not supported (the component would have to be created again).
+    pub reload_requested: AtomicBool,
+    /// Any other flags, or-ed (nothing this host needs to do; logged).
+    pub other_flags: AtomicU32,
     /// `performEdit` values (normalized), bounded by `EDIT_CAP`.
     pub edits: Mutex<Vec<(u32, f64)>>,
 }
@@ -624,6 +636,10 @@ impl Default for HostContext {
             restart_requested: AtomicBool::new(false),
             titles_changed: AtomicBool::new(false),
             values_changed: AtomicBool::new(false),
+            midi_cc_changed: AtomicBool::new(false),
+            io_changed: AtomicBool::new(false),
+            reload_requested: AtomicBool::new(false),
+            other_flags: AtomicU32::new(0),
             edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
         }
     }
@@ -694,7 +710,23 @@ impl IComponentHandlerTrait for HostContext {
         if flags as u32 & sv::RestartFlags_::kParamValuesChanged as u32 != 0 {
             self.values_changed.store(true, Ordering::Relaxed);
         }
-        self.restart_requested.store(true, Ordering::Relaxed);
+        if flags as u32 & sv::RestartFlags_::kMidiCCAssignmentChanged as u32 != 0 {
+            self.midi_cc_changed.store(true, Ordering::Relaxed);
+        }
+        if flags as u32 & sv::RestartFlags_::kIoChanged as u32 != 0 {
+            self.io_changed.store(true, Ordering::Relaxed);
+        }
+        if flags as u32 & sv::RestartFlags_::kReloadComponent as u32 != 0 {
+            self.reload_requested.store(true, Ordering::Relaxed);
+        }
+        let handled = sv::RestartFlags_::kLatencyChanged as u32
+            | sv::RestartFlags_::kParamTitlesChanged as u32
+            | sv::RestartFlags_::kParamValuesChanged as u32
+            | sv::RestartFlags_::kMidiCCAssignmentChanged as u32
+            | sv::RestartFlags_::kIoChanged as u32
+            | sv::RestartFlags_::kReloadComponent as u32;
+        self.other_flags.fetch_or(flags as u32 & !handled, Ordering::Relaxed);
+        self.restart_requested.store(true, Ordering::Release);
         sb::kResultOk
     }
 }
@@ -1170,10 +1202,6 @@ unsafe impl Send for Instance {}
 impl Instance {
     fn processor(&self) -> Option<&ComPtr<sv::IAudioProcessor>> {
         self.processor.as_ref()
-    }
-
-    pub fn host(&self) -> &HostContext {
-        &self.host
     }
 
     /// A counted reference to the host context (editor handles read its edit queue).
