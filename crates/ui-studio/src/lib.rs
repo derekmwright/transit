@@ -38,11 +38,11 @@ use std::sync::mpsc::Receiver;
 
 pub use control::ControlRequest;
 
-/// Our own UI state (serde, so agents can read and set it; saved as `ui.json` in the transit
-/// settings folder). Not `soundcraft-ui-egui`'s `UiState` (plan 06, L13).
 /// The most frames `ui.set imports_pace` may stretch a fake prepare over.
 const MAX_IMPORTS_PACE: u32 = 600;
 
+/// Our own UI state (serde, so agents can read and set it; saved as `ui.json` in the transit
+/// settings folder). Not `soundcraft-ui-egui`'s `UiState` (plan 06, L13).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UiState {

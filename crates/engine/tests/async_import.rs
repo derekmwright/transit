@@ -226,28 +226,71 @@ fn the_journaled_commit_replays_to_the_same_clip() {
 }
 
 #[test]
-fn finished_items_left_uncommitted_expire_by_age_and_by_count() {
+fn finished_items_a_polling_caller_left_uncommitted_expire_past_the_count_limit() {
     let d = Dir::new("expire");
     let (mut e, _) = engine_with_track();
     let path = d.file("tone.wav", &wav(1, 48_000, 480));
     e.imports.set_limits(Duration::from_secs(600), 3, Duration::ZERO);
     let ids: Vec<u64> = (0..5).map(|_| prepare(&mut e, &path)).collect();
-    for id in &ids {
-        // Finished jobs may already be dropped by the count limit: ignore those.
-        let t0 = Instant::now();
-        while e.imports.progress(*id).is_some_and(|v| !matches!(v["state"].as_str(), Some("done" | "failed")))
-            && t0.elapsed() < Duration::from_secs(20)
-        {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+    let t0 = Instant::now();
+    while e.imports.all().iter().any(|v| !matches!(v["state"].as_str(), Some("done" | "expired"))) {
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(2));
     }
-    let left: Vec<u64> = e.imports.all().iter().map(|v| v["id"].as_u64().unwrap()).collect();
-    assert_eq!(left.len(), 3, "{left:?}");
-    // A short time limit: everything finished goes.
-    e.imports.set_limits(Duration::from_millis(1), 32, Duration::ZERO);
-    std::thread::sleep(Duration::from_millis(10));
-    assert!(e.execute("file.import_progress", &json!({})).unwrap()["imports"].as_array().unwrap().is_empty());
-    assert!(e.imports.is_empty());
+    let states: Vec<String> = e.imports.all().iter().map(|v| v["state"].as_str().unwrap().to_string()).collect();
+    assert_eq!(states.iter().filter(|s| *s == "done").count(), 3, "{states:?}");
+    assert_eq!(states.iter().filter(|s| *s == "expired").count(), 2, "{states:?}");
+    assert_eq!(ids.len(), states.len(), "expired items keep their ids");
+}
+
+#[test]
+fn a_caller_that_was_away_finds_all_its_items_when_it_comes_back() {
+    let d = Dir::new("away");
+    let (mut e, track) = engine_with_track();
+    let path = d.file("tone.wav", &wav(1, 48_000, 480));
+    e.imports.set_limits(Duration::from_secs(600), 3, Duration::from_millis(50));
+    let ids: Vec<u64> = (0..5).map(|_| prepare(&mut e, &path)).collect();
+    // A modal dialog on the UI thread: nobody polls while the workers finish.
+    std::thread::sleep(Duration::from_millis(500));
+    for (i, id) in ids.iter().enumerate() {
+        wait(&mut e, *id);
+        let r = e.execute("file.commit_import", &json!({"id": id, "track": track, "at": i as i64 * 480}));
+        assert!(r.is_ok(), "item {i}: {r:?}");
+    }
+    assert_eq!(clips(&e, track).len(), 5);
+}
+
+#[test]
+fn an_item_left_uncommitted_while_the_caller_polls_others_goes_to_expired() {
+    let d = Dir::new("expired-state");
+    let (mut e, _) = engine_with_track();
+    let path = d.file("tone.wav", &wav(1, 48_000, 480));
+    e.imports.set_limits(Duration::from_millis(100), 32, Duration::from_secs(30));
+    let (a, b) = (prepare(&mut e, &path), prepare(&mut e, &path));
+    wait(&mut e, a);
+    wait(&mut e, b);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(400) {
+        e.imports.progress(b);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let v = e.imports.progress(a).expect("the id is kept");
+    assert_eq!(v["state"], "expired", "{v}");
+    assert!(v["error"].as_str().unwrap_or("").contains("expired"), "{v}");
+    assert!(e.execute("file.commit_import", &json!({"id": a})).unwrap_err().to_string().contains("expired"));
+    assert_eq!(e.imports.progress(b).unwrap()["state"], "done", "the polled item stays");
+    assert!(e.execute("file.import_cancel", &json!({"id": a})).unwrap()["canceled"].as_bool().unwrap());
+}
+
+#[test]
+fn name_with_several_paths_is_refused() {
+    let d = Dir::new("name-many");
+    let (mut e, _) = engine_with_track();
+    let (a, b) = (d.file("a.wav", &wav(1, 48_000, 480)), d.file("b.wav", &wav(1, 48_000, 480)));
+    let err = e.execute("file.import_audio", &json!({"paths": [a, b], "name": "Same"})).unwrap_err().to_string();
+    assert!(err.contains("name") && err.contains("one"), "{err}");
+    assert!(e.session().sources.is_empty());
+    assert!(e.execute("file.import_audio", &json!({"paths": [a], "name": "Solo"})).is_ok());
 }
 
 #[test]

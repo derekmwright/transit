@@ -248,6 +248,9 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
     let at = position_param(e, "file.import_audio", p, "at")?.unwrap_or(0).max(0);
     let target = import_audio_target(e, p)?;
     let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
+    if name.is_some() && paths.len() > 1 {
+        return Err(bad("file.import_audio", "`name` names one clip, so it needs exactly one path"));
+    }
     let mut out = Vec::new();
     for path in &paths {
         let bytes = crate::io::read_file(path)?;

@@ -28,6 +28,9 @@ pub const FINISHED_TTL: Duration = Duration::from_secs(600);
 /// How long a job just finished (or just polled) is safe from the count limit.
 pub const GRACE: Duration = Duration::from_secs(30);
 
+/// A caller that has not polled for longer than this was away, not slow.
+const AWAY: Duration = Duration::from_secs(5);
+
 /// How many finished or failed jobs may wait uncommitted; past that the oldest are dropped.
 pub const MAX_FINISHED: usize = 32;
 
@@ -38,6 +41,8 @@ pub enum JobState {
     Running,
     Done,
     Failed,
+    /// Left uncommitted while the caller was polling: the audio is freed, the id kept.
+    Expired,
 }
 
 impl JobState {
@@ -47,6 +52,7 @@ impl JobState {
             JobState::Running => "running",
             JobState::Done => "done",
             JobState::Failed => "failed",
+            JobState::Expired => "expired",
         }
     }
 }
@@ -76,24 +82,51 @@ struct Staging {
     ttl: Duration,
     max_finished: usize,
     grace: Duration,
+    /// When the caller last polled (any job).
+    last_poll: Option<Instant>,
 }
 
 impl Default for Staging {
     fn default() -> Self {
-        Staging { jobs: BTreeMap::new(), queue: VecDeque::new(), running: 0, ttl: FINISHED_TTL, max_finished: MAX_FINISHED, grace: GRACE }
+        Staging {
+            jobs: BTreeMap::new(),
+            queue: VecDeque::new(),
+            running: 0,
+            ttl: FINISHED_TTL,
+            max_finished: MAX_FINISHED,
+            grace: GRACE,
+            last_poll: None,
+        }
     }
 }
 
 impl Staging {
-    /// Drop finished or failed jobs nobody is looking at. A job is idle for as long as it has been
-    /// finished and unpolled; the UI polls every job it holds, so it never loses one it will
-    /// commit. Idle jobs go once they pass the time limit, and the oldest idle ones go when more
-    /// than the count limit are waiting (after a short grace, so a job just finished is never the
-    /// victim). Queued and running jobs are never dropped.
+    /// A poll by the caller. Returns after expiring what the caller left behind while it was
+    /// demonstrably polling; a caller that was away (a modal dialog, a hidden window) gets its idle
+    /// clocks reset instead, so it finds everything it prepared.
+    fn tick(&mut self, now: Instant) {
+        if self.last_poll.is_some_and(|p| now.saturating_duration_since(p) <= AWAY) {
+            self.expire();
+        } else {
+            for j in self.jobs.values_mut().filter(|j| j.seen.is_some()) {
+                j.seen = Some(now);
+            }
+        }
+        self.last_poll = Some(now);
+    }
+
+    /// Expire finished or failed jobs the caller has stopped asking about: idle is the time from
+    /// a job's last poll to the caller's previous poll, so only polls that happened count. Idle
+    /// jobs go past the time limit, and the longest idle ones go when more than the count limit
+    /// wait (after a short grace). A job never polled, a queued one and a running one stay. Never
+    /// called from a worker thread.
     fn expire(&mut self) {
-        let now = Instant::now();
-        let idle = |j: &Job| j.finished.map(|f| now.saturating_duration_since(f.max(j.seen.unwrap_or(f))));
-        let waiting = self.jobs.values().filter(|j| j.finished.is_some()).count();
+        let Some(at) = self.last_poll else { return };
+        let idle = |j: &Job| match (j.state, j.seen) {
+            (JobState::Done | JobState::Failed, Some(seen)) => Some(at.saturating_duration_since(seen)),
+            _ => None,
+        };
+        let waiting = self.jobs.values().filter(|j| matches!(j.state, JobState::Done | JobState::Failed)).count();
         let mut over = waiting.saturating_sub(self.max_finished);
         let mut idle_jobs: Vec<(Duration, u64)> = self.jobs.iter().filter_map(|(id, j)| idle(j).map(|d| (d, *id))).collect();
         // Longest idle first.
@@ -102,10 +135,13 @@ impl Staging {
             let stale = d >= self.ttl;
             let crowded = over > 0 && d >= self.grace;
             if (stale || crowded)
-                && let Some(j) = self.jobs.remove(&id)
+                && let Some(j) = self.jobs.get_mut(&id)
             {
                 over = over.saturating_sub(1);
-                log::info!("import {id} ({}) dropped: left uncommitted ({})", j.name, if stale { "too long" } else { "too many waiting" });
+                j.prepared = None;
+                j.state = JobState::Expired;
+                j.error = Some(format!("{}: expired while waiting to be placed; re-import", j.name));
+                log::info!("import {id} ({}) expired: left uncommitted ({})", j.name, if stale { "too long" } else { "too many waiting" });
             }
         }
     }
@@ -184,17 +220,18 @@ impl Imports {
     /// duration?}`; `None` when there is no such job.
     pub fn progress(&self, id: u64) -> Option<Value> {
         let mut g = lock(&self.shared);
-        g.expire();
+        let now = Instant::now();
+        g.tick(now);
         let j = g.jobs.get_mut(&id)?;
-        j.seen = Some(Instant::now());
+        j.seen = Some(now);
         Some(describe(id, j))
     }
 
     /// Every job, oldest first.
     pub fn all(&self) -> Vec<Value> {
         let mut g = lock(&self.shared);
-        g.expire();
         let now = Instant::now();
+        g.tick(now);
         g.jobs
             .iter_mut()
             .map(|(id, j)| {
@@ -234,7 +271,7 @@ impl Imports {
         let j = g.jobs.get(&id).ok_or_else(|| gone(id))?;
         match j.state {
             JobState::Done => Ok(()),
-            JobState::Failed => Err(EngineError::Io(j.error.clone().unwrap_or_else(|| format!("{}: failed", j.name)))),
+            JobState::Failed | JobState::Expired => Err(EngineError::Io(j.error.clone().unwrap_or_else(|| format!("{}: failed", j.name)))),
             s => Err(EngineError::BadParams("file.commit_import".into(), format!("import {id} ({}) is still {}", j.name, s.as_str()))),
         }
     }
@@ -344,6 +381,5 @@ fn work(shared: &Arc<Mutex<Staging>>) {
                 }
             }
         }
-        g.expire();
     }
 }

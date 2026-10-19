@@ -1088,3 +1088,23 @@ fn imports_pace_is_bounded_and_a_rejected_ui_set_leaves_it_alone() {
     assert!(t.app.set_ui(&json!({"imports_pace": null})).is_ok());
     assert_eq!(t.app.imports.pace, None);
 }
+
+#[test]
+fn an_import_the_engine_let_expire_says_so_and_is_removed() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    t.app.engine.imports.set_limits(std::time::Duration::ZERO, 32, std::time::Duration::from_secs(30));
+    for _ in 0..40 {
+        t.frames(6);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        if !t.app.imports.active() {
+            break;
+        }
+    }
+    assert!(!t.app.imports.active(), "{}", t.app.status);
+    assert_eq!(t.app.status, "The import of loop 90.wav expired: re-import");
+    assert!(t.app.engine.imports.is_empty(), "the staging entry is canceled");
+}

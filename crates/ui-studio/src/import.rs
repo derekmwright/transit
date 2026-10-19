@@ -275,6 +275,10 @@ pub fn step(app: &mut StudioApp, ctx: &egui::Context) {
             let paced = app.imports.pace.is_none_or(|n| front.frames_seen >= n);
             match front.state.as_str() {
                 "done" if paced => app.commit_front(),
+                "expired" => {
+                    let msg = format!("The import of {} expired: re-import", front.name);
+                    app.drop_item(0, msg);
+                }
                 "failed" => {
                     let msg = format!("Couldn't import {}: {}", front.name, front.error.clone().unwrap_or_default());
                     app.drop_item(0, msg);
