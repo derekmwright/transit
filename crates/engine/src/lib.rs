@@ -24,6 +24,7 @@ use soundcraft_model::{Clip, Session, TrackId, ZoomState};
 use soundcraft_time::Samples;
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use cmd::{CommandInfo, CommandSpec, command_specs, find_command};
 pub use soundcraft_model as model;
@@ -592,11 +593,27 @@ fn same_document(saved: &Session, doc: &Session) -> bool {
     *saved == doc
 }
 
+static AUDIO_THREAD_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of panics observed on audio callbacks and render workers since the
+/// first [`Engine`] installed its panic hook. Read on the control side for UI/telemetry;
+/// reporting a retained unwind payload is the responsibility of the caller that caught it.
+#[must_use]
+pub fn audio_thread_panics() -> u64 {
+    AUDIO_THREAD_PANICS.load(Ordering::Relaxed)
+}
+
 fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            if soundcraft_mix::on_audio_thread() {
+                // Neither backtrace/logging nor the previous hook (usually stderr) is realtime
+                // safe. Leave the payload to catch_unwind and report it on the control side.
+                AUDIO_THREAD_PANICS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             log::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
             prev(info);
         }));
