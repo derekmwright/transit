@@ -17,6 +17,7 @@ pub mod finish;
 pub mod groups;
 pub mod host;
 pub mod icons;
+pub mod import;
 pub mod keys;
 pub mod menus;
 pub mod mixer;
@@ -242,6 +243,8 @@ pub struct StudioApp {
     pub keys: keys::KeysState,
     /// The browser (slice 4): listings, selection, drag, last frame's layout.
     pub browser: browser::BrowserState,
+    /// Audio imports in flight (L30): prepared by the engine's workers, committed in order.
+    pub imports: import::ImportQueue,
     /// Help > Keyboard Shortcuts as last drawn (slice 5).
     pub shortcuts_window: menus::ShortcutsLayout,
     /// The output-callback telemetry readout and its window (polled a few times a second).
@@ -296,6 +299,7 @@ impl StudioApp {
             mixer: mixer::MixerState::default(),
             keys: keys::KeysState::default(),
             browser: browser::BrowserState::default(),
+            imports: import::ImportQueue::default(),
             shortcuts_window: menus::ShortcutsLayout::default(),
             telemetry: telemetry::TelemetryState::default(),
             finish: finish::FinishState::default(),
@@ -547,6 +551,7 @@ impl StudioApp {
         self.watch_output();
         self.watch_input();
         finish::step_bounce(self, ctx);
+        import::step(self, ctx);
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         automation::write_pass(self, ctx);
@@ -662,6 +667,7 @@ impl StudioApp {
         } else {
             arrange::show(self, ui);
         }
+        import::paint(self, &ctx);
         finish::rename_field(self, &ctx);
         menus::dialogs(self, &ctx);
         finish::bounce_dialog(self, &ctx);
@@ -720,6 +726,7 @@ impl StudioApp {
             "plugin_scan": plugin_scan::inspect(),
             "keys": self.keys.layout,
             "browser": self.browser.layout,
+            "imports": self.imports.layout,
             "shortcuts": self.shortcuts_window,
             "telemetry": self.telemetry.layout,
             "finish": self.finish.inspect(),

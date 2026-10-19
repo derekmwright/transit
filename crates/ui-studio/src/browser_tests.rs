@@ -125,6 +125,17 @@ impl T {
         self.frames(2);
     }
 
+    /// Frames until every import has been committed or dropped (or 10 s).
+    fn settle_imports(&mut self) {
+        let t0 = std::time::Instant::now();
+        while self.app.imports.active() && t0.elapsed().as_secs() < 10 {
+            self.frames(6);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!self.app.imports.active(), "imports never finished: {}", self.app.status);
+        self.frames(2);
+    }
+
     fn input(&mut self, method: &str, p: Value) {
         let (req, _rx) = crate::ControlRequest::new(method, p);
         let ctx = egui::Context::default();
@@ -455,6 +466,7 @@ fn dragging_a_wav_onto_an_audio_lane_at_bar_2_imports_it_there_in_one_undo_step(
     // A little after bar 2: snapped to the beat.
     let to = (t.x_of(t.bar(2)) + 2.0, (lane[1] + lane[3]) / 2.0);
     t.drag(from, to, json!({}));
+    t.settle_imports();
     let clips = t.clips(audio);
     assert_eq!(clips, vec![(t.bar(2), Samples::from(t.rate * 2), "loop 90".to_string())], "{}", t.app.status);
     assert_eq!(t.undo_len(), u0 + 1, "one undo step");
@@ -473,6 +485,7 @@ fn shift_turns_the_beat_snap_off() {
     let lane = t.lane(audio);
     let to = (t.x_of(t.bar(2)) + 9.0, (lane[1] + lane[3]) / 2.0);
     t.drag(from, to, json!({"shift": true}));
+    t.settle_imports();
     let start = t.clips(audio)[0].0;
     assert!(start > t.bar(2), "unsnapped: {start}");
 }
@@ -486,6 +499,7 @@ fn dragging_below_the_tracks_makes_a_new_audio_track() {
     let from = mid(t.row_named("loop 90.wav").rect.unwrap());
     let last = t.app.arrange.layout.tracks.last().unwrap().lane;
     t.drag(from, (t.x_of(t.bar(3)), last[3] + 30.0), json!({}));
+    t.settle_imports();
     let s = t.app.engine.session();
     assert_eq!(s.tracks.len(), n + 1, "{}", t.app.status);
     let new = s.tracks.iter().find(|tr| tr.name.starts_with("loop 90")).expect("the new track");
@@ -495,7 +509,7 @@ fn dragging_below_the_tracks_makes_a_new_audio_track() {
 }
 
 #[test]
-fn three_selected_files_go_one_after_another_on_one_track_in_one_undo_step() {
+fn three_selected_files_go_one_after_another_on_one_track_one_undo_step_each() {
     let mut t = T::new();
     t.add_and_expand();
     t.click(mid(t.row(&t.path("Kicks")).rect.unwrap()));
@@ -512,6 +526,7 @@ fn three_selected_files_go_one_after_another_on_one_track_in_one_undo_step() {
     let u0 = t.undo_len();
     let lane = t.lane(audio);
     t.drag(mid(k2), (t.x_of(t.bar(1)) + 1.0, (lane[1] + lane[3]) / 2.0), json!({}));
+    t.settle_imports();
     let half = Samples::from(t.rate / 2);
     let q = Samples::from(t.rate / 4);
     let clips = t.clips(audio);
@@ -521,7 +536,7 @@ fn three_selected_files_go_one_after_another_on_one_track_in_one_undo_step() {
         "{}",
         t.app.status
     );
-    assert_eq!(t.undo_len(), u0 + 1);
+    assert_eq!(t.undo_len(), u0 + 3, "one undo step per file");
     assert!(t.app.status.starts_with("Imported 3 files"), "{}", t.app.status);
 }
 
@@ -536,6 +551,7 @@ fn a_double_click_imports_at_the_cursor_on_the_selected_track() {
     let cursor = t.app.cursor();
     let u0 = t.undo_len();
     t.double_click(mid(t.row_named("loop 90.wav").rect.unwrap()));
+    t.settle_imports();
     assert_eq!(t.clips(audio), vec![(cursor, Samples::from(t.rate * 2), "loop 90".to_string())], "{}", t.app.status);
     assert_eq!(t.undo_len(), u0 + 1);
 }
@@ -859,13 +875,16 @@ fn a_long_name_is_elided_with_the_extension_kept() {
 }
 
 #[test]
-fn importing_announces_itself_before_the_synchronous_import() {
+fn importing_announces_itself_and_returns_before_the_file_is_placed() {
     let mut t = T::new();
     t.add_and_expand();
     let track = t.track(TrackKind::Audio);
     t.app.import_files(&[t.dir.0.join("loop 90.wav")], Some(track), 0).unwrap();
     assert_eq!(t.app.browser.import_notice, "Importing loop 90.wav…");
+    assert!(t.clips(track).is_empty(), "the call only queues the file");
+    t.settle_imports();
     assert!(t.app.status.starts_with("Imported loop 90.wav"), "{}", t.app.status);
+    assert_eq!(t.clips(track).len(), 1);
 }
 
 #[test]
@@ -881,4 +900,110 @@ fn rows_show_their_type_icons_and_a_click_on_the_chevron_row_expands() {
     assert_eq!(t.row_named("Kit.nki").icon, "file");
     // The name starts after the icon, still elided to fit.
     assert_eq!(t.row_named("loop 90.wav").shown, "loop 90.wav");
+}
+
+// ---- Asynchronous import (L30). `imports.pace` is the fake prepare: progress over N frames. ----
+
+/// Drag `name` onto `track`'s lane a little after bar 2 (snapped to bar 2).
+fn drop_on_lane(t: &mut T, name: &str, track: TrackId) {
+    let from = mid(t.row_named(name).rect.unwrap());
+    let lane = t.lane(track);
+    let to = (t.x_of(t.bar(2)) + 2.0, (lane[1] + lane[3]) / 2.0);
+    t.drag(from, to, json!({}));
+}
+
+#[test]
+fn a_drop_shows_an_outline_and_progress_then_commits_at_the_drop_in_one_undo_step() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(120);
+    let audio = t.track(TrackKind::Audio);
+    let u0 = t.undo_len();
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    assert!(t.app.imports.active(), "{}", t.app.status);
+    assert!(t.clips(audio).is_empty(), "nothing placed while preparing");
+    assert_eq!(t.undo_len(), u0);
+    let pct = t.app.status.strip_prefix("Importing loop 90.wav… ").and_then(|r| r.strip_suffix('%')).and_then(|n| n.parse::<u32>().ok());
+    assert!(pct.is_some_and(|p| (1..100).contains(&p)), "{}", t.app.status);
+    let item = t.app.imports.layout.items[0].clone();
+    let (r, lane) = (item.rect.expect("an outline on screen"), t.lane(audio));
+    assert_eq!(item.at, t.bar(2));
+    assert!((r[0] - t.x_of(t.bar(2))).abs() < 1.5 && r[1] >= lane[1] && r[3] <= lane[3], "{r:?} on lane {lane:?}");
+    assert!((r[2] - t.x_of(t.bar(2) + Samples::from(t.rate * 2))).abs() < 1.5, "as long as the header says: {r:?}");
+    assert!(item.cancel.is_some());
+    // The UI keeps running while the file is prepared.
+    t.frames(12);
+    assert!(t.app.imports.layout.max_step_ms < 40.0, "{}", t.app.imports.layout.max_step_ms);
+    t.settle_imports();
+    assert_eq!(t.clips(audio), vec![(t.bar(2), Samples::from(t.rate * 2), "loop 90".to_string())], "{}", t.app.status);
+    assert_eq!(t.undo_len(), u0 + 1);
+    assert_eq!(t.app.engine.undo_label(), Some("Import loop 90"));
+    assert!(t.app.status.starts_with("Imported loop 90.wav to") && t.app.status.ends_with("at 2.1.1"), "{}", t.app.status);
+    assert!(t.app.imports.layout.items.is_empty() && t.app.engine.imports.is_empty());
+}
+
+#[test]
+fn escape_cancels_the_imports_in_flight_and_changes_nothing() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    let (u0, rev) = (t.undo_len(), t.app.engine.revision);
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    assert!(t.app.imports.active());
+    t.key("escape", json!({}));
+    assert!(!t.app.imports.active());
+    assert_eq!(t.app.status, "Canceled the import of loop 90.wav");
+    assert!(t.app.engine.imports.is_empty(), "the staging item is dropped");
+    assert!(t.clips(audio).is_empty());
+    assert_eq!((t.undo_len(), t.app.engine.revision), (u0, rev));
+    assert!(t.app.engine.session().sources.is_empty());
+}
+
+#[test]
+fn the_x_on_an_outline_cancels_that_file() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    let u0 = t.undo_len();
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    let x = t.app.imports.layout.items[0].cancel.expect("an x");
+    let cursor = t.app.cursor();
+    t.click(mid(x));
+    assert!(!t.app.imports.active(), "{}", t.app.status);
+    assert_eq!(t.app.status, "Canceled the import of loop 90.wav");
+    assert_eq!(t.app.cursor(), cursor, "the click went to the x, not the lane");
+    assert!(t.clips(audio).is_empty() && t.app.engine.imports.is_empty());
+    assert_eq!(t.undo_len(), u0);
+}
+
+#[test]
+fn an_import_whose_track_was_deleted_meanwhile_is_refused() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    t.app.run("track.delete", json!({"tracks": [audio.0]})).unwrap();
+    let u0 = t.undo_len();
+    t.app.imports.pace = None;
+    t.settle_imports();
+    assert_eq!(t.app.status, "Couldn't import loop 90.wav: its track was deleted");
+    assert!(t.app.engine.imports.is_empty(), "the staging item is dropped");
+    assert!(t.app.engine.session().sources.is_empty());
+    assert_eq!(t.undo_len(), u0);
+}
+
+#[test]
+fn a_new_session_while_importing_stops_the_import() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    t.app.engine.execute("session.new", &json!({})).unwrap();
+    t.frames(12);
+    assert!(!t.app.imports.active());
+    assert_eq!(t.app.status, "The import of loop 90.wav stopped: the session changed");
 }

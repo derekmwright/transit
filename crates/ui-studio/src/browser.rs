@@ -11,7 +11,8 @@
 //! found (the scan caches only; never a scan), by type and then vendor, with favorites.
 //!
 //! A drag onto the arrangement, a mixer strip or the device chain, or a double-click, runs engine
-//! commands (`file.import_audio`, `mix.instrument`, `mix.insert`): one undo step per drop.
+//! commands: audio is imported in the background (`crate::import`, one undo step per file),
+//! plug-ins load with `mix.instrument` or `mix.insert` (one undo step per drop).
 //! Everything else here (tabs, width, expanding, filters, favorites) is view state.
 //!
 //! Audition is not built: the engine and `Player` have no way to play a file outside the
@@ -23,7 +24,7 @@ use crate::icons::Icon;
 use crate::shortcuts::{Action as A, pressed};
 use crate::theme::TOKENS;
 use egui::{Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use serde_json::{Value, json};
+use serde_json::json;
 use soundcraft_model::{TrackId, TrackKind};
 use soundcraft_time::Samples;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -311,8 +312,8 @@ pub struct BrowserState {
     max_gap_ms: f32,
     gap_armed: bool,
     serial: u64,
-    ctx: Option<egui::Context>,
-    /// The last "Importing …" notice, set just before the synchronous import call.
+    pub(crate) ctx: Option<egui::Context>,
+    /// The last "Importing …" notice, set when a drop or double-click queues an import.
     pub import_notice: String,
 }
 
@@ -352,6 +353,11 @@ impl Default for BrowserState {
 }
 
 impl BrowserState {
+    /// A file's length in seconds, when its header has been read for the list.
+    pub(crate) fn header_secs(&self, path: &Path) -> Option<f64> {
+        self.info.get(path).and_then(|i| i.as_ref()).map(|i| i.secs)
+    }
+
     /// Read `dir` on a background thread (once; a collapse forgets it so the next expand reads it
     /// fresh).
     fn request_listing(&mut self, dir: &Path, ctx: &egui::Context) {
@@ -657,7 +663,7 @@ fn elide(p: &egui::Painter, name: &str, font: &FontId, width: f32) -> String {
     format!("…{ext}")
 }
 
-fn file_name(p: &Path) -> String {
+pub(crate) fn file_name(p: &Path) -> String {
     p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }
 
@@ -719,7 +725,8 @@ impl StudioApp {
     }
 
     /// Import audio files at `at`: onto `track` (an audio track), or onto a new track when
-    /// `track` is `None`. Several files go one after another on the same track. One undo step.
+    /// `track` is `None`. Several files go one after another on the same track. The files are
+    /// prepared in the background and committed in order, one undo step each (see `import`).
     pub fn import_files(&mut self, files: &[PathBuf], track: Option<TrackId>, at: Samples) -> Result<(), String> {
         let (ok, closed): (Vec<&PathBuf>, Vec<&PathBuf>) = files.iter().partition(|p| kind_of(&p.to_string_lossy(), false) == Some(Kind::Audio));
         if ok.is_empty() {
@@ -735,49 +742,11 @@ impl StudioApp {
                 return Err(self.status.clone());
             }
         }
-        let before = self.engine.session_arc();
-        // The import below runs on this thread (engine path); say so and ask for a frame first.
         let what = if ok.len() == 1 { file_name(ok[0]) } else { format!("{} files", ok.len()) };
+        let files: Vec<PathBuf> = ok.into_iter().cloned().collect();
+        self.queue_imports(&files, track, at.max(0), closed.len())?;
         self.status = format!("Importing {what}…");
         self.browser.import_notice = self.status.clone();
-        if let Some(ctx) = &self.browser.ctx {
-            ctx.request_repaint();
-        }
-        self.browser.serial += 1;
-        let key = format!("browser:import:{}", self.browser.serial);
-        self.engine.end_merge();
-        let (mut target, mut pos) = (track, at.max(0));
-        for f in &ok {
-            let mut p = json!({"path": f.to_string_lossy(), "at": pos});
-            if let Some(t) = target {
-                p["track"] = json!(t.0);
-            }
-            match self.engine.execute_merged("file.import_audio", &p, &key) {
-                Ok(v) => {
-                    let r = &v["imported"][0];
-                    target = r.get("track").and_then(Value::as_u64).map(TrackId).or(target);
-                    pos += r.get("frames").and_then(Value::as_i64).unwrap_or(0);
-                }
-                Err(e) => {
-                    self.engine.end_merge();
-                    if !std::sync::Arc::ptr_eq(&before, &self.engine.session_arc()) {
-                        self.engine.undo();
-                    }
-                    self.status = format!("Couldn't import {}: {e}", file_name(f));
-                    return Err(self.status.clone());
-                }
-            }
-        }
-        self.engine.end_merge();
-        let name = target.and_then(|t| self.engine.session().track(t)).map_or_else(String::new, |t| t.name.clone());
-        let mut msg = format!("Imported {what} to {name} at {}", bbs(self, at.max(0)));
-        if !closed.is_empty() {
-            msg.push_str(&format!(" ({} Maschine/Kontakt file{} skipped: not supported)", closed.len(), if closed.len() == 1 { "" } else { "s" }));
-        }
-        self.status = msg;
-        if let Some(t) = target {
-            self.ui.focus_track = Some(t);
-        }
         Ok(())
     }
 
@@ -953,6 +922,11 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     // Escape during a drag cancels it: no drop, no message (and no other Escape action).
     if app.browser.drag.is_some() && pressed(ctx, A::BrowserCancel) {
         app.browser.drag = None;
+        return;
+    }
+    // Escape while files are being imported cancels them (L30).
+    if app.imports.active() && !ctx.egui_wants_keyboard_input() && app.dialog.is_none() && pressed(ctx, A::BrowserCancel) {
+        app.cancel_imports(None);
         return;
     }
     if ctx.egui_wants_keyboard_input() || app.dialog.is_some() {

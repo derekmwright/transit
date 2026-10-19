@@ -269,7 +269,7 @@ pub const TABLE: &[Shortcut] = &[
     row(A::DeletePoints, "Delete Selected Points", NONE, Key::Backspace, S::Automation, "Same as Delete."),
     row(A::DeselectPoints, "Deselect Points", NONE, Key::Escape, S::Automation, "Ours; a click on a clip or empty lane does the same."),
     // Browser.
-    row(A::BrowserCancel, "Cancel Drag or Add Folder", NONE, Key::Escape, S::Browser, "Ours."),
+    row(A::BrowserCancel, "Cancel Drag, Add Folder or Import", NONE, Key::Escape, S::Browser, "Ours."),
     row(A::BrowserAddFolder, "Add the Typed Folder", NONE, Key::Enter, S::Browser, "In the Add Folder field."),
     // Dialogs.
     row(A::DialogConfirm, "Confirm", NONE, Key::Enter, S::Dialog, "Delete Tracks."),
