@@ -10,8 +10,12 @@ use soundcraft_mix::{
     Shed, SlotBinding, SlotGen, Source, TransportEpoch,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
+use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
 
 const SR: u32 = 48_000;
 const BLOCK: usize = 256;
@@ -33,6 +37,8 @@ struct Recorder {
     rendered: u64,
     /// While set, the instrument renders NaN (the mix takes it out as failed).
     fail: Arc<AtomicBool>,
+    refuse_releases: Arc<AtomicBool>,
+    refuse_downs: Arc<AtomicBool>,
 }
 
 impl Plugin for Recorder {
@@ -67,6 +73,11 @@ impl Plugin for Recorder {
         }
     }
     fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        if (ev.is_release() && self.refuse_releases.load(Ordering::Relaxed))
+            || (matches!(ev.message, Message::Control { cc: 64..=69, value: 64..=127 }) && self.refuse_downs.load(Ordering::Relaxed))
+        {
+            return false;
+        }
         self.pending.push((offset, Some(*ev)));
         true
     }
@@ -87,6 +98,8 @@ struct Rig {
     track: TrackId,
     session: Session,
     fail: Arc<AtomicBool>,
+    refuse_releases: Arc<AtomicBool>,
+    refuse_downs: Arc<AtomicBool>,
 }
 
 fn instrument_session(id: &str) -> (Session, TrackId) {
@@ -115,6 +128,8 @@ impl Rig {
             track,
             session,
             fail: Arc::default(),
+            refuse_releases: Arc::default(),
+            refuse_downs: Arc::default(),
         };
         let s = rig.session.clone();
         rig.publish(&s);
@@ -127,6 +142,7 @@ impl Rig {
     fn publish(&mut self, s: &Session) {
         self.generation = self.generation.checked_next().unwrap();
         let (heard, made, fail) = (Arc::clone(&self.heard), Arc::clone(&self.made), Arc::clone(&self.fail));
+        let (refuse_releases, refuse_downs) = (Arc::clone(&self.refuse_releases), Arc::clone(&self.refuse_downs));
         let mut make = move |spec: &InstanceSpec, _: SlotGen| -> Option<NewInstance> {
             let mut inner = soundcraft_dsp::create("gain")?;
             inner.prepare(SR as f32, BLOCK, spec.ch);
@@ -139,6 +155,8 @@ impl Rig {
                 pending: Vec::with_capacity(4096),
                 rendered: 0,
                 fail: Arc::clone(&fail),
+                refuse_releases: Arc::clone(&refuse_releases),
+                refuse_downs: Arc::clone(&refuse_downs),
             });
             Some(NewInstance { plugin, refused_state: false })
         };
@@ -1174,4 +1192,217 @@ fn dense_clip_events_keep_every_release_and_same_sample_order() {
     assert_eq!(every_on_has_its_off(&rig.heard_by(1)), 900);
     assert!(!rig.mix.has_pending_events());
     assert_eq!(rig.mix.event_status().shed.note_on, 0);
+}
+
+fn dense_clip_pedal_trial(transitions: usize) -> (soundcraft_mix::EventStatus, bool, f32) {
+    let (mut session, track) = instrument_session("subtractive_synth");
+    let mut seq = soundcraft_midi::Sequence::default();
+    for i in 0..transitions {
+        seq.ctrls.push(soundcraft_midi::CtrlEvent {
+            tick: 22,
+            channel: 0,
+            kind: soundcraft_midi::CtrlKind::Cc(64),
+            value: if i % 2 == 0 { 127 } else { 0 },
+        });
+    }
+    let cid = session.new_clip_id();
+    session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::midi(cid, "dense pedals", 0, 48_000, seq));
+    let mut mix = MixEngine::realtime_with_events(target(), EngineEpoch::FIRST, EventLimits::default());
+    let mut comp = PlanCompiler::new(target(), PlanLimits::default());
+    let mut make = |spec: &InstanceSpec, _: SlotGen| {
+        let mut p = soundcraft_dsp::create(&spec.id)?;
+        p.prepare(SR as f32, BLOCK, spec.ch);
+        p.set_param("amp_release", 1.0);
+        Some(NewInstance { plugin: p, refused_state: false })
+    };
+    let mut env = comp.compile(Arc::new(session), PlanGeneration::EMPTY, PlanGeneration::EMPTY.checked_next().unwrap(), &mut make).unwrap();
+    assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+    comp.reclaim(env);
+    let binding = comp.active_bindings().into_iter().find(|b| b.0 == track && b.1 == INSTRUMENT_SLOT).unwrap();
+    let ev = |at, message| InstrumentEvent {
+        engine: EngineEpoch::FIRST,
+        target: binding,
+        due: Due::Frame(RenderFrame(at)),
+        transport: None,
+        source: port(1, 0),
+        message,
+        arrival: Arrival { host_ns: 0, sequence: 0 },
+    };
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    mix.render_active(0, BLOCK, &mut out);
+    assert!(mix.queue_event(&ev(256, on(60))).accepted());
+    mix.render_active(256, BLOCK, &mut out);
+    assert!(mix.queue_event(&ev(612, off(60))).accepted());
+    let ((), stats) = measure(|| {
+        mix.render_active(512, BLOCK, &mut out);
+        for i in 3..16 {
+            mix.render_active(i * BLOCK as i64, BLOCK, &mut out);
+        }
+    });
+    assert_eq!(stats, AllocStats::default(), "dense pedal traffic must not allocate");
+    let energy: f32 = out.iter().flatten().map(|x| x * x).sum();
+    println!("dense pedal clip: status={:?}; pending={}; energy={energy}", mix.event_status(), mix.has_pending_events());
+    (mix.event_status(), mix.has_pending_events(), energy)
+}
+
+#[test]
+fn refute_dense_clip_pedals_cannot_consume_a_live_notes_release_reserve() {
+    let (control, pending, energy) = dense_clip_pedal_trial(1000);
+    assert_eq!(control.host_refused[1], 0);
+    assert!(!pending);
+    assert!(energy < 0.000001, "control note must be silent: {energy}");
+    let (st, pending, energy) = dense_clip_pedal_trial(1400);
+    assert!(!pending);
+    assert_eq!(st.host_refused[1], 0, "the conforming built-in must receive the live note release; energy={energy}");
+    assert!(energy < 0.000001, "released note must be silent: {energy}");
+}
+
+#[test]
+fn refused_note_release_stays_pending_until_accepted() {
+    let mut rig = Rig::new();
+    let src = port(1, 3);
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now, on(60)).accepted());
+    rig.render(1);
+    let voice = rig.heard_by(1).last().unwrap().1.note_id;
+    let off = Message::NoteOff { key: 60, velocity: 47, id: NoteId::NONE };
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now + 100, off).accepted());
+    rig.refuse_releases.store(true, Ordering::Relaxed);
+    for _ in 0..3 {
+        let ((), stats) = measure(|| rig.render(1));
+        assert_eq!(stats, AllocStats::default(), "refused release retries must not allocate");
+        assert!(rig.mix.has_pending_events(), "a refused off must keep its identity and wake reservation");
+    }
+    assert_eq!(rig.mix.event_status().host_refused[1], 3);
+    assert_eq!(rig.heard_by(1).len(), 1);
+    rig.refuse_releases.store(false, Ordering::Relaxed);
+    let retry_at = rig.mix.next_frame().0;
+    let ((), stats) = measure(|| rig.render(1));
+    assert_eq!(stats, AllocStats::default(), "accepting a retry must not allocate");
+    assert_eq!(rig.heard_by(1).last(), Some(&(retry_at, PluginEvent { channel: 3, note_id: voice, message: off })));
+    assert!(!rig.mix.has_pending_events());
+    rig.render(1);
+    assert_eq!(rig.heard_by(1).len(), 2, "accepted releases are never retried");
+}
+
+#[test]
+fn refused_pedal_down_never_becomes_a_holder() {
+    for pedal in [64, 66, 67, 69] {
+        let mut rig = Rig::new();
+        let src = port(1, 0);
+        let now = rig.mix.next_frame().0;
+        rig.refuse_downs.store(true, Ordering::Relaxed);
+        assert!(rig.send(src, now + 10, cc(pedal, 127)).accepted());
+        assert!(rig.send(src, now + 20, cc(pedal, 63)).accepted());
+        rig.render(1);
+        assert!(rig.heard_by(1).is_empty(), "a refused down needs no host up");
+        assert!(!rig.mix.has_pending_events());
+        rig.refuse_downs.store(false, Ordering::Relaxed);
+        let now = rig.mix.next_frame().0;
+        assert!(rig.send(src, now, cc(pedal, 127)).accepted());
+        rig.render(1);
+        assert_eq!(rig.heard_by(1).last().unwrap().1.message, cc(pedal, 127), "the refused down must not update sent");
+        assert!(rig.send(src, rig.mix.next_frame().0, cc(pedal, 0)).accepted());
+        rig.render(1);
+        assert!(!rig.mix.has_pending_events());
+    }
+}
+
+#[test]
+fn refused_pedal_release_stays_pending_until_accepted() {
+    for pedal in [64, 66, 67, 69] {
+        let mut rig = Rig::new();
+        let src = port(1, 2);
+        let now = rig.mix.next_frame().0;
+        assert!(rig.send(src, now, cc(pedal, 127)).accepted());
+        rig.render(1);
+        rig.refuse_releases.store(true, Ordering::Relaxed);
+        let now = rig.mix.next_frame().0;
+        assert!(rig.send(src, now + 10, cc(pedal, 63)).accepted());
+        for _ in 0..3 {
+            rig.render(1);
+            assert!(rig.mix.has_pending_events());
+        }
+        assert_eq!(rig.mix.event_status().host_refused[1], 3);
+        assert_eq!(rig.heard_by(1).len(), 1);
+        rig.refuse_releases.store(false, Ordering::Relaxed);
+        let retry_at = rig.mix.next_frame().0;
+        rig.render(1);
+        assert_eq!(rig.heard_by(1).last(), Some(&(retry_at, PluginEvent { channel: 2, note_id: PluginEvent::NO_ID, message: cc(pedal, 63) })));
+        assert!(!rig.mix.has_pending_events());
+        rig.render(1);
+        assert_eq!(rig.heard_by(1).len(), 2);
+    }
+}
+
+#[test]
+fn refused_restrike_off_keeps_the_old_voice_for_retry() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now, on(60)).accepted());
+    rig.render(1);
+    let voice = rig.heard_by(1)[0].1.note_id;
+    rig.refuse_releases.store(true, Ordering::Relaxed);
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now + 10, on(60)).accepted());
+    rig.render(1);
+    assert_eq!(rig.heard_by(1).len(), 1, "a refused old off must not start an untracked new voice");
+    assert!(rig.mix.has_pending_events());
+    rig.refuse_releases.store(false, Ordering::Relaxed);
+    rig.render(1);
+    assert_eq!(rig.heard_by(1).last().unwrap().1.note_id, voice);
+    assert!(matches!(rig.heard_by(1).last().unwrap().1.message, Message::NoteOff { .. }));
+    assert!(!rig.mix.has_pending_events());
+}
+
+#[test]
+fn reset_and_revocation_keep_refused_releases_pending() {
+    for reset in [false, true] {
+        let mut rig = Rig::new();
+        let src = port(1, 0);
+        let now = rig.mix.next_frame().0;
+        assert!(rig.send(src, now, on(60)).accepted());
+        assert!(rig.send(src, now, cc(64, 127)).accepted());
+        rig.render(1);
+        rig.refuse_releases.store(true, Ordering::Relaxed);
+        if reset {
+            rig.mix.reset();
+        } else {
+            rig.mix.revoke_source(src.port, src.generation);
+        }
+        rig.render(1);
+        assert!(rig.mix.has_pending_events(), "reset={reset}");
+        rig.refuse_releases.store(false, Ordering::Relaxed);
+        rig.render(1);
+        assert!(!rig.mix.has_pending_events());
+        let heard = rig.heard_by(1);
+        assert!(heard.iter().any(|(_, e)| matches!(e.message, Message::NoteOff { key: 60, .. })));
+        assert!(heard.iter().any(|(_, e)| e.message == cc(64, 0)));
+    }
+}
+
+#[test]
+fn refused_restrike_preserves_a_future_on_and_its_release() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now, on(60)).accepted());
+    rig.render(1);
+    let now = rig.mix.next_frame().0;
+    assert!(rig.send(src, now + 10, on(60)).accepted());
+    assert!(rig.send(src, now + 2 * BLOCK as u64 + 10, on(60)).accepted());
+    rig.refuse_releases.store(true, Ordering::Relaxed);
+    rig.render(1);
+    rig.refuse_releases.store(false, Ordering::Relaxed);
+    rig.render(2);
+    assert!(rig.send(src, rig.mix.next_frame().0, off(60)).accepted());
+    rig.render(1);
+    let heard = rig.heard_by(1);
+    assert_eq!(heard.len(), 4);
+    assert_eq!(heard[0].1.note_id, heard[1].1.note_id);
+    assert_eq!(heard[2].1.note_id, heard[3].1.note_id);
+    assert_ne!(heard[0].1.note_id, heard[2].1.note_id);
+    assert!(!rig.mix.has_pending_events());
 }

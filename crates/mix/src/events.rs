@@ -14,6 +14,8 @@
 //!
 //! A re-strike (a second note-on for an open note) carries the old voice's off, so it is charged
 //! two of those slots.
+//! Host refusal never counts as delivery: refused downs acquire no holder, and refused releases
+//! keep their entries and exact values for a retry at offset zero before the next block's traffic.
 //!
 //! **Delivery**, before the instrument's `process`: controller chase, then clips (as
 //! [`Source::CLIP`], through the same note and pedal table) merged in time order with queue
@@ -45,7 +47,7 @@
 //!   without an adopted plan refuses every event ([`EventOutcome::NoInstrument`]).
 //! - An instrument that fails, or whose track is inactive, does not process its queue: the queue
 //!   is voided (counted `voided`), its notes and pedals are released at the plug-in, and it takes
-//!   no events until it plays again.
+//!   no events until it plays again. Refused releases stay pending until accepted.
 //!
 //! Nothing here allocates, locks or logs on the audio thread; counters are fixed storage read
 //! with [`MixEngine::event_status`].
@@ -417,12 +419,23 @@ struct NoteEntry {
     /// Note-ons queued and not yet delivered.
     ons: u16,
     release_queued: bool,
+    /// A refused off, retained until the host accepts it (including its release velocity).
+    retry_release: Option<u8>,
     /// Due frame of its latest queued note-on: its release is never ordered before it.
     last_on: u64,
 }
 
-const NO_NOTE: NoteEntry =
-    NoteEntry { used: false, source: CLIP_SOURCE, key: 0, sender: NoteId::NONE, voice: -1, ons: 0, release_queued: false, last_on: 0 };
+const NO_NOTE: NoteEntry = NoteEntry {
+    used: false,
+    source: CLIP_SOURCE,
+    key: 0,
+    sender: NoteId::NONE,
+    voice: -1,
+    ons: 0,
+    release_queued: false,
+    retry_release: None,
+    last_on: 0,
+};
 
 impl NoteEntry {
     /// Matching includes the whole source, then the sender id when there is one, else the key.
@@ -444,11 +457,13 @@ struct PedalEntry {
     /// Pedal-downs queued and not yet delivered.
     downs: u16,
     release_queued: bool,
+    /// A refused up: the holder stays down until this exact value is accepted.
+    retry_release: Option<u8>,
     last_down: u64,
 }
 
 const NO_PEDAL: PedalEntry =
-    PedalEntry { used: false, source: CLIP_SOURCE, cc: 0, down: false, value: 0, downs: 0, release_queued: false, last_down: 0 };
+    PedalEntry { used: false, source: CLIP_SOURCE, cc: 0, down: false, value: 0, downs: 0, release_queued: false, retry_release: None, last_down: 0 };
 
 /// Index of a pedal kind in the holder counts.
 fn pedal_kind(cc: u8) -> usize {
@@ -459,8 +474,6 @@ fn pedal_kind(cc: u8) -> usize {
         _ => 3,
     }
 }
-
-const PEDALS: [u8; 4] = [CC_SUSTAIN, CC_SOSTENUTO, soundcraft_dsp::event::CC_SOFT, soundcraft_dsp::event::CC_HOLD2];
 
 /// The last source to move a channel's bend or pressure, and whether it left it neutral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -600,7 +613,7 @@ impl InstrumentEvents {
                     None => {
                         let Some(n) = self.free_note() else { return Admit::Shed(Shed::NotesFull) };
                         if let Some(e) = self.notes.get_mut(n) {
-                            *e = NoteEntry { used: true, source, key, sender: id, voice: -1, ons: 0, release_queued: false, last_on: due };
+                            *e = NoteEntry { used: true, source, key, sender: id, last_on: due, ..NO_NOTE };
                         }
                         n
                     }
@@ -638,7 +651,7 @@ impl InstrumentEvents {
                     None => {
                         let Some(n) = self.free_pedal() else { return Admit::Shed(Shed::PedalsFull) };
                         if let Some(p) = self.pedals.get_mut(n) {
-                            *p = PedalEntry { used: true, source, cc, down: false, value: 0, downs: 0, release_queued: false, last_down: due };
+                            *p = PedalEntry { used: true, source, cc, last_down: due, ..NO_PEDAL };
                         }
                         n
                     }
@@ -774,9 +787,19 @@ impl InstrumentEvents {
     /// Note-on for entry `n`: a re-strike releases the voice it had first, at the same offset.
     fn deliver_on(&mut self, plugin: &mut dyn Plugin, offset: u32, n: usize, velocity: u8) {
         let Some(e) = self.notes.get(n).copied() else { return };
+        if e.retry_release.is_some() {
+            return;
+        }
         if e.voice >= 0 {
             self.status.restrikes = self.status.restrikes.saturating_add(1);
-            self.send(plugin, offset, e.source.channel, e.voice, Message::NoteOff { key: e.key, velocity: 0, id: e.sender });
+            // Do not replace the only identity that can release the old voice on refusal.
+            if !self.send(plugin, offset, e.source.channel, e.voice, Message::NoteOff { key: e.key, velocity: 0, id: e.sender }) {
+                if let Some(e) = self.notes.get_mut(n) {
+                    e.retry_release = Some(0);
+                    e.release_queued = true;
+                }
+                return;
+            }
         }
         let voice = self.voice_id();
         let ok = self.send(plugin, offset, e.source.channel, voice, Message::NoteOn { key: e.key, velocity, id: e.sender });
@@ -785,14 +808,26 @@ impl InstrumentEvents {
         }
     }
 
-    /// Releases entry `n`'s voice (when it sounds) and frees the entry.
+    /// Frees entry `n` only once its voice's off is accepted; otherwise retries next block.
     fn deliver_off(&mut self, plugin: &mut dyn Plugin, offset: u32, n: usize, velocity: u8) {
         let Some(e) = self.notes.get(n).copied() else { return };
-        if e.voice >= 0 {
-            self.send(plugin, offset, e.source.channel, e.voice, Message::NoteOff { key: e.key, velocity, id: e.sender });
+        if e.voice >= 0 && !self.send(plugin, offset, e.source.channel, e.voice, Message::NoteOff { key: e.key, velocity, id: e.sender }) {
+            if let Some(e) = self.notes.get_mut(n) {
+                e.retry_release = Some(velocity);
+                e.release_queued = true;
+            }
+            return;
         }
+        let release_queued = e.ons > 0 && self.queue.iter().any(|q| q.action == Action::Off(n as u8));
         if let Some(e) = self.notes.get_mut(n) {
-            *e = NO_NOTE;
+            if e.ons == 0 {
+                *e = NO_NOTE;
+            } else {
+                // A refused re-strike may have later ons still queued for this entry.
+                e.voice = -1;
+                e.retry_release = None;
+                e.release_queued = release_queued;
+            }
         }
     }
 
@@ -804,6 +839,39 @@ impl InstrumentEvents {
         let Some(p) = self.pedals.get(n).copied() else { return };
         let ch = p.source.channel & 0x0F;
         let kind = pedal_kind(p.cc);
+        // A refused down never became a holder and must not spend a host release slot.
+        if value < 64 && !p.down {
+            if let Some(p) = self.pedals.get_mut(n) {
+                *p = NO_PEDAL;
+            }
+            return;
+        }
+        // Compute the prospective OR without publishing a delivery that may be refused.
+        let other = self
+            .pedals
+            .iter()
+            .enumerate()
+            .filter(|(i, q)| *i != n && q.used && q.down && q.cc == p.cc && q.source.channel & 0x0F == ch)
+            .map(|(_, q)| q.value)
+            .max();
+        let out = if value >= 64 { other.map_or(value, |v| v.max(value)) } else { other.unwrap_or(value) };
+        let Some(sent) = self.sent.get(usize::from(ch)).and_then(|s| s.get(kind)).copied() else { return };
+        if sent == out {
+            self.status.absorbed_pedal_edges = self.status.absorbed_pedal_edges.saturating_add(1);
+        } else if !self.send(plugin, offset, ch, PluginEvent::NO_ID, Message::Control { cc: p.cc, value: out }) {
+            if let Some(p) = self.pedals.get_mut(n) {
+                if value < 64 {
+                    p.retry_release = Some(value);
+                    p.release_queued = true;
+                } else if !p.down && p.downs == 0 && !p.release_queued {
+                    *p = NO_PEDAL;
+                }
+            }
+            return;
+        }
+        if let Some(sent) = self.sent.get_mut(usize::from(ch)).and_then(|s| s.get_mut(kind)) {
+            *sent = out;
+        }
         if let Some(count) = self.holders.get_mut(usize::from(ch)).and_then(|h| h.get_mut(kind)) {
             if value >= 64 && !p.down {
                 *count = count.saturating_add(1);
@@ -819,14 +887,20 @@ impl InstrumentEvents {
                 *p = NO_PEDAL;
             }
         }
-        let holding = |q: &&PedalEntry| q.used && q.down && q.cc == p.cc && q.source.channel & 0x0F == ch;
-        let out = self.pedals.iter().filter(holding).map(|q| q.value).max().unwrap_or(value);
-        let Some(sent) = self.sent.get_mut(usize::from(ch)).and_then(|s| s.get_mut(kind)) else { return };
-        if *sent == out {
-            self.status.absorbed_pedal_edges = self.status.absorbed_pedal_edges.saturating_add(1);
-        } else {
-            *sent = out;
-            self.send(plugin, offset, ch, PluginEvent::NO_ID, Message::Control { cc: p.cc, value: out });
+    }
+
+    /// Retry refused releases before this block's new traffic. The fixed entry tables retain
+    /// identities and values, so retries neither allocate nor compete for ingress queue slots.
+    pub(crate) fn retry_releases(&mut self, plugin: &mut dyn Plugin) {
+        for n in 0..MAX_OPEN {
+            if let Some(velocity) = self.notes.get(n).and_then(|e| e.retry_release) {
+                self.deliver_off(plugin, 0, n, velocity);
+            }
+        }
+        for n in 0..MAX_PEDALS {
+            if let Some(value) = self.pedals.get(n).and_then(|p| p.retry_release) {
+                self.pedal_set(plugin, 0, n, value);
+            }
         }
     }
 
@@ -838,8 +912,9 @@ impl InstrumentEvents {
         if self.holders.get(ch).is_some_and(|h| h.iter().any(|&n| n > 0)) {
             return;
         }
-        self.send(plugin, offset, channel, PluginEvent::NO_ID, Message::Control { cc: CC_RESET_CONTROLLERS, value });
-        if let Some(sent) = self.sent.get_mut(ch) {
+        if self.send(plugin, offset, channel, PluginEvent::NO_ID, Message::Control { cc: CC_RESET_CONTROLLERS, value })
+            && let Some(sent) = self.sent.get_mut(ch)
+        {
             *sent = [0; 4];
         }
     }
@@ -957,28 +1032,28 @@ impl InstrumentEvents {
     pub(crate) fn release_all(&mut self, plugin: &mut dyn Plugin) {
         self.queue.clear();
         self.non_release = 0;
+        for e in &mut self.notes {
+            e.ons = 0;
+        }
+        for p in &mut self.pedals {
+            p.downs = 0;
+        }
         for n in 0..MAX_OPEN {
             if self.notes.get(n).is_some_and(|e| e.used) {
                 self.deliver_off(plugin, 0, n, 0);
             }
         }
-        for ch in 0..16u8 {
-            let sent = self.sent.get(usize::from(ch)).copied().unwrap_or_default();
-            for (cc, v) in PEDALS.into_iter().zip(sent) {
-                if v > 0 {
-                    self.send(plugin, 0, ch, PluginEvent::NO_ID, Message::Control { cc, value: 0 });
-                }
+        for n in 0..MAX_PEDALS {
+            if self.pedals.get(n).is_some_and(|p| p.used) {
+                self.pedal_set(plugin, 0, n, 0);
             }
         }
-        self.pedals = [NO_PEDAL; MAX_PEDALS];
-        self.holders = [[0; 4]; 16];
-        self.sent = [[0; 4]; 16];
         self.writers = [[None; 2]; 16];
     }
 
     /// The instrument failed, or its track is inactive: it will not process this queue. Its
     /// queued events are dropped (counted `voided`) and its notes and pedals are released at the
-    /// plug-in at once, so nothing stays pending.
+    /// plug-in at once. A refused release stays pending for the next attempt.
     pub(crate) fn void(&mut self, plugin: &mut dyn Plugin) {
         if !self.busy() {
             return;
@@ -1004,7 +1079,7 @@ impl InstrumentEvents {
 
     /// A clip note-on. A full table sheds it (counted): it is not delivered untracked.
     pub(crate) fn clip_on(&mut self, plugin: &mut dyn Plugin, offset: u32, key: u8, velocity: u8) {
-        let n = match self.notes.iter().position(|e| e.matches(&CLIP_SOURCE, key, NoteId::NONE)) {
+        let n = match self.notes.iter().position(|e| e.matches(&CLIP_SOURCE, key, NoteId::NONE) && e.retry_release.is_none()) {
             Some(n) => n,
             None => {
                 let Some(n) = self.free_note() else {
@@ -1020,6 +1095,7 @@ impl InstrumentEvents {
                         voice: -1,
                         ons: 0,
                         release_queued: false,
+                        retry_release: None,
                         last_on: 0,
                     };
                 }
@@ -1031,7 +1107,7 @@ impl InstrumentEvents {
 
     /// A clip note-off (nothing when the clip's note is not open: shed, or released at a seek).
     pub(crate) fn clip_off(&mut self, plugin: &mut dyn Plugin, offset: u32, key: u8) {
-        if let Some(n) = self.notes.iter().position(|e| e.matches(&CLIP_SOURCE, key, NoteId::NONE)) {
+        if let Some(n) = self.notes.iter().position(|e| e.matches(&CLIP_SOURCE, key, NoteId::NONE) && e.retry_release.is_none()) {
             self.deliver_off(plugin, offset, n, 0);
         }
     }
@@ -1043,7 +1119,7 @@ impl InstrumentEvents {
         let source = Source { channel: msg[0] & 0x0F, ..CLIP_SOURCE };
         match message {
             Message::Control { cc, value } if is_pedal(cc) => {
-                let open = self.pedals.iter().position(|p| p.used && p.source == source && p.cc == cc);
+                let open = self.pedals.iter().position(|p| p.used && p.source == source && p.cc == cc && p.retry_release.is_none());
                 match (open, value >= 64) {
                     (Some(n), _) => self.pedal_set(plugin, offset, n, value),
                     (None, true) => {
@@ -1052,7 +1128,7 @@ impl InstrumentEvents {
                             return;
                         };
                         if let Some(p) = self.pedals.get_mut(n) {
-                            *p = PedalEntry { used: true, source, cc, down: false, value: 0, downs: 0, release_queued: false, last_down: 0 };
+                            *p = PedalEntry { used: true, source, cc, ..NO_PEDAL };
                         }
                         self.pedal_set(plugin, offset, n, value);
                     }

@@ -1907,6 +1907,9 @@ fn process_strip<B: Busses + ?Sized>(
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
                 inst.plugin.set_transport(&transport);
+                if let Some(e) = inst.events.as_deref_mut() {
+                    e.retry_releases(&mut *inst.plugin);
+                }
                 // Stopped: no clips, but the instrument still plays auditioned notes.
                 if !live.monitor_only {
                     if std::mem::take(&mut strip.chase) {
