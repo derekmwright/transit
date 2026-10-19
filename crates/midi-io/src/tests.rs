@@ -302,6 +302,46 @@ fn unplugging_the_first_of_two_identical_inputs_flags_the_dead_handle_not_the_li
 }
 
 #[test]
+fn mixed_ids_unplugging_identified_input_keeps_anonymous_input_live() {
+    let fake = Fake::default();
+    let identified = fake.add_input("Keys");
+    let anonymous = fake.add_input_anonymous("Keys");
+    let io = fake.io();
+    let mut watcher = io.watcher().unwrap();
+    let (dead, dead_consumer) = io.open_input(&identified, InputConfig::default()).unwrap();
+    let (live, mut consumer) = io.open_input(&anonymous, InputConfig::default()).unwrap();
+    let sender = fake.input_port(&anonymous).unwrap();
+
+    fake.remove_input(&identified);
+    let changes = watcher.poll().unwrap();
+    assert!(sender.deliver(1, &[0x90, 60, 100]));
+    assert_eq!(consumer.pop().unwrap().message(), &[0x90, 60, 100]);
+    assert!(dead.is_disconnected() && dead_consumer.is_disconnected());
+    assert!(!live.is_disconnected() && !consumer.is_disconnected(), "live port flagged: {changes:?}");
+    assert!(matches!(&changes[..], [PortChange::Removed { port, was_open: true }] if port.key.id == identified.id), "{changes:?}");
+    assert_eq!(io.list_inputs().unwrap()[0].key, anonymous);
+    assert!(watcher.poll().unwrap().is_empty());
+
+    // The saved anonymous key still opens the survivor after its enumeration index changes.
+    drop(live);
+    let (reopened, mut consumer) = io.open_input(&anonymous, InputConfig::default()).unwrap();
+    assert!(sender.deliver(2, &[0x80, 60, 0]));
+    assert_eq!(consumer.pop().unwrap().message(), &[0x80, 60, 0]);
+    fake.remove_input(&anonymous);
+    assert!(matches!(&watcher.poll().unwrap()[..], [PortChange::Removed { was_open: true, .. }]));
+    assert!(reopened.is_disconnected() && consumer.is_disconnected());
+}
+
+#[test]
+fn missing_port_with_max_ordinal_formats_without_overflow() {
+    let io = Fake::default().io();
+    let key = Fake::key("missing", u32::MAX);
+    let error = io.open_input(&key, InputConfig::default()).err().unwrap();
+    assert!(matches!(&error, MidiIoError::PortNotFound(missing) if *missing == key));
+    assert_eq!(error.to_string(), "MIDI port not found: missing #4294967296");
+}
+
+#[test]
 fn id_less_keys_fall_back_to_name_and_ordinal() {
     let fake = Fake::default();
     let k = fake.add_input_anonymous("Old");

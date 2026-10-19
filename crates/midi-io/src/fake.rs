@@ -97,7 +97,8 @@ fn raws<T>(ports: &[Port<T>]) -> Vec<RawPort> {
 fn key_at<T>(ports: &[Port<T>], index: usize) -> PortKey {
     let name = ports.get(index).map(|p| p.raw.name.clone()).unwrap_or_default();
     let id = ports.get(index).map(|p| p.raw.id.clone()).unwrap_or_default();
-    let ordinal = u32::try_from(ports.iter().take(index).filter(|p| p.raw.name == name).count()).unwrap_or(u32::MAX);
+    let ordinal =
+        u32::try_from(ports.iter().take(index).filter(|p| p.raw.name == name && (!id.is_empty() || p.raw.id.is_empty())).count()).unwrap_or(u32::MAX);
     PortKey { backend: BackendId::Fake, name, ordinal, id }
 }
 
