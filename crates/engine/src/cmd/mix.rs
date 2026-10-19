@@ -150,7 +150,7 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("automation.write_range", "Write Automation", [], None, "{track?, param, start?, end?, value}", has_selection, write_range),
         cmd!("automation.clear", "Clear Automation", [], None, "{track?, param?, start?, end?}", has_selection, clear_lane),
-        cmd!("automation.thin", "Thin", ["Edit", "Automation"], Some("Cmd+Alt+T"), "{tracks?, tolerance?: 0.1}", has_selection, |e, p| thin(
+        cmd!("automation.thin", "Thin", ["Edit", "Automation"], Some("Cmd+Alt+T"), "{tracks?, param?, tolerance?: 0.1}", has_selection, |e, p| thin(
             e, p, false
         )),
         cmd!("automation.thin_all", "Thin All", ["Edit", "Automation"], None, "{tolerance?: 0.1}", has_tracks, |e, p| thin(e, p, true)),
@@ -566,11 +566,13 @@ fn clear_lane(e: &mut Engine, p: &Value) -> Result<Value> {
 fn thin(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
     let tracks = if all { e.session().tracks.iter().map(|t| t.id).collect() } else { tracks_required(e, "automation.thin", p)? };
     let tol = f32_or(p, "tolerance", 0.1).clamp(0.0, 100.0);
+    // Only the lane a write pass just wrote, when named; a lane the track lacks is a no-op.
+    let only = if all || p.get("param").is_none() { None } else { Some(lane_param(p, "automation.thin")?) };
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
-            for l in &mut tr.automation {
+            for l in tr.automation.iter_mut().filter(|l| only.as_ref().is_none_or(|x| x == &l.param)) {
                 n += l.thin(tol);
             }
         }
