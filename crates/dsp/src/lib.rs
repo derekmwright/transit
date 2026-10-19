@@ -14,6 +14,7 @@
 //! Audio is planar `f32`: `io[channel][frame]`.
 
 pub mod biquad;
+pub mod event;
 pub mod meter;
 pub mod offline;
 mod osc;
@@ -249,6 +250,30 @@ pub trait Plugin: Send {
     /// program change) at a sample offset within the next block.
     fn midi(&mut self, _offset: usize, _msg: [u8; 3]) {}
     fn all_notes_off(&mut self) {}
+    /// Instruments: one event at a sample offset within the next block, on a MIDI 1.0 channel
+    /// and with the host's voice id (see [`event::PluginEvent`]). `false` only when the
+    /// plug-in's own queue refused it (the mix counts it). The default maps the event onto
+    /// [`Plugin::note_on`], [`Plugin::note_off`] and [`Plugin::midi`] on channel 0, dropping
+    /// the channel and the id: a plug-in that does not override it is a single-channel one.
+    fn event(&mut self, offset: u32, ev: &event::PluginEvent) -> bool {
+        let at = offset as usize;
+        match ev.message {
+            event::Message::NoteOn { key, velocity, .. } => self.note_on(at, key.min(127), velocity.min(127)),
+            event::Message::NoteOff { key, .. } => self.note_off(at, key.min(127)),
+            m => {
+                for msg in m.midi1(0).into_iter().flatten() {
+                    self.midi(at, msg);
+                }
+            }
+        }
+        true
+    }
+    /// Sets a parameter at a sample offset within the next block. `false` if `id` is unknown or
+    /// the plug-in's queue refused the point. The default applies it at the block start
+    /// ([`Plugin::set_param`]); hosts that pass timed points override it.
+    fn set_param_at(&mut self, _offset: u32, id: &str, value: f32) -> bool {
+        self.set_param(id, value)
+    }
     /// Sample-playing instruments (the Sampler): the recorded audio to play, `None` to clear it.
     /// `false` when the plugin does not play samples. Does not allocate; sounding voices stop.
     /// The previous sample is dropped here, so hosts keep their own reference to it (the
