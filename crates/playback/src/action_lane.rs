@@ -1,19 +1,20 @@
-//! Bounded ordered actions for one runtime generation. Copy payloads carry no heap owners.
-//! A plan prerequisite names the exact compiled plan; an unavailable future plan defers
-//! normal actions, while Stop and note-release recovery remain independently serviceable.
-//! Both endpoints stay anchored on control through quiescence, like the publication ports.
+//! Independent bounded transport and note lanes for one prepared-plan runtime.
+//! Transport may wait for an exact compiled plan. Notes never wait for transport or a
+//! plan prerequisite. Each class owns its own admission, return and callback budgets.
+//! Copy payloads carry no heap owners; endpoints stay anchored on control until quiescence.
 
+use crate::plan_bridge;
 use soundcraft_mix::PlanGeneration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CAPACITY: usize = 256;
+pub const NOTE_CAPACITY: usize = 256;
 pub const CALLBACK_ACTIONS: usize = 32;
+pub const CALLBACK_NOTES: usize = 32;
 
-/// Monotonic within one runtime generation. Exhaustion refuses, never aliases old work.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sequence(u64);
-
 impl Sequence {
     pub fn get(self) -> u64 {
         self.0
@@ -21,12 +22,16 @@ impl Sequence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Class {
+pub enum NoteKind {
+    On,
+    Off,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
     Ordinary,
     NoteOn,
     NoteOff,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Applied,
@@ -37,25 +42,21 @@ pub enum Outcome {
     Faulted,
     Shutdown,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
     Full { release_recovery: Option<Sequence> },
     SequenceExhausted,
+    NotePrerequisite,
 }
 
-/// A returned admission credit and its explicit disposition. Recovery means a rejected
-/// note-off caused AllNotesOff; this is a counted failure policy, not normal note timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Receipt<T: Copy> {
     pub sequence: Sequence,
     pub payload: T,
     pub outcome: Outcome,
-    pub release_recovery: bool,
 }
 
-/// The handler must make Stop stop transport AND release notes. Recovery never waits
-/// for a plan. If the handler unwinds, the lane faults and never calls it again.
+/// Stop must stop transport AND release notes. A handler unwind permanently faults both lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<T: Copy> {
     Action { sequence: Sequence, payload: T },
@@ -70,17 +71,14 @@ struct Entry<T: Copy> {
     class: Class,
     plan: Option<PlanGeneration>,
 }
-
 #[derive(Clone, Copy)]
 struct Pending<T: Copy> {
     entry: Entry<T>,
-    finished: Option<(Outcome, bool)>,
+    finished: Option<Outcome>,
 }
-
 impl<T: Copy> Pending<T> {
     fn receipt(self) -> Receipt<T> {
-        let (outcome, release_recovery) = self.finished.unwrap_or((Outcome::Shutdown, false));
-        Receipt { sequence: self.entry.sequence, payload: self.entry.payload, outcome, release_recovery }
+        Receipt { sequence: self.entry.sequence, payload: self.entry.payload, outcome: self.finished.unwrap_or(Outcome::Shutdown) }
     }
 }
 
@@ -93,20 +91,32 @@ struct Shared {
     applied_release: AtomicU64,
 }
 
-/// Use one budget across all chunks/blocks of the actual device callback.
+/// Minted only by the actual device adapter and shared across every conversion chunk.
 pub struct Budget {
     remaining: usize,
+    notes_remaining: usize,
     stop_serviced: bool,
     release_serviced: bool,
 }
-
 pub(super) fn callback_scope() -> Budget {
-    Budget { remaining: CALLBACK_ACTIONS, stop_serviced: false, release_serviced: false }
+    Budget { remaining: CALLBACK_ACTIONS, notes_remaining: CALLBACK_NOTES, stop_serviced: false, release_serviced: false }
 }
-
 impl Budget {
     pub fn remaining(&self) -> usize {
         self.remaining
+    }
+    pub fn notes_remaining(&self) -> usize {
+        self.notes_remaining
+    }
+    fn available(&self, notes: bool) -> usize {
+        if notes { self.notes_remaining } else { self.remaining }
+    }
+    fn spend(&mut self, notes: bool) {
+        if notes {
+            self.notes_remaining -= 1;
+        } else {
+            self.remaining -= 1;
+        }
     }
 }
 
@@ -119,32 +129,73 @@ pub struct Service {
     pub recovery_deferred: bool,
     pub faulted: bool,
 }
-
-pub struct Control<T: Copy> {
-    send: rtrb::Producer<Entry<T>>,
-    returned: rtrb::Consumer<Receipt<T>>,
-    shared: Arc<Shared>,
-    next: u64,
-    credits: usize,
+impl Service {
+    fn combine(&mut self, other: Self) {
+        self.examined += other.examined;
+        self.applied += other.applied;
+        self.waiting_for_plan |= other.waiting_for_plan;
+        self.return_pending |= other.return_pending;
+        self.recovery_deferred |= other.recovery_deferred;
+        self.faulted |= other.faulted;
+    }
 }
 
-pub struct Audio<T: Copy> {
+struct ControlLane<T: Copy> {
+    send: rtrb::Producer<Entry<T>>,
+    returned: rtrb::Consumer<Receipt<T>>,
+    credits: usize,
+}
+struct AudioLane<T: Copy> {
     receive: rtrb::Consumer<Entry<T>>,
     returned: rtrb::Producer<Receipt<T>>,
-    shared: Arc<Shared>,
     pending: Option<Pending<T>>,
+}
+fn lane<T: Copy>(capacity: usize) -> (ControlLane<T>, AudioLane<T>) {
+    let (send, receive) = rtrb::RingBuffer::new(capacity);
+    let (return_send, returned) = rtrb::RingBuffer::new(capacity);
+    (ControlLane { send, returned, credits: capacity }, AudioLane { receive, returned: return_send, pending: None })
+}
+impl<T: Copy> ControlLane<T> {
+    fn reclaim(&mut self) -> Option<Receipt<T>> {
+        let receipt = self.returned.pop().ok()?;
+        self.credits += 1;
+        Some(receipt)
+    }
+}
+
+pub struct Control<T: Copy> {
+    actions: ControlLane<T>,
+    notes: ControlLane<T>,
+    shared: Arc<Shared>,
+    next: u64,
+    prefer_notes: bool,
+}
+pub struct Audio<T: Copy> {
+    actions: AudioLane<T>,
+    notes: AudioLane<T>,
+    state: State,
+    runtime: plan_bridge::RuntimeIdentity,
+}
+struct State {
+    shared: Arc<Shared>,
     seen_stop: Sequence,
     seen_release: Sequence,
     faulted: bool,
 }
 
-pub fn pair<T: Copy>() -> (Control<T>, Audio<T>) {
-    let (send, receive) = rtrb::RingBuffer::new(CAPACITY);
-    let (return_send, returned) = rtrb::RingBuffer::new(CAPACITY);
+/// Pair only with this bridge incarnation. A new device/rate bridge needs new action lanes.
+pub fn pair<T: Copy>(bridge: &plan_bridge::Control) -> (Control<T>, Audio<T>) {
+    let (actions, audio_actions) = lane(CAPACITY);
+    let (notes, audio_notes) = lane(NOTE_CAPACITY);
     let shared = Arc::new(Shared::default());
     (
-        Control { send, returned, shared: Arc::clone(&shared), next: 0, credits: CAPACITY },
-        Audio { receive, returned: return_send, shared, pending: None, seen_stop: Sequence(0), seen_release: Sequence(0), faulted: false },
+        Control { actions, notes, shared: Arc::clone(&shared), next: 0, prefer_notes: false },
+        Audio {
+            actions: audio_actions,
+            notes: audio_notes,
+            state: State { shared, seen_stop: Sequence(0), seen_release: Sequence(0), faulted: false },
+            runtime: bridge.runtime_identity(),
+        },
     )
 }
 
@@ -153,18 +204,35 @@ impl<T: Copy> Control<T> {
         self.next = self.next.checked_add(1).ok_or(SendError::SequenceExhausted)?;
         Ok(Sequence(self.next))
     }
-
-    /// A full note-off lane requests release recovery even though the ordered action
-    /// was refused. Its sequence also cancels older queued note-ons, preventing a
-    /// delayed note-on from arriving after its lost release.
-    pub fn send(&mut self, payload: T, class: Class, plan: Option<PlanGeneration>) -> Result<Sequence, SendError> {
-        if self.credits == 0 {
+    pub fn send_action(&mut self, payload: T, plan: Option<PlanGeneration>) -> Result<Sequence, SendError> {
+        self.send(payload, Class::Ordinary, plan)
+    }
+    /// Notes have no plan prerequisite. The payload's instrument/note identity is validated
+    /// by the event handler; a future instrument must be refused, never block a release.
+    pub fn send_note(&mut self, payload: T, kind: NoteKind) -> Result<Sequence, SendError> {
+        self.send(
+            payload,
+            match kind {
+                NoteKind::On => Class::NoteOn,
+                NoteKind::Off => Class::NoteOff,
+            },
+            None,
+        )
+    }
+    fn send(&mut self, payload: T, class: Class, plan: Option<PlanGeneration>) -> Result<Sequence, SendError> {
+        let note = class != Class::Ordinary;
+        if note && plan.is_some() {
+            return Err(SendError::NotePrerequisite);
+        }
+        let credits = if note { self.notes.credits } else { self.actions.credits };
+        if credits == 0 {
             let release_recovery = if class == Class::NoteOff { Some(self.all_notes_off()?) } else { None };
             return Err(SendError::Full { release_recovery });
         }
         let sequence = self.sequence()?;
         let entry = Entry { sequence, payload, class, plan };
-        if self.send.push(entry).is_err() {
+        let lane = if note { &mut self.notes } else { &mut self.actions };
+        if lane.send.push(entry).is_err() {
             let release_recovery = if class == Class::NoteOff {
                 self.shared.release.store(sequence.0, Ordering::Release);
                 Some(sequence)
@@ -173,65 +241,63 @@ impl<T: Copy> Control<T> {
             };
             return Err(SendError::Full { release_recovery });
         }
-        self.credits -= 1;
+        lane.credits -= 1;
         Ok(sequence)
     }
-
-    /// Supersedes older queued actions and never spends a normal admission credit.
     pub fn stop(&mut self) -> Result<Sequence, SendError> {
         let sequence = self.sequence()?;
         self.shared.stop.store(sequence.0, Ordering::Release);
         Ok(sequence)
     }
-
     pub fn all_notes_off(&mut self) -> Result<Sequence, SendError> {
         let sequence = self.sequence()?;
         self.shared.release.store(sequence.0, Ordering::Release);
         Ok(sequence)
     }
-
-    /// Call when the N=1 plan protocol confirms rejection/cancellation of a compiled
-    /// generation. No later action may wait forever for that unreachable generation.
+    /// This pair's strictly sequential N=1 plan protocol confirms an unreachable generation.
     pub fn reject_plan(&mut self, generation: PlanGeneration) {
         let previous = self.shared.rejected.load(Ordering::Relaxed);
         self.shared.rejected.store(previous.max(generation.get()), Ordering::Release);
     }
-
-    /// Copy receipt: no owner disposal can occur after credit restoration.
+    /// Each class is FIFO; receipts from independent classes may arrive out of sequence.
+    /// Round-robin reclamation prevents a busy transport lane starving note credits.
     pub fn reclaim(&mut self) -> Option<Receipt<T>> {
-        let receipt = self.returned.pop().ok()?;
-        self.credits += 1;
-        Some(receipt)
+        self.prefer_notes = !self.prefer_notes;
+        if self.prefer_notes {
+            self.notes.reclaim().or_else(|| self.actions.reclaim())
+        } else {
+            self.actions.reclaim().or_else(|| self.notes.reclaim())
+        }
     }
-
     pub fn credits(&self) -> usize {
-        self.credits
+        self.actions.credits
     }
-
-    /// Independent acknowledgement counters may straddle a callback; not a time map.
+    pub fn note_credits(&self) -> usize {
+        self.notes.credits
+    }
     pub fn recovery_progress(&self) -> (Sequence, Sequence) {
         (Sequence(self.shared.applied_stop.load(Ordering::Acquire)), Sequence(self.shared.applied_release.load(Ordering::Acquire)))
     }
-
-    /// After quiescence, recover receipts plus waiting/queued actions on control.
-    /// No event handler runs during teardown. Both ring allocations also drop here.
     pub fn retire(mut self, mut audio: Audio<T>) -> Vec<Receipt<T>> {
-        let mut receipts = Vec::with_capacity(CAPACITY);
+        let mut receipts = Vec::with_capacity(CAPACITY + NOTE_CAPACITY);
         while let Some(receipt) = self.reclaim() {
             receipts.push(receipt);
         }
-        if let Some(pending) = audio.pending.take() {
-            receipts.push(pending.receipt());
+        for lane in [&mut audio.actions, &mut audio.notes] {
+            if let Some(pending) = lane.pending.take() {
+                receipts.push(pending.receipt());
+            }
+            while let Ok(entry) = lane.receive.pop() {
+                receipts.push(Pending { entry, finished: None }.receipt());
+            }
         }
-        while let Ok(entry) = audio.receive.pop() {
-            receipts.push(Pending { entry, finished: None }.receipt());
-        }
+        receipts.sort_unstable_by_key(|r| r.sequence);
         receipts
     }
 }
 
-impl<T: Copy> Audio<T> {
-    fn urgent(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>)) {
+impl State {
+    fn urgent<T: Copy>(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>)) {
         if stop {
             self.seen_stop = sequence;
         } else {
@@ -243,26 +309,18 @@ impl<T: Copy> Audio<T> {
         if stop {
             self.shared.applied_stop.store(sequence.0, Ordering::Release);
         }
-        let released = self.seen_stop.max(self.seen_release);
-        self.shared.applied_release.store(released.0, Ordering::Release);
+        self.shared.applied_release.store(self.seen_stop.max(self.seen_release).0, Ordering::Release);
     }
-
-    fn recover(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>)) -> bool {
+    fn recover<T: Copy>(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>)) -> bool {
         if self.faulted {
             return true;
         }
         let stop = Sequence(self.shared.stop.load(Ordering::Acquire));
         let release = Sequence(self.shared.release.load(Ordering::Acquire));
         let new_stop = stop > self.seen_stop;
-        let new_release = release > self.seen_release;
-        // Two observed urgent actions run in their control-side order.
-        if new_release && (!new_stop || release < stop) {
-            if budget.release_serviced {
-                return false;
-            }
-            budget.release_serviced = true;
-            self.urgent(false, release, apply);
-        }
+        let new_release = release > self.seen_release.max(self.seen_stop);
+        // Stop includes release through its sequence. An older release never delays it,
+        // even if this callback already spent the independent AllNotesOff budget.
         if new_stop {
             if budget.stop_serviced {
                 return false;
@@ -270,7 +328,7 @@ impl<T: Copy> Audio<T> {
             budget.stop_serviced = true;
             self.urgent(true, stop, apply);
         }
-        if new_release && new_stop && release > stop {
+        if new_release && release > self.seen_stop {
             if budget.release_serviced {
                 return false;
             }
@@ -279,8 +337,7 @@ impl<T: Copy> Audio<T> {
         }
         true
     }
-
-    fn disposition(&self, entry: Entry<T>, active: PlanGeneration) -> Option<Outcome> {
+    fn disposition<T: Copy>(&self, entry: Entry<T>, active: PlanGeneration) -> Option<Outcome> {
         if self.faulted {
             return Some(Outcome::Faulted);
         }
@@ -290,7 +347,9 @@ impl<T: Copy> Audio<T> {
         if entry.class == Class::NoteOn && entry.sequence <= self.seen_release {
             return Some(Outcome::NotesReleased);
         }
-        let Some(required) = entry.plan else { return Some(Outcome::Applied) };
+        let Some(required) = entry.plan else {
+            return Some(Outcome::Applied);
+        };
         if required == active {
             Some(Outcome::Applied)
         } else if required < active {
@@ -301,70 +360,83 @@ impl<T: Copy> Audio<T> {
             None
         }
     }
-
-    /// Bounded normal work, independent urgent recovery. Re-read urgent state after
-    /// dequeuing: the queue's acquire observes urgent stores preceding this action's
-    /// publication, so a newer Play cannot run before an earlier unseen Stop.
-    pub fn service(&mut self, budget: &mut Budget, active: PlanGeneration, apply: &mut impl FnMut(Event<T>)) -> Service {
+    fn service_lane<T: Copy>(
+        &mut self,
+        lane: &mut AudioLane<T>,
+        notes: bool,
+        budget: &mut Budget,
+        active: PlanGeneration,
+        apply: &mut impl FnMut(Event<T>),
+    ) -> Service {
         let mut result = Service::default();
         if !self.recover(budget, apply) {
             result.recovery_deferred = true;
             return result;
         }
         loop {
-            if let Some(pending) = self.pending.filter(|p| p.finished.is_some()) {
-                if self.returned.push(pending.receipt()).is_err() {
+            if let Some(pending) = lane.pending.filter(|p| p.finished.is_some()) {
+                if lane.returned.push(pending.receipt()).is_err() {
                     result.return_pending = true;
                     break;
                 }
-                self.pending = None;
+                lane.pending = None;
             }
-            if budget.remaining == 0 {
+            if budget.available(notes) == 0 {
                 break;
             }
-            if self.pending.is_none() {
-                let Ok(entry) = self.receive.pop() else { break };
-                self.pending = Some(Pending { entry, finished: None });
+            if lane.pending.is_none() {
+                let Ok(entry) = lane.receive.pop() else {
+                    break;
+                };
+                lane.pending = Some(Pending { entry, finished: None });
             }
-            budget.remaining -= 1;
+            budget.spend(notes);
             result.examined += 1;
+            // Acquire after dequeue observes urgent stores preceding a newer publication.
             if !self.recover(budget, apply) {
                 result.recovery_deferred = true;
                 break;
             }
-            let Some(pending) = self.pending else { break };
+            let Some(pending) = lane.pending else {
+                break;
+            };
             let Some(outcome) = self.disposition(pending.entry, active) else {
                 result.waiting_for_plan = true;
                 break;
             };
-            let recovery = pending.entry.class == Class::NoteOff && matches!(outcome, Outcome::PlanRejected | Outcome::PlanSuperseded);
-            let needs_release = recovery && pending.entry.sequence > self.seen_release.max(self.seen_stop);
-            if needs_release && budget.release_serviced {
-                result.recovery_deferred = true;
-                break;
-            }
-            // Store failure disposition BEFORE invoking foreign engine/plugin behavior.
-            self.pending = Some(Pending { finished: Some((Outcome::Faulted, false)), ..pending });
-            if needs_release {
-                budget.release_serviced = true;
-                self.urgent(false, pending.entry.sequence, apply);
-            }
+            lane.pending = Some(Pending { finished: Some(Outcome::Faulted), ..pending });
             if outcome == Outcome::Applied {
                 self.faulted = true;
                 apply(Event::Action { sequence: pending.entry.sequence, payload: pending.entry.payload });
                 self.faulted = false;
                 result.applied += 1;
             }
-            self.pending = Some(Pending { finished: Some((outcome, recovery)), ..pending });
+            lane.pending = Some(Pending { finished: Some(outcome), ..pending });
         }
         result.faulted = self.faulted;
         result
     }
+}
 
-    /// After an external render fault, return future actions as Faulted without invoking
-    /// handlers. Ownership and admission credits still round-trip until main reclaims.
+impl<T: Copy> Audio<T> {
+    /// The paired bridge supplies both generation and permanent fault state. A foreign
+    /// runtime, even with equal numeric generations, permanently refuses this lane.
+    pub fn service(&mut self, budget: &mut Budget, bridge: &plan_bridge::Audio, apply: &mut impl FnMut(Event<T>)) -> Service {
+        if !bridge.matches_runtime(&self.runtime) || bridge.engine().faulted() {
+            self.state.faulted = true;
+        }
+        self.service_generation(budget, bridge.engine().active().generation, apply)
+    }
+    // Private fixture seam; production callers cannot bypass runtime/fault validation.
+    fn service_generation(&mut self, budget: &mut Budget, active: PlanGeneration, apply: &mut impl FnMut(Event<T>)) -> Service {
+        let mut result = self.state.service_lane(&mut self.notes, true, budget, active, apply);
+        if !result.recovery_deferred {
+            result.combine(self.state.service_lane(&mut self.actions, false, budget, active, apply));
+        }
+        result
+    }
     pub fn fault(&mut self) {
-        self.faulted = true;
+        self.state.faulted = true;
     }
 }
 

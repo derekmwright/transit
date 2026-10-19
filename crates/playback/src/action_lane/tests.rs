@@ -11,9 +11,166 @@ fn generation(n: u64) -> PlanGeneration {
     PlanGeneration::from_raw(n)
 }
 
+fn bridge() -> (crate::plan_bridge::Control, crate::plan_bridge::Audio) {
+    crate::plan_bridge::pair(
+        soundcraft_mix::RenderTarget { device: soundcraft_mix::DeviceGeneration(1), sample_rate: 48_000, max_block: 512 },
+        soundcraft_mix::PlanLimits::default(),
+    )
+}
+
+fn fixture<T: Copy>() -> (action_lane::Control<T>, action_lane::Audio<T>) {
+    let (control, audio) = bridge();
+    let result = action_lane::pair(&control);
+    control.retire(audio);
+    result
+}
+
+#[test]
+fn notes_do_not_wait_for_transport_prerequisites_or_consume_transport_credits() {
+    use super::NoteKind;
+    let (mut control, mut audio) = fixture();
+    control.send_action(0, Some(generation(5))).unwrap();
+    let mut applied = 0;
+    for note in 1..=50 {
+        control.send_note(note, NoteKind::Off).unwrap();
+        let (result, stats) = measure(|| {
+            audio.service_generation(&mut super::callback_scope(), generation(4), &mut |event| {
+                assert!(matches!(event,Event::Action { payload,.. } if payload==note));
+                applied += 1;
+            })
+        });
+        assert!(stats.is_zero());
+        assert!(result.waiting_for_plan);
+        let receipt = control.reclaim().unwrap();
+        assert_eq!((receipt.payload, receipt.outcome), (note, Outcome::Applied));
+    }
+    assert_eq!(applied, 50);
+    assert_eq!(control.credits(), CAPACITY - 1);
+    assert_eq!(control.note_credits(), super::NOTE_CAPACITY);
+    assert_eq!(control.send(51, Class::NoteOff, Some(generation(5))), Err(SendError::NotePrerequisite));
+    assert_eq!(control.retire(audio).len(), 1);
+}
+
+#[test]
+fn saturated_notes_leave_transport_credit_and_each_class_keeps_its_callback_budget() {
+    use super::NoteKind;
+    let (mut control, mut audio) = fixture();
+    for i in 0..super::NOTE_CAPACITY {
+        control.send_note(i, NoteKind::On).unwrap();
+    }
+    for i in 0..CAPACITY {
+        control.send_action(1000 + i, None).unwrap();
+    }
+    assert_eq!((control.credits(), control.note_credits()), (0, 0));
+    let (mut notes, mut actions) = (0, 0);
+    let mut budget = super::callback_scope();
+    for _ in 0..3 {
+        let (_, stats) = measure(|| {
+            audio.service_generation(&mut budget, generation(1), &mut |event| {
+                if let Event::Action { payload, .. } = event {
+                    if payload < 1000 {
+                        notes += 1;
+                    } else {
+                        actions += 1;
+                    }
+                }
+            })
+        });
+        assert!(stats.is_zero());
+    }
+    assert_eq!((notes, actions), (super::CALLBACK_NOTES, CALLBACK_ACTIONS));
+    for _ in 0..(notes + actions) {
+        control.reclaim().unwrap();
+    }
+    assert_eq!((control.credits(), control.note_credits()), (CALLBACK_ACTIONS, super::CALLBACK_NOTES));
+    assert_eq!(control.retire(audio).len(), CAPACITY + super::NOTE_CAPACITY - notes - actions);
+}
+
+#[test]
+fn a_full_waiting_transport_lane_cannot_refuse_a_note_release() {
+    let (mut control, mut audio) = fixture();
+    for i in 0..CAPACITY {
+        control.send_action(i, Some(generation(5))).unwrap();
+    }
+    let release = control.send_note(999, super::NoteKind::Off).unwrap();
+    let mut received = None;
+    let result = audio.service_generation(&mut super::callback_scope(), generation(4), &mut |event| received = Some(event));
+    assert!(result.waiting_for_plan);
+    assert_eq!(received, Some(Event::Action { sequence: release, payload: 999 }));
+    assert_eq!(control.reclaim().unwrap().sequence, release);
+    assert_eq!((control.credits(), control.note_credits()), (0, super::NOTE_CAPACITY));
+    assert_eq!(control.retire(audio).len(), CAPACITY);
+}
+
+#[test]
+fn urgent_handler_unwind_faults_both_classes_without_acknowledging_or_replaying() {
+    for stop in [true, false] {
+        let (mut control, mut audio) = fixture();
+        if stop {
+            control.stop().unwrap();
+        } else {
+            control.all_notes_off().unwrap();
+        }
+        control.send_action(1, None).unwrap();
+        control.send_note(2, super::NoteKind::Off).unwrap();
+        let mut calls = 0;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| {
+                    calls += 1;
+                    panic!("urgent handler fault");
+                });
+            }))
+            .is_err()
+        );
+        let result = audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| calls += 1);
+        assert!(result.faulted);
+        assert_eq!(calls, 1);
+        assert_eq!(control.recovery_progress(), (super::Sequence(0), super::Sequence(0)));
+        let receipts = control.retire(audio);
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|r| r.outcome == Outcome::Faulted));
+    }
+}
+
+#[test]
+fn stop_absorbs_an_older_release_after_the_release_budget_was_spent() {
+    let (mut control, mut audio) = fixture::<u8>();
+    let first = control.all_notes_off().unwrap();
+    let mut budget = super::callback_scope();
+    let mut events = Vec::with_capacity(4);
+    audio.service_generation(&mut budget, generation(1), &mut |e| events.push(e));
+    control.all_notes_off().unwrap();
+    let stop = control.stop().unwrap();
+    let (result, stats) = measure(|| audio.service_generation(&mut budget, generation(1), &mut |e| events.push(e)));
+    assert!(stats.is_zero());
+    assert!(!result.recovery_deferred);
+    assert_eq!(events, [Event::AllNotesOff { sequence: first }, Event::Stop { sequence: stop }]);
+    assert_eq!(control.recovery_progress(), (stop, stop));
+    control.retire(audio);
+}
+
+#[test]
+fn production_service_rejects_a_foreign_runtime_even_with_equal_numeric_generations() {
+    let (first_control, first_audio) = bridge();
+    let (second_control, second_audio) = bridge();
+    assert_eq!(first_audio.engine().active(), second_audio.engine().active());
+    let (mut control, mut audio) = action_lane::pair(&first_control);
+    control.send_action(1, None).unwrap();
+    control.send_note(2, super::NoteKind::Off).unwrap();
+    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), &second_audio, &mut |_| panic!("wrong runtime")));
+    assert!(stats.is_zero());
+    assert!(result.faulted);
+    control.send_action(3, None).unwrap();
+    assert!(audio.service(&mut super::callback_scope(), &first_audio, &mut |_| panic!("fault must be permanent")).faulted);
+    assert!(control.retire(audio).iter().all(|r| r.outcome == Outcome::Faulted));
+    first_control.retire(first_audio);
+    second_control.retire(second_audio);
+}
+
 #[test]
 fn capacity_and_callback_budget_are_separate_and_credit_waits_for_reclaim() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     for i in 0..CAPACITY {
         control.send(i, Class::Ordinary, None).unwrap();
     }
@@ -22,7 +179,7 @@ fn capacity_and_callback_budget_are_separate_and_credit_waits_for_reclaim() {
     let mut seen = Vec::with_capacity(CAPACITY);
     let ((), stats) = measure(|| {
         for _ in 0..4 {
-            audio.service(&mut budget, generation(1), &mut |e| seen.push(e));
+            audio.service_generation(&mut budget, generation(1), &mut |e| seen.push(e));
         }
     });
     assert!(stats.is_zero(), "{stats:?}");
@@ -42,16 +199,16 @@ fn capacity_and_callback_budget_are_separate_and_credit_waits_for_reclaim() {
 
 #[test]
 fn stop_bypasses_a_waiting_plan_and_a_newer_play_survives() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     control.send(1, Class::Ordinary, Some(generation(2))).unwrap();
     control.send(2, Class::Ordinary, Some(generation(1))).unwrap();
     let mut events = Vec::with_capacity(8);
-    let result = audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e));
+    let result = audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| events.push(e));
     assert!(result.waiting_for_plan);
     assert!(events.is_empty());
     let stop = control.stop().unwrap();
     let play = control.send(3, Class::Ordinary, Some(generation(1))).unwrap();
-    let (_, stats) = measure(|| audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)));
+    let (_, stats) = measure(|| audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)));
     assert!(stats.is_zero());
     assert_eq!(events, [Event::Stop { sequence: stop }, Event::Action { sequence: play, payload: 3 }]);
     assert_eq!(control.reclaim().unwrap().outcome, Outcome::Stopped);
@@ -63,16 +220,16 @@ fn stop_bypasses_a_waiting_plan_and_a_newer_play_survives() {
 
 #[test]
 fn plan_arrival_unblocks_exact_actions_and_rejection_cancels_unreachable_ones() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     control.send(1, Class::Ordinary, Some(generation(2))).unwrap();
     let mut events = Vec::with_capacity(8);
-    assert!(audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)).waiting_for_plan);
-    audio.service(&mut super::callback_scope(), generation(2), &mut |e| events.push(e));
+    assert!(audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)).waiting_for_plan);
+    audio.service_generation(&mut super::callback_scope(), generation(2), &mut |e| events.push(e));
     assert_eq!(control.reclaim().unwrap().outcome, Outcome::Applied);
     control.send(2, Class::Ordinary, Some(generation(1))).unwrap();
     control.send(3, Class::Ordinary, Some(generation(3))).unwrap();
     control.reject_plan(generation(3));
-    audio.service(&mut super::callback_scope(), generation(2), &mut |e| events.push(e));
+    audio.service_generation(&mut super::callback_scope(), generation(2), &mut |e| events.push(e));
     assert_eq!(events.len(), 1);
     assert_eq!(control.reclaim().unwrap().outcome, Outcome::PlanSuperseded);
     assert_eq!(control.reclaim().unwrap().outcome, Outcome::PlanRejected);
@@ -80,34 +237,17 @@ fn plan_arrival_unblocks_exact_actions_and_rejection_cancels_unreachable_ones() 
 }
 
 #[test]
-fn rejected_note_off_recovers_before_a_newer_note_on() {
-    let (mut control, mut audio) = action_lane::pair();
-    let off = control.send(0, Class::NoteOff, Some(generation(3))).unwrap();
-    let on = control.send(1, Class::NoteOn, Some(generation(2))).unwrap();
-    control.reject_plan(generation(3));
-    let mut events = Vec::with_capacity(4);
-    let (_, stats) = measure(|| audio.service(&mut super::callback_scope(), generation(2), &mut |e| events.push(e)));
-    assert!(stats.is_zero());
-    assert_eq!(events, [Event::AllNotesOff { sequence: off }, Event::Action { sequence: on, payload: 1 }]);
-    let receipt = control.reclaim().unwrap();
-    assert_eq!(receipt.outcome, Outcome::PlanRejected);
-    assert!(receipt.release_recovery);
-    assert_eq!(control.reclaim().unwrap().outcome, Outcome::Applied);
-    control.retire(audio);
-}
-
-#[test]
 fn full_note_off_requests_recovery_and_cancels_older_queued_note_ons() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     for i in 0..CAPACITY {
-        control.send(i, Class::NoteOn, Some(generation(9))).unwrap();
+        control.send(i, Class::NoteOn, None).unwrap();
     }
-    let Err(SendError::Full { release_recovery: Some(recovery) }) = control.send(0, Class::NoteOff, Some(generation(9))) else {
+    let Err(SendError::Full { release_recovery: Some(recovery) }) = control.send(0, Class::NoteOff, None) else {
         panic!("full note-off must explicitly report recovery");
     };
     let mut events = Vec::with_capacity(2);
     for _ in 0..CAPACITY.div_ceil(CALLBACK_ACTIONS) {
-        let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)));
+        let (result, stats) = measure(|| audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| events.push(e)));
         assert!(stats.is_zero());
         assert!(!result.waiting_for_plan);
     }
@@ -123,17 +263,18 @@ fn full_note_off_requests_recovery_and_cancels_older_queued_note_ons() {
 
 #[test]
 fn handler_unwind_is_not_replayed_and_future_actions_return_faulted() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     control.send(1, Class::Ordinary, None).unwrap();
     control.send(2, Class::Ordinary, None).unwrap();
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            audio.service(&mut super::callback_scope(), generation(1), &mut |_| panic!("injected action failure"));
+            audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| panic!("injected action failure"));
         }))
         .is_err()
     );
     control.stop().unwrap();
-    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), generation(1), &mut |_| panic!("handler must stay faulted")));
+    let (result, stats) =
+        measure(|| audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| panic!("handler must stay faulted")));
     assert!(stats.is_zero());
     assert!(result.faulted);
     for payload in [1, 2] {
@@ -145,15 +286,15 @@ fn handler_unwind_is_not_replayed_and_future_actions_return_faulted() {
 
 #[test]
 fn teardown_preserves_finished_receipts_and_cancels_every_waiting_or_queued_action() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     for i in 0..7 {
         control.send(i, Class::Ordinary, None).unwrap();
     }
-    audio.service(&mut super::callback_scope(), generation(1), &mut |_| {});
+    audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| {});
     for i in 7..12 {
         control.send(i, Class::Ordinary, Some(generation(99))).unwrap();
     }
-    assert!(audio.service(&mut super::callback_scope(), generation(1), &mut |_| {}).waiting_for_plan);
+    assert!(audio.service_generation(&mut super::callback_scope(), generation(1), &mut |_| {}).waiting_for_plan);
     let receipts = control.retire(audio);
     assert_eq!(receipts.len(), 12);
     for (i, receipt) in receipts.into_iter().enumerate() {
@@ -166,7 +307,7 @@ fn teardown_preserves_finished_receipts_and_cancels_every_waiting_or_queued_acti
 fn concurrent_borrowed_audio_endpoint_preserves_all_twenty_thousand_receipts() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     let stop = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(10);
     let (mut sent, mut received, mut ordered) = (0, 0, true);
@@ -175,7 +316,7 @@ fn concurrent_borrowed_audio_endpoint_preserves_all_twenty_thousand_receipts() {
             let (mut count, mut ordered, mut heap_free) = (0, true, true);
             while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
                 let (_, stats) = measure(|| {
-                    audio.service(&mut super::callback_scope(), generation(1), &mut |event| {
+                    audio.service_generation(&mut super::callback_scope(), generation(1), &mut |event| {
                         if let Event::Action { payload, .. } = event {
                             ordered &= payload == count;
                             count += 1;
@@ -209,22 +350,22 @@ fn concurrent_borrowed_audio_endpoint_preserves_all_twenty_thousand_receipts() {
 
 #[test]
 fn urgent_storms_are_bounded_and_a_deferred_stop_precedes_newer_play() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     let first = control.stop().unwrap();
     let mut events = Vec::with_capacity(8);
     let mut budget = super::callback_scope();
-    audio.service(&mut budget, generation(1), &mut |e| events.push(e));
+    audio.service_generation(&mut budget, generation(1), &mut |e| events.push(e));
     let second = control.stop().unwrap();
     let release = control.all_notes_off().unwrap();
     let play = control.send(7, Class::Ordinary, None).unwrap();
     for _ in 0..10 {
-        let (result, stats) = measure(|| audio.service(&mut budget, generation(1), &mut |e| events.push(e)));
+        let (result, stats) = measure(|| audio.service_generation(&mut budget, generation(1), &mut |e| events.push(e)));
         assert!(stats.is_zero());
         assert!(result.recovery_deferred);
     }
     assert_eq!(events, [Event::Stop { sequence: first }]);
     assert!(control.reclaim().is_none());
-    audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e));
+    audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| events.push(e));
     assert_eq!(
         events,
         [
@@ -241,12 +382,12 @@ fn urgent_storms_are_bounded_and_a_deferred_stop_precedes_newer_play() {
 
 #[test]
 fn a_stop_published_during_service_is_observed_before_its_following_play() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     let initial = control.send(1, Class::Ordinary, None).unwrap();
     let mut events = Vec::with_capacity(4);
     let (mut stop, mut play) = (None, None);
     let (_, stats) = measure(|| {
-        audio.service(&mut super::callback_scope(), generation(1), &mut |event| {
+        audio.service_generation(&mut super::callback_scope(), generation(1), &mut |event| {
             events.push(event);
             if event == (Event::Action { sequence: initial, payload: 1 }) {
                 stop = Some(control.stop().unwrap());
@@ -267,30 +408,8 @@ fn a_stop_published_during_service_is_observed_before_its_following_play() {
 }
 
 #[test]
-fn rejected_note_offs_share_the_release_budget_and_stay_pending_until_recovered() {
-    let (mut control, mut audio) = action_lane::pair();
-    let first = control.send(1, Class::NoteOff, Some(generation(2))).unwrap();
-    let second = control.send(2, Class::NoteOff, Some(generation(2))).unwrap();
-    let on = control.send(3, Class::NoteOn, Some(generation(1))).unwrap();
-    control.reject_plan(generation(2));
-    let mut events = Vec::with_capacity(4);
-    let mut budget = super::callback_scope();
-    for _ in 0..3 {
-        assert!(audio.service(&mut budget, generation(1), &mut |e| events.push(e)).recovery_deferred);
-    }
-    assert_eq!(events, [Event::AllNotesOff { sequence: first }]);
-    assert!(control.reclaim().unwrap().release_recovery);
-    assert!(control.reclaim().is_none());
-    audio.service(&mut super::callback_scope(), generation(1), &mut |e| events.push(e));
-    assert_eq!(events, [Event::AllNotesOff { sequence: first }, Event::AllNotesOff { sequence: second }, Event::Action { sequence: on, payload: 3 }]);
-    assert!(control.reclaim().unwrap().release_recovery);
-    assert_eq!(control.reclaim().unwrap().outcome, Outcome::Applied);
-    assert!(control.retire(audio).is_empty());
-}
-
-#[test]
 fn sequence_exhaustion_refuses_without_reusing_or_cancelling_existing_work() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     control.next = u64::MAX - 1;
     let last = control.send(1, Class::Ordinary, None).unwrap();
     assert_eq!(last.get(), u64::MAX);
@@ -298,7 +417,7 @@ fn sequence_exhaustion_refuses_without_reusing_or_cancelling_existing_work() {
     assert_eq!(control.stop(), Err(SendError::SequenceExhausted));
     assert_eq!(control.all_notes_off(), Err(SendError::SequenceExhausted));
     let mut seen = None;
-    audio.service(&mut super::callback_scope(), generation(1), &mut |e| seen = Some(e));
+    audio.service_generation(&mut super::callback_scope(), generation(1), &mut |e| seen = Some(e));
     assert_eq!(seen, Some(Event::Action { sequence: last, payload: 1 }));
     assert_eq!(control.reclaim().unwrap().sequence, last);
     assert_eq!(control.credits(), CAPACITY);
@@ -307,26 +426,23 @@ fn sequence_exhaustion_refuses_without_reusing_or_cancelling_existing_work() {
 
 #[test]
 fn a_defensively_full_return_lane_retains_the_finished_action_without_replaying_it() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     // Artificially consume the reserved return slots, violating the normal credit invariant.
     // The defensive path must still preserve the real pending receipt.
     for _ in 0..CAPACITY {
-        audio
-            .returned
-            .push(super::Receipt { sequence: super::Sequence(0), payload: 0, outcome: Outcome::Shutdown, release_recovery: false })
-            .unwrap();
+        audio.actions.returned.push(super::Receipt { sequence: super::Sequence(0), payload: 0, outcome: Outcome::Shutdown }).unwrap();
     }
     let sequence = control.send(9, Class::Ordinary, None).unwrap();
     let mut calls = 0;
     let mut budget = super::callback_scope();
     for _ in 0..3 {
-        assert!(audio.service(&mut budget, generation(1), &mut |_| calls += 1).return_pending);
+        assert!(audio.service_generation(&mut budget, generation(1), &mut |_| calls += 1).return_pending);
     }
     assert_eq!(calls, 1);
     for _ in 0..CAPACITY {
-        control.returned.pop().unwrap();
+        control.actions.returned.pop().unwrap();
     }
-    audio.service(&mut budget, generation(1), &mut |_| calls += 1);
+    audio.service_generation(&mut budget, generation(1), &mut |_| calls += 1);
     assert_eq!(calls, 1);
     assert_eq!(control.reclaim().unwrap().sequence, sequence);
     assert_eq!(control.credits(), CAPACITY);
@@ -335,7 +451,7 @@ fn a_defensively_full_return_lane_retains_the_finished_action_without_replaying_
 
 #[test]
 fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
-    let (mut control, mut audio) = action_lane::pair();
+    let (mut control, mut audio) = fixture();
     for i in 0..100 {
         control.send(i, Class::Ordinary, None).unwrap();
     }
@@ -344,7 +460,7 @@ fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
     let (mut actions, mut chunks) = (0, 0);
     let ((), stats) = measure(|| {
         callback.fill_with(&mut device, |_, _, budget| {
-            audio.service(budget, generation(1), &mut |event| {
+            audio.service_generation(budget, generation(1), &mut |event| {
                 if matches!(event, Event::Action { .. }) {
                     actions += 1;
                 }
@@ -360,7 +476,7 @@ fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
     let mut events = Vec::with_capacity(4);
     chunks = 0;
     callback.fill_with(&mut device, |_, _, budget| {
-        let result = audio.service(budget, generation(1), &mut |e| events.push(e));
+        let result = audio.service_generation(budget, generation(1), &mut |e| events.push(e));
         if chunks == 0 {
             second = Some(control.stop().unwrap());
             play = Some(control.send(999, Class::Ordinary, None).unwrap());
@@ -372,7 +488,7 @@ fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
     assert_eq!(events, [Event::Stop { sequence: first }]);
     for _ in 0..2 {
         callback.fill_with(&mut device, |_, _, budget| {
-            audio.service(budget, generation(1), &mut |e| events.push(e));
+            audio.service_generation(budget, generation(1), &mut |e| events.push(e));
         });
     }
     assert_eq!(

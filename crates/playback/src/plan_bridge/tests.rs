@@ -223,6 +223,7 @@ struct Tracked {
     inner: Box<dyn soundcraft_dsp::Plugin>,
     drops: Arc<Mutex<Vec<std::thread::ThreadId>>>,
     panic_sample: Option<Arc<std::sync::atomic::AtomicBool>>,
+    panic_processing: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl soundcraft_dsp::Plugin for Tracked {
@@ -233,6 +234,7 @@ impl soundcraft_dsp::Plugin for Tracked {
         self.inner.prepare(rate, block, channels);
     }
     fn reset(&mut self) {
+        assert!(!self.panic_processing.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)), "reset after torn adoption");
         self.inner.reset();
     }
     fn set_param(&mut self, id: &str, value: f32) -> bool {
@@ -242,7 +244,23 @@ impl soundcraft_dsp::Plugin for Tracked {
         self.inner.param(id)
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        assert!(!self.panic_processing.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)), "process after torn adoption");
         self.inner.process(io, frames);
+    }
+    fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
+        assert!(!self.panic_processing.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)), "note after torn adoption");
+        self.inner.note_on(offset, note, velocity);
+    }
+    fn note_off(&mut self, offset: usize, note: u8) {
+        assert!(!self.panic_processing.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)), "release after torn adoption");
+        self.inner.note_off(offset, note);
+    }
+    fn all_notes_off(&mut self) {
+        assert!(
+            !self.panic_processing.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+            "all-notes-off after torn adoption"
+        );
+        self.inner.all_notes_off();
     }
     fn set_sample(&mut self, sample: Option<Arc<dyn soundcraft_dsp::SampleSource>>) -> bool {
         assert!(!self.panic_sample.as_ref().is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)), "injected sample adoption fault");
@@ -268,7 +286,10 @@ fn shutdown_recovers_queued_returned_rejected_and_live_instances_on_control() {
             .prepare(&mut |spec, _| {
                 let mut inner = soundcraft_dsp::create("gain")?;
                 inner.prepare(48_000.0, 512, spec.ch);
-                Some(NewInstance { plugin: Box::new(Tracked { inner, drops: Arc::clone(&drops), panic_sample: None }), refused_state: false })
+                Some(NewInstance {
+                    plugin: Box::new(Tracked { inner, drops: Arc::clone(&drops), panic_sample: None, panic_processing: None }),
+                    refused_state: false,
+                })
             })
             .unwrap();
         let bindings = control.pending_bindings().unwrap();
@@ -319,13 +340,19 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     }
     let drops = Arc::new(Mutex::new(Vec::new()));
     let fault = Arc::new(AtomicBool::new(false));
+    let forbid = Arc::new(AtomicBool::new(false));
     control.request(Arc::new(s.clone()), None);
     control
         .prepare(&mut |spec, _| {
             let mut inner = soundcraft_dsp::create(&spec.id)?;
             inner.prepare(48_000.0, 512, spec.ch);
             Some(NewInstance {
-                plugin: Box::new(Tracked { inner, drops: Arc::clone(&drops), panic_sample: Some(Arc::clone(&fault)) }),
+                plugin: Box::new(Tracked {
+                    inner,
+                    drops: Arc::clone(&drops),
+                    panic_sample: Some(Arc::clone(&fault)),
+                    panic_processing: Some(Arc::clone(&forbid)),
+                }),
                 refused_state: false,
             })
         })
@@ -348,6 +375,24 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     })
     .unwrap();
     assert!(audio.engine().faulted());
+    forbid.store(true, Ordering::Relaxed);
+    let (mut actions, mut action_audio) = crate::action_lane::pair(&control);
+    actions.send_action(1u8, Some(audio.engine().active().generation)).unwrap();
+    actions.send_note(2u8, crate::action_lane::NoteKind::Off).unwrap();
+    let (result, stats) = measure(|| {
+        action_audio.service(&mut crate::action_lane::callback_scope(), &audio, &mut |_| panic!("torn bridge must refuse action handlers"))
+    });
+    assert!(stats.is_zero());
+    assert!(result.faulted);
+    assert!(actions.retire(action_audio).iter().all(|r| r.outcome == crate::action_lane::Outcome::Faulted));
+    let ((), stats) = measure(|| {
+        audio.reset();
+        audio.all_notes_off();
+        audio.flush_releases(128);
+        audio.live_note(track, 60, 100);
+        audio.live_note(track, 60, 0);
+    });
+    assert!(stats.is_zero());
     assert!(drops.lock().unwrap().is_empty());
     assert!(control.poll().is_none(), "in-flight envelope remains anchored on the audio endpoint after unwind");
     let (result, stats) = measure(|| audio.return_pending(&mut super::callback_scope()));
@@ -433,6 +478,34 @@ fn prolonged_render_ahead_deferral_is_counted_once_per_actual_callback() {
     assert_eq!(telemetry.current_age_callbacks, 0);
     assert_eq!(telemetry.maximum_age_callbacks, 10);
     assert_eq!(telemetry.published_generation, telemetry.admitted_generation);
+    control.retire(audio);
+}
+
+#[test]
+fn returning_an_unadopted_plan_spends_the_callback_budget_before_a_new_publication() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    control.request(Arc::new(session(ChannelFormat::Stereo)), None);
+    control.prepare(&mut make).unwrap();
+    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut device = vec![0.0f32; 40_000];
+    let mut chunks = 0;
+    callback.fill_with(&mut device, |_, budget, _actions| {
+        if chunks == 0 {
+            assert_eq!(audio.return_pending(budget), Service::Returned);
+            assert_eq!(control.poll().unwrap().state, EnvelopeState::Pending);
+            control.request(Arc::new(session(ChannelFormat::Surround51)), None);
+            control.prepare(&mut make).unwrap();
+        }
+        assert_eq!(audio.service(budget, true), Service::Empty);
+        chunks += 1;
+    });
+    assert_eq!(chunks, 3);
+    assert_eq!(audio.engine().active().generation, PlanGeneration::EMPTY);
+    callback.fill_with(&mut device[..128], |_, budget, _actions| {
+        assert_eq!(audio.service(budget, true), Service::Returned);
+    });
+    assert_eq!(audio.output().len(), 6);
+    control.poll();
     control.retire(audio);
 }
 

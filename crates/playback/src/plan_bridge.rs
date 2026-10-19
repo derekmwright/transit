@@ -212,6 +212,9 @@ struct Counters {
     maximum_age: AtomicU64,
 }
 
+/// Identity of this actual pair, independent of numeric device/plan generations.
+pub(super) struct RuntimeIdentity(Arc<Counters>);
+
 /// Independent diagnostic fields can straddle a callback. Age counts callbacks in
 /// which a pending publication could not be admitted; it is not physical latency.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +298,9 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
 }
 
 impl Control {
+    pub(super) fn runtime_identity(&self) -> RuntimeIdentity {
+        RuntimeIdentity(Arc::clone(&self.counters))
+    }
     /// Coalesce before construction. Replaced unsent owners die here, on control.
     pub fn request(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) {
         self.latest = Some(Request { session, input });
@@ -410,6 +416,9 @@ impl Control {
 }
 
 impl Audio {
+    pub(super) fn matches_runtime(&self, identity: &RuntimeIdentity) -> bool {
+        Arc::ptr_eq(&self.counters, &identity.0)
+    }
     fn deferred(&mut self, budget: &mut CallbackBudget) {
         if !budget.deferral_counted && self.counters.published.load(Ordering::Acquire) > self.counters.admitted.load(Ordering::Relaxed) {
             budget.deferral_counted = true;
@@ -479,16 +488,24 @@ impl Audio {
         self.mix.no_suspend = editors_open;
     }
     pub fn reset(&mut self) {
-        self.mix.reset();
+        if !self.mix.faulted() {
+            self.mix.reset();
+        }
     }
     pub fn all_notes_off(&mut self) {
-        self.mix.all_notes_off();
+        if !self.mix.faulted() {
+            self.mix.all_notes_off();
+        }
     }
     pub fn flush_releases(&mut self, frames: usize) {
-        self.mix.flush_releases(frames);
+        if !self.mix.faulted() {
+            self.mix.flush_releases(frames);
+        }
     }
     pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
-        self.mix.live_note(track, pitch, velocity);
+        if !self.mix.faulted() {
+            self.mix.live_note(track, pitch, velocity);
+        }
     }
     pub fn output(&self) -> &[Vec<f32>] {
         &self.buffers.output
