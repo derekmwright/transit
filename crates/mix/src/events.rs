@@ -1125,7 +1125,8 @@ impl MixEngine {
         outcome
     }
 
-    /// The outcome and the frame it was (or would have been) queued for.
+    /// The outcome and the frame it was (or would have been) queued for. Order: engine epoch,
+    /// port revocation, plan, binding, then transport (non-releases only).
     fn admit(&mut self, ev: &InstrumentEvent) -> (EventOutcome, Option<u64>) {
         if self.events.epoch != Some(ev.engine) {
             return (EventOutcome::StaleEngine, None);
@@ -1143,12 +1144,18 @@ impl MixEngine {
             Ok(i) => i,
             Err(o) => return (o, None),
         };
-        if ev.transport.is_some_and(|t| Some(t) != self.events.transport) {
-            return (EventOutcome::StaleTransport, None);
+        let release = ev.message.is_release() || matches!(ev.message, Message::NoteOn { velocity: 0, .. });
+        // A release is never refused for transport staleness: its note or pedal may already sound.
+        // It is no longer the old transport's either (a later change does not cancel it).
+        let mut transport = ev.transport;
+        if transport.is_some_and(|t| Some(t) != self.events.transport) {
+            if !release {
+                return (EventOutcome::StaleTransport, None);
+            }
+            transport = None;
         }
         let next = self.events.next_frame;
         let horizon = next.saturating_add(u64::from(self.events.limits.max_future_frames));
-        let release = ev.message.is_release() || matches!(ev.message, Message::NoteOn { velocity: 0, .. });
         let (due, late, advanced) = match ev.due {
             Due::Next => (next, 0, 0),
             Due::Frame(RenderFrame(f)) if f < next => (next, next - f, 0),
@@ -1168,7 +1175,7 @@ impl MixEngine {
             Message::NoteOn { key, velocity: 0, id } => Message::NoteOff { key, velocity: 0, id },
             m => m,
         };
-        let outcome = match events.admit(due, ev.source, ev.transport, message, st) {
+        let outcome = match events.admit(due, ev.source, transport, message, st) {
             Admit::Queued if advanced > 0 => EventOutcome::ReleaseAdvanced { frames: frames(advanced) },
             Admit::Queued if late > 0 => EventOutcome::QueuedLate { frames: frames(late) },
             Admit::Queued => EventOutcome::Queued,
@@ -1181,7 +1188,8 @@ impl MixEngine {
 
     /// Audio thread, with every seek, start, stop and loop wrap: the current transport epoch.
     /// Queued events derived from another transport are cancelled (counted
-    /// `cancelled_transport`); their releases are kept.
+    /// `cancelled_transport`); their releases are kept, and a release that arrives later with an
+    /// old epoch is still admitted.
     pub fn set_transport_epoch(&mut self, epoch: TransportEpoch) {
         if self.events.transport == Some(epoch) {
             return;

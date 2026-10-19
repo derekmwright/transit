@@ -693,3 +693,29 @@ fn a_reset_releases_every_source_and_the_releases_survive_the_host_reset() {
     assert_eq!(rig.send(port(1, 0), rig.mix.next_frame().0, off(72)), EventOutcome::Unmatched, "the reset released it");
 }
 
+/// Review F10-2: a release carrying an older transport epoch, for a note and pedal that sound, is
+/// admitted and delivered; nothing stays pending.
+#[test]
+fn a_release_with_a_stale_transport_is_still_delivered() {
+    let mut rig = Rig::new();
+    let (t1, t2) = (TransportEpoch(1), TransportEpoch(2));
+    rig.mix.set_transport_epoch(t1);
+    let now = rig.mix.next_frame().0;
+    let src = port(3, 0);
+    let tev = |rig: &Rig, at: u64, m: Message| InstrumentEvent { transport: Some(t1), ..rig.event(src, Due::Frame(RenderFrame(at)), m) };
+    assert_eq!(rig.mix.queue_event(&tev(&rig, now, on(60))), EventOutcome::Queued);
+    assert_eq!(rig.mix.queue_event(&tev(&rig, now, cc(64, 127))), EventOutcome::Queued);
+    rig.render(1);
+    rig.mix.set_transport_epoch(t2);
+    assert_eq!(rig.mix.queue_event(&tev(&rig, now + 300, off(60))), EventOutcome::Queued);
+    assert_eq!(rig.mix.queue_event(&tev(&rig, now + 300, cc(64, 0))), EventOutcome::Queued);
+    assert_eq!(rig.mix.queue_event(&tev(&rig, now + 300, on(61))), EventOutcome::StaleTransport, "non-releases still are refused");
+    // A later transport change does not cancel the admitted releases.
+    rig.mix.set_transport_epoch(TransportEpoch(3));
+    rig.render(2);
+    let heard = rig.heard_by(1);
+    assert_eq!(every_on_has_its_off(&heard), 1);
+    assert_eq!(pedal_values(&heard, 64), vec![(now, 127), (now + 300, 0)]);
+    assert!(!rig.mix.has_pending_events());
+}
+
