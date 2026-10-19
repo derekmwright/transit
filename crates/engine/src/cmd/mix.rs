@@ -150,9 +150,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("automation.write_range", "Write Automation", [], None, "{track?, param, start?, end?, value}", has_selection, write_range),
         cmd!("automation.clear", "Clear Automation", [], None, "{track?, param?, start?, end?}", has_selection, clear_lane),
-        cmd!("automation.thin", "Thin", ["Edit", "Automation"], Some("Cmd+Alt+T"), "{tracks?, param?, tolerance?: 0.1}", has_selection, |e, p| thin(
-            e, p, false
-        )),
+        cmd!(
+            "automation.thin",
+            "Thin",
+            ["Edit", "Automation"],
+            Some("Cmd+Alt+T"),
+            "{tracks?, param?, start?, end?, tolerance?: 0.1}",
+            has_selection,
+            |e, p| thin(e, p, false)
+        ),
         cmd!("automation.thin_all", "Thin All", ["Edit", "Automation"], None, "{tolerance?: 0.1}", has_tracks, |e, p| thin(e, p, true)),
         cmd!("automation.write_to_current", "Write to Current", ["Edit", "Automation"], Some("Cmd+/"), "{tracks?}", has_range, |e, p| write_current(
             e, p, false
@@ -567,13 +573,33 @@ fn thin(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
     let tracks = if all { e.session().tracks.iter().map(|t| t.id).collect() } else { tracks_required(e, "automation.thin", p)? };
     let tol = f32_or(p, "tolerance", 0.1).clamp(0.0, 100.0);
     // Only the lane a write pass just wrote, when named; a lane the track lacks is a no-op.
-    let only = if all || p.get("param").is_none() { None } else { Some(lane_param(p, "automation.thin")?) };
+    // A null `param` counts as absent (every lane); any other non-string is rejected.
+    let only = match p.get("param") {
+        None | Some(Value::Null) => None,
+        Some(_) if all => None,
+        Some(Value::String(_)) => Some(lane_param(p, "automation.thin")?),
+        Some(_) => return Err(bad("automation.thin", "`param` must be a lane address string")),
+    };
+    // With `start`/`end`/`length`, only the points inside that range are thinned; its first and last points stay.
+    let ranged = !all && ["start", "end", "length"].iter().any(|k| p.get(k).is_some_and(|v| !v.is_null()));
+    let range = if ranged { Some(range_param(e, "automation.thin", p)?) } else { None };
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
             for l in tr.automation.iter_mut().filter(|l| only.as_ref().is_none_or(|x| x == &l.param)) {
-                n += l.thin(tol);
+                n += match &range {
+                    None => l.thin(tol),
+                    Some(r) => {
+                        let mut part = l.clone();
+                        part.points.retain(|x| x.at >= r.start && x.at <= r.end);
+                        let removed = part.thin(tol);
+                        l.points.retain(|x| x.at < r.start || x.at > r.end);
+                        l.points.extend(part.points);
+                        l.points.sort_by_key(|x| x.at);
+                        removed
+                    }
+                };
             }
         }
     }
