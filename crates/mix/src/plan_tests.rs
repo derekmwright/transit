@@ -859,14 +859,13 @@ fn reclaiming_a_torn_envelope_pools_nothing_under_the_wrong_spec() {
     assert!(r.is_err());
     assert_eq!(env.state(), EnvelopeState::Pending);
     rig.comp.reclaim(env);
-    let pooled = rig.comp.pooled();
-    // Same compiler: a compile that wants chorus at (a, 0).
+    // Nothing from the torn envelope waits in the pool to be installed under the wrong spec, and
+    // the faulted compiler makes no further plan at all.
+    assert_eq!(rig.comp.pooled(), 0);
+    let _ = a;
     let mut make = factory(&rig.log);
-    let env = rig.comp.compile(Arc::new(s.clone()), rig.comp.active(), PlanGeneration::from_raw(30), &mut make).unwrap();
-    let t = env.plan.tables.as_ref().unwrap();
-    let si = t.strip_of(a).unwrap();
-    let got = t.strips[si].plugins[0].as_ref().map(|p| p.plugin.info().id);
-    assert_eq!(got, Some("chorus"), "pooled after unwind: {pooled}; the chorus cell holds {got:?}");
+    let r = rig.comp.compile(Arc::new(s.clone()), rig.comp.active(), PlanGeneration::from_raw(30), &mut make);
+    assert_eq!(r.unwrap_err(), CompileError::Faulted);
 }
 
 #[test]
@@ -1374,4 +1373,100 @@ fn after_a_torn_reclaim_at_any_commit_step_the_active_bindings_are_what_the_engi
         drop(retired);
         assert_eq!(rig.drops(), rig.log.made.load(Ordering::Relaxed), "step {step}: every instance dropped once");
     }
+}
+
+fn rich_torn(step: usize) -> (Vec<SlotBinding>, Vec<SlotBinding>, Vec<SlotBinding>, usize, usize, Rig, Session) {
+    let (mut s, a, b) = audio_session();
+    let inst = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    let audio = |v: f32| Arc::new(SourceAudio::new(AudioBuffer { sample_rate: SR, channels: vec![vec![v; 480]] }));
+    s.pool.insert(SourceId(5), audio(0.5));
+    s.pool.insert(SourceId(6), audio(0.25));
+    let mut smp = Insert::new("sampler");
+    smp.sample = Some(SourceId(5));
+    s.track_mut(inst).unwrap().instrument = Some(smp);
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("room_reverb"));
+    s.track_mut(a).unwrap().mixer.inserts[1] = Some(builtin("compressor"));
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    rig.render(2);
+    // A refused plan leaves a fresh gain at (b, 0) in the pool.
+    let mut s2 = s.clone();
+    s2.track_mut(b).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.g"));
+    let mut env = rig.compile(&s2);
+    let i = env.plan.moves.iter().position(|m| m.kind == CellKind::Strip).unwrap();
+    env.plan.moves[i].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    assert_eq!(rig.comp.pooled(), 1);
+    // The torn plan: reuse the pooled gain, replace the reverb (displaced), keep the compressor,
+    // swap the sampler's sample.
+    s2.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("chorus"));
+    s2.track_mut(inst).unwrap().instrument.as_mut().unwrap().sample = Some(SourceId(6));
+    let mut env = rig.compile(&s2);
+    assert!(env.plan.attach.iter().any(|x| matches!(x, Attach::Sample { .. })));
+    let mut released = rig.comp.take_released();
+    FAULT_AT.set(step);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.eng.adopt_plan(&mut env)));
+    FAULT_AT.set(0);
+    assert!(r.is_err() && env.torn());
+    rig.comp.reclaim(env);
+    assert!(rig.comp.faulted());
+    released.extend(rig.comp.take_released());
+    let active = rig.comp.active_bindings();
+    let retired = std::mem::replace(&mut rig.eng, MixEngine::realtime(target())).into_retired();
+    let owned = sorted(retired.instances());
+    drop(retired);
+    rig.comp.clear_pool();
+    released.extend(rig.comp.take_released());
+    let made = rig.log.made.load(Ordering::Relaxed);
+    let drops = rig.drops();
+    (active, owned, released, made, drops, rig, s)
+}
+
+#[test]
+fn a_torn_reclaim_that_displaced_reused_and_moved_instances_matches_the_engine_at_every_step() {
+    for step in 1..=4 {
+        let (active, owned, released, made, drops, _, _) = rich_torn(step);
+        assert_eq!(active, owned, "step {step}");
+        assert!(active.iter().all(|b| !released.contains(b)), "step {step}: overlap");
+        let mut all: Vec<_> = released.iter().chain(owned.iter()).copied().collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "step {step}: double release");
+        assert_eq!(n, made, "step {step}: every instance accounted once");
+        assert_eq!(drops, made, "step {step}");
+        if step >= 3 {
+            assert!(!released.is_empty(), "step {step}: the displaced reverb came back");
+        }
+    }
+}
+
+#[test]
+fn compile_after_a_torn_reclaim_is_refused() {
+    let (mut rig, _, mut env) = rig_with_pending();
+    // replace a module so something is displaced
+    FAULT_AT.set(4);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.eng.adopt_plan(&mut env)));
+    FAULT_AT.set(0);
+    rig.comp.reclaim(env);
+    assert!(rig.comp.faulted());
+    let released = rig.comp.take_released();
+    let (s, _, _) = audio_session();
+    let mut make = factory(&rig.log);
+    let r = rig.comp.compile(Arc::new(s), rig.comp.active(), PlanGeneration::from_raw(77), &mut make);
+    assert_eq!(r.unwrap_err(), CompileError::Faulted, "released: {released:?}");
+    assert_eq!(rig.comp.pending_bindings(), None, "nothing in flight");
+}
+
+#[test]
+fn a_session_only_compile_after_a_torn_reclaim_lists_no_released_binding_as_pending() {
+    let (_, _, released, _, _, mut rig, s_old) = rich_torn(4);
+    let mut make = factory(&rig.log);
+    let mut s = s_old.clone();
+    s.tracks[0].mixer.volume_db = -3.0;
+    let r = rig.comp.compile(Arc::new(s), rig.comp.active(), PlanGeneration::from_raw(90), &mut make);
+    assert_eq!(r.unwrap_err(), CompileError::Faulted);
+    let pend = rig.comp.pending_bindings().unwrap_or_default();
+    assert!(pend.iter().all(|b| !released.contains(b)), "pending {pend:?} includes released {released:?}");
 }

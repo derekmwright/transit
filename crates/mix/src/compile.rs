@@ -49,6 +49,9 @@ pub enum CompileError {
     ResourceLimit { what: &'static str, need: usize, limit: usize },
     /// A plan is still in flight (N = 1): reclaim its envelope first.
     InFlight { pending: PlanGeneration },
+    /// A torn envelope was reclaimed ([`PlanCompiler::faulted`]): the engine is faulted and only
+    /// teardown remains. No plan is made, so nothing can list a destroyed instance as pending.
+    Faulted,
 }
 
 /// Smallest delay-line capacity a plan prepares (samples per channel).
@@ -457,6 +460,9 @@ impl PlanCompiler {
         next: PlanGeneration,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
     ) -> Result<PlanEnvelope, CompileError> {
+        if self.faulted.is_some() {
+            return Err(CompileError::Faulted);
+        }
         if let Some(p) = &self.pending {
             return Err(CompileError::InFlight { pending: p.generation });
         }
