@@ -43,8 +43,8 @@
 mod backend;
 mod clock;
 mod event;
-#[cfg(test)]
-mod fake;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
 mod port;
 mod ring;
 #[cfg(test)]
@@ -56,6 +56,7 @@ pub use port::{BackendId, Direction, PortInfo, PortKey};
 pub use ring::{InputConfig, InputConsumer, InputCounters};
 
 use backend::{Backend, InputConnection, OutputConnection};
+use port::PortIdentity;
 use ring::{InputSink, PortShared};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -72,8 +73,10 @@ pub enum MidiIoError {
     /// The key names a port of another backend.
     #[error("MIDI port {0} belongs to another backend")]
     WrongBackend(PortKey),
-    /// The backend refused to open the port (on WinMM, `MMSYSERR_ALLOCATED` when another
-    /// program holds it).
+    /// The backend refused to open the port. On WinMM a driver may report `MMSYSERR_ALLOCATED`
+    /// when another program holds the port, but that is not guaranteed: a second open of the same
+    /// input succeeded on Windows 11 with Windows MIDI Services, so do not rely on exclusivity
+    /// either way.
     #[error("cannot open MIDI port {key}: {reason}")]
     Open {
         /// The port.
@@ -81,7 +84,7 @@ pub enum MidiIoError {
         /// The backend's reason.
         reason: String,
     },
-    /// The input configuration cannot work (zero capacity).
+    /// The input configuration cannot work (zero capacity, or a size above [`MAX_INPUT_EVENTS`]).
     #[error("invalid MIDI input configuration: {0}")]
     InvalidConfig(&'static str),
     /// Sending failed (invalid message, or the device is gone).
@@ -89,8 +92,14 @@ pub enum MidiIoError {
     Send(String),
 }
 
-/// Open ports per (direction, key), so a watcher can flag the ones that vanish.
-type Registry = Mutex<Vec<(Direction, PortKey, Weak<PortShared>)>>;
+/// The largest `capacity` or `release_reserve` [`MidiIo::open_input`] accepts: 1 048 576 events,
+/// 24 MiB of ring per port at 24 bytes an event. A DIN link tops out near 3125 messages a
+/// second, so this is hours of backlog; larger values are a mistake, and `usize::MAX` would
+/// overflow or abort on allocation.
+pub const MAX_INPUT_EVENTS: usize = 1 << 20;
+
+/// Open ports per (direction, identity), so a watcher can flag the ones that vanish.
+type Registry = Mutex<Vec<(Direction, PortIdentity, Weak<PortShared>)>>;
 
 struct Inner {
     backend: Box<dyn Backend>,
@@ -141,7 +150,7 @@ impl MidiIo {
     }
 
     fn list(&self, direction: Direction) -> Result<Vec<PortInfo>, MidiIoError> {
-        Ok(port::infos(self.backend(), direction, self.inner.backend.names(direction)?))
+        Ok(port::infos(self.backend(), direction, self.inner.backend.ports(direction)?))
     }
 
     fn check_backend(&self, key: &PortKey) -> Result<(), MidiIoError> {
@@ -149,9 +158,10 @@ impl MidiIo {
     }
 
     fn register(&self, direction: Direction, key: &PortKey, shared: &Arc<PortShared>) {
+        let identity = key.identity();
         let mut open = self.inner.open.lock().unwrap_or_else(PoisonError::into_inner);
         open.retain(|(_, _, w)| w.strong_count() > 0);
-        open.push((direction, key.clone(), Arc::downgrade(shared)));
+        open.push((direction, identity, Arc::downgrade(shared)));
     }
 
     /// Opens an input port. The backend callback pushes into a ring of
@@ -162,19 +172,22 @@ impl MidiIo {
         if config.capacity == 0 {
             return Err(MidiIoError::InvalidConfig("capacity must be at least 1"));
         }
+        if config.capacity > MAX_INPUT_EVENTS || config.release_reserve > MAX_INPUT_EVENTS {
+            return Err(MidiIoError::InvalidConfig("capacity and release_reserve are limited to MAX_INPUT_EVENTS"));
+        }
         let (sink, consumer, shared) = InputSink::new(&config);
-        let connection = self.inner.backend.open_input(key, sink)?;
-        self.register(Direction::Input, key, &shared);
-        Ok((InputHandle { key: key.clone(), shared, connection: Some(connection) }, consumer))
+        let (key, connection) = self.inner.backend.open_input(key, sink)?;
+        self.register(Direction::Input, &key, &shared);
+        Ok((InputHandle { key, shared, connection: Some(connection) }, consumer))
     }
 
     /// Opens an output port for immediate sends.
     pub fn open_output(&self, key: &PortKey) -> Result<OutputHandle, MidiIoError> {
         self.check_backend(key)?;
-        let connection = self.inner.backend.open_output(key)?;
+        let (key, connection) = self.inner.backend.open_output(key)?;
         let shared = Arc::new(PortShared::default());
-        self.register(Direction::Output, key, &shared);
-        Ok(OutputHandle { key: key.clone(), shared, connection })
+        self.register(Direction::Output, &key, &shared);
+        Ok(OutputHandle { key, shared, connection })
     }
 
     /// A watcher whose first [`PortWatcher::poll`] reports changes since now.
@@ -188,9 +201,15 @@ impl MidiIo {
 /// An open input port. Dropping it (or [`InputHandle::close`]) closes the port.
 ///
 /// `Send`: it may be dropped on any control thread, not necessarily the one that opened it, but
-/// never on the audio thread: closing makes OS calls and, on WinMM, waits under midir's lock for
-/// the driver callback to finish. After the drop returns the callback has stopped and the
-/// consumer reports [`InputConsumer::is_closed`].
+/// never on the audio thread: closing makes OS calls and, on WinMM, waits for the driver
+/// callback to finish. After the drop returns the callback has stopped and the consumer reports
+/// [`InputConsumer::is_closed`].
+///
+/// Known midir caveat (not reproduced): midir's WinMM callback takes its lock only when it
+/// requeues a SysEx buffer, but `close_internal` holds that lock across `midiInReset`, which can
+/// hand a partially filled SysEx buffer back to the callback that then wants the same lock. A
+/// close racing a SysEx could in theory deadlock inside midir. Close from a control thread that
+/// can afford to be stuck, never from the audio thread.
 pub struct InputHandle {
     key: PortKey,
     shared: Arc<PortShared>,
@@ -284,7 +303,7 @@ pub enum PortChange {
 /// handle is then dead; poll more often than a person can unplug and replug.
 pub struct PortWatcher {
     io: MidiIo,
-    known: BTreeMap<(Direction, PortKey), PortInfo>,
+    known: BTreeMap<(Direction, PortIdentity), PortInfo>,
 }
 
 impl std::fmt::Debug for PortWatcher {
@@ -294,14 +313,14 @@ impl std::fmt::Debug for PortWatcher {
 }
 
 impl PortWatcher {
-    fn snapshot(&self) -> Result<BTreeMap<(Direction, PortKey), PortInfo>, MidiIoError> {
+    fn snapshot(&self) -> Result<BTreeMap<(Direction, PortIdentity), PortInfo>, MidiIoError> {
         let mut all = self.io.list_inputs()?;
         all.extend(self.io.list_outputs()?);
-        Ok(all.into_iter().map(|p| ((p.direction, p.key.clone()), p)).collect())
+        Ok(all.into_iter().map(|p| ((p.direction, p.key.identity()), p)).collect())
     }
 
     /// Enumerates again and reports what changed since the previous poll: removals first, then
-    /// additions, each in (direction, key) order. Open handles of removed ports are flagged
+    /// additions, each in (direction, identity) order. Open handles of removed ports are flagged
     /// ([`InputHandle::is_disconnected`], [`InputConsumer::is_disconnected`]). On an enumeration
     /// error nothing is reported or flagged and the previous state is kept.
     pub fn poll(&mut self) -> Result<Vec<PortChange>, MidiIoError> {
@@ -314,9 +333,9 @@ impl PortWatcher {
                 continue;
             }
             let mut was_open = false;
-            for (direction, key, weak) in open.iter() {
+            for (direction, identity, weak) in open.iter() {
                 if *direction == id.0
-                    && *key == id.1
+                    && *identity == id.1
                     && let Some(shared) = weak.upgrade()
                 {
                     shared.mark_disconnected();

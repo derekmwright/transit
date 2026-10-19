@@ -54,13 +54,18 @@ pub enum Direction {
     Output,
 }
 
-/// A stable port reference: backend, the backend's port name, and the ordinal of this port among
-/// the ports of the same direction with exactly that name, in enumeration order (0 for the first
-/// or only one).
+/// A stable port reference: backend, the backend's port name, the ordinal of this port among the
+/// ports of the same direction with exactly that name, and the backend's own port id when it has
+/// a stable one.
 ///
-/// It survives unplug and replug of the same device and process restarts, so it is what a session
-/// stores. With two identical devices the ordinal follows enumeration order, which can change when
-/// the first is unplugged; that ambiguity is inherent in name-based identity.
+/// **Identity.** When `id` is non-empty it alone identifies the port: opening and hot-plug
+/// tracking match on it, so two identical devices stay distinguishable and unplugging the first
+/// does not make the second look like the first. On Windows `id` is the WinMM interface path
+/// (midir's `MidiInputPort::id`), stable across enumerations, replugs and restarts. When `id` is
+/// empty (a backend whose ids are not stable across runs, which is every backend but WinMM here,
+/// or a key written before ids existed) identity falls back to `name` plus `ordinal`, which
+/// follows enumeration order and can shift when an identical device is unplugged; that ambiguity
+/// is inherent in name-based identity. `name` and `ordinal` stay set either way, for display.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PortKey {
     /// The backend that enumerates the port.
@@ -69,11 +74,26 @@ pub struct PortKey {
     pub name: String,
     /// Which port with this name, in enumeration order.
     pub ordinal: u32,
+    /// The backend's stable port id, or empty when it has none.
+    pub id: String,
 }
 
 impl fmt::Display for PortKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.ordinal == 0 { write!(f, "{}", self.name) } else { write!(f, "{} #{}", self.name, self.ordinal + 1) }
+    }
+}
+
+/// What identifies a port across polls: its backend id, else name plus ordinal.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum PortIdentity {
+    Id(String),
+    Slot(String, u32),
+}
+
+impl PortKey {
+    pub(crate) fn identity(&self) -> PortIdentity {
+        if self.id.is_empty() { PortIdentity::Slot(self.name.clone(), self.ordinal) } else { PortIdentity::Id(self.id.clone()) }
     }
 }
 
@@ -88,20 +108,31 @@ pub struct PortInfo {
     pub display_name: String,
 }
 
-/// Turns names in enumeration order into infos, numbering duplicates.
-pub(crate) fn infos(backend: BackendId, direction: Direction, names: Vec<String>) -> Vec<PortInfo> {
-    let mut out: Vec<PortInfo> = Vec::with_capacity(names.len());
-    for name in names {
+/// A port as a backend reports it: name and stable id (empty when the backend has none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawPort {
+    pub(crate) name: String,
+    pub(crate) id: String,
+}
+
+/// Turns ports in enumeration order into infos, numbering duplicate names.
+pub(crate) fn infos(backend: BackendId, direction: Direction, ports: Vec<RawPort>) -> Vec<PortInfo> {
+    let mut out: Vec<PortInfo> = Vec::with_capacity(ports.len());
+    for RawPort { name, id } in ports {
         let ordinal = u32::try_from(out.iter().filter(|p| p.key.name == name).count()).unwrap_or(u32::MAX);
-        let key = PortKey { backend, name, ordinal };
+        let key = PortKey { backend, name, ordinal, id };
         out.push(PortInfo { display_name: key.to_string(), key, direction });
     }
     out
 }
 
-/// The enumeration index of the port `key` names, if present in `names`.
-pub(crate) fn index_of(names: &[String], key: &PortKey) -> Option<usize> {
-    names.iter().enumerate().filter(|(_, n)| **n == key.name).nth(usize::try_from(key.ordinal).ok()?).map(|(i, _)| i)
+/// The enumeration index of the port `key` names, if present: by id when the key has one,
+/// otherwise by name and ordinal.
+pub(crate) fn resolve(ports: &[RawPort], key: &PortKey) -> Option<usize> {
+    if !key.id.is_empty() {
+        return ports.iter().position(|p| p.id == key.id);
+    }
+    ports.iter().enumerate().filter(|(_, p)| p.name == key.name).nth(usize::try_from(key.ordinal).ok()?).map(|(i, _)| i)
 }
 
 #[cfg(test)]
@@ -110,14 +141,27 @@ mod tests {
 
     #[test]
     fn duplicate_names_get_ordinals_and_resolve_back() {
-        let names: Vec<String> = ["A", "B", "A", "A"].iter().map(|s| (*s).to_string()).collect();
+        let names: Vec<RawPort> = ["A", "B", "A", "A"].iter().map(|s| RawPort { name: (*s).to_string(), id: String::new() }).collect();
         let ports = infos(BackendId::Fake, Direction::Input, names.clone());
         let shown: Vec<_> = ports.iter().map(|p| p.display_name.as_str()).collect();
         assert_eq!(shown, ["A", "B", "A #2", "A #3"]);
         for (i, p) in ports.iter().enumerate() {
-            assert_eq!(index_of(&names, &p.key), Some(i));
+            assert_eq!(resolve(&names, &p.key), Some(i));
         }
-        let missing = PortKey { backend: BackendId::Fake, name: "A".into(), ordinal: 3 };
-        assert_eq!(index_of(&names, &missing), None);
+        let missing = PortKey { backend: BackendId::Fake, name: "A".into(), ordinal: 3, id: String::new() };
+        assert_eq!(resolve(&names, &missing), None);
+    }
+
+    #[test]
+    fn ids_win_over_names_and_ordinals() {
+        let raw = |n: &str, id: &str| RawPort { name: n.into(), id: id.into() };
+        let ports = vec![raw("A", "x"), raw("A", "y")];
+        let infos = infos(BackendId::Fake, Direction::Input, ports.clone());
+        assert_eq!(resolve(&ports, &infos[1].key), Some(1));
+        // The first unplugs: the second is now at index 0 and ordinal 0, but its id still finds it.
+        let after = vec![raw("A", "y")];
+        assert_eq!(resolve(&after, &infos[1].key), Some(0));
+        assert_eq!(resolve(&after, &infos[0].key), None);
+        assert_ne!(infos[0].key.identity(), infos[1].key.identity());
     }
 }

@@ -12,6 +12,10 @@ midir.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
 
+[features]
+# Exposes the in-process fake backend (`soundcraft_midi_io::fake`) so other crates' tests can drive ports without hardware.
+fake = []
+
 [dev-dependencies]
 # Dev-only: the counting global allocator for the push-path allocation test (xtask allows dev edges).
 soundcraft-rt = { workspace = true, features = ["testing"] }
