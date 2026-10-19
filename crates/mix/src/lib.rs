@@ -805,8 +805,10 @@ pub struct PreparedLines {
 
 impl PreparedLines {
     /// Control side: lines holding delays up to `need` samples (rounded up as plans size theirs)
-    /// for every strip of `s`, in blocks up to `max_block` (the engine's), and a pre-fader line
-    /// only for a strip with a pre-fader send.
+    /// for every strip of `s`, in blocks up to `max_block`, and a pre-fader line only for a strip
+    /// with a pre-fader send. `max_block` must be the block size of the engine that adopts them
+    /// ([`MixEngine::max_block`]): [`MixEngine::adopt_lines`] refuses lines whose ring cannot hold
+    /// a full block of that engine at their longest delay.
     #[must_use]
     pub fn new(s: &Session, max_block: usize, need: usize) -> Self {
         let cap = line_capacity(need.min(MAX_LATENCY));
@@ -1294,16 +1296,22 @@ impl MixEngine {
     /// Audio side (legacy engines): takes in the delay lines `lines` prepared off the audio thread
     /// for a strip whose own are shorter (or missing), each carrying the old line's history over so
     /// the delay continues; what it replaced goes back into `lines`, to drop on the control side.
-    /// Allocates and frees nothing; copies at most each replaced line's samples. Clears the clamp
+    /// A prepared line that is not longer than the current one, has another channel count, or has a
+    /// ring too small for a full block of this engine at its length stays in `lines` (to drop on
+    /// the control side too), and its strip keeps its clamp report. Allocates and frees nothing;
+    /// copies at most each replaced line's samples. Clears the clamp
     /// report ([`MixEngine::status`]) when the lines now hold what a render asked for. Call it after
     /// [`MixEngine::ensure_synced`] for the session the lines were prepared from.
     pub fn adopt_lines(&mut self, lines: &mut PreparedLines) {
         let mut holds = usize::MAX;
+        let block = self.max_block;
         for (track, post, pre) in &mut lines.lines {
             let Some(st) = self.strips.get_mut(track) else { continue };
             let ch = st.buf.len();
             for (new, old) in [(post, &mut st.tap), (pre, &mut st.tap_pre)] {
-                if new.bufs.len() == ch && new.len > old.len {
+                // A line is only taken in when its ring holds a full block of this engine at the
+                // longest delay; a shorter ring would drop samples and silently misalign the strip.
+                if new.bufs.len() == ch && new.len > old.len && new.ring() >= new.len.saturating_add(block) {
                     new.take_history(old);
                     std::mem::swap(new, old);
                 }
