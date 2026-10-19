@@ -260,6 +260,7 @@ fn a_values_rescan_is_read_on_main_and_reported_like_an_editor_edit() {
     assert!(!p.load_state(b"CMD:rescan-values:1.25"));
     assert!(ed.idle().is_empty(), "nothing differs from the host's view");
     assert!(p.set_param("7", 0.5));
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK); // the 0.5 reaches the plug-in
     assert!(!p.load_state(b"CMD:rescan-values:1.25"));
     assert_eq!(ed.idle(), vec![("7".to_string(), 1.25)], "differs from the 0.5 the host set");
     // CLAP_PARAM_RESCAN_ALL re-reads the values too.
@@ -354,4 +355,96 @@ fn reset_reaches_the_plugin_before_its_next_block() {
     let reset = names.iter().position(|n| *n == "reset").expect("reset");
     assert_eq!(names[reset + 1], "process", "{names:?}");
     assert_eq!(r.log[reset].1, r.log[reset + 1].1, "on the thread that processes");
+}
+
+/// Review N2: a restart whose activation fails mid-session is faded silence, not the input at
+/// unity, and the slot reports no latency (nothing to compensate) and counts the failure.
+#[test]
+fn a_restart_whose_activation_fails_is_faded_silence() {
+    let (mut p, _reader, _) = new_requests();
+    assert!(p.set_param("7", 0.25));
+    p.set_input_silent(false);
+    let block = |p: &mut Box<dyn Plugin>| {
+        let mut io = vec![vec![0.5f32; BLOCK]; 2];
+        p.process(&mut io, BLOCK);
+        io
+    };
+    let wet = block(&mut p)[0][BLOCK - 1];
+    assert!(p.load_state(b"CMD:restart-fail-now"));
+    assert_eq!(soundcraft_clap_host::service_requests().restarts_waiting, 1);
+    let mut out = block(&mut p)[0].clone(); // parks
+    let s = soundcraft_clap_host::service_requests();
+    assert_eq!((s.restarted, s.failed), (0, 1), "{s:?}");
+    assert_eq!(p.latency(), 0);
+    for _ in 0..3 {
+        out.extend(block(&mut p)[0].iter().copied());
+    }
+    for (i, &x) in out.iter().enumerate() {
+        let want = if i < FADE { wet * (1.0 - i as f32 / FADE as f32) } else { 0.0 };
+        assert!((x - want).abs() < 1e-6, "sample {i}: {x}, want {want} (never the 0.5 input)");
+    }
+}
+
+/// Review N3: a value the host set that the plug-in has not processed yet (no block since, e.g.
+/// the device is stopped) is the host's, and a rescan must not report the plug-in's older value
+/// back over it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_host_value_not_yet_processed_is_not_reverted_by_a_rescan() {
+    common::fixture_dir();
+    let mut p = soundcraft_clap_host::create("clap:org.soundcraft.test.gain").expect("gain fixture");
+    p.prepare(48_000.0, BLOCK, 2);
+    let mut ed = p.editor().expect("editor");
+    let _ = ed.idle();
+    assert!(p.set_param("7", 0.5));
+    assert!(!p.load_state(b"CMD:rescan-values:1.0"));
+    assert!(ed.idle().is_empty(), "the host's 0.5 has not reached the plug-in yet: it stands");
+    p.set_input_silent(false);
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    assert!(!p.load_state(b"CMD:rescan-values:1.0"));
+    assert_eq!(ed.idle(), vec![("7".to_string(), 1.0)], "once processed, a change by the plug-in is news");
+}
+
+/// Mutant C9 of the review: a block the audio side skips because the main thread holds the
+/// instance (here: a rescan every block) is a fade to silence, never the dry input.
+#[test]
+fn a_block_skipped_while_main_holds_the_instance_is_a_fade() {
+    let (mut p, mut reader, _) = new_requests();
+    assert!(p.load_state(b"CMD:rescan-every-block"));
+    assert!(p.set_param("7", 0.25)); // after the load, which drops pending changes
+    let stop = Arc::new(AtomicBool::new(false));
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let (halt, skips) = (Arc::clone(&stop), Arc::clone(&skipped));
+    let audio = std::thread::spawn(move || {
+        let mut bad = None;
+        let mut first = true;
+        while !halt.load(Ordering::SeqCst) {
+            let mut io = vec![vec![0.5f32; BLOCK]; 2];
+            p.set_input_silent(false);
+            p.process(&mut io, BLOCK);
+            let b = &io[0];
+            if first {
+                first = false;
+                continue;
+            }
+            if b.iter().all(|&x| (x - 0.125).abs() < 1e-6) {
+                continue;
+            }
+            skips.fetch_add(1, Ordering::SeqCst);
+            if b.iter().any(|&x| x > 0.125 + 1e-6 || x < 0.0) {
+                bad.get_or_insert(b.clone());
+            }
+        }
+        (p, bad)
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while skipped.load(Ordering::SeqCst) < 5 && Instant::now() < deadline {
+        soundcraft_clap_host::service_requests();
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (_p, bad) = audio.join().unwrap();
+    assert!(skipped.load(Ordering::SeqCst) >= 5, "the audio side met the main thread at work");
+    assert_eq!(bad, None, "a skipped block passed the dry input");
+    let r = String::from_utf8(reader.save_state().unwrap()).unwrap();
+    assert!(r.starts_with("gain=0.25;"), "the host's gain reached the plug-in: {}", &r[..40.min(r.len())]);
 }

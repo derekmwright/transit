@@ -219,6 +219,7 @@ pub struct Serviced {
     pub callbacks: usize,
     pub rescans: usize,
     pub restarted_without_audio: usize,
+    pub failed: usize,
     pub pending: usize,
     pub other_thread: usize,
 }

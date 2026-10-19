@@ -115,6 +115,10 @@ struct Fx {
     next_latency: Option<u32>,
     /// Requests plugin: at this `process` call (1-based), ask for a restart to this latency.
     restart_at: Option<(u64, u32)>,
+    /// `activate` fails (requests plugin, `CMD:restart-fail-now`).
+    refuse_activate: bool,
+    /// Every `process` calls `params.rescan(VALUES)` (requests plugin, `CMD:rescan-every-block`).
+    rescan_every_block: bool,
     processes: u64,
     /// Requests plugin: (call, thread token) in order.
     log: std::sync::Mutex<Vec<(String, u64)>>,
@@ -154,6 +158,8 @@ fn on_io_thread(host: *const clap_host, f: impl FnOnce(HostPtr) + Send + 'static
 
 /// `CMD:process-now`, `CMD:process-after:<ms>`, `CMD:flush-now`, `CMD:callback-now`,
 /// `CMD:restart-now:<latency>`, `CMD:restart-at:<process call>:<latency>`,
+/// `CMD:restart-fail-now` (asks for a restart whose `activate` then fails),
+/// `CMD:rescan-every-block` (each `process` calls `params.rescan(VALUES)`),
 /// `CMD:rescan-values:<gain>`, `CMD:rescan-all:<gain>`. The `-now` requests come from another thread (an "IO" thread),
 /// joined before this returns; `process-after` leaves that thread running; `restart-at` asks from
 /// the audio thread (inside `process`); `rescan-values` changes the gain "internally" and calls
@@ -196,6 +202,14 @@ fn requests_command(f: &mut Fx, cmd: &str) -> bool {
             });
         }
         Some("restart-at") => f.restart_at = num(1).zip(num(2).map(|l| l as u32)),
+        Some("restart-fail-now") => {
+            f.refuse_activate = true;
+            on_io_thread(f.host, |h| {
+                let host = unsafe { &*h.0 };
+                unsafe { (host.request_restart.unwrap())(h.0) };
+            });
+        }
+        Some("rescan-every-block") => f.rescan_every_block = true,
         Some(which @ ("rescan-values" | "rescan-all")) => {
             f.gain = parts.get(1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(1.0);
             let params = unsafe { host_ext::<clap_host_params>(f.host, CLAP_EXT_PARAMS).as_ref() }.expect("host params");
@@ -236,6 +250,10 @@ unsafe extern "C" fn destroy(p: *const clap_plugin) {
 unsafe extern "C" fn activate(p: *const clap_plugin, sr: f64, min: u32, max: u32) -> bool {
     let f = unsafe { fx(p) };
     if f.active || !(sr > 0.0) || min == 0 || max < min {
+        return false;
+    }
+    if f.refuse_activate {
+        note(f, "activate refused");
         return false;
     }
     f.active = true;
@@ -366,6 +384,11 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &note.header) });
     }
     f.processes += 1;
+    if f.rescan_every_block {
+        // The host only records the request; it services it on its main thread.
+        let params = unsafe { host_ext::<clap_host_params>(f.host, CLAP_EXT_PARAMS).as_ref() }.expect("host params");
+        unsafe { (params.rescan.unwrap())(f.host, CLAP_PARAM_RESCAN_VALUES) };
+    }
     note(f, "process");
     if let Some((at, latency)) = f.restart_at
         && at == f.processes
@@ -741,6 +764,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         latency: if requests { 5 } else { 3 },
         next_latency: None,
         restart_at: None,
+        refuse_activate: false,
+        rescan_every_block: false,
         processes: 0,
         log: std::sync::Mutex::new(Vec::new()),
         gain: 1.0,

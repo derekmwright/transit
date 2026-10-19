@@ -88,6 +88,8 @@ pub struct Serviced {
     /// Restarts the main thread completed itself because no audio callback parked the instance
     /// within `PARK_DEADLINE` (included in `restarted`).
     pub restarted_without_audio: usize,
+    /// Restarts whose reactivation the plug-in refused (logged; the slot is silent).
+    pub failed: usize,
     /// Instances with a request still in progress after this call: call again soon.
     pub pending: usize,
     /// Instances skipped because this is not the thread that created them.
@@ -108,8 +110,8 @@ struct Core {
 
 impl Core {
     /// Reads the audio ports, sizes their buffers and activates (inactive instance, main thread).
-    /// Returns the latency read after a successful activation.
-    fn activate(&mut self, id: &str) -> usize {
+    /// Returns the latency read after a successful activation, `None` when it failed.
+    fn activate(&mut self, id: &str) -> Option<usize> {
         let ins = self.inst.audio_ports(true);
         let outs = self.inst.audio_ports(false);
         self.in_main = pick_main(&ins);
@@ -121,11 +123,11 @@ impl Core {
                 // `clap_host_latency.changed` is only legal during `activate`: reading the latency
                 // now covers it.
                 self.inst.state().latency_changed.store(false, Ordering::Relaxed);
-                self.inst.latency() as usize
+                Some(self.inst.latency() as usize)
             }
             Err(e) => {
                 log::warn!("{id}: {e}");
-                0
+                None
             }
         }
     }
@@ -155,6 +157,13 @@ pub(crate) struct Shared {
     view: Box<[AtomicU64]>,
     /// When the main thread asked the audio side to park (main thread only).
     park_since: Mutex<Option<Instant>>,
+    /// Host values not yet processed (review N3): `set_param` numbers each change (`host_gen`,
+    /// stored per parameter in `set_at`); a block that hands the plug-in every queued change
+    /// records the number it started from (`processed_gen`). A parameter with `set_at` above it
+    /// still has the host's value on its way, which a rescan must not report the old value over.
+    host_gen: AtomicU64,
+    processed_gen: AtomicU64,
+    set_at: Box<[AtomicU64]>,
 }
 
 /// A `params.rescan` of the values being serviced: the next parameter to re-read.
@@ -223,6 +232,7 @@ impl Shared {
                     out.restarted_without_audio += 1;
                 }
                 Restart::Waiting => out.restarts_waiting += 1,
+                Restart::Failed => out.failed += 1,
             }
         }
         let rescanning = lock(&self.rescan).active;
@@ -255,9 +265,14 @@ impl Shared {
         let read: Vec<(usize, u32, f64)> =
             ids.iter().take(n).enumerate().filter_map(|(k, &id)| core.inst.param_value(id).map(|v| (st.next + k, id, v))).collect();
         drop(core);
-        // Only what differs from the host's view is news to it.
+        // Only what differs from the host's view is news to it, and a value the host set that has
+        // not reached the plug-in yet stands (review N3).
+        let processed = self.processed_gen.load(Ordering::Acquire);
         let mut values = Vec::new();
         for (i, id, v) in read {
+            if self.set_at.get(i).is_some_and(|g| g.load(Ordering::Acquire) > processed) {
+                continue;
+            }
             if let Some(view) = self.view.get(i)
                 && differs(f64::from_bits(view.load(Ordering::Relaxed)), v)
             {
@@ -288,11 +303,11 @@ impl Shared {
             PARKED => {
                 // The audio side stopped processing and no longer touches the instance.
                 let Some(mut core) = try_lock(&self.core) else { return Restart::Waiting };
-                self.restart(&mut core);
+                let ok = self.restart(&mut core);
                 drop(core);
                 *lock(&self.park_since) = None;
                 self.life.store(RUNNING, Ordering::Release);
-                Restart::Done
+                if ok { Restart::Done } else { Restart::Failed }
             }
             PARK => {
                 let late = lock(&self.park_since).is_none_or(|t| t.elapsed() >= PARK_DEADLINE);
@@ -303,12 +318,12 @@ impl Shared {
                 // the instance, this thread is its only audio thread (see the module docs).
                 let Some(mut core) = try_lock(&self.core) else { return Restart::Waiting };
                 core.inst.stop_processing();
-                self.restart(&mut core);
+                let ok = self.restart(&mut core);
                 drop(core);
                 *lock(&self.park_since) = None;
                 self.life.store(RUNNING, Ordering::Release);
                 log::info!("{}: restarted without an audio callback (none parked it within {PARK_DEADLINE:?})", self.info.id);
-                Restart::DoneWithoutAudio
+                if ok { Restart::DoneWithoutAudio } else { Restart::Failed }
             }
             _ => {
                 if let Some(mut core) = try_lock(&self.core)
@@ -316,8 +331,7 @@ impl Shared {
                 {
                     // Not in the processing state: nothing to stop on the audio thread. The lock
                     // keeps the audio side out while it restarts.
-                    self.restart(&mut core);
-                    return Restart::Done;
+                    return if self.restart(&mut core) { Restart::Done } else { Restart::Failed };
                 }
                 // (The lock, if taken, is released here.)
                 *lock(&self.park_since) = Some(Instant::now());
@@ -328,15 +342,22 @@ impl Shared {
     }
 
     /// Deactivates and reactivates at the same rate and block size (main thread, not processing).
-    fn restart(&self, core: &mut Core) {
+    /// False when the plug-in refused the activation: it stays inactive, its slot silent (review
+    /// N2) with no latency, until the plug-in asks for another restart or is prepared again.
+    fn restart(&self, core: &mut Core) -> bool {
         // Cleared first: a request made while it reactivates asks again.
         self.host.restart.store(false, Ordering::Relaxed);
         core.inst.deactivate();
-        let latency = core.activate(self.info.id);
+        let Some(latency) = core.activate(self.info.id) else {
+            self.latency.store(0, Ordering::Release);
+            log::warn!("{}: the plug-in refused to activate again after a restart; its slot is silent", self.info.id);
+            return false;
+        };
         self.latency.store(latency, Ordering::Release);
         // The host starts processing again (CLAP: start_processing on the audio thread before
         // the next process); one block lets it, after which it may sleep again.
         self.host.process.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -345,6 +366,8 @@ enum Restart {
     Done,
     DoneWithoutAudio,
     Waiting,
+    /// The reactivation failed.
+    Failed,
 }
 
 /// A parameter value the host does not know yet (beyond rounding).
@@ -412,6 +435,9 @@ impl ClapPlugin {
             rescan: Mutex::new(Rescan::default()),
             view,
             park_since: Mutex::new(None),
+            host_gen: AtomicU64::new(0),
+            processed_gen: AtomicU64::new(0),
+            set_at: ids.iter().map(|_| AtomicU64::new(0)).collect(),
         });
         lock(live()).push(Arc::downgrade(&shared));
         ClapPlugin {
@@ -445,8 +471,9 @@ impl ClapPlugin {
             }
         }
         drop(core);
-        // Pending changes from before the load would undo it.
+        // Pending changes from before the load would undo it; none is on its way any more.
         self.queue.retain(|e| !matches!(e, Event::Param { .. }));
+        self.shared.processed_gen.store(self.shared.host_gen.load(Ordering::Acquire), Ordering::Release);
     }
 
     /// Inserts keeping the queue time-sorted; drops the event when the queue is full (never
@@ -535,7 +562,7 @@ impl Plugin for ClapPlugin {
         self.status = ProcessStatus::Continue;
         // A full (re)activation answers any restart request, including one left half done.
         self.host.restart.store(false, Ordering::Relaxed);
-        let latency = core.activate(self.info.id);
+        let latency = core.activate(self.info.id).unwrap_or(0);
         drop(core);
         shared.latency.store(latency, Ordering::Release);
         shared.life.store(RUNNING, Ordering::Release);
@@ -558,6 +585,9 @@ impl Plugin for ClapPlugin {
         }
         if let Some(view) = self.shared.view.get(i) {
             view.store(f64::from(v).to_bits(), Ordering::Relaxed);
+        }
+        if let Some(at) = self.shared.set_at.get(i) {
+            at.store(self.shared.host_gen.fetch_add(1, Ordering::AcqRel) + 1, Ordering::Release);
         }
         // Coalesce with a pending change of the same parameter.
         if let Some(Event::Param { value, .. }) = self.queue.iter_mut().find(|e| matches!(e, Event::Param { id, .. } if *id == cid)) {
@@ -604,9 +634,17 @@ impl Plugin for ClapPlugin {
             return;
         };
         let core = &mut *guard;
-        if !core.inst.is_active() || core.max_block == 0 {
+        if core.max_block == 0 {
+            return; // never prepared
+        }
+        if !core.inst.is_active() {
+            // Its activation failed: silent, not the input at unity (review N2).
+            drop(guard);
+            self.gate.skip(io, ch, frames);
             return;
         }
+        // Every change queued so far goes out in this block (parameter events are at time 0).
+        let queued_up_to = shared.host_gen.load(Ordering::Acquire);
         if std::mem::take(&mut self.reset_pending) {
             core.inst.reset();
         }
@@ -663,6 +701,7 @@ impl Plugin for ClapPlugin {
             }
             start += n;
         }
+        shared.processed_gen.store(queued_up_to, Ordering::Release);
         drop(guard);
         self.gate.processed(io, ch, frames);
     }
