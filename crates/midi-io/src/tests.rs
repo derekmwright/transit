@@ -1,5 +1,8 @@
 //! Ring, counter, sequence and hot-plug behavior against the fake backend.
 
+mod ordering_model;
+mod refutation;
+
 use crate::fake::Fake;
 use crate::ring::InputSink;
 use crate::*;

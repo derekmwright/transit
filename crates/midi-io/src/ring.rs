@@ -141,19 +141,28 @@ pub struct InputBoundary {
 }
 
 impl InputBoundary {
-    /// Captures the exclusive offered-sequence cutoff with one Acquire load.
+    /// Captures the exclusive offered-sequence cutoff with one AcqRel read-modify-write (RMW).
     ///
-    /// The producer publishes the next sequence with Release ordering **before** publishing
-    /// its event to the ring. Every already-published event has `seq < cutoff`, even if another
-    /// thread has drained it. An offer exposed before this capture is also covered when its
-    /// ring publication is delayed. Offers after the capture have `seq >= cutoff`; a racing
-    /// offer falls on the side selected by this load. Drops consume sequence numbers too.
+    /// Every event whose offer was stamped before the cutoff RMW in the stamp's modification
+    /// order has `seq < cutoff`. The producer stamps with Release ordering **before** ring
+    /// publication, so this covers those offers even if publication is delayed or a worker has
+    /// already drained them. Offers stamped after the RMW have `seq >= cutoff`; racing offers
+    /// fall on the side selected by that modification order. Drops consume sequence numbers too.
+    ///
+    /// The precondition for covering an offer is that its stamp precedes the RMW in that
+    /// modification order (in particular, a stamp that happens-before the RMW is covered).
+    /// Observing a worker's relaxed counter alone does not establish that ordering.
+    /// Stop must capture this cutoff on control **before** telling the worker to cancel, and
+    /// pass that captured value to the worker. Call this on control, not on the audio callback.
     ///
     /// This is per open port, not a cross-port atomic snapshot. Retain the cutoff to reject
     /// delayed publications as well as queued events; it does not imply the ring is drained.
     #[must_use]
     pub fn cutoff(&self) -> SeqCutoff {
-        self.shared.offered.load(Ordering::Acquire)
+        // Acquire alone may read an older release. An RMW must read the immediately preceding
+        // modification, covering every stamp that happens-before or is coherence-ordered before
+        // it. Adding zero preserves the producer's value, including the terminal MAX boundary.
+        self.shared.offered.fetch_add(0, Ordering::AcqRel)
     }
 
     /// All sequence numbers have been assigned; playback should revoke this source.

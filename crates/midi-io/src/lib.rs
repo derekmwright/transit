@@ -11,6 +11,8 @@
 //! * **Control** (any non-realtime thread): [`MidiIo`] methods, [`PortWatcher::poll`],
 //!   opening, closing and dropping handles, [`OutputHandle::send`]. These allocate, lock and make
 //!   OS calls.
+//!   [`InputBoundary::cutoff`] also belongs on control: it uses an atomic RMW. Stop captures
+//!   the cutoff here before passing it to the ingress worker for cancellation.
 //! * **Backend callback** (midir's thread; the WinMM driver callback on Windows): the input push
 //!   path. It reads the clock once, splits the bytes into messages and pushes them into the ring.
 //!   It does not allocate, lock, log or wait (the crate's tests count its allocations). Ring
@@ -28,7 +30,8 @@
 //!   [`InputCounters::dropped_releases`].
 //! * **Order**: events leave the ring in backend delivery order; [`InputEvent::seq`] numbers every
 //!   message offered to the ring, so drops show as gaps. [`InputBoundary::cutoff`] captures an
-//!   exclusive per-open-port cutoff independently of the consumer, including delayed offers.
+//!   exclusive per-open-port cutoff independently of the consumer: offers stamped before its
+//!   RMW in the stamp's modification order are covered, including delayed publications.
 //!   It is not a cross-port atomic snapshot. Sequences never wrap: at the terminal cutoff
 //!   (`u64::MAX`), [`InputBoundary::is_exhausted`] tells playback to revoke the source, and
 //!   further ingress is refused and counted in [`InputCounters::exhausted_dropped`].
