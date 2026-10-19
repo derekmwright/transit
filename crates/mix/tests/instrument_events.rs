@@ -262,22 +262,29 @@ fn a_note_off_survives_an_overfull_queue() {
     let mut rig = Rig::new();
     let src = port(1, 0);
     let mut admitted = 0;
-    // Three rounds: controllers, then note-on/off pairs whose offs are due far ahead (future
-    // pairs), one block rendered between rounds.
+    // Controllers that stay queued, then three rounds of note-on/off pairs whose offs are due
+    // far ahead (future pairs), one block rendered between rounds. Without the reservation the
+    // offs of the first round alone would not fit.
+    let now = rig.mix.next_frame().0;
+    for i in 0..120u64 {
+        assert_eq!(rig.send(src, now + 7000 + i, cc(1, 1)), EventOutcome::Queued);
+    }
     for round in 0..3u64 {
         let now = rig.mix.next_frame().0;
-        for i in 0..40u8 {
-            rig.send(src, now + 7000, cc(1, i));
-        }
+        let mut ons = Vec::new();
         for i in 0..300u32 {
-            let key = (i % 128) as u8;
-            let id = round as u32 * 1000 + i;
+            let (key, id) = ((i % 128) as u8, round as u32 * 1000 + i);
             let o = rig.send(src, now + u64::from(i % 50), on_id(key, id));
-            if o == EventOutcome::Queued {
+            assert!(matches!(o, EventOutcome::Queued | EventOutcome::Refused(Shed::QueueFull | Shed::NotesFull)), "{o:?}");
+            ons.push((key, id, o == EventOutcome::Queued));
+        }
+        for (key, id, queued) in ons {
+            let o = rig.send(src, now + 8000, off_id(key, id));
+            if queued {
                 admitted += 1;
-                assert_eq!(rig.send(src, now + 8000, off_id(key, id)), EventOutcome::Queued, "an admitted note's off is always queued");
+                assert_eq!(o, EventOutcome::Queued, "an admitted note's off is always queued");
             } else {
-                assert!(matches!(o, EventOutcome::Refused(Shed::QueueFull | Shed::NotesFull)), "{o:?}");
+                assert_eq!(o, EventOutcome::Unmatched);
             }
         }
         rig.render(1);
@@ -287,7 +294,7 @@ fn a_note_off_survives_an_overfull_queue() {
     assert_eq!(st.dropped_releases, 0);
     assert_eq!(st.release_collapses, 0);
     assert_eq!(st.host_refused, [0, 0]);
-    assert!(admitted >= MAX_OPEN, "the table filled: {admitted}");
+    assert_eq!(admitted, MAX_OPEN, "the queue, then the table filled");
     let heard = rig.heard_by(1);
     assert_eq!(every_on_has_its_off(&heard), admitted, "every admitted note-on was delivered, and released");
 }
