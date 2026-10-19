@@ -111,12 +111,13 @@ fn clear_discards_interpolation_history_and_incomplete_frames_never_shift_channe
 
 #[test]
 fn simultaneous_input_and_output_keep_fifo_order() {
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
     let ring = InputRing::new(1, 48_000);
     ring.push(&(0..256).map(|i| i as f32).collect::<Vec<_>>());
-    let gate = Arc::new(Barrier::new(2));
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
     let input_ring = Arc::clone(&ring);
-    let input_gate = Arc::clone(&gate);
     let producer = std::thread::spawn(move || {
         let mut input = vec![0.0; 256];
         let mut heap_free = true;
@@ -124,10 +125,14 @@ fn simultaneous_input_and_output_keep_fifo_order() {
             for (i, x) in input.iter_mut().enumerate() {
                 *x = (block * 256 + i) as f32;
             }
-            input_gate.wait();
+            if start_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                return false;
+            }
             let ((), stats) = measure(|| input_ring.push(&input));
             heap_free &= stats.is_zero();
-            input_gate.wait();
+            if done_tx.try_send(()).is_err() {
+                return false;
+            }
         }
         heap_free
     });
@@ -135,15 +140,16 @@ fn simultaneous_input_and_output_keep_fifo_order() {
     let mut ordered = true;
     let mut heap_free = true;
     for block in 0..1000 {
-        gate.wait();
+        start_tx.try_send(()).unwrap();
         let ((), stats) = measure(|| ring.pop_into(&mut output, 256, 48_000));
         heap_free &= stats.is_zero();
         for (i, &x) in output[0].iter().enumerate() {
             ordered &= x == (block * 256 + i) as f32;
         }
-        gate.wait();
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     }
-    // Assertions happen after all rendezvous, so a mismatch cannot strand the other thread.
+    // Rendezvous is outside measured callback work and has a failure-only watchdog.
+    // Disconnect/timeout exits the producer if the test fails on the control thread.
     assert!(producer.join().unwrap());
     assert!(heap_free);
     assert!(ordered);
