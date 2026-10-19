@@ -37,3 +37,11 @@ dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+# Test-only hook in the scan (see tests/registry_race.rs); off in every normal build.
+[features]
+test-hooks = []
+
+# Turns the hook on for this crate's own tests.
+[dev-dependencies]
+soundcraft-clap-host = { path = ".", features = ["test-hooks"] }
