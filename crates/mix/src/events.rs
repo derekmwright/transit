@@ -131,6 +131,9 @@ pub enum EventOutcome {
     Coalesced,
     /// The engine epoch differs (or the engine takes no realtime events).
     StaleEngine,
+    /// The source's port generation was revoked ([`MixEngine::revoke_source`]): a late event
+    /// from it never starts anything.
+    RevokedSource,
     /// The instrument at the target is another instance.
     StaleBinding,
     /// `transport` is `Some` and not current.
@@ -202,6 +205,8 @@ pub struct EventStatus {
     pub lateness_log2: [u32; 16],
     /// Refused: engine, binding, transport.
     pub refused_stale: [u64; 3],
+    /// Refused because their port generation was revoked.
+    pub refused_revoked: u64,
     pub refused_no_instrument: u64,
     pub refused_too_early: u64,
     pub shed: ShedCounts,
@@ -245,6 +250,7 @@ impl EventStatus {
             add(a, b);
         }
         add(&mut self.refused_no_instrument, o.refused_no_instrument);
+        add(&mut self.refused_revoked, o.refused_revoked);
         add(&mut self.refused_too_early, o.refused_too_early);
         let (s, t) = (&mut self.shed, o.shed);
         add(&mut s.note_on, t.note_on);
@@ -900,6 +906,11 @@ impl InstrumentEvents {
         self.notes.iter().filter(|e| e.used && e.voice >= 0).map(|e| (e.source, e.key, e.voice))
     }
 
+    /// Anything queued, sounding or held.
+    fn busy(&self) -> bool {
+        !self.queue.is_empty() || self.notes.iter().any(|e| e.used) || self.pedals.iter().any(|p| p.used)
+    }
+
     // ---- clips: delivered at once, through the same table, as `Source::CLIP` ----
 
     /// A clip note-on. A full table sheds it (counted): it is not delivered untracked.
@@ -1015,11 +1026,15 @@ pub(crate) struct EngineEvents {
     pub(crate) transport: Option<TransportEpoch>,
     pub(crate) status: EventStatus,
     tap: Vec<TapRecord>,
+    /// Per port: one past the highest revoked generation (0: none). Sized for every port when
+    /// the engine takes events, so recording a revocation never allocates.
+    revoked: Vec<u64>,
 }
 
 impl EngineEvents {
     pub(crate) fn new(epoch: Option<EngineEpoch>, limits: EventLimits) -> Self {
-        EngineEvents { epoch, limits, next_frame: 0, transport: None, status: EventStatus::default(), tap: Vec::new() }
+        let revoked = if epoch.is_some() { vec![0; usize::from(u16::MAX) + 1] } else { Vec::new() };
+        EngineEvents { epoch, limits, next_frame: 0, transport: None, status: EventStatus::default(), tap: Vec::new(), revoked }
     }
 }
 
@@ -1077,6 +1092,7 @@ impl MixEngine {
             }
             EventOutcome::Coalesced => bump(&mut st.coalesced),
             EventOutcome::StaleEngine => bump(&mut st.refused_stale[0]),
+            EventOutcome::RevokedSource => bump(&mut st.refused_revoked),
             EventOutcome::StaleBinding => bump(&mut st.refused_stale[1]),
             EventOutcome::StaleTransport => bump(&mut st.refused_stale[2]),
             EventOutcome::NoInstrument => bump(&mut st.refused_no_instrument),
@@ -1100,6 +1116,10 @@ impl MixEngine {
     fn admit(&mut self, ev: &InstrumentEvent) -> (EventOutcome, Option<u64>) {
         if self.events.epoch != Some(ev.engine) {
             return (EventOutcome::StaleEngine, None);
+        }
+        // Port generations only increase: one at or below the revoked one is gone for good.
+        if self.events.revoked.get(usize::from(ev.source.port)).is_some_and(|&r| ev.source.generation < r) {
+            return (EventOutcome::RevokedSource, None);
         }
         let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::StaleEngine, None) };
         if plan.faulted {
@@ -1162,6 +1182,10 @@ impl MixEngine {
     /// events, releases its notes and pedals at offset 0 of the next block (a pedal goes up at
     /// the plug-in only when it was the last holder), and returns bend and pressure to neutral
     /// where it was the last writer. Bounded: instruments × (512 + 224 + 32). Counted `revoked`.
+    ///
+    /// The port stays revoked: a later event from this generation or an older one (one still in
+    /// flight in playback's lane) is refused with [`EventOutcome::RevokedSource`] until a newer
+    /// generation of the port appears.
     pub fn revoke_source(&mut self, port: u16, generation: u64) {
         let mut done = 0u64;
         if let Some(p) = self.plan.as_deref_mut() {
@@ -1174,6 +1198,25 @@ impl MixEngine {
             }
         }
         self.events.status.revoked = self.events.status.revoked.saturating_add(done);
+        if let Some(r) = self.events.revoked.get_mut(usize::from(port)) {
+            *r = (*r).max(generation.saturating_add(1));
+        }
+    }
+
+    /// The wake contract: true while any instrument still has something to deliver or release:
+    /// queued events (future ones included), sounding notes, held pedals, or reserved releases.
+    /// A stopped host keeps processing while this holds. Allocation-free; bounded by the
+    /// instruments × (512 + 224 + 32) entries.
+    ///
+    /// It covers undelivered events, holds and reservations only. `false` does not mean the
+    /// engine is quiet: release envelopes, one-shots and insert or delay tails still need
+    /// processing after the last release is delivered; the caller decides when to idle (see
+    /// [`Plugin::tail_samples`] and [`Plugin::process_status`]).
+    #[must_use]
+    pub fn has_pending_events(&self) -> bool {
+        self.plan.as_deref().is_some_and(|p| {
+            p.tables.strips.iter().filter_map(|st| st.instrument.as_ref()).filter_map(|i| i.events.as_deref()).any(InstrumentEvents::busy)
+        })
     }
 
     /// The render frame of the next block's first sample.

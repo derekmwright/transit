@@ -599,3 +599,46 @@ fn all_notes_off_releases_every_tracked_voice() {
     );
     assert!(rig.heard.lock().unwrap().iter().any(|(_, _, e)| e.is_none()), "and the plug-in was told to release everything");
 }
+
+#[test]
+fn a_revoked_source_stays_revoked_until_a_newer_generation() {
+    let mut rig = Rig::new();
+    let (g, newer) = (Source { port: 4, channel: 0, generation: 7 }, Source { port: 4, channel: 0, generation: 8 });
+    rig.mix.revoke_source(4, 7);
+    let now = rig.mix.next_frame().0;
+    // A note-on that was still in flight when the revocation was acknowledged.
+    assert_eq!(rig.send(g, now, on(60)), EventOutcome::RevokedSource);
+    assert_eq!(rig.send(Source { generation: 6, ..g }, now, on(61)), EventOutcome::RevokedSource, "older generations too");
+    rig.render(2);
+    assert!(rig.heard_by(1).is_empty(), "nothing from a revoked source reaches the plug-in");
+    assert_eq!(rig.send(newer, now + 2 * BLOCK as u64, on(62)), EventOutcome::Queued);
+    assert_eq!(rig.send(port(5, 0), now + 2 * BLOCK as u64, on(63)), EventOutcome::Queued, "other ports are untouched");
+    rig.render(1);
+    assert_eq!(rig.heard_by(1).len(), 2);
+    assert_eq!(rig.mix.event_status().refused_revoked, 2);
+}
+
+#[test]
+fn pending_events_keep_a_stopped_engine_awake_until_delivered() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    assert!(!rig.mix.has_pending_events());
+    let now = rig.mix.next_frame().0;
+    rig.send(src, now + 600, on(60));
+    rig.send(src, now + 1200, off(60));
+    let mut awake = Vec::new();
+    for _ in 0..8 {
+        awake.push(rig.mix.has_pending_events());
+        rig.render(1);
+    }
+    assert_eq!(awake, [true, true, true, true, true, false, false, false], "true until the off at frame +1200 is delivered");
+    // A held pedal keeps it awake until a revocation releases it.
+    let now = rig.mix.next_frame().0;
+    rig.send(src, now, cc(64, 127));
+    rig.render(3);
+    assert!(rig.mix.has_pending_events(), "the pedal is held");
+    rig.mix.revoke_source(1, 1);
+    assert!(!rig.mix.has_pending_events(), "released by the revocation");
+    rig.render(1);
+    assert_eq!(pedal_edges(&rig.heard_by(1), 64).last(), Some(&(now + 3 * BLOCK as u64, false)));
+}
