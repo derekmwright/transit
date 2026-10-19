@@ -28,11 +28,11 @@ fn drain(consumer: &mut InputConsumer) -> Vec<InputEvent> {
 fn messages_keep_order_running_status_is_expanded_and_seq_counts_up() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", InputConfig::default());
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
-    assert!(Fake::deliver(&slot, 1000, &[0x90, 60, 100]));
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    assert!(slot.deliver(1000, &[0x90, 60, 100]));
     // Running status, a clock tick inside a message, program change.
-    assert!(Fake::deliver(&slot, 2000, &[0x90, 62, 90, 64, 0xF8, 80, 0xC1, 5]));
-    assert!(Fake::deliver(&slot, 3000, &[0x80, 60, 0]));
+    assert!(slot.deliver(2000, &[0x90, 62, 90, 64, 0xF8, 80, 0xC1, 5]));
+    assert!(slot.deliver(3000, &[0x80, 60, 0]));
     let events = drain(&mut consumer);
     let got: Vec<(&[u8], u64)> = events.iter().map(|e| (e.message(), e.backend_time_us)).collect();
     assert_eq!(
@@ -55,12 +55,12 @@ fn messages_keep_order_running_status_is_expanded_and_seq_counts_up() {
 fn a_full_ring_drops_and_counts_without_blocking() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", config(8, 2));
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
     // A producer thread that would hang forever if a full ring blocked it.
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let producer = std::thread::spawn(move || {
         for i in 0..100_000u64 {
-            Fake::deliver(&slot, i, &[0x90, (i % 128) as u8, 1]);
+            slot.deliver(i, &[0x90, (i % 128) as u8, 1]);
         }
         let _ = done_tx.send(());
     });
@@ -73,8 +73,8 @@ fn a_full_ring_drops_and_counts_without_blocking() {
     let events = drain(&mut consumer);
     assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
     // After a drain the ring accepts again, and seq shows the gap.
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
-    Fake::deliver(&slot, 0, &[0x90, 1, 1]);
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    slot.deliver(0, &[0x90, 1, 1]);
     assert_eq!(consumer.pop().unwrap().seq, 100_000);
 }
 
@@ -82,17 +82,17 @@ fn a_full_ring_drops_and_counts_without_blocking() {
 fn releases_use_the_reserve_and_are_counted_separately_when_even_it_is_full() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", config(4, 3));
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
     for key in 0..10 {
-        Fake::deliver(&slot, 0, &[0x90, key, 100]);
+        slot.deliver(0, &[0x90, key, 100]);
     }
     // Releases of each kind: note-off, note-on velocity 0, sustain up, then one too many.
-    Fake::deliver(&slot, 1, &[0x80, 0, 0]);
-    Fake::deliver(&slot, 1, &[0x91, 1, 0]);
-    Fake::deliver(&slot, 1, &[0xB0, 64, 0]);
-    Fake::deliver(&slot, 1, &[0xB0, 123, 0]);
+    slot.deliver(1, &[0x80, 0, 0]);
+    slot.deliver(1, &[0x91, 1, 0]);
+    slot.deliver(1, &[0xB0, 64, 0]);
+    slot.deliver(1, &[0xB0, 123, 0]);
     // A non-release still finds no room.
-    Fake::deliver(&slot, 1, &[0xB0, 1, 0]);
+    slot.deliver(1, &[0xB0, 1, 0]);
     let c = handle.counters();
     assert_eq!((c.delivered, c.dropped, c.dropped_releases), (7, 7, 1));
     let events = drain(&mut consumer);
@@ -104,11 +104,11 @@ fn releases_use_the_reserve_and_are_counted_separately_when_even_it_is_full() {
 fn sysex_is_dropped_and_counted_across_chunks_while_real_time_bytes_pass() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", InputConfig::default());
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
-    Fake::deliver(&slot, 0, &[0xF0, 0x7E, 0x7F, 0xF8, 0x06]);
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    slot.deliver(0, &[0xF0, 0x7E, 0x7F, 0xF8, 0x06]);
     // WinMM-style continuation chunk: data bytes, the end, then a channel message.
-    Fake::deliver(&slot, 1, &[0x01, 0x02, 0xF7, 0x90, 60, 1]);
-    Fake::deliver(&slot, 2, &[0xF0, 1, 2, 3, 0xF7]);
+    slot.deliver(1, &[0x01, 0x02, 0xF7, 0x90, 60, 1]);
+    slot.deliver(2, &[0xF0, 1, 2, 3, 0xF7]);
     let msgs: Vec<Vec<u8>> = drain(&mut consumer).iter().map(|e| e.message().to_vec()).collect();
     assert_eq!(msgs, [vec![0xF8], vec![0x90, 60, 1]]);
     let c = handle.counters();
@@ -119,12 +119,12 @@ fn sysex_is_dropped_and_counted_across_chunks_while_real_time_bytes_pass() {
 fn malformed_bytes_and_active_sensing_are_counted_not_delivered() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", InputConfig::default());
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
-    Fake::deliver(&slot, 0, &[0x40, 0x41]); // data with no status
-    Fake::deliver(&slot, 0, &[0x90, 60]); // cut short by the end
-    Fake::deliver(&slot, 0, &[0xB0, 7, 0x90, 61, 2]); // cut short by a status
-    Fake::deliver(&slot, 0, &[0xF4, 0xFD, 0xF7]); // undefined and stray EOX
-    Fake::deliver(&slot, 0, &[0xFE, 0xFE]);
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    slot.deliver(0, &[0x40, 0x41]); // data with no status
+    slot.deliver(0, &[0x90, 60]); // cut short by the end
+    slot.deliver(0, &[0xB0, 7, 0x90, 61, 2]); // cut short by a status
+    slot.deliver(0, &[0xF4, 0xFD, 0xF7]); // undefined and stray EOX
+    slot.deliver(0, &[0xFE, 0xFE]);
     let msgs: Vec<Vec<u8>> = drain(&mut consumer).iter().map(|e| e.message().to_vec()).collect();
     assert_eq!(msgs, [vec![0x90, 61, 2]]);
     let c = handle.counters();
@@ -132,7 +132,7 @@ fn malformed_bytes_and_active_sensing_are_counted_not_delivered() {
     let (_io2, _h2, mut passing) = {
         let fake = Fake::default();
         let r = open(&fake, "AS", InputConfig { pass_active_sensing: true, ..InputConfig::default() });
-        Fake::deliver(&fake.input_slot(&Fake::key("AS", 0)).unwrap(), 0, &[0xFE]);
+        fake.input_port(&Fake::key("AS", 0)).unwrap().deliver(0, &[0xFE]);
         r
     };
     assert_eq!(passing.pop().map(|e| e.message().to_vec()), Some(vec![0xFE]));
@@ -163,10 +163,10 @@ fn the_push_path_allocates_nothing() {
     // The same through the fake backend's callback stand-in (an uncontended std mutex).
     let fake = Fake::default();
     let (_io, _handle, _consumer) = open(&fake, "Keys", cfg);
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
     let ((), stats) = measure(|| {
         for round in 0..1_000u64 {
-            Fake::deliver(&slot, round, &[0x90, 60, 100]);
+            slot.deliver(round, &[0x90, 60, 100]);
         }
     });
     assert!(stats.is_zero(), "{stats:?}");
@@ -177,10 +177,10 @@ fn host_arrival_is_monotonic_and_seq_strictly_increases() {
     let fake = Fake::default();
     let origin = host_origin();
     let (_io, _handle, mut consumer) = open(&fake, "Keys", InputConfig { host_origin: origin, ..InputConfig::new(4096) });
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
     let before = host_now_ns();
     for i in 0..1000u64 {
-        Fake::deliver(&slot, i * 1000, &[0x90, 1, 1, 0x80, 1, 0]);
+        slot.deliver(i * 1000, &[0x90, 1, 1, 0x80, 1, 0]);
     }
     let after = host_now_ns();
     let events = drain(&mut consumer);
@@ -205,12 +205,12 @@ fn a_custom_origin_shifts_host_time() {
 fn dropping_the_handle_closes_the_port() {
     let fake = Fake::default();
     let (_io, handle, mut consumer) = open(&fake, "Keys", InputConfig::default());
-    let slot = fake.input_slot(&Fake::key("Keys", 0)).unwrap();
-    Fake::deliver(&slot, 0, &[0x90, 60, 1]);
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    slot.deliver(0, &[0x90, 60, 1]);
     assert!(!consumer.is_closed());
     drop(handle);
     assert!(consumer.is_closed());
-    assert!(!Fake::deliver(&slot, 0, &[0x90, 61, 1]), "no sink after close");
+    assert!(!slot.deliver(0, &[0x90, 61, 1]), "no sink after close");
     assert_eq!(drain(&mut consumer).len(), 1, "events already queued stay readable");
     // The port can be opened again.
     let io = fake.io();
@@ -242,22 +242,21 @@ fn the_watcher_reports_added_and_removed_ports_and_flags_open_ones() {
 
     fake.remove_input(&Fake::key("B", 0));
     let changes = watcher.poll().unwrap();
-    assert!(matches!(&changes[..], [PortChange::Removed { port, was_open: false }] if port.key == Fake::key("B", 0)));
+    assert!(matches!(&changes[..], [PortChange::Removed { port, was_open: false }] if port.key.name == "B"));
     assert!(!handle.is_disconnected());
 
-    // Unplug both "A" inputs (a hub going away). Unplugging only the first would leave its key
-    // naming the second: name-plus-ordinal identity cannot tell identical devices apart.
+    // Unplug both "A" inputs (a hub going away).
     fake.remove_input(&Fake::key("A", 1));
     fake.remove_input(&Fake::key("A", 0));
     let changes = watcher.poll().unwrap();
     assert_eq!(changes.len(), 2);
-    assert!(changes.iter().any(|c| matches!(c, PortChange::Removed { port, was_open: true } if port.key == Fake::key("A", 0))));
+    assert!(changes.iter().any(|c| matches!(c, PortChange::Removed { port, was_open: true } if port.key.name == "A" && port.key.ordinal == 0)));
     assert!(handle.is_disconnected() && consumer.is_disconnected());
     assert_eq!(watcher.ports().count(), 1, "the output A remains");
 
     fake.add_input("A");
     let changes = watcher.poll().unwrap();
-    assert!(matches!(&changes[..], [PortChange::Added(p)] if p.key == Fake::key("A", 0) && p.direction == Direction::Input));
+    assert!(matches!(&changes[..], [PortChange::Added(p)] if p.key.name == "A" && p.key.ordinal == 0 && p.direction == Direction::Input));
     assert!(handle.is_disconnected(), "a returning port does not revive the old handle");
 }
 
@@ -275,4 +274,114 @@ fn outputs_send_and_errors_are_typed() {
     assert!(matches!(io.open_output(&wrong), Err(MidiIoError::WrongBackend(_))));
     fake.add_input("Keys");
     assert!(matches!(io.open_input(&Fake::key("Keys", 0), config(0, 4)), Err(MidiIoError::InvalidConfig(_))));
+}
+
+#[test]
+fn unplugging_the_first_of_two_identical_inputs_flags_the_dead_handle_not_the_live_one() {
+    let fake = Fake::default();
+    let k0 = fake.add_input("KeyStep");
+    let k1 = fake.add_input("KeyStep");
+    assert_ne!(k0.id, k1.id);
+    let io = fake.io();
+    let mut watcher = io.watcher().unwrap();
+    let (h0, c0) = io.open_input(&k0, InputConfig::default()).unwrap();
+    let (h1, mut c1) = io.open_input(&k1, InputConfig::default()).unwrap();
+    let live = fake.input_port(&k1).unwrap();
+    fake.remove_input(&k0);
+    let changes = watcher.poll().unwrap();
+    assert!(matches!(&changes[..], [PortChange::Removed { port, was_open: true }] if port.key.id == k0.id), "{changes:?}");
+    assert!(h0.is_disconnected() && c0.is_disconnected(), "the dead handle is flagged");
+    assert!(!h1.is_disconnected() && !c1.is_disconnected(), "the live handle is not");
+    // The survivor is now first in enumeration order, yet still the same port.
+    assert_eq!(io.list_inputs().unwrap()[0].key.id, k1.id);
+    assert!(live.deliver(0, &[0x90, 60, 100]));
+    assert_eq!(c1.pop().map(|e| e.message().to_vec()), Some(vec![0x90, 60, 100]));
+    // Opening by the survivor's old key still finds it by id.
+    drop(h1);
+    assert!(io.open_input(&k1, InputConfig::default()).is_ok());
+}
+
+#[test]
+fn id_less_keys_fall_back_to_name_and_ordinal() {
+    let fake = Fake::default();
+    let k = fake.add_input_anonymous("Old");
+    assert!(k.id.is_empty());
+    let io = fake.io();
+    let (handle, _c) = io.open_input(&k, InputConfig::default()).unwrap();
+    let mut watcher = io.watcher().unwrap();
+    fake.remove_input(&k);
+    assert!(matches!(&watcher.poll().unwrap()[..], [PortChange::Removed { was_open: true, .. }]));
+    assert!(handle.is_disconnected());
+}
+
+#[test]
+fn huge_capacities_are_rejected_not_allocated() {
+    let fake = Fake::default();
+    let key = fake.add_input("A");
+    let io = fake.io();
+    for cfg in [
+        InputConfig { capacity: usize::MAX, release_reserve: 16, ..InputConfig::default() },
+        InputConfig { capacity: MAX_INPUT_EVENTS + 1, ..InputConfig::default() },
+        InputConfig { release_reserve: usize::MAX, ..InputConfig::default() },
+    ] {
+        assert!(matches!(io.open_input(&key, cfg), Err(MidiIoError::InvalidConfig(_))));
+    }
+    assert!(io.open_input(&key, InputConfig { capacity: MAX_INPUT_EVENTS, release_reserve: 1, ..InputConfig::default() }).is_ok());
+}
+
+/// Pushes each chunk as one backend callback and returns what the ring held, plus the counters.
+fn framed(chunks: &[&[u8]]) -> (Vec<Vec<u8>>, InputCounters) {
+    let (mut sink, mut consumer, shared) = InputSink::new(&InputConfig::new(256));
+    for chunk in chunks {
+        sink.push(0, chunk);
+    }
+    (drain(&mut consumer).iter().map(|e| e.message().to_vec()).collect(), shared.snapshot())
+}
+
+#[test]
+fn sysex_clears_running_status() {
+    // M1: data after a complete SysEx must not reuse the earlier 0x90.
+    let (msgs, c) = framed(&[&[0x90, 60, 1, 0xF0, 1, 0xF7, 61, 1]]);
+    assert_eq!(msgs, [vec![0x90, 60, 1]]);
+    assert_eq!((c.malformed_bytes, c.sysex_dropped, c.sysex_bytes_dropped), (2, 1, 3));
+}
+
+#[test]
+fn f7_ends_sysex_so_later_bare_data_is_malformed_not_sysex() {
+    // M3: after F0 .. F7, data in a later callback is stray data.
+    let (msgs, c) = framed(&[&[0xF0, 1, 2, 0xF7], &[0x11, 0x12]]);
+    assert!(msgs.is_empty());
+    assert_eq!((c.sysex_bytes_dropped, c.malformed_bytes), (4, 2));
+}
+
+#[test]
+fn a_status_byte_inside_sysex_ends_it() {
+    // M13: the cut-off SysEx must not keep swallowing data bytes (here, running status data).
+    let (msgs, c) = framed(&[&[0xF0, 1, 2], &[0x90, 60, 1, 61, 1]]);
+    assert_eq!(msgs, [vec![0x90, 60, 1], vec![0x90, 61, 1]]);
+    assert_eq!((c.sysex_bytes_dropped, c.malformed_bytes), (3, 0));
+}
+
+#[test]
+fn system_common_does_not_set_running_status() {
+    // M6: data after a system common message is not another system common message.
+    let (msgs, c) = framed(&[&[0xF1, 0x10, 0x20], &[0x90, 60, 1, 0xF3, 2, 5]]);
+    assert_eq!(msgs, [vec![0xF1, 0x10], vec![0x90, 60, 1], vec![0xF3, 2]]);
+    assert_eq!(c.malformed_bytes, 2);
+}
+
+#[test]
+fn song_position_is_three_bytes_and_tune_request_is_one() {
+    // M14 and M15.
+    let (msgs, c) = framed(&[&[0xF2, 1, 2, 0xF6, 0xF3, 4]]);
+    assert_eq!(msgs, [vec![0xF2, 1, 2], vec![0xF6], vec![0xF3, 4]]);
+    assert_eq!(c.malformed_bytes, 0);
+}
+
+#[test]
+fn an_undefined_status_clears_running_status() {
+    // M7: data after F4 must not reuse the earlier 0x90.
+    let (msgs, c) = framed(&[&[0x90, 60, 1, 0xF4, 61, 1]]);
+    assert_eq!(msgs, [vec![0x90, 60, 1]]);
+    assert_eq!(c.malformed_bytes, 3);
 }

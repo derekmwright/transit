@@ -225,8 +225,9 @@ impl InputSink {
             if got == len {
                 self.offer(bytes, len, backend_time_us, host);
             } else {
+                // No need to clear running status: the next byte is a status byte, which sets or
+                // clears it itself, or the callback's bytes have ended.
                 bump(&self.shared.counters.malformed_bytes, (got - usize::from(start == i)).max(1) as u64);
-                running = None;
             }
             i = j.max(i + 1);
         }
