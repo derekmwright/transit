@@ -15,8 +15,9 @@
 //!   to load: `LEARN:<cc>` maps that controller to the volume instead (a "MIDI learn") and calls
 //!   `restartComponent(kMidiCCAssignmentChanged)`; `LATENCY:<n>` reports `n` samples after the
 //!   next `setActive(true)` and calls `restartComponent(kLatencyChanged)`; `RESTART:<flags>`
-//!   calls `restartComponent` with those flags; `ARM:<command>` runs the command at the next
-//!   `getState` instead (a main-thread call the host makes while the processor runs elsewhere,
+//!   calls `restartComponent` with those flags; `REFUSE` makes `setActive(true)` fail from then
+//!   on; `EVERY:<command>` runs the command at every `getState`; `ARM:<command>` runs the command
+//!   at the next `getState` instead (a main-thread call the host makes while the processor runs elsewhere,
 //!   like a learn in the plug-in's own window). Its component state is a report: the OS thread of
 //!   the `getState` call (`me=`) and the threads that ran `getMidiControllerAssignment`,
 //!   `setActive`, `process` and `getLatencySamples`.
@@ -250,11 +251,13 @@ impl IAudioProcessorTrait for GainProcessor {
 struct GainController {
     gain: AtomicU64,
     freq: AtomicU64,
-    /// A gain (normalized, f64 bits) to switch to at the next `getState`, as a preset change in
-    /// the plug-in's own window would, telling the host with
+    /// A gain (normalized, f64 bits) the controller returns to at every `getState` where its gain
+    /// differs, as a preset in the plug-in's own window would, telling the host with
     /// `restartComponent(kParamValuesChanged)`; `u64::MAX`: none. Set by a controller state that
     /// carries a second f64 after the Freq value.
     preset: AtomicU64,
+    /// The host's component handler for this controller.
+    handler: AtomicPtr<IComponentHandler>,
     _live: Live,
 }
 
@@ -427,14 +430,17 @@ impl IEditControllerTrait for GainController {
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
             self.preset.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
+        // Like many plug-ins, it tells the host its values changed while it loads a state.
+        if let Some(h) = unsafe { ComRef::from_raw(self.handler.load(Ordering::SeqCst)) } {
+            unsafe { h.restartComponent(RestartFlags_::kParamValuesChanged as i32) };
+        }
         kResultOk
     }
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
         ctrl_call("getState");
-        let preset = self.preset.swap(u64::MAX, Ordering::Relaxed);
-        if preset != u64::MAX {
-            self.gain.store(preset, Ordering::Relaxed);
-            if let Some(h) = unsafe { ComRef::from_raw(HANDLER.load(Ordering::SeqCst)) } {
+        let preset = self.preset.load(Ordering::Relaxed);
+        if preset != u64::MAX && self.gain.swap(preset, Ordering::Relaxed) != preset {
+            if let Some(h) = unsafe { ComRef::from_raw(self.handler.load(Ordering::SeqCst)) } {
                 unsafe { h.restartComponent(RestartFlags_::kParamValuesChanged as i32) };
             }
         }
@@ -509,6 +515,7 @@ impl IEditControllerTrait for GainController {
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
         ctrl_call("setComponentHandler");
         HANDLER.store(handler, Ordering::SeqCst);
+        self.handler.store(handler, Ordering::SeqCst);
         // Exercise the host's handler: an edit from the "plugin GUI" must be accepted.
         if let Some(h) = unsafe { ComRef::from_raw(handler) } {
             assert_eq!(unsafe { h.beginEdit(7) }, kResultOk);
@@ -542,6 +549,10 @@ struct Synth {
     handler: AtomicPtr<IComponentHandler>,
     /// A command for the next `getState`.
     armed: std::sync::Mutex<Option<String>>,
+    /// A command for every `getState`.
+    every: std::sync::Mutex<Option<String>>,
+    /// `setActive(true)` fails.
+    refuse: AtomicBool,
     /// (call, OS thread), each pair once.
     threads: std::sync::Mutex<Vec<(&'static str, usize)>>,
     _live: Live,
@@ -556,6 +567,8 @@ impl Synth {
             next_latency: AtomicI64::new(-1),
             handler: AtomicPtr::new(std::ptr::null_mut()),
             armed: std::sync::Mutex::new(None),
+            every: std::sync::Mutex::new(None),
+            refuse: AtomicBool::new(false),
             threads: std::sync::Mutex::new(Vec::new()),
             _live: Live::new(&OBJECTS),
         }
@@ -589,6 +602,8 @@ impl Synth {
             }
             "RESTART" => self.restart(arg.parse().unwrap_or(0)),
             "ARM" => *self.armed.lock().unwrap() = Some(arg.to_string()),
+            "EVERY" => *self.every.lock().unwrap() = Some(arg.to_string()),
+            "REFUSE" => self.refuse.store(true, Ordering::SeqCst),
             _ => return false,
         }
         true
@@ -683,6 +698,9 @@ impl IComponentTrait for Synth {
     }
     unsafe fn setActive(&self, state: TBool) -> tresult {
         self.note_thread("active");
+        if state != 0 && self.refuse.load(Ordering::SeqCst) {
+            return kResultFalse;
+        }
         if state != 0 {
             let next = self.next_latency.swap(-1, Ordering::SeqCst);
             if next >= 0 {
@@ -706,6 +724,10 @@ impl IComponentTrait for Synth {
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
         let armed = self.armed.lock().unwrap().take();
         if let Some(cmd) = armed {
+            self.command(&cmd);
+        }
+        let every = self.every.lock().unwrap().clone();
+        if let Some(cmd) = every {
             self.command(&cmd);
         }
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
@@ -891,6 +913,7 @@ impl IPluginFactoryTrait for Factory {
                 gain: AtomicU64::new(0.5f64.to_bits()),
                 freq: AtomicU64::new(0.5f64.to_bits()),
                 preset: AtomicU64::new(u64::MAX),
+                handler: AtomicPtr::new(std::ptr::null_mut()),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()

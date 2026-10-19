@@ -170,7 +170,7 @@ fn io_changes_reactivate_and_a_reload_request_is_refused_clearly() {
 }
 
 /// A state for the gain fixture whose controller part also carries a "preset" gain (normalized)
-/// that the plug-in switches to at its next `getState` (see `tests/fixture`).
+/// that the plug-in returns to at each `getState` (see `tests/fixture`).
 fn gain_state_with_preset(preset: f64) -> Vec<u8> {
     let comp = 0.25f64.to_le_bytes();
     let ctrl: Vec<u8> = [0.5f64.to_le_bytes(), preset.to_le_bytes()].concat();
@@ -205,4 +205,97 @@ fn values_changed_by_the_plugin_are_re_read_on_main_and_reported_like_edits() {
     assert_eq!(edits[0].0, "7");
     assert!((edits[0].1 - 1.6).abs() < 1e-6, "{edits:?}");
     assert!(ed.idle().is_empty(), "once");
+    // Review R3: the host then sets 2.0 (normalized 1.0) and the plug-in goes back to its 0.8.
+    // The value read (0.8) is the one read last time, but not what the host believes: reported.
+    assert!(p.set_param("7", 2.0));
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    let _ = reader.save_state(); // syncs the host's 2.0 to the controller; it returns to 0.8
+    let edits = ed.idle();
+    assert_eq!(edits.len(), 1, "{edits:?}");
+    assert!((edits[0].1 - 1.6).abs() < 1e-6, "differs from the host's 2.0: {edits:?}");
+}
+
+/// Mutant V4 of the review: a state the host loads, whose plug-in reports changed values while
+/// loading it, is not reported back as edits (the host already holds those values).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn values_changed_during_a_host_state_load_are_not_reported() {
+    let found = soundcraft_vst3_host::scan_paths(&[common::fixture_dir().to_path_buf()]);
+    let id = found.into_iter().find(|d| d.name == "Fixture Gain").expect("fixture gain").id;
+    let mut p = soundcraft_vst3_host::create(&id).expect("instantiate");
+    p.prepare(48_000.0, BLOCK, 2);
+    let mut ed = p.editor().expect("editor handle");
+    let _ = ed.idle();
+    // Gain 0.7 (component) and Freq 0.3 (controller), both different from before; the controller
+    // calls restartComponent(kParamValuesChanged) inside setState.
+    let mut blob = b"SCV3".to_vec();
+    blob.extend_from_slice(&8u32.to_le_bytes());
+    blob.extend_from_slice(&0.7f64.to_le_bytes());
+    blob.extend_from_slice(&8u32.to_le_bytes());
+    blob.extend_from_slice(&0.3f64.to_le_bytes());
+    assert!(p.load_state(&blob));
+    assert!(ed.idle().is_empty(), "the host loaded these values itself");
+    assert!(ed.idle().is_empty());
+}
+
+/// Review R5: a reactivation the plug-in refuses is tried once per request, logged, counted as
+/// failed, and not retried every frame.
+#[test]
+fn a_refused_reactivation_fails_once_and_is_not_retried() {
+    let (mut p, _reader) = synth();
+    assert!(p.load_state(b"REFUSE"));
+    assert!(p.load_state(b"RESTART:8")); // kLatencyChanged
+    let s = soundcraft_vst3_host::service_requests();
+    assert_eq!((s.restarted, s.failed), (0, 1), "{s:?}");
+    for _ in 0..5 {
+        let s = soundcraft_vst3_host::service_requests();
+        assert_eq!((s.restarted, s.failed, s.restarts_waiting), (0, 0, 0), "not retried: {s:?}");
+    }
+    assert_eq!(p.latency(), 0);
+}
+
+/// Review R1: a block the audio side skips because the main thread holds the instance (here,
+/// reactivations for kLatencyChanged over and over) is silence faded from the last output, not
+/// the buffer as it was (for an instrument: whatever the strip held, here a stale 0.5).
+#[test]
+fn a_block_skipped_during_a_reactivation_is_a_fade_to_silence() {
+    let (mut p, mut reader) = synth();
+    assert!(p.load_state(b"EVERY:RESTART:8"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let (halt, skips) = (Arc::clone(&stop), Arc::clone(&skipped));
+    let audio = std::thread::spawn(move || {
+        p.note_on(0, 60, 127);
+        let mut last = 0.0f32;
+        let mut bad = None;
+        while !halt.load(Ordering::SeqCst) {
+            let mut io = vec![vec![0.5f32; BLOCK]; 2];
+            p.process(&mut io, BLOCK);
+            let block = &io[0];
+            if block.iter().all(|&x| x == 1.0) {
+                last = 1.0;
+                continue;
+            }
+            skips.fetch_add(1, Ordering::SeqCst);
+            // A fade out (never above where it was, never the stale 0.5 held flat), silence, or
+            // a fade in (from silence, or continuing one from the block before) back to the note.
+            let flat_stale = block.iter().all(|&x| x == 0.5);
+            let out_ok = block.windows(2).all(|w| w[1] <= w[0]) && block[0] <= last + 1e-6;
+            let in_ok = block.windows(2).all(|w| w[1] >= w[0]) && (block[0] <= 0.02 || block[0] >= last - 1e-6);
+            if flat_stale || !(out_ok || in_ok) {
+                bad.get_or_insert(block.clone());
+            }
+            last = block[BLOCK - 1];
+        }
+        (p, bad)
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while skipped.load(Ordering::SeqCst) < 5 && Instant::now() < deadline {
+        let _ = Report::read(&mut reader); // restartComponent(kLatencyChanged) on this thread
+        soundcraft_vst3_host::service_requests(); // reactivates while holding the instance
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (_p, bad) = audio.join().unwrap();
+    assert!(skipped.load(Ordering::SeqCst) >= 5, "the audio side met the main thread at work");
+    assert_eq!(bad, None, "a skipped block passed something other than a fade");
 }

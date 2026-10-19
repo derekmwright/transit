@@ -47,6 +47,8 @@ pub mod scan;
 #[allow(unsafe_code)]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+mod gate;
+#[cfg(not(target_arch = "wasm32"))]
 mod params;
 #[cfg(not(target_arch = "wasm32"))]
 mod plugin;
@@ -249,6 +251,8 @@ pub struct Serviced {
     pub midi_maps: usize,
     pub value_rescans: usize,
     pub unsupported: usize,
+    pub failed: usize,
+    pub pending: usize,
     pub other_thread: usize,
 }
 

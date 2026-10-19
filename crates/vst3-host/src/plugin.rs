@@ -22,8 +22,8 @@
 //!   `prepare`. The latency reaches delay compensation through [`Plugin::latency`].
 //! - `kParamValuesChanged` ("the host invalidates all caches of parameter values and asks the
 //!   edit controller for the current values"): `getParamNormalized` for every parameter, 64 per
-//!   call; the values that differ from the last ones read are reported like editor edits (the
-//!   path a GUI edit takes into the session). A state load re-reads the values itself and
+//!   call; the values that differ from the host's own view (the last value it set or was told)
+//!   are reported like editor edits (the path a GUI edit takes into the session). A state load re-reads the values itself and
 //!   reports nothing (that is the host's own change).
 //! - `kParamTitlesChanged`: the conversion curves are invalidated (the editor handle re-samples
 //!   them). Titles, ranges and step counts in `PluginInfo` stay as read at load (`'static`).
@@ -31,11 +31,16 @@
 //!   not supported here (the instance would have to be created again by its owner); logged as a
 //!   warning and counted in [`Serviced::unsupported`]. Other flags need nothing from this host.
 //!
+//! A block the audio side cannot run because the main thread holds the instance is silence with
+//! short fades, and the slot keeps its latency ([`Gate`]). A reactivation the plug-in refuses is
+//! logged and counted once ([`Serviced::failed`]), not retried until it asks again.
+//!
 //! The audio side only `try_lock`s the instance and the main thread only `try_lock`s it while it
 //! may be processing, so neither ever waits for the other; a busy instance is serviced by a later
 //! call. Servicing happens only on the thread that created the instance.
 
 use crate::ffi::{AFTERTOUCH, BusBuffers, EVENT_CAP, EditorLink, HostContext, Instance, NoteEvent, PARAM_QUEUE_CAP, PITCH_BEND};
+use crate::gate::{Gate, MAX_CHANNELS};
 use crate::params::{ParamCurves, PendingParams};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
@@ -46,8 +51,6 @@ use vst3::ComWrapper;
 
 /// Largest block we set a plugin up for.
 const MAX_BLOCK: usize = 1 << 16;
-/// Most channels a host strip may ask for.
-const MAX_CHANNELS: usize = 64;
 /// An `unsynced` slot with no value waiting (a NaN pattern, which `set_param` never stores).
 const SYNCED: u64 = u64::MAX;
 /// Most curves one editor `idle` samples, and the time after which it stops (it always samples
@@ -94,6 +97,10 @@ pub struct Serviced {
     pub value_rescans: usize,
     /// Requests this host cannot honor (`kReloadComponent`), logged.
     pub unsupported: usize,
+    /// Reactivations the plug-in refused (logged; not retried until it asks again).
+    pub failed: usize,
+    /// Instances with a request still in progress after this call: call again soon.
+    pub pending: usize,
     /// Instances skipped because this is not the thread that created them.
     pub other_thread: usize,
 }
@@ -128,6 +135,12 @@ impl MidiMap {
     /// Copies the table into `out` (no allocation). The generation read, or `None` when a write
     /// was in progress (`out` is then partly overwritten: the caller keeps its other copy).
     fn read(&self, out: &mut [Option<u32>; MAP_LEN]) -> Option<u64> {
+        self.read_with(out, || {})
+    }
+
+    /// `read`, running `between` after the entries are copied and before the sequence is checked
+    /// again (tests put a publication there).
+    fn read_with(&self, out: &mut [Option<u32>; MAP_LEN], between: impl FnOnce()) -> Option<u64> {
         let s1 = self.seq.load(Ordering::Acquire);
         if s1 & 1 == 1 {
             return None;
@@ -136,6 +149,7 @@ impl MidiMap {
             let v = slot.load(Ordering::Relaxed);
             *o = (v != NO_PARAM).then_some(v);
         }
+        between();
         fence(Ordering::Acquire);
         (self.seq.load(Ordering::Relaxed) == s1).then_some(s1)
     }
@@ -156,12 +170,16 @@ struct Core {
     mono: bool,
 }
 
-/// A `kParamValuesChanged` re-read (main thread only): the last values read and the next one.
+/// A `kParamValuesChanged` re-read in progress (main thread only): the next parameter.
 struct Values {
-    /// Normalized, per parameter (same order as `ids`; NaN: never read).
-    known: Vec<f64>,
     next: usize,
     active: bool,
+}
+
+/// A normalized value the host does not know yet (beyond conversion rounding).
+fn differs(host: f64, plugin: f64) -> bool {
+    let d = (host - plugin).abs();
+    d.is_nan() || d > 1e-6
 }
 
 /// The part of an instance both its owner (the audio thread, once in the engine) and the main
@@ -181,6 +199,9 @@ pub(crate) struct Shared {
     info: &'static PluginInfo,
     ids: Vec<u32>,
     values: Mutex<Values>,
+    /// The host's view of each parameter (normalized, `f64` bits; same order as `ids`): what it
+    /// last sent or was told. A values re-read reports what differs from it.
+    view: Box<[AtomicU64]>,
 }
 
 fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
@@ -221,9 +242,12 @@ pub(crate) fn service_requests() -> Serviced {
 
 impl Shared {
     /// (Re)activates on the main thread at the size `prepare` asked for, then publishes what the
-    /// audio side reads: latency, tail, event input, the MIDI table and a new activation.
-    fn activate(&self, core: &mut Core) {
-        // Cleared first: a request made while it reactivates asks again.
+    /// audio side reads: latency, tail, event input, the MIDI table and a new activation. False
+    /// when the plug-in refused (logged; it stays inactive until asked again).
+    fn activate(&self, core: &mut Core) -> bool {
+        // Cleared first: a request made while it reactivates asks again, and a refused one is
+        // not retried by every later service call (review R5).
+        self.host.latency_changed.store(false, Ordering::Relaxed);
         self.host.io_changed.store(false, Ordering::Relaxed);
         self.host.midi_cc_changed.store(false, Ordering::Relaxed);
         core.max_block = 0;
@@ -239,13 +263,16 @@ impl Shared {
                 self.latency.store(core.inst.latency() as usize, Ordering::Release);
                 self.tail.store(core.inst.tail() as usize, Ordering::Relaxed);
                 self.map.publish(&core.inst.midi_mapping());
+                self.activation.fetch_add(1, Ordering::Release);
+                true
             }
             Err(e) => {
                 log::warn!("{}: {e}", self.info.id);
                 self.latency.store(0, Ordering::Release);
+                self.activation.fetch_add(1, Ordering::Release);
+                false
             }
         }
-        self.activation.fetch_add(1, Ordering::Release);
     }
 
     /// Main-thread service of this instance's `restartComponent` flags (see the module docs).
@@ -283,13 +310,20 @@ impl Shared {
             out.value_rescans += 1;
         }
         if h.latency_changed.load(Ordering::Acquire) || h.io_changed.load(Ordering::Acquire) {
-            match try_lock(&self.core) {
-                Some(mut core) => {
-                    self.activate(&mut core);
-                    out.restarted += 1;
-                }
+            match try_lock(&self.core).map(|mut core| self.activate(&mut core)) {
+                Some(true) => out.restarted += 1,
+                Some(false) => out.failed += 1,
                 None => out.restarts_waiting += 1,
             }
+        }
+        let rescanning = lock(&self.values).active;
+        if h.midi_cc_changed.load(Ordering::Relaxed)
+            || h.values_changed.load(Ordering::Relaxed)
+            || h.latency_changed.load(Ordering::Relaxed)
+            || h.io_changed.load(Ordering::Relaxed)
+            || rescanning
+        {
+            out.pending += 1;
         }
     }
 
@@ -309,12 +343,13 @@ impl Shared {
         let end = (start + VALUES_CHUNK).min(self.ids.len());
         let read: Vec<(usize, f64)> = (start..end).filter_map(|i| core.inst.normalized_value(*self.ids.get(i)?).map(|v| (i, v))).collect();
         drop(core);
+        // Only what differs from the host's view is news to it (review R3).
         let mut changed = Vec::new();
         for (i, v) in read {
-            if let (Some(k), Some(&id)) = (st.known.get_mut(i), self.ids.get(i))
-                && k.to_bits() != v.to_bits()
+            if let (Some(view), Some(&id)) = (self.view.get(i), self.ids.get(i))
+                && differs(f64::from_bits(view.load(Ordering::Relaxed)), v)
             {
-                *k = v;
+                view.store(v.to_bits(), Ordering::Relaxed);
                 changed.push((id, v));
             }
         }
@@ -337,11 +372,13 @@ impl Shared {
         true
     }
 
-    /// The controller's values become the known ones (after a load the host made itself).
+    /// The controller's values become the host's view (after a load the host made itself).
     fn remember_values(&self, inst: &Instance) {
         let mut st = lock(&self.values);
-        for (k, &id) in st.known.iter_mut().zip(&self.ids) {
-            *k = inst.normalized_value(id).unwrap_or(f64::NAN);
+        for (view, &id) in self.view.iter().zip(&self.ids) {
+            if let Some(v) = inst.normalized_value(id) {
+                view.store(v.to_bits(), Ordering::Relaxed);
+            }
         }
         st.active = false;
     }
@@ -389,6 +426,8 @@ pub struct Vst3Plugin {
     channels: usize,
     /// Every audio input of the next block is silent (VST3 silence flags).
     silent: bool,
+    /// Silence with fades for blocks the plug-in is not called for.
+    gate: Gate,
     position: i64,
     transport: Option<Transport>,
 }
@@ -422,7 +461,7 @@ impl Vst3Plugin {
         // thousands of parameters): the editor handle's idle samples them lazily and on demand.
         let plain: Vec<bool> = maps.iter().map(|m| *m == Mapping::Plain).collect();
         let curves = Arc::new(ParamCurves::new(&ids, &plain));
-        let known: Vec<f64> = ids.iter().map(|&id| inst.normalized_value(id).unwrap_or(f64::NAN)).collect();
+        let view: Box<[AtomicU64]> = ids.iter().map(|&id| AtomicU64::new(inst.normalized_value(id).unwrap_or(f64::NAN).to_bits())).collect();
         let host = inst.host_ref();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
@@ -446,7 +485,8 @@ impl Vst3Plugin {
             curves: Arc::clone(&curves),
             info,
             ids: ids.clone(),
-            values: Mutex::new(Values { known, next: 0, active: false }),
+            values: Mutex::new(Values { next: 0, active: false }),
+            view,
         });
         lock(live()).push(Arc::downgrade(&shared));
         let mut p = Vst3Plugin {
@@ -467,6 +507,7 @@ impl Vst3Plugin {
             held: [false; 128],
             channels: 2,
             silent: false,
+            gate: Gate::new(),
             position: 0,
             transport: None,
             ids,
@@ -545,6 +586,9 @@ impl Vst3Plugin {
     fn queue(&mut self, i: usize) {
         let Some(&v) = self.values.get(i) else { return };
         let Some(n) = self.normalized_from_plain(i, v) else { return };
+        if let Some(view) = self.shared.view.get(i) {
+            view.store(n.to_bits(), Ordering::Relaxed);
+        }
         if let Some(u) = self.unsynced.get(i) {
             u.store(f64::from(v).to_bits(), Ordering::Relaxed);
         }
@@ -620,6 +664,7 @@ impl Plugin for Vst3Plugin {
         let mut core = lock(&shared.core);
         core.sample_rate = sr;
         core.block = mb;
+        self.gate.set_rate(sr);
         core.mono = self.channels == 1;
         shared.activate(&mut core);
         drop(core);
@@ -674,16 +719,19 @@ impl Plugin for Vst3Plugin {
             self.curves_seen = generation;
             self.resend_host_set();
         }
-        let shared: &Shared = &self.shared;
-        // Held by the main thread only while it services the instance: skip the block.
-        let Some(mut guard) = try_lock(&shared.core) else { return };
-        let core = &mut *guard;
-        if !core.inst.is_active() || core.max_block == 0 {
-            return;
-        }
         let ch = self.channels.min(io.len());
         let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
         if frames == 0 || ch == 0 {
+            return;
+        }
+        let shared: &Shared = &self.shared;
+        // Held by the main thread only while it services the instance: a silent block.
+        let Some(mut guard) = try_lock(&shared.core) else {
+            self.gate.skip(io, ch, frames);
+            return;
+        };
+        let core = &mut *guard;
+        if !core.inst.is_active() || core.max_block == 0 {
             return;
         }
         core.inputs.set_silent(self.silent);
@@ -750,7 +798,9 @@ impl Plugin for Vst3Plugin {
             }
             start += n;
         }
+        drop(guard);
         self.controls.clear();
+        self.gate.processed(io, ch, frames);
     }
 
     fn latency(&self) -> usize {
@@ -1003,6 +1053,25 @@ mod tests {
         assert_eq!(resend_indices(&[false, false, false], 8).count(), 0, "readings from the plugin stay put");
         assert_eq!(resend_indices(&[false, true, false, true], 8).collect::<Vec<_>>(), vec![1, 3]);
         assert_eq!(resend_indices(&[true, true, true], 2).collect::<Vec<_>>(), vec![0, 1], "bounded by the queue");
+    }
+
+    #[test]
+    fn a_table_published_while_it_is_read_is_not_taken() {
+        let m = MidiMap::new();
+        let a: Vec<Option<u32>> = (0..MAP_LEN as u32).map(Some).collect();
+        let b: Vec<Option<u32>> = vec![Some(7); MAP_LEN];
+        m.publish(&a);
+        let mut out = [None; MAP_LEN];
+        let g = m.read(&mut out).expect("a published table");
+        assert_eq!(out.to_vec(), a);
+        // A publication that lands after the entries were copied: the copy may mix both tables,
+        // so the sequence check must refuse it (review mutant V1).
+        assert_eq!(m.read_with(&mut out, || m.publish(&b)), None);
+        assert_eq!(m.read(&mut out), Some(g + 2));
+        assert_eq!(out.to_vec(), b);
+        // A write in progress (odd sequence) is refused before anything is copied.
+        m.seq.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(m.read(&mut out), None);
     }
 
     #[test]
