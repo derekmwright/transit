@@ -418,9 +418,22 @@ impl StudioApp {
         Ok(r)
     }
 
-    /// Add a track (Add Track): `audio` or `instrument`. It becomes the cursor's track.
+    /// Add a track (Add Track): `audio` or `instrument`. It becomes the cursor's track. An audio
+    /// track is mono, the engine's default and the common case (a guitar or a mic).
     pub fn add_track(&mut self, kind: &str) -> Result<Value, String> {
-        let p = if kind == "audio" { json!({"kind": "audio", "format": "stereo"}) } else { json!({"kind": kind}) };
+        if kind == "audio" {
+            return self.add_audio_track("mono");
+        }
+        self.add_track_with(json!({"kind": kind}))
+    }
+
+    /// Add an audio track of `format` (`mono`, `stereo`, ...). A mono track reads "In 1", a stereo
+    /// one "In 1-2" (`mixer::route_label`).
+    pub fn add_audio_track(&mut self, format: &str) -> Result<Value, String> {
+        self.add_track_with(json!({"kind": "audio", "format": format}))
+    }
+
+    fn add_track_with(&mut self, p: Value) -> Result<Value, String> {
         let r = self.run("track.new", p)?;
         if let Some(id) = r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64) {
             let at = self.cursor();

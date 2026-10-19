@@ -107,8 +107,12 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 });
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Edit".into(), String::new(), edit_menu.response.rect));
                 let track_menu = ui.menu_button("Track", |ui| {
-                    if ui.add(egui::Button::new("Add Audio Track").shortcut_text(label(A::NewAudioTrack))).clicked() {
-                        let _ = app.add_track("audio");
+                    if ui.add(egui::Button::new("Add Mono Audio Track").shortcut_text(label(A::NewAudioTrack))).clicked() {
+                        let _ = app.add_audio_track("mono");
+                        ui.close();
+                    }
+                    if ui.button("Add Stereo Audio Track").clicked() {
+                        let _ = app.add_audio_track("stereo");
                         ui.close();
                     }
                     if ui.add(egui::Button::new("Add Instrument Track").shortcut_text(label(A::NewInstrumentTrack))).clicked() {

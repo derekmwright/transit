@@ -244,13 +244,34 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let add_i = Rect::from_min_size(pos2(add_a.max.x + 8.0, below), add_a.size());
     if add_a.min.y < list.max.y {
         let clip = ui.painter().with_clip_rect(list);
-        for (r, label, kind, salt) in [(add_a, "Audio", "audio", "add_audio"), (add_i, "Instrument", "instrument", "add_instrument")] {
-            let resp = ui.interact(r.intersect(list), ui.id().with(salt), Sense::click());
-            clip.rect_filled(r, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-            crate::icons::paint_labeled(&clip, r, false, crate::icons::Icon::Plus, 12.0, label, FontId::proportional(12.0), TOKENS.text);
-            if resp.clicked() {
-                let _ = app.add_track(kind);
+        // Audio adds a mono track (the common case: one guitar or mic); its chevron picks mono or stereo.
+        let chev_w = 18.0;
+        let main = Rect::from_min_max(add_a.min, pos2(add_a.max.x - chev_w, add_a.max.y));
+        let chev = Rect::from_min_max(pos2(add_a.max.x - chev_w, add_a.min.y), add_a.max);
+        let main_resp = ui.interact(main.intersect(list), ui.id().with("add_audio"), Sense::click());
+        let chev_resp = ui.interact(chev.intersect(list), ui.id().with("add_audio_format"), Sense::click());
+        let hot = main_resp.hovered() || chev_resp.hovered();
+        clip.rect_filled(add_a, crate::theme::RADIUS, if hot { TOKENS.button_hover } else { TOKENS.button });
+        crate::icons::paint_labeled(&clip, main, false, crate::icons::Icon::Plus, 12.0, "Audio", FontId::proportional(12.0), TOKENS.text);
+        crate::icons::paint(&clip, chev.center(), crate::icons::Icon::ChevronDown, 10.0, TOKENS.text_dim);
+        if main_resp.clicked() {
+            let _ = app.add_audio_track("mono");
+        }
+        egui::Popup::menu(&chev_resp).width(110.0).show(|ui| {
+            if ui.button("Mono").clicked() {
+                let _ = app.add_audio_track("mono");
+                ui.close();
             }
+            if ui.button("Stereo").clicked() {
+                let _ = app.add_audio_track("stereo");
+                ui.close();
+            }
+        });
+        let resp = ui.interact(add_i.intersect(list), ui.id().with("add_instrument"), Sense::click());
+        clip.rect_filled(add_i, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        crate::icons::paint_labeled(&clip, add_i, false, crate::icons::Icon::Plus, 12.0, "Instrument", FontId::proportional(12.0), TOKENS.text);
+        if resp.clicked() {
+            let _ = app.add_track("instrument");
         }
     }
     layout.add_audio = r4(add_a);
@@ -509,6 +530,9 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
         let _ = app.new_midi_clip(Some(id));
         ui.close();
     }
+    if kind == TrackKind::Audio {
+        width_item(app, ui, id);
+    }
     if kind != TrackKind::Master {
         crate::groups::menu_items(app, ui, Some(id));
         ui.separator();
@@ -531,6 +555,21 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Delete Track".into(), String::new(), del.rect));
     if del.clicked() {
         let _ = app.request_delete_tracks(vec![id]);
+        ui.close();
+    }
+}
+
+/// "Make Stereo" on a mono audio track, "Make Mono" on a stereo one (`track.change_width`, one
+/// undo step). Other widths (surround) are left to the engine command.
+pub(crate) fn width_item(app: &mut StudioApp, ui: &mut Ui, id: TrackId) {
+    let Some(channels) = app.engine.session().track(id).map(|t| t.channels()) else { return };
+    let (label, format) = match channels {
+        1 => ("Make Stereo", "stereo"),
+        2 => ("Make Mono", "mono"),
+        _ => return,
+    };
+    if ui.button(label).clicked() {
+        let _ = app.run("track.change_width", json!({"tracks": [id.0], "format": format}));
         ui.close();
     }
 }
@@ -785,8 +824,12 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         }
     }
     resp.context_menu(|ui| {
-        if ui.button("Add Audio Track").clicked() {
-            let _ = app.add_track("audio");
+        if ui.button("Add Mono Audio Track").clicked() {
+            let _ = app.add_audio_track("mono");
+            ui.close();
+        }
+        if ui.button("Add Stereo Audio Track").clicked() {
+            let _ = app.add_audio_track("stereo");
             ui.close();
         }
         if ui.button("Add Instrument Track").clicked() {

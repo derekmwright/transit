@@ -1947,3 +1947,65 @@ fn the_card_editor_button_toggles_the_editor_window() {
     app.toggle_editor(key);
     assert_eq!(app.ui.plugin_windows, vec![key], "and again opens");
 }
+
+fn input_label(app: &StudioApp, t: TrackId) -> String {
+    let s = app.engine.session();
+    let tr = s.track(t).unwrap();
+    crate::mixer::route_label(s, &tr.mixer.input, true, tr.channels())
+}
+
+fn new_audio(app: &mut StudioApp, r: Result<Value, String>) -> TrackId {
+    let t = TrackId(r.unwrap()["tracks"][0].as_u64().unwrap());
+    assert_eq!(app.cursor_track(), Some(t), "the new track is the cursor's track");
+    t
+}
+
+#[test]
+fn a_bare_audio_track_is_mono_on_input_one() {
+    let mut app = app();
+    let r = app.add_track("audio");
+    let t = new_audio(&mut app, r);
+    assert_eq!(app.engine.session().track(t).unwrap().channels(), 1);
+    assert_eq!(app.engine.session().track(t).unwrap().format, soundcraft_model::ChannelFormat::Mono);
+    assert_eq!(input_label(&app, t), "In 1");
+}
+
+#[test]
+fn the_menu_makes_mono_and_stereo_audio_tracks() {
+    let mut app = app();
+    let r = app.add_audio_track("mono");
+    let mono = new_audio(&mut app, r);
+    let r = app.add_audio_track("stereo");
+    let stereo = new_audio(&mut app, r);
+    assert_eq!(app.engine.session().track(mono).unwrap().format, soundcraft_model::ChannelFormat::Mono);
+    assert_eq!(input_label(&app, mono), "In 1");
+    assert_eq!(app.engine.session().track(stereo).unwrap().format, soundcraft_model::ChannelFormat::Stereo);
+    assert_eq!(input_label(&app, stereo), "In 1-2");
+}
+
+#[test]
+fn a_mono_track_can_take_input_two() {
+    let mut app = app();
+    let r = app.add_audio_track("mono");
+    let t = new_audio(&mut app, r);
+    let s = app.engine.session_arc();
+    let labels: Vec<String> = crate::mixer::input_choices(&s, s.track(t).unwrap(), 2).into_iter().map(|c| c.0).collect();
+    assert_eq!(labels, ["In 1", "In 2"]);
+    app.set_input(t, "In 2").unwrap();
+    assert_eq!(input_label(&app, t), "In 2");
+}
+
+#[test]
+fn change_width_is_one_undo_step() {
+    let mut app = app();
+    let r = app.add_audio_track("mono");
+    let t = new_audio(&mut app, r);
+    let steps = app.engine.undo_history().len();
+    app.run("track.change_width", json!({"tracks": [t.0], "format": "stereo"})).unwrap();
+    assert_eq!(app.engine.session().track(t).unwrap().channels(), 2);
+    assert_eq!(app.engine.undo_history().len(), steps + 1);
+    assert_eq!(input_label(&app, t), "In 1-2");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(app.engine.session().track(t).unwrap().channels(), 1);
+    assert_eq!(app.engine.undo_history().len(), steps);
+}

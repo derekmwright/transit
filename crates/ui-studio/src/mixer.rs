@@ -1562,6 +1562,9 @@ fn strip(
     if resp.double_clicked() && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| name_r.contains(p)) {
         app.start_rename(crate::finish::RenameTarget::Track(id), r4(name_r));
     }
+    if t.kind == TrackKind::Audio {
+        resp.context_menu(|ui| crate::arrange::width_item(app, ui, id));
+    }
     let mut y = r.min.y + 26.0;
     // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
