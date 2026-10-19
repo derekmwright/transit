@@ -31,18 +31,9 @@ pub(crate) fn observe(stream: Option<&cpal::Stream>) -> WorkerPriority {
     let Some(stream) = stream else { return WorkerPriority::NoWorker };
     #[cfg(target_os = "windows")]
     {
-        use cpal::platform::{StreamInner, WasapiThreadPriorityStatus as Status};
+        use cpal::platform::StreamInner;
         match stream.as_inner() {
-            StreamInner::Wasapi(stream) => match stream.thread_priority_observation().status() {
-                Status::Unobserved => WorkerPriority::Unobserved,
-                Status::Pending => WorkerPriority::Pending,
-                Status::Promoted => WorkerPriority::MmcssAudio,
-                Status::PromotionFailed => WorkerPriority::PromotionFailed,
-                Status::Released => WorkerPriority::Released,
-                Status::ReleaseFailed => WorkerPriority::ReleaseFailed,
-                // The fork marks its API non-exhaustive. Unknown future states are not success.
-                _ => WorkerPriority::Unobserved,
-            },
+            StreamInner::Wasapi(stream) => observed_wasapi(stream.thread_priority_observation().status()),
             #[cfg(feature = "asio")]
             StreamInner::Asio(_) => WorkerPriority::Unobserved,
         }
@@ -51,5 +42,44 @@ pub(crate) fn observe(stream: Option<&cpal::Stream>) -> WorkerPriority {
     {
         let _ = stream;
         WorkerPriority::Unobserved
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn observed_wasapi(status: cpal::platform::WasapiThreadPriorityStatus) -> WorkerPriority {
+    use cpal::platform::WasapiThreadPriorityStatus as Status;
+    match status {
+        Status::Unobserved => WorkerPriority::Unobserved,
+        Status::Pending => WorkerPriority::Pending,
+        Status::Promoted => WorkerPriority::MmcssAudio,
+        Status::PromotionFailed => WorkerPriority::PromotionFailed,
+        Status::Released => WorkerPriority::Released,
+        Status::ReleaseFailed => WorkerPriority::ReleaseFailed,
+        // The fork marks its API non-exhaustive. Unknown future states are not success.
+        _ => WorkerPriority::Unobserved,
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use cpal::platform::WasapiThreadPriorityStatus as Status;
+
+    #[test]
+    fn only_observed_promotion_reports_mmcss_audio() {
+        let states = [
+            (Status::Unobserved, WorkerPriority::Unobserved),
+            (Status::Pending, WorkerPriority::Pending),
+            (Status::Promoted, WorkerPriority::MmcssAudio),
+            (Status::PromotionFailed, WorkerPriority::PromotionFailed),
+            (Status::Released, WorkerPriority::Released),
+            (Status::ReleaseFailed, WorkerPriority::ReleaseFailed),
+        ];
+        for (status, expected) in states {
+            let actual = observed_wasapi(status);
+            assert_eq!(actual, expected, "fork status: {status:?}");
+            assert_eq!(actual == WorkerPriority::MmcssAudio, status == Status::Promoted);
+        }
+        assert_eq!(observe(None), WorkerPriority::NoWorker);
     }
 }
