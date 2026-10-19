@@ -232,8 +232,8 @@ fn add(a: usize, b: usize) -> Result<usize, CompileError> {
 
 /// Bytes one strip's prepared storage takes: `buf`, `pre`, `outbuf` and `clipbuf` (channels ×
 /// block each), `scratch` (block), two delay lines (channels × (`cap` + block); 0 when the strip
-/// keeps its live lines), its insert positions (filled or not), its clip-effect entries, the held-note
-/// capacity, its meter, and the strip itself.
+/// keeps its live lines), its insert positions (filled or not), its clip-effect entries, its
+/// meter, and the strip itself. (An instrument's event state is its slot's, see `plan_slot`.)
 pub(crate) fn strip_bytes(ch: usize, block: usize, cap: usize, inserts: usize, clips: usize) -> Result<usize, CompileError> {
     let f = size_of::<f32>();
     let bufs = mul(mul(mul(ch, block)?, 4)?, f)?;
@@ -241,9 +241,8 @@ pub(crate) fn strip_bytes(ch: usize, block: usize, cap: usize, inserts: usize, c
     let delays = if cap == 0 { 0 } else { mul(mul(mul(ch, add(cap, block)?)?, 2)?, f)? };
     let slots = mul(inserts, size_of::<Option<PluginSlot>>())?;
     let entries = mul(clips, size_of::<(u64, ClipFx)>())?;
-    let held = 128 * size_of::<u8>();
     let meter = mul(ch, f)?;
-    [scratch, delays, slots, entries, held, meter, size_of::<Strip>()].into_iter().try_fold(bufs, add)
+    [scratch, delays, slots, entries, meter, size_of::<Strip>()].into_iter().try_fold(bufs, add)
 }
 
 /// Checks every limit and the prepared bytes, with each strip's delay capacity from `cap_of`
@@ -657,6 +656,10 @@ impl PlanCompiler {
         if slot.applied.heap.len() != long || !slot.applied.fixed {
             slot.applied = Applied::prepared(if long > 0 { vec![f32::NAN; long] } else { Vec::new() });
         }
+        // An instrument takes realtime events (F10): its queue and note table, sized here.
+        if p.kind == CellKind::Instrument && slot.events.is_none() {
+            slot.events = Some(crate::events::InstrumentEvents::new());
+        }
         if p.kind == CellKind::Instrument && sample_id(slot.sample_audio.as_ref()) != sample {
             let wrapper = p.sample.as_ref().map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
             slot.plugin.set_sample(wrapper.clone());
@@ -797,7 +800,6 @@ impl PlanCompiler {
             st.pre = (0..ch).map(|_| Vec::with_capacity(block)).collect();
             st.scratch = vec![0.0; block];
             st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
-            st.held = Vec::with_capacity(128);
             st.clipbuf = vec![vec![0.0; block]; ch];
             st.external = true;
             // A strip that keeps its live lines gets placeholders: the move brings the lines.

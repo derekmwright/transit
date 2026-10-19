@@ -48,12 +48,11 @@ fn slot_shape(kind: CellKind, s: &PluginSlot) -> Shape {
     Shape { kind, ch: u16::try_from(s.ch).unwrap_or(u16::MAX), layout: s.layout }
 }
 
-/// Moves a strip's running state into a new strip shell: held notes, note chasing, mute, gain
+/// Moves a strip's running state into a new strip shell: note chasing, mute, gain
 /// reduction, latency, failures, meter, and its delay lines whole (with their contents and
 /// capacity) where the shell holds placeholders for them. A shell with real (larger) lines keeps
 /// them. Only swaps and copies; what the shell had goes back with the old strip.
 fn move_strip(old: &mut Strip, new: &mut Strip) {
-    std::mem::swap(&mut old.held, &mut new.held);
     new.chase = old.chase;
     new.muted = old.muted;
     new.gr = old.gr;
@@ -267,6 +266,8 @@ impl MixEngine {
             }
             fault_point(3);
             std::mem::swap(&mut active.tables, new);
+            // The displaced instruments' queued events retire with them (F10).
+            MixEngine::retire_events(&mut self.events.status, &mut new.strips);
         }
         std::mem::swap(&mut active.session, &mut plan.session);
         fault_point(4);
@@ -347,6 +348,7 @@ impl MixEngine {
     pub fn render_active(&mut self, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
         let Some(plan) = self.plan.as_deref_mut().filter(|p| !p.faulted) else {
+            self.events.next_frame = self.events.next_frame.saturating_add(frames as u64);
             for o in out.iter_mut() {
                 o.iter_mut().take(frames).for_each(|x| *x = 0.0);
             }
@@ -357,15 +359,20 @@ impl MixEngine {
         let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, .. } = tables;
         let (phase1, aux_end) = (*phase1, *aux_end);
         let main_fmt = *main_fmt;
+        // A seek or loop wrap releases what the clips play; live sources keep sounding (F10).
         if pos != self.last_end && !self.monitor_only {
             for st in strips.iter_mut() {
                 if let Some(i) = &mut st.instrument {
-                    i.plugin.all_notes_off();
+                    match i.events.as_deref_mut() {
+                        Some(e) => e.release_clips(&mut *i.plugin),
+                        None => i.plugin.all_notes_off(),
+                    }
                 }
-                st.held.clear();
                 st.chase = true;
             }
         }
+        let frame = self.events.next_frame;
+        self.events.next_frame = frame.saturating_add(frames as u64);
         self.last_end = pos.saturating_add(frames as i64);
         for (_, b) in busses.0.iter_mut() {
             b.clear(frames);
@@ -377,7 +384,8 @@ impl MixEngine {
         let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
         let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
         let track = |st: &Strip| s.tracks.get(usize::from(st.track));
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend };
+        let live_in =
+            LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame };
         let n_strips = strips.len();
         let (p1, rest) = strips.split_at_mut(phase1.min(n_strips));
         let (auxes, others) = rest.split_at_mut(aux_end.saturating_sub(phase1).min(rest.len()));

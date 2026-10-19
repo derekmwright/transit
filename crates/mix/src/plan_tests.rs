@@ -193,9 +193,8 @@ fn digest(eng: &MixEngine) -> Vec<u64> {
     d.push(u64::from(p.faulted));
     d.push(p.tables.cells.len() as u64);
     for st in &p.tables.strips {
-        d.extend([st.generation.get(), st.id.0, st.buf.as_ptr() as usize as u64, st.held.as_ptr() as usize as u64, st.latency as u64]);
+        d.extend([st.generation.get(), st.id.0, st.buf.as_ptr() as usize as u64, st.latency as u64]);
         d.extend([st.tap.len as u64, st.tap.idx as u64, st.tap.bufs.as_ptr() as usize as u64, u64::from(st.tap.live)]);
-        d.extend(st.held.iter().map(|x| u64::from(*x)));
         let slots = st.plugins.iter().chain(std::iter::once(&st.instrument)).chain(st.clip_fx.0.iter().flat_map(|(_, fx)| [&fx.eq, &fx.comp]));
         for s in slots {
             match s {
@@ -205,6 +204,7 @@ fn digest(eng: &MixEngine) -> Vec<u64> {
                     s.applied.heap.as_ptr() as usize as u64,
                     s.applied.heap.len() as u64,
                     s.sample_audio.as_ref().map_or(0, |a| Arc::as_ptr(a) as usize as u64),
+                    s.events.as_deref().map_or(0, |e| e as *const _ as usize as u64),
                 ]),
                 None => d.push(u64::MAX),
             }
@@ -959,7 +959,7 @@ fn a_sample_attachment_on_an_instrument_that_is_not_the_sampler_is_rejected() {
 }
 
 #[test]
-fn held_notes_and_note_chasing_move_with_the_strip() {
+fn held_notes_move_with_the_instrument_and_note_chasing_with_the_strip() {
     let mut s = Session::default();
     let t = synth_track(&mut s);
     let mut rig = Rig::new();
@@ -968,7 +968,8 @@ fn held_notes_and_note_chasing_move_with_the_strip() {
     let strip = |rig: &Rig| {
         let p = rig.eng.plan.as_deref().unwrap();
         let st = &p.tables.strips[p.tables.strip_of(t).unwrap()];
-        (st.held.clone(), st.chase)
+        let keys: Vec<u8> = st.instrument.as_ref().unwrap().events.as_deref().unwrap().sounding().map(|(_, key, _)| key).collect();
+        (keys, st.chase)
     };
     let before = strip(&rig);
     assert_eq!(before, (vec![60, 64, 67], false), "three notes sound; the controllers were chased");

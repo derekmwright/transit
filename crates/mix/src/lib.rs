@@ -78,11 +78,16 @@ use std::sync::Arc;
 
 mod active;
 mod compile;
+mod events;
 mod plan;
 #[cfg(test)]
 mod plan_tests;
 
 pub use compile::{CompileError, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
+pub use events::{
+    Arrival, Due, EngineEpoch, EventLimits, EventOutcome, EventStatus, InstrumentEvent, MAX_OPEN, MAX_PEDALS, Message, NoteId, PluginEvent,
+    QUEUE_CAP, RenderFrame, Shed, ShedCounts, Source, TapRecord, TransportEpoch,
+};
 pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
     RenderTarget, Retired, SlotBinding, SlotGen,
@@ -408,6 +413,9 @@ struct PluginSlot {
     /// owners stay here, so the plug-in never drops the last one.
     sample_audio: Option<Arc<SourceAudio>>,
     sample_wrapper: Option<Arc<dyn SampleSource>>,
+    /// Plan mode, instruments: the event queue and the open notes and pedals (F10), prepared by
+    /// the compiler. They travel with the instance and retire with it.
+    events: Option<Box<events::InstrumentEvents>>,
 }
 
 impl PluginSlot {
@@ -430,6 +438,7 @@ impl PluginSlot {
             layout: 0,
             sample_audio: None,
             sample_wrapper: None,
+            events: None,
         }
     }
 }
@@ -443,8 +452,6 @@ struct Strip {
     instrument: Option<PluginSlot>,
     /// The pool audio handed to the instrument with `set_sample` (sample-playing instruments).
     sample: Option<Arc<SourceAudio>>,
-    /// MIDI notes currently sounding on the instrument (pitch), for note-offs at stops/seek.
-    held: Vec<u8>,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     chase: bool,
     muted: bool,
@@ -772,7 +779,6 @@ impl Strip {
             plugins: Vec::new(),
             instrument: None,
             sample: None,
-            held: Vec::new(),
             chase: true,
             muted: false,
             gr: 0.0,
@@ -897,6 +903,8 @@ pub struct MixEngine {
     serial: bool,
     /// Plan mode ([`MixEngine::realtime`]): the active plan [`MixEngine::render_active`] renders.
     plan: Option<Box<plan::ActivePlan>>,
+    /// Instrument events (F10): the epoch, the render clock and the counters.
+    events: events::EngineEvents,
 }
 
 /// What `sync` needs to fill a slot.
@@ -1009,6 +1017,7 @@ impl MixEngine {
             work: Vec::new(),
             serial: false,
             plan: None,
+            events: events::EngineEvents::new(None, EventLimits::default()),
         }
     }
 
@@ -1111,6 +1120,10 @@ impl MixEngine {
 
     /// Play (velocity > 0) or release (velocity 0) `pitch` on a track's instrument at the next
     /// block, outside the clips: the MIDI Editor's audition. Does nothing before `sync`.
+    ///
+    /// Superseded by [`MixEngine::queue_event`] (F10), which carries the source, channel, voice
+    /// identity and due frame and reserves the release; kept until the Player migrates. Notes
+    /// sent here are not tracked: a revocation or seek does not release them.
     pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
         let strip = match self.plan.as_deref_mut() {
             Some(p) => p.tables.strip_of(track).and_then(|i| p.tables.strips.get_mut(i)),
@@ -1128,11 +1141,13 @@ impl MixEngine {
                 p.failed = false;
             }
             if let Some(i) = &mut s.instrument {
+                if let Some(e) = i.events.as_deref_mut() {
+                    e.release_all(&mut *i.plugin);
+                }
                 i.plugin.all_notes_off();
                 i.plugin.reset();
                 i.failed = false;
             }
-            s.held.clear();
             s.chase = true;
             s.tap.clear();
             s.tap_pre.clear();
@@ -1154,12 +1169,16 @@ impl MixEngine {
 
     /// Release every held note on every instrument now. Unlike `reset`, this leaves plugin state,
     /// the playback position and note chasing alone, so queued releases still sound out.
+    /// Every source is released: queued instrument events are dropped and each open note and
+    /// pedal gets its release first (stop and panic).
     pub fn all_notes_off(&mut self) {
         for st in self.all_strips() {
             if let Some(i) = &mut st.instrument {
+                if let Some(e) = i.events.as_deref_mut() {
+                    e.release_all(&mut *i.plugin);
+                }
                 i.plugin.all_notes_off();
             }
-            st.held.clear();
         }
     }
 
@@ -1400,7 +1419,6 @@ impl MixEngine {
                 if let Some(i) = &mut st.instrument {
                     i.plugin.all_notes_off();
                 }
-                st.held.clear();
                 st.chase = true;
             }
         }
@@ -1436,7 +1454,8 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend };
+        let live_in =
+            LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame: 0 };
         // A plug-in that panics unwinds out of here (the first strip's panic, see `guarded`). The
         // strips go back into the engine first, so their instances (and any other strip's panic)
         // can still be drained and torn down off the audio thread, not dropped by the unwind.
@@ -1505,7 +1524,8 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend };
+            let live_in =
+                LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame: 0 };
             // As in phase 1: a panicking plug-in leaves its strip in the engine, not dropped by the unwind.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
@@ -1765,6 +1785,8 @@ struct LiveInput<'a> {
     recording: bool,
     /// [`MixEngine::no_suspend`]: every insert runs every block.
     no_suspend: bool,
+    /// The block's first render frame (plan mode: instrument events are due against it).
+    frame: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1882,7 +1904,11 @@ fn process_strip<B: Busses + ?Sized>(
                     if std::mem::take(&mut strip.chase) {
                         chase_controllers(s, t, pos, inst);
                     }
-                    schedule_notes(s, t, pos, frames, inst, &mut strip.held);
+                    schedule_notes(s, t, pos, frames, inst);
+                }
+                // Then the live events due in this block (F10), stopped or not.
+                if let Some(e) = inst.events.as_deref_mut() {
+                    e.deliver(&mut *inst.plugin, live.frame, frames);
                 }
                 if strip.buf.len() >= 2 {
                     inst.plugin.process(&mut strip.buf, frames);
@@ -2721,7 +2747,8 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
 }
 
 /// Send note on/offs and controllers for MIDI clips overlapping the block.
-fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot, held: &mut Vec<u8>) {
+/// Plan mode routes them through the instrument's note and pedal table as [`Source::CLIP`].
+fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
     // the block looks that far back into the clips.
@@ -2768,14 +2795,18 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                     continue;
                 }
                 if ons && on >= pos && on < end {
-                    inst.plugin.note_on(usize::try_from(on - pos).unwrap_or(0), n.pitch, n.velocity);
-                    if !held.contains(&n.pitch) && held.len() < 128 {
-                        held.push(n.pitch);
+                    let at = usize::try_from(on - pos).unwrap_or(0);
+                    match inst.events.as_deref_mut() {
+                        Some(e) => e.clip_on(&mut *inst.plugin, u32::try_from(at).unwrap_or(u32::MAX), n.pitch, n.velocity),
+                        None => inst.plugin.note_on(at, n.pitch, n.velocity),
                     }
                 }
                 if off >= pos && off < end && (ons == (off == on)) {
-                    inst.plugin.note_off(usize::try_from(off - pos).unwrap_or(0), n.pitch);
-                    held.retain(|p| *p != n.pitch);
+                    let at = usize::try_from(off - pos).unwrap_or(0);
+                    match inst.events.as_deref_mut() {
+                        Some(e) => e.clip_off(&mut *inst.plugin, u32::try_from(at).unwrap_or(u32::MAX), n.pitch),
+                        None => inst.plugin.note_off(at, n.pitch),
+                    }
                 }
             }
             if !ons {
@@ -2791,7 +2822,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 }
                 let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
                 if at >= pos && at < end && at < clip.end() {
-                    inst.plugin.midi(usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
+                    clip_midi(inst, usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
                 }
             }
         }
@@ -2817,7 +2848,7 @@ fn ctrl_message(kind: CtrlKind, value: i32, transpose: i64) -> [u8; 3] {
 /// Before an instrument plays from `pos`: reset its controllers, then send each one the last value
 /// it had on this track before `pos`.
 fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot) {
-    inst.plugin.midi(0, [0xB0, 121, 0]);
+    clip_midi(inst, 0, [0xB0, 121, 0]);
     let pos = pos.saturating_sub(midi_offset(s, t));
     const BEND: usize = 128;
     const PRESSURE: usize = 129;
@@ -2856,8 +2887,17 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
             n => CtrlKind::Cc(u8::try_from(n).unwrap_or(0)),
         };
         if at != i64::MIN {
-            inst.plugin.midi(0, ctrl_message(kind, value, 0));
+            clip_midi(inst, 0, ctrl_message(kind, value, 0));
         }
+    }
+}
+
+/// A clip controller: in plan mode through the instrument's pedal table (as [`Source::CLIP`],
+/// keeping live sources' pedals), else straight to the plug-in.
+fn clip_midi(inst: &mut PluginSlot, offset: usize, msg: [u8; 3]) {
+    match inst.events.as_deref_mut() {
+        Some(e) => e.clip_ctrl(&mut *inst.plugin, u32::try_from(offset).unwrap_or(u32::MAX), msg),
+        None => inst.plugin.midi(offset, msg),
     }
 }
 
@@ -4293,7 +4333,6 @@ mod tests {
         heard.lock().unwrap().clear();
         render_block(&mut eng, &s, 23_744);
         assert_eq!(*heard.lock().unwrap(), vec![("off", 256, 60), ("on", 256, 60)]);
-        assert_eq!(eng.strips[&t].held, vec![60]);
     }
 
     #[test]
@@ -4311,7 +4350,6 @@ mod tests {
         eng.set_external_instances(true);
         eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.spy".into(), ch: 2, plugin: Box::new(spy) }]);
         render_block(&mut eng, &s, 0);
-        assert_eq!(eng.strips[&t].held, vec![60]);
         let (offs, resets) = {
             let c = calls.lock().unwrap();
             assert_eq!(c.on, vec![60]);
@@ -4321,7 +4359,6 @@ mod tests {
         let c = calls.lock().unwrap();
         assert_eq!(c.all_off, offs + 1, "the instrument was told to release");
         assert_eq!(c.resets, resets, "reset would discard the queued releases");
-        assert!(eng.strips[&t].held.is_empty());
     }
 
     #[test]
