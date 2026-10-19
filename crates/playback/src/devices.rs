@@ -170,12 +170,52 @@ pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
         .as_deref()
         .and_then(|want| cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case(want)))
         .and_then(shared_host);
-    chosen.or_else(|| {
+    let host = chosen.or_else(|| {
         if let Some(s) = &cfg.system {
             log::warn!("audio system `{s}` is not available; using the default");
         }
         shared_host(cpal::default_host().id())
-    })
+    });
+    if host.is_none_or(|h| h.id().name() != ASIO_SYSTEM) {
+        release_asio_device_cache();
+    }
+    host
+}
+
+static ASIO_OUTPUT: Mutex<Option<cpal::Device>> = Mutex::new(None);
+
+/// Release the buffer-sharing device after closing the old input and output, before opening
+/// their replacements. Streams retain their own driver references; this only removes the cache's
+/// ownership. Otherwise the process-wide ASIO loader cannot load a different driver.
+pub fn release_asio_device_cache() {
+    *ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+fn cached_device<D: Clone>(
+    open: &mut Option<D>,
+    asio: bool,
+    name: Option<&str>,
+    output: bool,
+    device_name: impl Fn(&D) -> Option<String>,
+    load: impl FnOnce() -> Option<D>,
+) -> Option<D> {
+    let changed_driver = name.is_some_and(|n| open.as_ref().is_some_and(|d| device_name(d).as_deref() != Some(n)));
+    if !asio || output || changed_driver {
+        // Release BEFORE loading: assigning the new value after load keeps the old driver alive.
+        *open = None;
+    }
+    if asio
+        && !output
+        && let Some(d) = open.as_ref()
+        && (name.is_none() || device_name(d).as_deref() == name)
+    {
+        return Some(d.clone());
+    }
+    let d = load();
+    if asio {
+        open.clone_from(&d);
+    }
+    d
 }
 
 /// The named output (or input) device of `host`, else its default device.
@@ -186,22 +226,8 @@ pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
 /// so it remade the buffers for the input alone and the output went silent (arming a track
 /// silenced the SSL 2+). From the same `Device`, cpal makes the buffers for both.
 pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
-    static ASIO_OUTPUT: Mutex<Option<cpal::Device>> = Mutex::new(None);
-    if host.id().name() != ASIO_SYSTEM {
-        return find_device(host, name, output);
-    }
     let mut open = ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner);
-    if output {
-        // A new output starts from fresh buffers (the previous player is closed first).
-        let d = find_device(host, name, true);
-        open.clone_from(&d);
-        return d;
-    }
-    // No name: the open driver is the only one ASIO can use anyway.
-    match open.as_ref() {
-        Some(d) if name.is_none() || device_name(d).as_deref() == name => Some(d.clone()),
-        _ => find_device(host, name, false),
-    }
+    cached_device(&mut open, host.id().name() == ASIO_SYSTEM, name, output, device_name, || find_device(host, name, output))
 }
 
 fn find_device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
@@ -230,6 +256,41 @@ pub(crate) fn buffer_size(want: Option<u32>, supported: &cpal::SupportedBufferSi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asio_cache_releases_before_loading_another_driver_and_leaving_asio() {
+        use std::sync::{Arc, Weak};
+        // Like asio-sys, the loader refuses B while any strong reference to A survives.
+        let mut loaded = Weak::<String>::new();
+        let mut cache = None;
+        let mut load = |name: &str| {
+            if let Some(d) = loaded.upgrade() {
+                return (d.as_str() == name).then_some(d);
+            }
+            let d = Arc::new(name.to_string());
+            loaded = Arc::downgrade(&d);
+            Some(d)
+        };
+        let name = |d: &Arc<String>| Some(d.as_ref().clone());
+        let a = cached_device(&mut cache, true, Some("A"), true, name, || load("A")).unwrap();
+        let input = cached_device(&mut cache, true, None, false, name, || panic!("input must share the output's buffers")).unwrap();
+        assert!(Arc::ptr_eq(&a, &input));
+        drop(a);
+        assert!(cache.is_some(), "the input still uses A");
+        drop(input);
+        let b = cached_device(&mut cache, true, Some("B"), true, name, || load("B")).expect("A must unload BEFORE loading B");
+        assert_eq!(b.as_str(), "B");
+        drop(b);
+        let _ = cached_device(&mut cache, false, None, true, name, || None);
+        assert!(cache.is_none(), "WASAPI must not retain the ASIO driver");
+        let a = load("A").expect("B must also unload when switching through WASAPI");
+        assert_eq!(a.as_str(), "A");
+        drop(a);
+        let a = cached_device(&mut cache, true, Some("A"), false, name, || load("A")).unwrap();
+        drop(a);
+        let b = cached_device(&mut cache, true, Some("B"), false, name, || load("B")).expect("recorder-only driver changes must unload A too");
+        assert_eq!(b.as_str(), "B");
+    }
 
     #[test]
     fn config_round_trips_and_tolerates_missing_fields() {
@@ -288,6 +349,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware enumeration: opt in only on a test audio machine"]
     fn unknown_systems_and_devices_fall_back_to_the_defaults() {
         let cfg = AudioConfig { system: Some("No Such System".into()), ..Default::default() };
         assert_eq!(host(&cfg).map(|h| h.id()), Some(cpal::default_host().id()));
@@ -298,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "hardware enumeration loads ASIO drivers: opt in only on a test audio machine"]
     fn enumeration_does_not_fail() {
         let systems = audio_systems();
         // Every listed system has a name; on a machine without audio the lists are just empty.
