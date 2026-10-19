@@ -27,6 +27,7 @@ pub mod action_lane;
 pub mod device_clock;
 pub mod devices;
 pub mod plan_bridge;
+pub mod player;
 pub mod publication;
 pub mod record;
 pub mod scheduling;

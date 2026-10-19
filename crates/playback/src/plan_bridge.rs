@@ -367,6 +367,13 @@ impl Control {
     pub fn active(&self) -> PlanGeneration {
         self.compiler.active()
     }
+    pub(super) fn can_prepare(&self) -> bool {
+        self.port.credits() != 0
+    }
+    pub(super) fn issued(&self) -> PlanGeneration {
+        self.issued
+    }
+
     /// A torn adoption permanently faults this pair. Retire it on control after quiescence.
     pub fn faulted(&self) -> bool {
         self.compiler.faulted()

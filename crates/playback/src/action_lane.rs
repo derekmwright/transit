@@ -5,6 +5,7 @@
 
 use crate::plan_bridge;
 use soundcraft_mix::PlanGeneration;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,6 +13,8 @@ pub const CAPACITY: usize = 256;
 pub const NOTE_CAPACITY: usize = 256;
 pub const CALLBACK_ACTIONS: usize = 32;
 pub const CALLBACK_NOTES: usize = 32;
+/// Fixed upper bound on a handler receipt's stack/ring copy cost.
+pub const MAX_RESULT_BYTES: usize = 64;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Sequence(u64);
@@ -47,6 +50,8 @@ pub enum SendError {
     Full { release_recovery: Option<Sequence> },
     SequenceExhausted,
     NotePrerequisite,
+    UnknownReservation,
+    EarlierReservation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +160,9 @@ struct ControlLane<T: Copy, R: Copy = ()> {
     send: rtrb::Producer<Entry<T>>,
     returned: rtrb::Consumer<Receipt<T, R>>,
     credits: usize,
+    reserved: Vec<Entry<T>>,
+    cancelled: VecDeque<Receipt<T, R>>,
+    prefer_cancelled: bool,
 }
 struct AudioLane<T: Copy, R: Copy = ()> {
     receive: rtrb::Consumer<Entry<T>>,
@@ -164,11 +172,26 @@ struct AudioLane<T: Copy, R: Copy = ()> {
 fn lane<T: Copy, R: Copy>(capacity: usize) -> (ControlLane<T, R>, AudioLane<T, R>) {
     let (send, receive) = rtrb::RingBuffer::new(capacity);
     let (return_send, returned) = rtrb::RingBuffer::new(capacity);
-    (ControlLane { send, returned, credits: capacity }, AudioLane { receive, returned: return_send, pending: None })
+    (
+        ControlLane {
+            send,
+            returned,
+            credits: capacity,
+            reserved: Vec::with_capacity(capacity),
+            cancelled: VecDeque::with_capacity(capacity),
+            prefer_cancelled: false,
+        },
+        AudioLane { receive, returned: return_send, pending: None },
+    )
 }
 impl<T: Copy, R: Copy> ControlLane<T, R> {
     fn reclaim(&mut self) -> Option<Receipt<T, R>> {
-        let receipt = self.returned.pop().ok()?;
+        self.prefer_cancelled = !self.prefer_cancelled;
+        let receipt = if self.prefer_cancelled {
+            self.cancelled.pop_front().or_else(|| self.returned.pop().ok())
+        } else {
+            self.returned.pop().ok().or_else(|| self.cancelled.pop_front())
+        }?;
         self.credits += 1;
         Some(receipt)
     }
@@ -200,7 +223,21 @@ pub fn pair<T: Copy>(bridge: &plan_bridge::Control) -> (Control<T>, Audio<T>) {
 }
 
 /// Typed results travel back in the same reserved receipt, without a side channel.
+/// Handler results have a fixed copy budget as well as the `Copy` ownership bound.
+///
+/// ```compile_fail
+/// use soundcraft_playback::{action_lane, plan_bridge};
+/// use soundcraft_mix::{DeviceGeneration, PlanLimits, RenderTarget};
+/// let (bridge, _) = plan_bridge::pair(
+///     RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 },
+///     PlanLimits::default(),
+/// );
+/// let _ = action_lane::pair_with_result::<(), [u8; 65]>(&bridge);
+/// ```
 pub fn pair_with_result<T: Copy, R: Copy>(bridge: &plan_bridge::Control) -> (Control<T, R>, Audio<T, R>) {
+    const {
+        assert!(size_of::<R>() <= MAX_RESULT_BYTES, "action handler result exceeds its fixed copy budget");
+    }
     let (actions, audio_actions) = lane(CAPACITY);
     let (notes, audio_notes) = lane(NOTE_CAPACITY);
     let shared = Arc::new(Shared::default());
@@ -221,7 +258,47 @@ impl<T: Copy, R: Copy> Control<T, R> {
         Ok(Sequence(self.next))
     }
     pub fn send_action(&mut self, payload: T, plan: Option<PlanGeneration>) -> Result<Sequence, SendError> {
+        if !self.actions.reserved.is_empty() {
+            return Err(SendError::EarlierReservation);
+        }
         self.send(payload, Class::Ordinary, plan)
+    }
+    /// Reserve an action's order/credit while Player prepares its exact session plan.
+    /// No entry reaches audio until publish_reserved assigns the compiled prerequisite.
+    pub(super) fn reserve_action(&mut self, payload: T) -> Result<Sequence, SendError> {
+        if self.actions.credits == 0 {
+            return Err(SendError::Full { release_recovery: None });
+        }
+        let sequence = self.sequence()?;
+        self.actions.reserved.push(Entry { sequence, payload, class: Class::Ordinary, plan: None });
+        self.actions.credits -= 1;
+        Ok(sequence)
+    }
+    pub(super) fn publish_reserved(&mut self, sequence: Sequence, plan: Option<PlanGeneration>) -> Result<(), SendError> {
+        let Some(index) = self.actions.reserved.iter().position(|entry| entry.sequence == sequence) else {
+            return Err(SendError::UnknownReservation);
+        };
+        if index != 0 {
+            return Err(SendError::EarlierReservation);
+        }
+        let mut entry = self.actions.reserved.remove(index);
+        entry.plan = plan;
+        if let Err(rtrb::PushError::Full(entry)) = self.actions.send.push(entry) {
+            // Preserve the original position/order if the credit invariant was violated.
+            self.actions.reserved.insert(index, entry);
+            return Err(SendError::Full { release_recovery: None });
+        }
+        Ok(())
+    }
+    pub(super) fn cancel_reserved(&mut self, sequence: Sequence, outcome: Outcome) -> bool {
+        if matches!(outcome, Outcome::Applied | Outcome::NotesReleased) {
+            return false;
+        }
+        let Some(index) = self.actions.reserved.iter().position(|entry| entry.sequence == sequence) else { return false };
+        let entry = self.actions.reserved.remove(index);
+        // Each cancelled entry already owns a receipt credit; this cannot grow capacity.
+        self.actions.cancelled.push_back(Pending { entry, finished: Some(outcome), handler_result: None }.receipt());
+        true
     }
     /// Notes have no plan prerequisite. The payload's instrument/note identity is validated
     /// by the event handler; a future instrument must be refused, never block a release.
@@ -263,6 +340,11 @@ impl<T: Copy, R: Copy> Control<T, R> {
     pub fn stop(&mut self) -> Result<Sequence, SendError> {
         let sequence = self.sequence()?;
         self.shared.stop.store(sequence.0, Ordering::Release);
+        // Old staged Plays must finish even if their session is never compiled. Their
+        // order was reserved at admission, so no later publication can revive them.
+        for entry in self.actions.reserved.drain(..) {
+            self.actions.cancelled.push_back(Pending { entry, finished: Some(Outcome::Stopped), handler_result: None }.receipt());
+        }
         Ok(sequence)
     }
     pub fn all_notes_off(&mut self) -> Result<Sequence, SendError> {
@@ -275,8 +357,9 @@ impl<T: Copy, R: Copy> Control<T, R> {
         let previous = self.shared.rejected.load(Ordering::Relaxed);
         self.shared.rejected.store(previous.max(generation.get()), Ordering::Release);
     }
-    /// Each class is FIFO; receipts from independent classes may arrive out of sequence.
-    /// Round-robin reclamation prevents a busy transport lane starving note credits.
+    /// Dispatch within each class is FIFO; a control-side cancellation can return
+    /// before older audio work. Match every receipt by sequence, never return order.
+    /// Round-robin reclamation prevents transport or cancellations starving notes/audio.
     pub fn reclaim(&mut self) -> Option<Receipt<T, R>> {
         self.prefer_notes = !self.prefer_notes;
         if self.prefer_notes {
@@ -298,6 +381,9 @@ impl<T: Copy, R: Copy> Control<T, R> {
         let mut receipts = Vec::with_capacity(CAPACITY + NOTE_CAPACITY);
         while let Some(receipt) = self.reclaim() {
             receipts.push(receipt);
+        }
+        for entry in self.actions.reserved.drain(..).chain(self.notes.reserved.drain(..)) {
+            receipts.push(Pending { entry, finished: Some(Outcome::Shutdown), handler_result: None }.receipt());
         }
         for lane in [&mut audio.actions, &mut audio.notes] {
             if let Some(pending) = lane.pending.take() {

@@ -26,6 +26,72 @@ fn fixture<T: Copy>() -> (action_lane::Control<T>, action_lane::Audio<T>) {
 }
 
 #[test]
+fn reserved_transport_keeps_admission_order_and_stop_cancels_uncompiled_play() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, u8>(&plan_control);
+    let first = control.reserve_action(1).unwrap();
+    let second = control.reserve_action(2).unwrap();
+    assert_eq!(control.send_action(3, None), Err(SendError::EarlierReservation));
+    assert_eq!(control.publish_reserved(second, None), Err(SendError::EarlierReservation));
+    assert!(!control.cancel_reserved(first, Outcome::Applied));
+    let note = control.send_note(9, super::NoteKind::Off).unwrap();
+    audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |event, _| {
+        assert!(matches!(event, Event::Action { sequence, payload: 9 } if sequence == note));
+        99
+    });
+    let result = control.reclaim().unwrap();
+    assert_eq!((result.sequence, result.handler_result), (note, Some(99)));
+    let stop = control.stop().unwrap();
+    assert_eq!(control.publish_reserved(first, None), Err(SendError::UnknownReservation));
+    assert_eq!(control.publish_reserved(second, None), Err(SendError::UnknownReservation));
+    let newer = control.reserve_action(4).unwrap();
+    assert!(newer > stop);
+    control.publish_reserved(newer, None).unwrap();
+    let mut seen = Vec::with_capacity(2);
+    let (_, stats) = measure(|| {
+        audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |event, _| {
+            seen.push(event);
+            44
+        })
+    });
+    assert!(stats.is_zero());
+    assert_eq!(seen, [Event::Stop { sequence: stop }, Event::Action { sequence: newer, payload: 4 }]);
+    let receipts = control.retire(audio);
+    assert_eq!(
+        receipts.iter().map(|r| (r.sequence, r.outcome, r.handler_result)).collect::<Vec<_>>(),
+        [(first, Outcome::Stopped, None), (second, Outcome::Stopped, None), (newer, Outcome::Applied, Some(44)),]
+    );
+    plan_control.retire(plan_audio);
+}
+
+#[test]
+fn reservations_share_transport_credit_and_cancellation_waits_for_reclamation() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<usize, u8>(&plan_control);
+    let mut sequences = Vec::with_capacity(CAPACITY);
+    for i in 0..CAPACITY {
+        sequences.push(control.reserve_action(i).unwrap());
+    }
+    assert_eq!(control.credits(), 0);
+    assert_eq!(control.reserve_action(999), Err(SendError::Full { release_recovery: None }));
+    for sequence in &sequences {
+        assert!(control.cancel_reserved(*sequence, Outcome::PlanSuperseded));
+    }
+    assert_eq!(control.credits(), 0);
+    assert_eq!(control.reserve_action(999), Err(SendError::Full { release_recovery: None }));
+    assert_eq!(audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |_, _| panic!("cancelled actions")).applied, 0);
+    for sequence in sequences {
+        let receipt = control.reclaim().unwrap();
+        assert_eq!((receipt.sequence, receipt.outcome, receipt.handler_result), (sequence, Outcome::PlanSuperseded, None));
+    }
+    assert_eq!(control.credits(), CAPACITY);
+    let reserved = control.reserve_action(1000).unwrap();
+    let receipts = control.retire(audio);
+    assert_eq!((receipts[0].sequence, receipts[0].outcome, receipts[0].handler_result), (reserved, Outcome::Shutdown, None));
+    plan_control.retire(plan_audio);
+}
+
+#[test]
 fn typed_receipts_keep_handler_refusal_separate_from_successful_lane_dispatch() {
     let (plan_control, mut plan_audio) = bridge();
     let (mut control, mut audio) = action_lane::pair_with_result::<u8, bool>(&plan_control);
