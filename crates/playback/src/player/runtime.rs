@@ -227,6 +227,12 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         self.sources.revoke(source).map_err(PlayerError::Source)
     }
+    pub fn source_permit(&self, source: sources::Token) -> Result<sources::Permit, PlayerError> {
+        if self.faulted() {
+            return Err(PlayerError::Faulted);
+        }
+        self.sources.permit(source).map_err(PlayerError::Source)
+    }
     pub fn source_admitted(&self, source: sources::Token) -> bool {
         !self.faulted() && self.sources.admits(source)
     }

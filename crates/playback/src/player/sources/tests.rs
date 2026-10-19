@@ -208,3 +208,133 @@ fn backend_ids_and_the_mix_owned_clip_port_are_not_ingress_registrations() {
     assert!(audio.permits(AUDITION_PORT, audition.generation()));
     assert_eq!(control.register(AUDITION_PORT), Err(Error::PortRegistered));
 }
+
+#[test]
+fn worker_disconnect_releases_without_main_polling_and_old_workers_cannot_close_reuse() {
+    fn require_send_sync<T: Send + Sync>() {}
+    require_send_sync::<Permit>();
+    let (_bridge, mut plans, mut control, mut audio) = setup();
+    let token = control.register(7).unwrap();
+    let permit = control.permit(token).unwrap();
+    let delayed = permit.clone();
+    let heap = std::thread::spawn(move || {
+        assert!(permit.admits());
+        measure(|| {
+            permit.invalidate();
+            assert!(!permit.admits());
+        })
+        .1
+    })
+    .join()
+    .unwrap();
+    assert!(heap.is_zero(), "worker recovery must not allocate: {heap:?}");
+    assert!(!audio.permits(token.port(), token.generation()));
+    // No Control method or UI service ran between worker invalidation and this
+    // real source service. Recovery runs through the same restricted audio view.
+    let mut released = Vec::with_capacity(1);
+    let (report, heap) = measure(|| {
+        audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |port, generation, _| {
+            released.push((port, generation));
+            Ok(())
+        })
+    });
+    assert!(heap.is_zero(), "{heap:?}");
+    assert_eq!(report.revoked, 1);
+    assert_eq!(released, [(7, token.generation())]);
+    assert!(!control.admits(token));
+    assert!(matches!(control.permit(token), Err(Error::Revoked)));
+    let request = control.revoke(token).unwrap();
+    assert_eq!(control.release(request), Err(Error::NotRevoked));
+    let report = audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| panic!("already released"));
+    assert_eq!(report.revoked, 0);
+    assert_eq!(control.status(request), Ok(State::Revoked));
+    control.release(request).unwrap();
+    // Reuse both the fixed storage slot and then the original port identity.
+    let replacement = control.register(7).unwrap();
+    assert_eq!(replacement.slot, token.slot);
+    let next = control.permit(replacement).unwrap();
+    std::thread::spawn(move || {
+        assert!(!delayed.admits());
+        for _ in 0..1000 {
+            delayed.invalidate();
+        }
+    })
+    .join()
+    .unwrap();
+    assert!(next.admits());
+    assert!(control.admits(replacement));
+    assert!(audio.permits(7, replacement.generation()));
+    let report = audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| panic!("old worker closed replacement"));
+    assert_eq!(report.revoked, 0);
+}
+
+#[test]
+fn worker_recovery_shares_the_actual_callback_budget_with_main_revocation() {
+    let (_bridge, mut plans, mut control, mut audio) = setup();
+    let tokens: Vec<_> = (0..PORTS as u16).map(|port| control.register(port).unwrap()).collect();
+    let permits: Vec<_> = tokens.iter().map(|&token| control.permit(token).unwrap()).collect();
+    let request = control.revoke(tokens[0]).unwrap();
+    for permit in &permits {
+        permit.invalidate();
+    }
+    let mut seen = [0; PORTS];
+    for callback in 0..PORTS {
+        let mut budget = action_lane::callback_scope();
+        let ((), heap) = measure(|| {
+            for _ in 0..8 {
+                audio.service(&mut budget, &mut plans, &mut |port, _, _| {
+                    seen[usize::from(port)] += 1;
+                    Ok(())
+                });
+            }
+        });
+        assert!(heap.is_zero(), "{heap:?}");
+        assert_eq!(seen.iter().sum::<usize>(), callback + 1);
+    }
+    assert_eq!(seen, [1; PORTS]);
+    assert_eq!(control.status(request), Ok(State::Revoked));
+    assert!(permits.iter().all(|permit| !permit.admits()));
+}
+
+#[test]
+fn worker_permits_close_on_shared_fault_main_revoke_and_owner_shutdown() {
+    let (mut bridge, _plans, mut control, _audio) = setup();
+    let (_other_bridge, _other_plans, mut other, _other_audio) = setup();
+    let token = control.register(2).unwrap();
+    let foreign = other.register(2).unwrap();
+    assert!(matches!(control.permit(foreign), Err(Error::StaleToken)));
+    let permit = control.permit(token).unwrap();
+    bridge.fault();
+    assert!(!permit.admits());
+    assert!(matches!(control.permit(token), Err(Error::Faulted)));
+
+    let (_bridge, _plans, mut control, audio) = setup();
+    let token = control.register(2).unwrap();
+    let permit = control.permit(token).unwrap();
+    control.revoke(token).unwrap();
+    assert!(!permit.admits());
+    assert!(!audio.permits(2, token.generation()));
+
+    let (_bridge, _plans, mut control, audio) = setup();
+    let token = control.register(2).unwrap();
+    let permit = control.permit(token).unwrap();
+    drop(control);
+    assert!(!permit.admits(), "no callback is needed to observe owner shutdown");
+    assert!(!audio.permits(2, token.generation()));
+}
+
+#[test]
+fn failed_worker_recovery_faults_every_source_without_acknowledging_release() {
+    let (_bridge, mut plans, mut control, mut audio) = setup();
+    let token = control.register(1).unwrap();
+    let permit = control.permit(token).unwrap();
+    let other = control.register(2).unwrap();
+    let other_permit = control.permit(other).unwrap();
+    permit.invalidate();
+    let report = audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| Err(ApplyError::Refused));
+    assert!(report.faulted);
+    assert_eq!(report.revoked, 0);
+    assert!(!other_permit.admits());
+    assert!(!audio.permits(2, other.generation()));
+    assert_eq!(control.revoke(token), Err(Error::Faulted));
+}

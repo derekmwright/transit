@@ -55,6 +55,7 @@ pub enum Error {
     Exhausted,
     StaleToken,
     NotRevoked,
+    Revoked,
     Faulted,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,7 @@ impl std::fmt::Display for Error {
             Self::PortOutOfRange => "MIDI sources require a compact port index or the UI audition port",
             Self::Exhausted => "MIDI source identities are exhausted; reopen the runtime",
             Self::StaleToken => "this MIDI source no longer belongs to this runtime",
+            Self::Revoked => "this MIDI source no longer admits input",
             Self::NotRevoked => "the audio callback has not acknowledged this source's release",
             Self::Faulted => "MIDI source recovery is faulted; reopen the runtime",
         })
@@ -81,6 +83,7 @@ struct Port {
     port: AtomicU32,
     generation: AtomicU64,
     admitted: AtomicBool,
+    invalidated: AtomicU64,
     requested: AtomicU64,
     acknowledged: AtomicU64,
 }
@@ -88,12 +91,46 @@ struct Shared {
     runtime: plan_bridge::RuntimeIdentity,
     ports: [Port; PORTS],
     faulted: AtomicBool,
+    closed: AtomicBool,
 }
 impl Shared {
     fn faulted(&self) -> bool {
         self.runtime.faulted() || self.faulted.load(Ordering::Acquire)
     }
 }
+/// Read-only admission identity plus a generation-bound recovery signal for a
+/// native MIDI worker. It carries no Main-thread handles or mutable producer.
+/// A successful check is provisional: audio validates the source again at dispatch.
+#[derive(Clone)]
+pub struct Permit {
+    token: Token,
+    shared: Arc<Shared>,
+}
+impl Permit {
+    pub fn token(&self) -> Token {
+        self.token
+    }
+    pub fn admits(&self) -> bool {
+        if self.shared.closed.load(Ordering::Acquire) || self.shared.faulted() {
+            return false;
+        }
+        let Some(port) = self.shared.ports.get(usize::from(self.token.slot)) else { return false };
+        port.generation.load(Ordering::Acquire) == self.token.generation
+            && port.port.load(Ordering::Relaxed) == u32::from(self.token.port)
+            && port.admitted.load(Ordering::Acquire)
+            && port.invalidated.load(Ordering::Acquire) < self.token.generation
+            && port.generation.load(Ordering::Acquire) == self.token.generation
+    }
+    /// Disconnect or an unprotected dropped release closes this generation now.
+    /// The audio source pass performs release without needing Main to poll. This
+    /// signal is idempotent and cannot close a newer registration in the same slot.
+    pub fn invalidate(&self) {
+        if let Some(port) = self.shared.ports.get(usize::from(self.token.slot)) {
+            port.invalidated.fetch_max(self.token.generation, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Entry {
     token: Token,
@@ -126,8 +163,12 @@ pub fn pair(bridge: &plan_bridge::Control) -> Result<(Control, Audio), Error> {
     // The renamed try_update is newer than the workspace's Rust 1.90 minimum.
     #[allow(deprecated)]
     let registry = NEXT_REGISTRY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)).map_err(|_| Error::Exhausted)?;
-    let shared =
-        Arc::new(Shared { runtime: bridge.runtime_identity(), ports: std::array::from_fn(|_| Port::default()), faulted: AtomicBool::new(false) });
+    let shared = Arc::new(Shared {
+        runtime: bridge.runtime_identity(),
+        ports: std::array::from_fn(|_| Port::default()),
+        faulted: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+    });
     Ok((
         Control { registry, shared: Arc::clone(&shared), entries: [None; PORTS], generation: 0, request: 0, main_thread: PhantomData },
         Audio { shared, seen: [0; PORTS], revoked: [0; PORTS], cursor: 0, panic_payload: None },
@@ -166,7 +207,19 @@ impl Control {
             .ok_or(Error::StaleToken)
     }
     pub fn admits(&self, token: Token) -> bool {
-        !self.faulted() && self.entry(token).is_ok_and(|entry| entry.request.is_none())
+        !self.faulted()
+            && self.entry(token).is_ok_and(|entry| entry.request.is_none())
+            && self.shared.ports[usize::from(token.slot)].invalidated.load(Ordering::Acquire) < token.generation
+    }
+    pub fn permit(&self, token: Token) -> Result<Permit, Error> {
+        if self.faulted() {
+            return Err(Error::Faulted);
+        }
+        self.entry(token)?;
+        if !self.admits(token) {
+            return Err(Error::Revoked);
+        }
+        Ok(Permit { token, shared: Arc::clone(&self.shared) })
     }
     /// Idempotent while this registration exists. Repeated calls return the SAME
     /// request; they cannot consume new storage or postpone its acknowledgment.
@@ -244,12 +297,20 @@ impl Control {
     }
 }
 
+impl Drop for Control {
+    fn drop(&mut self) {
+        // Workers may retain their permit while closing native connections.
+        // Owner shutdown closes admission even if no callback can run again.
+        self.shared.closed.store(true, Ordering::Release);
+    }
+}
+
 impl Audio {
     /// Validate AGAIN immediately before event dispatch. Main may have revoked
     /// this source since admission; the local tombstone also prevents a stale load
     /// of the shared admission flag from undoing an already acknowledged revoke.
     pub fn permits(&self, port: u16, generation: u64) -> bool {
-        if self.shared.faulted() {
+        if self.shared.closed.load(Ordering::Acquire) || self.shared.faulted() {
             return false;
         }
         self.shared.ports.iter().enumerate().any(|(slot, shared)| {
@@ -260,6 +321,7 @@ impl Audio {
             observed == generation
                 && shared.port.load(Ordering::Relaxed) == u32::from(port)
                 && shared.admitted.load(Ordering::Acquire)
+                && shared.invalidated.load(Ordering::Acquire) < generation
                 && shared.generation.load(Ordering::Acquire) == observed
         })
     }
@@ -291,10 +353,18 @@ impl Audio {
             self.cursor = (self.cursor + 1) % PORTS;
             let port = &self.shared.ports[slot];
             let requested = port.requested.load(Ordering::Acquire);
-            if requested <= self.seen[slot] {
+            let generation = port.generation.load(Ordering::Acquire);
+            let worker_recovery = generation != 0 && port.invalidated.load(Ordering::Acquire) >= generation && generation > self.revoked[slot];
+            if requested <= self.seen[slot] && !worker_recovery {
                 continue;
             }
-            let generation = port.generation.load(Ordering::Acquire);
+            if generation <= self.revoked[slot] {
+                // A later Main revoke can acknowledge the worker's completed
+                // release without applying it again. This scan remains bounded.
+                self.seen[slot] = requested;
+                port.acknowledged.store(requested, Ordering::Release);
+                continue;
+            }
             let id = port.port.load(Ordering::Relaxed) as u16;
             let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(id, generation, &mut bridge.processing())));
             let succeeded = match applied {
