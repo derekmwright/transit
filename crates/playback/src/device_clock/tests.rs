@@ -491,7 +491,7 @@ fn residual_and_drift_policy_cannot_be_bypassed_by_a_long_span() {
 }
 
 #[test]
-fn a_seek_resets_loop_iteration_and_past_end_seek_has_explicit_wrap_policy() {
+fn a_seek_resets_loop_iteration_and_past_end_seek_continues_linearly() {
     let k = key(45, Direction::Output);
     let mut timeline = Timeline::new(k, 1, 0, 0, Rate::new(1, 1).unwrap()).unwrap();
     timeline.change(2, None, Rate::new(1, 1).unwrap(), true, Some((0, 256))).unwrap();
@@ -499,7 +499,15 @@ fn a_seek_resets_loop_iteration_and_past_end_seek_has_explicit_wrap_policy() {
     timeline.change(3, Some(100), Rate::new(1, 1).unwrap(), true, Some((0, 256))).unwrap();
     timeline.advance(1, |s| assert_eq!((s.loop_iteration, s.session.sample), (0, 100))).unwrap();
     timeline.change(4, Some(10_000), Rate::new(1, 1).unwrap(), true, Some((0, 256))).unwrap();
-    timeline.advance(1, |s| assert_eq!((s.loop_iteration, s.session.sample), (39, 16))).unwrap();
+    timeline.advance(1, |s| assert_eq!((s.loop_iteration, s.session.sample), (0, 10_000))).unwrap();
+    assert_eq!(timeline.position().unwrap().sample, 10_001);
+    timeline.change(5, Some(256), Rate::new(1, 1).unwrap(), true, Some((0, 256))).unwrap();
+    timeline.advance(256, |s| assert_eq!((s.loop_iteration, s.session.sample), (0, 256))).unwrap();
+    assert_eq!(timeline.position().unwrap().sample, 512);
+    timeline.change(6, Some(-10), Rate::new(1, 1).unwrap(), true, Some((0, 256))).unwrap();
+    timeline.advance(266, |s| assert_eq!((s.loop_iteration, s.session.sample), (0, -10))).unwrap();
+    assert_eq!(timeline.position().unwrap().sample, 0);
+    timeline.advance(1, |s| assert_eq!((s.loop_iteration, s.session.sample), (1, 0))).unwrap();
 }
 
 #[test]

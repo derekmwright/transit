@@ -111,6 +111,7 @@ pub struct Timeline {
     rate: Rate,
     playing: bool,
     loop_range: Option<(i64, i64)>,
+    loop_active: bool,
     iteration: u64,
 }
 
@@ -127,15 +128,16 @@ impl Timeline {
             rate,
             playing: false,
             loop_range: None,
+            loop_active: false,
             iteration: 0,
         })
     }
     /// A seek/start/stop/speed edit is one transaction at the next consumed output frame.
     /// A strictly newer transport identity prevents old events from acquiring a new meaning.
-    /// Loop policy: while playing, a seek at/past the loop end normalizes into the
-    /// loop on the next advance, counting skipped loop lengths from a new iteration
-    /// epoch. Seeking before the loop start plays through into it. Stopped seeks do
-    /// not wrap. A seek resets iteration before applying that normalization.
+    /// Loop policy: seeking at/past the loop end continues linearly; it does not
+    /// jump back into the loop. Seeking before its start plays through into it.
+    /// A new seek starts iteration zero; only crossing an engaged loop end adds
+    /// iterations. A later seek into/before the range engages looping again.
     pub fn change(&mut self, transport: u64, seek: Option<i64>, rate: Rate, playing: bool, loop_range: Option<(i64, i64)>) -> Result<(), MapError> {
         if transport <= self.transport {
             return Err(MapError::WrongGeneration);
@@ -168,6 +170,7 @@ impl Timeline {
         self.rate = Rate { numerator, denominator: common };
         self.playing = playing;
         self.loop_range = loop_range;
+        self.loop_active = loop_range.is_some_and(|(_, end)| position < i128::from(end) * i128::from(common));
         if seek.is_some() {
             self.iteration = 0;
         }
@@ -182,6 +185,7 @@ impl Timeline {
 
     fn wrap(&self, position: &mut i128, iteration: &mut u64) -> Result<(), MapError> {
         if self.playing
+            && self.loop_active
             && let Some((start, stop)) = self.loop_range
         {
             let loop_end = i128::from(stop) * i128::from(self.rate.denominator);
@@ -207,6 +211,7 @@ impl Timeline {
             let mut length = end - output;
             self.wrap(&mut position, &mut iteration)?;
             if self.playing
+                && self.loop_active
                 && let Some((_, stop)) = self.loop_range
             {
                 let loop_end = i128::from(stop) * i128::from(self.rate.denominator);
