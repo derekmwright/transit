@@ -23,6 +23,7 @@
 //! through handles taken from each instance before it leaves ([`Player::open_editor`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod action_lane;
 pub mod devices;
 pub mod plan_bridge;
 pub mod publication;
@@ -1209,7 +1210,7 @@ impl OutputCallback {
         let started = telemetry::Timer::start();
         mark_audio_thread();
         let channels = self.channels;
-        self.fill_with(data, |s, _budget| {
+        self.fill_with(data, |s, _plans, _actions| {
             render_held(state, fault, shared, s, channels);
         });
         self.timing.record(&fault.telemetry, data.len() / self.channels, self.rate, started.elapsed());
@@ -1220,12 +1221,13 @@ impl OutputCallback {
     fn fill_with<T: cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         data: &mut [T],
-        mut render: impl FnMut(&mut [f32], &mut plan_bridge::CallbackBudget),
+        mut render: impl FnMut(&mut [f32], &mut plan_bridge::CallbackBudget, &mut action_lane::Budget),
     ) {
         let mut budget = plan_bridge::callback_scope();
+        let mut actions = action_lane::callback_scope();
         for out in data.chunks_mut(self.scratch.len()) {
             let Some(s) = self.scratch.get_mut(..out.len()) else { break };
-            render(s, &mut budget);
+            render(s, &mut budget, &mut actions);
             for (o, x) in out.iter_mut().zip(s.iter()) {
                 *o = T::from_sample(*x);
             }
