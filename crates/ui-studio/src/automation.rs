@@ -320,10 +320,50 @@ pub struct PointRef {
     pub at: Samples,
 }
 
+/// A point drag. The pressed point is the anchor; every selected point of the lane moves by the
+/// anchor's delta in time (samples) and in height (the lane's 0..1 scale).
+#[derive(Debug, Clone)]
+pub struct PointDrag {
+    pub track: TrackId,
+    pub lane: String,
+    pub orig_at: Samples,
+    pub orig_v: f32,
+    /// The anchor's current time and value, and the delta applied so far.
+    pub cur_at: Samples,
+    pub cur_v: f32,
+    pub cur_dk: f32,
+    pub press: Pos2,
+    pub key: String,
+    /// The moving points as they were when the drag began, by time.
+    pub group: Vec<(Samples, f32)>,
+    /// The lane's other points: the moving ones never cross or replace them.
+    pub fixed: Vec<Samples>,
+}
+
+impl PointDrag {
+    /// The time delta nearest `dt` that keeps every moving point between its fixed neighbors
+    /// and at or after zero.
+    fn clamp_dt(&self, dt: Samples) -> Samples {
+        let (mut lo, mut hi) = (Samples::MIN, Samples::MAX);
+        for (at, _) in &self.group {
+            lo = lo.max(self.fixed.iter().copied().filter(|f| f < at).max().map_or(0, |f| f + 1) - at);
+            hi = hi.min(self.fixed.iter().copied().filter(|f| f > at).min().map_or(Samples::MAX, |f| f - 1).saturating_sub(*at));
+        }
+        dt.clamp(lo, hi.max(lo))
+    }
+
+    /// The height delta nearest `dk` that keeps every moving point inside 0..1.
+    fn clamp_dk(&self, dk: f32, norms: &[f32]) -> f32 {
+        let lo = norms.iter().map(|k| -k).fold(f32::MIN, f32::max);
+        let hi = norms.iter().map(|k| 1.0 - k).fold(f32::MAX, f32::min);
+        dk.clamp(lo, hi.max(lo))
+    }
+}
+
 /// A gesture on a lane.
 #[derive(Debug, Clone)]
 pub enum AutoGesture {
-    Point { track: TrackId, lane: String, orig_at: Samples, orig_v: f32, cur_at: Samples, cur_v: f32, press: Pos2, key: String },
+    Point(Box<PointDrag>),
     Band { track: TrackId, lane: String, press: Pos2 },
     Height { track: TrackId, lane: String, start_h: f32, press_y: f32 },
 }
@@ -774,11 +814,26 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
                 if !app.auto.selection.contains(&me) {
                     app.auto.selection = vec![me];
                 }
+                // Every selected point of the lane moves with the one pressed.
+                let moving = |a: &Samples| app.auto.selection.iter().any(|q| q.track == t.id.0 && q.lane == lid && q.at == *a);
+                let group: Vec<(Samples, f32)> = pts.iter().filter(|p| moving(&p.0)).copied().collect();
+                let fixed: Vec<Samples> = pts.iter().map(|p| p.0).filter(|a| !moving(a)).collect();
                 app.engine.end_merge();
                 app.auto.serial += 1;
                 let key = format!("autodrag:{}", app.auto.serial);
-                app.auto.gesture =
-                    Some(AutoGesture::Point { track: t.id, lane: lid.clone(), orig_at: at, orig_v: v, cur_at: at, cur_v: v, press, key });
+                app.auto.gesture = Some(AutoGesture::Point(Box::new(PointDrag {
+                    track: t.id,
+                    lane: lid.clone(),
+                    orig_at: at,
+                    orig_v: v,
+                    cur_at: at,
+                    cur_v: v,
+                    cur_dk: 0.0,
+                    press,
+                    key,
+                    group,
+                    fixed,
+                })));
             }
             None if mods.alt => {
                 // Alt-drag on a segment bends it in Ableton; the model has no curve shapes (L38).
@@ -788,39 +843,47 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
         }
     }
     if resp.dragged()
-        && let Some(AutoGesture::Point { track, lane: gl, orig_at, orig_v, cur_at, cur_v, press, key }) = app.auto.gesture.clone()
-        && track == t.id
-        && gl == lid
+        && let Some(AutoGesture::Point(g)) = app.auto.gesture.clone()
+        && g.track == t.id
+        && g.lane == lid
         && let Some(now) = ui.input(|i| i.pointer.latest_pos())
     {
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         let fine_drag = mods.shift;
         let ratio = if fine_drag { fine::FINE } else { 1.0 };
-        let d = now - press;
-        let k = lane.norm(t, orig_v) - d.y / (ys.h - 2.0 * PAD).max(1.0) * ratio;
-        let v = lane.denorm(t, k);
+        let d = now - g.press;
+        // The height delta, kept so that no moving point leaves the range.
+        let norms: Vec<f32> = g.group.iter().map(|(_, v)| lane.norm(t, *v)).collect();
+        let dk = g.clamp_dk(-d.y / (ys.h - 2.0 * PAD).max(1.0) * ratio, &norms);
+        let v = lane.denorm(t, lane.norm(t, g.orig_v) + dk);
         // A vertical drag changes the value only: off-grid points (a write pass makes them all)
         // keep their time until the pointer moves sideways past a small threshold.
-        let raw = orig_at + (f64::from(d.x * ratio) * map.spp).round() as Samples;
-        let at = if d.x.abs() < DRAG_SLOP {
-            orig_at
+        let raw = g.orig_at + (f64::from(d.x * ratio) * map.spp).round() as Samples;
+        let want = if d.x.abs() < DRAG_SLOP {
+            g.orig_at
         } else if fine_drag {
             raw
         } else {
             snap(s, map.spp, raw)
         };
-        // A point stays between its neighbours (moving past one would replace it).
-        let lo = pts.iter().map(|p| p.0).filter(|a| *a < cur_at).max().map_or(0, |a| a + 1);
-        let hi = pts.iter().map(|p| p.0).filter(|a| *a > cur_at).min().map_or(Samples::MAX, |a| a - 1);
-        let at = at.clamp(lo, hi.max(lo));
-        if at != cur_at || (v - cur_v).abs() > f32::EPSILON {
-            let mut cmds = lane.set_cmds(t, at, v, None);
-            if at != cur_at {
-                cmds.extend(lane.clear_cmds(t, cur_at));
+        // The moving points stay between their fixed neighbors (moving past one would replace it).
+        let dt = g.clamp_dt(want - g.orig_at);
+        let at = g.orig_at + dt;
+        let cur_dt = g.cur_at - g.orig_at;
+        if dt != cur_dt || (dk - g.cur_dk).abs() > f32::EPSILON {
+            let mut cmds = Vec::new();
+            if dt != cur_dt {
+                for (a, _) in &g.group {
+                    cmds.extend(lane.clear_cmds(t, a + cur_dt));
+                }
             }
-            if app.auto_exec(cmds, Some(&key)).is_ok() {
-                app.auto.gesture = Some(AutoGesture::Point { track, lane: gl, orig_at, orig_v, cur_at: at, cur_v: v, press, key });
-                app.auto.selection = vec![PointRef { track: t.id.0, lane: lid.clone(), at }];
+            for (a, v0) in &g.group {
+                cmds.extend(lane.set_cmds(t, a + dt, lane.denorm(t, lane.norm(t, *v0) + dk), None));
+            }
+            if app.auto_exec(cmds, Some(&g.key)).is_ok() {
+                app.auto.selection.retain(|q| !(q.track == t.id.0 && q.lane == lid));
+                app.auto.selection.extend(g.group.iter().map(|(a, _)| PointRef { track: t.id.0, lane: lid.clone(), at: a + dt }));
+                app.auto.gesture = Some(AutoGesture::Point(Box::new(PointDrag { cur_at: at, cur_v: v, cur_dk: dk, ..*g })));
             }
         }
         // The value as the drag sets it, beside the point.
@@ -849,7 +912,7 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
                     }
                 }
             }
-            Some(AutoGesture::Point { .. }) => app.engine.end_merge(),
+            Some(AutoGesture::Point(_)) => app.engine.end_merge(),
             other => app.auto.gesture = other,
         }
     }

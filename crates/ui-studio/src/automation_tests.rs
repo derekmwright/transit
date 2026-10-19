@@ -702,3 +702,74 @@ fn grabbing_a_strip_fader_in_read_writes_the_static_value_from_where_it_shows() 
     assert_eq!(t.points(a, &AutoParam::Volume).len(), 2, "Read writes no automation points");
     assert!(t.app.engine.session().track(a).unwrap().mixer.volume_db > -144.0);
 }
+
+fn select_all_points(t: &mut T, a: TrackId, n: usize) {
+    let p = t.lane(a, "volume").points[0].clone();
+    t.click((p.x, p.y));
+    for i in 1..n {
+        let p = t.lane(a, "volume").points[i].clone();
+        t.click_mods((p.x, p.y), json!({"shift": true}));
+    }
+    assert_eq!(t.app.auto.selection.len(), n);
+}
+
+#[test]
+fn dragging_one_of_three_selected_points_moves_all_three_as_one_undo_step() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    // Off-grid times, as a write pass leaves them; a fourth point stays unselected.
+    for (at, v) in [(3_137_i64, -6.0), (20_211, -9.0), (40_309, -3.0), (90_001, -12.0)] {
+        set_point(&mut t, a, at, v);
+    }
+    for v in &mut t.app.ui.auto_lanes {
+        v.height = crate::automation::LANE_MAX;
+    }
+    t.frames(3);
+    select_all_points(&mut t, a, 3);
+    let before = t.points(a, &AutoParam::Volume);
+    let anchor = t.lane(a, "volume").points[1].clone();
+    let h = t.lane(a, "volume").area[3] - t.lane(a, "volume").area[1] - 14.0;
+    let undo = t.undo_len();
+    // Straight down by 0.1 of the lane's height.
+    t.drag((anchor.x, anchor.y), (anchor.x, anchor.y + 0.1 * h), json!({}));
+    let after = t.points(a, &AutoParam::Volume);
+    assert_eq!(after.len(), 4, "nothing added or lost");
+    assert_eq!(t.undo_len(), undo + 1, "the gesture is one undo step");
+    for i in 0..3 {
+        assert_eq!(after[i].0, before[i].0, "off-grid time {i} kept on a vertical drag");
+        assert!(after[i].1 < before[i].1 - 0.1, "point {i} moved down: {} -> {}", before[i].1, after[i].1);
+    }
+    assert_eq!(after[3], before[3], "the unselected point is untouched");
+    assert!(after.windows(2).all(|w| w[0].0 < w[1].0), "order preserved");
+    assert_eq!(t.app.auto.selection.len(), 3, "the selection stays");
+    // One undo restores the lane.
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume), before);
+}
+
+#[test]
+fn a_group_drag_stops_at_its_unselected_neighbors_and_at_the_range() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    for (at, v) in [(40_000_i64, -6.0), (60_000, -9.0), (80_000, -3.0), (120_000, -12.0)] {
+        set_point(&mut t, a, at, v);
+    }
+    t.frames(3);
+    select_all_points(&mut t, a, 3);
+    let anchor = t.lane(a, "volume").points[0].clone();
+    // Far right: the group stops one sample short of the unselected point, order intact.
+    t.drag((anchor.x, anchor.y), (anchor.x + 2_000.0, anchor.y), json!({}));
+    let pts = t.points(a, &AutoParam::Volume);
+    assert_eq!(pts.len(), 4, "no point replaced another: {pts:?}");
+    assert_eq!(pts[2].0, 119_999);
+    assert_eq!(pts[1].0 - pts[0].0, 20_000, "spacing is kept");
+    assert_eq!(pts[3].0, 120_000);
+    // Far up: values stay in range and keep their spacing in height.
+    let top = t.lane(a, "volume").points[2].clone();
+    t.drag((top.x, top.y), (top.x, top.y - 2_000.0), json!({}));
+    let pts = t.points(a, &AutoParam::Volume);
+    let max = pts[..3].iter().map(|p| p.1).fold(f32::MIN, f32::max);
+    assert!(max <= crate::fine::DB_MAX + 1e-3, "in range: {max}");
+    assert!(pts[..3].iter().all(|p| p.1 >= crate::fine::DB_MIN));
+    assert!(pts[0].1 < pts[2].1 || pts[0].1 != pts[1].1, "the group keeps its shape instead of flattening");
+}
