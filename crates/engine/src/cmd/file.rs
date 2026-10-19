@@ -59,12 +59,14 @@ pub fn specs() -> Vec<CommandSpec> {
             "Audio...",
             ["File", "Import"],
             Some("Cmd+Shift+I"),
-            "{path | paths: [..], track?: target track, at?: position, new_tracks?: true (default; false uses `track` or the selected audio track)}",
+            "{path | paths: [..], track?: target track, at?: position, name?: clip, source and new track name, new_tracks?: true (default; false uses `track` or the selected audio track)}",
             always,
             import_audio
         ),
         // Asynchronous import (L30). Prepare, progress and cancel never touch the document, so
         // they are not journaled; the commit is one undo step, "Import <name>".
+        // `rate` is for tests: an item prepared at a rate other than the session's can never be
+        // committed (the commit asks for a re-import), so the session rate is the only useful one.
         cmd!(query "file.prepare_import", "Prepare Audio Import", [], None, "{path, rate?: session rate} -> {id}: decode and resample on a worker thread", always, prepare_import),
         cmd!(query "file.import_progress", "Audio Import Progress", [], None, "{id?} -> {id, name, state: queued|running|done|failed, progress: 0-100, error?, frames?, channels?, duration?} (no id: {imports: [..]})", always, import_progress),
         cmd!(query "file.import_cancel", "Cancel Audio Import", [], None, "{id} -> {canceled}", always, |e, p| {
@@ -245,12 +247,13 @@ fn import_audio(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     let at = position_param(e, "file.import_audio", p, "at")?.unwrap_or(0).max(0);
     let target = import_audio_target(e, p)?;
+    let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
     let mut out = Vec::new();
     for path in &paths {
         let bytes = crate::io::read_file(path)?;
-        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
-        let r = crate::io::import_audio_bytes(e, &name, &bytes, Some(path.as_str()), target, at)?;
-        out.push(r);
+        let file = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("Audio").to_string();
+        let prepared = crate::io::prepare_audio_bytes(&file, &bytes, Some(path.as_str()), e.session().sample_rate.hz(), &mut |_| true)?;
+        out.push(crate::io::place_prepared(e, prepared, target, at, name)?);
     }
     Ok(json!({"imported": out}))
 }
@@ -310,8 +313,9 @@ fn commit_import(e: &mut Engine, p: &Value) -> Result<Value> {
     // Journal what a replay can run: the same import by path, onto the track it landed on.
     if let Some(path) = path {
         let mut j = json!({"path": path, "at": at});
-        if let Some(t) = r.get("track") {
-            j["track"] = t.clone();
+        // A track the commit made is made again on replay; only a track it was given is named.
+        if let Some(t) = track {
+            j["track"] = json!(t);
         }
         if let Some(n) = name {
             j["name"] = json!(n);

@@ -230,7 +230,7 @@ fn finished_items_left_uncommitted_expire_by_age_and_by_count() {
     let d = Dir::new("expire");
     let (mut e, _) = engine_with_track();
     let path = d.file("tone.wav", &wav(1, 48_000, 480));
-    e.imports.set_limits(Duration::from_secs(600), 3);
+    e.imports.set_limits(Duration::from_secs(600), 3, Duration::ZERO);
     let ids: Vec<u64> = (0..5).map(|_| prepare(&mut e, &path)).collect();
     for id in &ids {
         // Finished jobs may already be dropped by the count limit: ignore those.
@@ -244,7 +244,7 @@ fn finished_items_left_uncommitted_expire_by_age_and_by_count() {
     let left: Vec<u64> = e.imports.all().iter().map(|v| v["id"].as_u64().unwrap()).collect();
     assert_eq!(left.len(), 3, "{left:?}");
     // A short time limit: everything finished goes.
-    e.imports.set_limits(Duration::from_millis(1), 32);
+    e.imports.set_limits(Duration::from_millis(1), 32, Duration::ZERO);
     std::thread::sleep(Duration::from_millis(10));
     assert!(e.execute("file.import_progress", &json!({})).unwrap()["imports"].as_array().unwrap().is_empty());
     assert!(e.imports.is_empty());
@@ -262,4 +262,44 @@ fn a_commit_after_a_session_rate_change_asks_for_a_re_import() {
     assert!(err.contains("prepared at 48000 Hz; the session is now 44100 Hz: re-import"), "{err}");
     assert!(e.session().sources.is_empty() && clips(&e, track).is_empty());
     assert_eq!(e.execute("file.import_progress", &json!({"id": id})).unwrap()["state"], "done", "the item stays");
+}
+
+#[test]
+fn items_the_caller_keeps_polling_are_never_dropped_for_the_count_limit() {
+    let d = Dir::new("keep");
+    let (mut e, track) = engine_with_track();
+    let path = d.file("tone.wav", &wav(1, 48_000, 480));
+    e.imports.set_limits(Duration::from_secs(600), 3, Duration::from_secs(30));
+    let ids: Vec<u64> = (0..6).map(|_| prepare(&mut e, &path)).collect();
+    let t0 = Instant::now();
+    while e.imports.all().iter().any(|v| v["state"] != "done") {
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    for (i, id) in ids.iter().enumerate() {
+        assert!(e.execute("file.commit_import", &json!({"id": id, "track": track, "at": i as i64 * 480})).is_ok(), "item {i} committed");
+    }
+    assert_eq!(clips(&e, track).len(), 6);
+}
+
+#[test]
+fn a_commit_without_a_track_replays_on_a_fresh_engine_with_the_same_track_clip_and_names() {
+    let d = Dir::new("replay-new-track");
+    let mut e = Engine::default();
+    let path = d.file("tone.wav", &wav(2, 48_000, 24_000));
+    let id = prepare(&mut e, &path);
+    wait(&mut e, id);
+    let r = e.execute("file.commit_import", &json!({"id": id, "at": 480, "name": "Lead Vox"})).unwrap();
+    let (cmd, params) = e.journal.last().cloned().unwrap();
+    assert_eq!(cmd, "file.import_audio");
+    assert!(params.get("track").is_none(), "{params}");
+    let mut f = Engine::default();
+    f.execute(&cmd, &params).unwrap();
+    let names = |x: &Engine| x.session().tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&f), names(&e));
+    assert_eq!(names(&f), vec!["Lead Vox".to_string()]);
+    let tid = r["track"].as_u64().unwrap();
+    let ftid = f.session().tracks[0].id.0;
+    assert_eq!(clips(&f, ftid), clips(&e, tid));
+    assert_eq!(clips(&f, ftid), vec![(480, 24_000, "Lead Vox".to_string())]);
 }

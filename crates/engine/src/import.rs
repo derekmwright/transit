@@ -25,6 +25,9 @@ pub const MAX_PREPARES: usize = 4;
 /// How long a finished or failed job may wait uncommitted before it is dropped.
 pub const FINISHED_TTL: Duration = Duration::from_secs(600);
 
+/// How long a job just finished (or just polled) is safe from the count limit.
+pub const GRACE: Duration = Duration::from_secs(30);
+
 /// How many finished or failed jobs may wait uncommitted; past that the oldest are dropped.
 pub const MAX_FINISHED: usize = 32;
 
@@ -61,6 +64,8 @@ struct Job {
     prepared: Option<PreparedAudio>,
     /// When it became done or failed.
     finished: Option<Instant>,
+    /// When it was last polled.
+    seen: Option<Instant>,
 }
 
 struct Staging {
@@ -70,27 +75,36 @@ struct Staging {
     running: usize,
     ttl: Duration,
     max_finished: usize,
+    grace: Duration,
 }
 
 impl Default for Staging {
     fn default() -> Self {
-        Staging { jobs: BTreeMap::new(), queue: VecDeque::new(), running: 0, ttl: FINISHED_TTL, max_finished: MAX_FINISHED }
+        Staging { jobs: BTreeMap::new(), queue: VecDeque::new(), running: 0, ttl: FINISHED_TTL, max_finished: MAX_FINISHED, grace: GRACE }
     }
 }
 
 impl Staging {
-    /// Drop finished or failed jobs nobody committed: those older than the time limit, then the
-    /// oldest past the count limit. A caller that cancels what it refuses never gets here.
+    /// Drop finished or failed jobs nobody is looking at. A job is idle for as long as it has been
+    /// finished and unpolled; the UI polls every job it holds, so it never loses one it will
+    /// commit. Idle jobs go once they pass the time limit, and the oldest idle ones go when more
+    /// than the count limit are waiting (after a short grace, so a job just finished is never the
+    /// victim). Queued and running jobs are never dropped.
     fn expire(&mut self) {
         let now = Instant::now();
-        let mut done: Vec<(Instant, u64)> = self.jobs.iter().filter_map(|(id, j)| j.finished.map(|t| (t, *id))).collect();
-        done.sort();
-        let over = done.len().saturating_sub(self.max_finished);
-        for (i, (t, id)) in done.into_iter().enumerate() {
-            let stale = now.saturating_duration_since(t) >= self.ttl;
-            if (stale || i < over)
+        let idle = |j: &Job| j.finished.map(|f| now.saturating_duration_since(f.max(j.seen.unwrap_or(f))));
+        let waiting = self.jobs.values().filter(|j| j.finished.is_some()).count();
+        let mut over = waiting.saturating_sub(self.max_finished);
+        let mut idle_jobs: Vec<(Duration, u64)> = self.jobs.iter().filter_map(|(id, j)| idle(j).map(|d| (d, *id))).collect();
+        // Longest idle first.
+        idle_jobs.sort_by(|a, b| b.0.cmp(&a.0));
+        for (d, id) in idle_jobs {
+            let stale = d >= self.ttl;
+            let crowded = over > 0 && d >= self.grace;
+            if (stale || crowded)
                 && let Some(j) = self.jobs.remove(&id)
             {
+                over = over.saturating_sub(1);
                 log::info!("import {id} ({}) dropped: left uncommitted ({})", j.name, if stale { "too long" } else { "too many waiting" });
             }
         }
@@ -141,6 +155,7 @@ impl Imports {
             error: None,
             prepared: None,
             finished: None,
+            seen: None,
         };
         let spawn = {
             let mut g = lock(&self.shared);
@@ -170,14 +185,23 @@ impl Imports {
     pub fn progress(&self, id: u64) -> Option<Value> {
         let mut g = lock(&self.shared);
         g.expire();
-        g.jobs.get(&id).map(|j| describe(id, j))
+        let j = g.jobs.get_mut(&id)?;
+        j.seen = Some(Instant::now());
+        Some(describe(id, j))
     }
 
     /// Every job, oldest first.
     pub fn all(&self) -> Vec<Value> {
         let mut g = lock(&self.shared);
         g.expire();
-        g.jobs.iter().map(|(id, j)| describe(*id, j)).collect()
+        let now = Instant::now();
+        g.jobs
+            .iter_mut()
+            .map(|(id, j)| {
+                j.seen = Some(now);
+                describe(*id, j)
+            })
+            .collect()
     }
 
     /// Drop a job, stopping its work at the next step. `false` when there was no such job.
@@ -220,11 +244,13 @@ impl Imports {
         lock(&self.shared).jobs.get(&id).and_then(|j| j.prepared.as_ref()).map(PreparedAudio::rate)
     }
 
-    /// Change the limits on finished jobs left uncommitted (tests use short ones).
-    pub fn set_limits(&mut self, ttl: Duration, max_finished: usize) {
+    /// Change the limits on finished jobs left uncommitted (tests use short ones): the idle time
+    /// limit, the count limit, and the grace before the count limit may drop a job.
+    pub fn set_limits(&mut self, ttl: Duration, max_finished: usize, grace: Duration) {
         let mut g = lock(&self.shared);
         g.ttl = ttl;
         g.max_finished = max_finished;
+        g.grace = grace;
     }
 
     /// Take a finished job's audio out of the map.
