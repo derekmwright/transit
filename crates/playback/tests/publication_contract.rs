@@ -4,7 +4,7 @@
 use soundcraft_playback::publication::{Service, channel};
 use soundcraft_rt::testing::measure;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
@@ -176,6 +176,9 @@ fn shutdown_recovers_queued_returned_and_interrupted_owners_on_control() {
 
 #[test]
 fn unpublished_dependency_slot_returns_empty_before_producer_resumes() {
+    // The chunk API exposes the pre-publication boundary deterministically. This is a proxy
+    // for push's payload-write / Release-tail sequence, verified in pinned 0.4.0 source;
+    // it does not instrument a suspension inside Producer::push itself.
     let (mut producer, mut consumer) = rtrb::RingBuffer::<u64>::new(2);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
@@ -194,6 +197,65 @@ fn unpublished_dependency_slot_returns_empty_before_producer_resumes() {
     assert!(stats.is_zero(), "{stats:?}");
     assert_eq!(before_publication, Err(rtrb::PopError::Empty));
     assert_eq!(consumer.pop(), Ok(42));
+}
+
+#[test]
+fn concurrent_publication_and_reclamation_preserve_credit_fifo_and_drop_affinity() {
+    const COUNT: usize = 20_000;
+    for capacity in [1, 2, 3, 7] {
+        let trace = Trace::new();
+        let (mut control, mut audio) = channel(NonZeroUsize::new(capacity).unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let done_audio = Arc::clone(&done);
+        let worker = thread::spawn(move || {
+            let mut applied = 0;
+            let ((), stats) = measure(|| {
+                while !done_audio.load(Ordering::Acquire) {
+                    let result = audio.service_one(|p: &mut Payload| {
+                        assert_eq!(p.id, applied, "FIFO and exactly once");
+                        applied += 1;
+                    });
+                    assert_ne!(result, Service::ReturnPending);
+                    if result == Service::Empty {
+                        thread::yield_now();
+                    }
+                }
+            });
+            (audio, applied, stats)
+        });
+        let (mut submitted, mut reclaimed) = (0, 0);
+        let mut random = 0x1234_5678_u64;
+        let mut waiting = None;
+        let deadline = std::time::Instant::now() + WATCHDOG;
+        while reclaimed < COUNT && std::time::Instant::now() < deadline {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            if submitted < COUNT {
+                let payload = waiting.take().unwrap_or_else(|| Payload::new(submitted, &trace));
+                match control.try_publish(payload) {
+                    Ok(()) => submitted += 1,
+                    Err(payload) => waiting = Some(payload),
+                }
+            }
+            if random & 3 != 0 {
+                control.reclaim_one(|p| {
+                    assert_eq!(p.id, reclaimed, "returned FIFO");
+                    reclaimed += 1;
+                });
+            }
+            assert_eq!(control.credits(), capacity - (submitted - reclaimed));
+        }
+        done.store(true, Ordering::Release);
+        let (audio, applied, stats) = worker.join().unwrap();
+        assert_eq!(reclaimed, COUNT, "watchdog is failure, never proof of quiescence");
+        assert_eq!(applied, COUNT);
+        assert!(stats.is_zero(), "{stats:?}");
+        assert_eq!(trace.counts(), (COUNT, 0));
+        assert_eq!(control.credits(), capacity);
+        drop(audio);
+        drop(control);
+    }
 }
 
 #[test]

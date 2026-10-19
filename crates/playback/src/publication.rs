@@ -100,12 +100,14 @@ impl<T> ControlPort<T> {
 }
 
 impl<T> AudioPort<T> {
-    /// Admit at most one envelope. `apply` must be bounded and allocation/destruction-free.
+    /// Admit at most one envelope. `apply` must be bounded and allocation/destruction-free,
+    /// including destruction of its captures when it is not called (Empty or recovery).
     /// It validates the predecessor/device generation before moving resources. Rejection
     /// leaves the envelope intact for return; success moves all retired owners into it.
     ///
     /// If `apply` unwinds, the envelope stays in this port. The caller's fault handler must
     /// stop processing; the next call only returns that envelope, without applying it again.
+    /// The port adds no allocation or free during unwind; the panic runtime and `apply` may.
     /// This protects its ownership, not the semantic consistency of a half-applied plan.
     pub fn service_one(&mut self, apply: impl FnOnce(&mut T)) -> Service {
         if self.in_flight.is_none() {
