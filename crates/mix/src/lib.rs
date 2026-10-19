@@ -21,21 +21,24 @@
 //!   -3 dB, LFE dropped), or map speaker by speaker into other multichannel layouts.
 //!
 //! ## Plugin instances and threads
-//! [`MixEngine::sync`] brings plugin instances in line with the session. Built-in plugins are
-//! cheap (allocation only) and are always created there, on whichever thread renders. Hosted
-//! third-party plugins (`clap:` / `vst3:` ids, see [`is_third_party`]) are expensive and have
-//! main-thread rules, so a realtime host keeps them off the audio thread:
+//! [`MixEngine::sync`] brings plugin instances in line with the session. Hosted third-party
+//! plugins (`clap:` / `vst3:` ids, see [`is_third_party`]) are expensive and have main-thread
+//! rules; built-in plugins only allocate, but allocating is not allowed on the audio thread
+//! either. So a realtime host makes every instance off the audio thread:
 //! - with [`MixEngine::set_external_instances`]`(true)` (realtime playback), `sync` never creates a
-//!   third-party plugin. The host's control (UI) thread creates them with [`create_instance`] from
-//!   [`instance_specs`] (restoring each insert's stored [`Insert::state`] and calling `prepare`
-//!   there), and hands them over with [`MixEngine::adopt`]; `sync` then moves the matching one
-//!   into its slot. A slot whose instance has not arrived yet passes audio through.
+//!   plugin, built-in or hosted, insert, instrument or clip effect. The host's control (UI) thread
+//!   creates them with [`create_instance`] from [`realtime_instance_specs`] (restoring each hosted
+//!   insert's stored [`Insert::state`] and calling `prepare` there), and hands them over with
+//!   [`MixEngine::adopt`]; `sync` then moves the matching one into its slot. A slot whose
+//!   instance has not arrived yet passes audio through. ([`instance_specs`] lists the hosted
+//!   instances only.)
 //! - every instance `sync` replaces or removes (built-in or not) goes to a retired list instead of
 //!   being dropped; the host takes it with [`MixEngine::take_retired`] and drops it on the control
 //!   thread, so plugin destruction never runs on the audio thread either.
 //! - without external instances (the default: offline [`render_range`], bounces, tests) `sync`
-//!   creates third-party plugins itself, synchronously, restores their stored state before the
-//!   first `process`, and drops retired instances at the end of `sync`.
+//!   creates every plugin itself, synchronously (a clip effect when its clip first plays),
+//!   restores stored state before the first `process`, and drops retired instances at the end of
+//!   `sync`.
 //!
 //! An instance starts from its stored state; the insert's parameter values are then applied on
 //! top before the first block (the session's values are kept in step with the plugin, including
@@ -83,12 +86,41 @@ pub fn is_third_party(id: &str) -> bool {
         || id.starts_with(soundcraft_au_host::ID_PREFIX)
 }
 
-/// A third-party plugin instance a session needs: which slot, which plugin, how many channels,
-/// and the state to restore.
+/// Top bit of a clip-effect slot index (see [`clip_fx_slot`]). Insert slots are small, and
+/// [`INSTRUMENT_SLOT`] is never a clip-effect slot.
+const CLIP_FX_BIT: usize = 1 << (usize::BITS - 1);
+/// Built-in plugins a clip's effect chain is made of (Clip Effects).
+const CLIP_EQ: &str = "eq_7band";
+const CLIP_COMP: &str = "compressor";
+
+/// Slot index of a clip's effect module in [`InstanceSpec`] and [`PreparedInstance`]: its EQ
+/// (`comp` false) or its compressor. `None` for a clip id too large to encode (not made by
+/// [`Session::new_clip_id`] in practice); such a clip plays without its effects in realtime.
+#[must_use]
+pub fn clip_fx_slot(clip: u64, comp: bool) -> Option<usize> {
+    let clip = usize::try_from(clip).ok().filter(|c| *c < (1 << (usize::BITS - 2)) - 1)?;
+    Some(CLIP_FX_BIT | (clip << 1) | usize::from(comp))
+}
+
+/// The clip and module ([`clip_fx_slot`]) a slot index names, if it is a clip-effect slot.
+fn clip_fx_of_slot(slot: usize) -> Option<(u64, bool)> {
+    if slot == INSTRUMENT_SLOT || slot & CLIP_FX_BIT == 0 {
+        return None;
+    }
+    Some((((slot & !CLIP_FX_BIT) >> 1) as u64, slot & 1 == 1))
+}
+
+/// Which clip-effect modules (EQ, compressor) a clip's current parameters need.
+fn clip_fx_modules(s: &Session, clip: u64) -> (bool, bool) {
+    clip_fx_params(s, clip).map_or((false, false), |p| (p.clone().any(|(k, _)| k.starts_with("eq.")), p.clone().any(|(k, _)| k.starts_with("comp."))))
+}
+
+/// A plugin instance a session needs: which slot, which plugin, how many channels, and the state
+/// to restore.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstanceSpec {
     pub track: TrackId,
-    /// Insert slot index, or [`INSTRUMENT_SLOT`].
+    /// Insert slot index, [`INSTRUMENT_SLOT`], or a clip-effect slot ([`clip_fx_slot`]).
     pub slot: usize,
     pub id: String,
     /// Channel count the instance is prepared for.
@@ -109,21 +141,39 @@ pub struct PreparedInstance {
 /// Every third-party plugin slot (inserts and instruments) of a session, with the channel count
 /// [`MixEngine::sync`] prepares it for. Inactive and master tracks are included (they have strips).
 pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
+    let mut out = realtime_instance_specs(s);
+    out.retain(|x| is_third_party(&x.id));
+    out
+}
+
+/// Every plugin instance a realtime engine ([`MixEngine::set_external_instances`]) takes from
+/// its host: each insert and instrument, built-in or third-party, and each clip-effect module
+/// (an EQ or compressor per clip, [`clip_fx_slot`]) of an audio track, with the channel count
+/// [`MixEngine::sync`] prepares it for. Only third-party plugins carry a state to restore.
+/// Inactive and master tracks are included (they have strips).
+pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
     let main_ch = main_channels(s);
+    let state = |ins: &soundcraft_model::Insert| if is_third_party(&ins.plugin) { ins.state_bytes() } else { None };
     let mut out = Vec::new();
     for t in &s.tracks {
         let ch = strip_channels(t, main_ch);
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
-            if let Some(ins) = ins
-                && is_third_party(&ins.plugin)
-            {
-                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: ins.state_bytes() });
+            if let Some(ins) = ins {
+                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: state(ins) });
             }
         }
-        if let Some(ins) = &t.instrument
-            && is_third_party(&ins.plugin)
-        {
-            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: ins.state_bytes() });
+        if let Some(ins) = &t.instrument {
+            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: state(ins) });
+        }
+        if t.kind == TrackKind::Audio {
+            for clip in t.clips().iter().filter(|c| c.is_audio()) {
+                let (eq, comp) = clip_fx_modules(s, clip.id.0);
+                for (want, is_comp, id) in [(eq, false, CLIP_EQ), (comp, true, CLIP_COMP)] {
+                    if let Some(slot) = clip_fx_slot(clip.id.0, is_comp).filter(|_| want) {
+                        out.push(InstanceSpec { track: t.id, slot, id: id.to_string(), ch, state: None });
+                    }
+                }
+            }
         }
     }
     out
@@ -205,13 +255,44 @@ struct BusBuf {
     buf: Vec<Vec<f32>>,
 }
 
+/// Parameter maps up to this long are tracked inline in a [`PluginSlot`] (every built-in's is).
+const APPLIED_INLINE: usize = 64;
+
+/// The parameter values last pushed to a plugin, in the insert's parameter-map order. Up to
+/// [`APPLIED_INLINE`] values live inline, so a slot filled on the audio thread allocates nothing
+/// for them; a longer map (a hosted plugin's edited parameters) spills to the heap once.
+struct Applied {
+    len: usize,
+    inline: [f32; APPLIED_INLINE],
+    heap: Vec<f32>,
+}
+
+impl Applied {
+    const fn new() -> Self {
+        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap: Vec::new() }
+    }
+
+    /// The `n` values, all NaN ("never pushed") when the map's length changed.
+    fn values(&mut self, n: usize) -> &mut [f32] {
+        if n != self.len {
+            self.len = n;
+            if n <= APPLIED_INLINE {
+                self.inline.fill(f32::NAN);
+            } else {
+                self.heap = vec![f32::NAN; n];
+            }
+        }
+        if n <= APPLIED_INLINE { self.inline.get_mut(..n).unwrap_or_default() } else { &mut self.heap }
+    }
+}
+
 struct PluginSlot {
     id: String,
     /// Channel count the plugin was prepared for.
     ch: usize,
     plugin: Box<dyn Plugin>,
     /// Last values pushed to the plugin, in the insert's parameter-map order.
-    applied: Vec<f32>,
+    applied: Applied,
     failed: bool,
     /// A hosted plugin that has not had its first parameter pass yet (see `apply_values`).
     fresh: bool,
@@ -247,6 +328,9 @@ struct Strip {
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     clip_fx: HashMap<u64, ClipFx>,
     clipbuf: Vec<Vec<f32>>,
+    /// The engine takes its instances from the host ([`MixEngine::set_external_instances`]):
+    /// clip-effect modules come from `sync`, never from the render.
+    external: bool,
     /// Total latency of the active inserts (samples).
     latency: usize,
     /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
@@ -307,12 +391,27 @@ impl DelayLine {
 /// Clip Effects: an EQ and a compressor per clip, configured from `edit.values`
 /// (`clip_fx.<clip>.eq.<param>`, `clip_fx.<clip>.comp.<param>`, `clip_fx.<clip>.gain`).
 struct ClipFx {
-    eq: Option<Box<dyn Plugin>>,
-    comp: Option<Box<dyn Plugin>>,
+    eq: Option<ClipModule>,
+    comp: Option<ClipModule>,
+    /// The clip's parameters use the module this block. A realtime engine keeps a module whose
+    /// parameters went away (it is not dropped on the audio thread) until `sync` retires it.
+    eq_on: bool,
+    comp_on: bool,
     gain_db: f32,
     sr: f32,
     ch: usize,
+    /// Offline engines: modules are made when a clip's parameters first need them and dropped
+    /// when they no longer do. Realtime engines get them from the host through `sync`.
+    lazy: bool,
 }
+
+/// A clip-effect module and the plugin id it came with from the host (kept with it, so that
+/// string is not freed on the audio thread when the module arrives).
+type ClipModule = (Box<dyn Plugin>, String);
+
+/// Room for this many clip-effect chains per audio strip is reserved when the strip is made, so
+/// the first ones added during playback do not grow the table on the audio thread.
+const CLIP_FX_RESERVE: usize = 16;
 
 impl Strip {
     fn new() -> Self {
@@ -329,6 +428,7 @@ impl Strip {
             gr: 0.0,
             clip_fx: HashMap::new(),
             clipbuf: Vec::new(),
+            external: false,
             latency: 0,
             align: DelayLine::default(),
             align_pre: DelayLine::default(),
@@ -379,12 +479,15 @@ pub struct MixEngine {
     /// Mix the metronome (Options > Click) into the output. Playback turns this on; offline renders
     /// (bounces, stems, exports) leave it off so the click is never printed into a file.
     pub metronome: bool,
-    /// Third-party instances come from [`MixEngine::adopt`] instead of being created in `sync`.
+    /// Every plugin instance comes from [`MixEngine::adopt`] instead of being created in `sync`.
     external: bool,
-    /// Instances handed over by the host, waiting for `sync` to place them.
-    adopt: HashMap<(TrackId, usize), PreparedInstance>,
+    /// Instances handed over by the host, waiting for `sync` to place them (at most one per
+    /// slot). The buffer is the one the host sent; `adopt` hands the previous one back.
+    adopt: Vec<PreparedInstance>,
     /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
     retired: Vec<Box<dyn Plugin>>,
+    /// Scratch for `processing_order` (aux depths), reused so a re-sync does not allocate.
+    order_depth: Vec<usize>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
     /// Render every strip on the calling thread (tests compare it with the parallel render).
@@ -396,7 +499,7 @@ struct SlotCtx<'a> {
     sr: f32,
     mb: usize,
     external: bool,
-    adopt: &'a mut HashMap<(TrackId, usize), PreparedInstance>,
+    adopt: &'a mut Vec<PreparedInstance>,
     retired: &'a mut Vec<Box<dyn Plugin>>,
 }
 
@@ -407,35 +510,54 @@ impl SlotCtx<'_> {
         }
     }
 
+    fn retire_module(&mut self, module: Option<ClipModule>) {
+        if let Some((plugin, _)) = module {
+            self.retired.push(plugin);
+        }
+    }
+
+    fn waiting_at(&self, t: TrackId, idx: usize) -> Option<usize> {
+        self.adopt.iter().position(|p| p.track == t && p.slot == idx)
+    }
+
     /// True when the host handed over an instance for this slot. It replaces whatever the slot
     /// holds, even an instance of the same plugin: the host made it because it no longer tracks
     /// the old one (it was removed and re-added between two renders), and drives its editor.
     fn waiting(&self, t: TrackId, idx: usize) -> bool {
-        self.external && self.adopt.contains_key(&(t, idx))
+        self.external && self.waiting_at(t, idx).is_some()
     }
 
-    /// A new instance for `ins` on track `t`, slot `idx`, prepared for `ch` channels.
+    /// The next clip-effect module the host handed over for track `t`: its clip, whether it is
+    /// the compressor (else the EQ), and the instance.
+    fn take_clip_module(&mut self, t: TrackId) -> Option<(u64, bool, PreparedInstance)> {
+        let i = self.adopt.iter().position(|p| p.track == t && clip_fx_of_slot(p.slot).is_some())?;
+        let p = self.adopt.swap_remove(i);
+        let (clip, comp) = clip_fx_of_slot(p.slot)?;
+        Some((clip, comp, p))
+    }
+
+    /// A new instance for `ins` on track `t`, slot `idx`, prepared for `ch` channels: the one
+    /// the host handed over (realtime), or one made here (offline).
     fn make(&mut self, t: TrackId, idx: usize, ins: &soundcraft_model::Insert, ch: usize) -> Option<PluginSlot> {
         let third = is_third_party(&ins.plugin);
-        let plugin = if third && self.external {
-            match self.adopt.remove(&(t, idx)) {
-                Some(p) if p.id == ins.plugin && p.ch == ch => Some(p.plugin),
-                Some(p) => {
-                    self.retired.push(p.plugin);
-                    None
-                }
-                None => None,
+        let (plugin, id) = if self.external {
+            let p = self.waiting_at(t, idx).map(|i| self.adopt.swap_remove(i))?;
+            if p.id != ins.plugin || p.ch != ch {
+                self.retired.push(p.plugin);
+                return None;
             }
+            // The host's id string moves into the slot: nothing is copied or freed here.
+            (p.plugin, p.id)
         } else {
             let state = if third { ins.state_bytes() } else { None };
-            create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch).map(|n| n.plugin)
-        }?;
+            (create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)?.plugin, ins.plugin.clone())
+        };
         let suspendable = third && idx != INSTRUMENT_SLOT;
         Some(PluginSlot {
-            id: ins.plugin.clone(),
+            id,
             ch,
             plugin,
-            applied: Vec::new(),
+            applied: Applied::new(),
             failed: false,
             fresh: third,
             suspendable,
@@ -489,47 +611,88 @@ impl MixEngine {
             no_suspend: false,
             metronome: false,
             external: false,
-            adopt: HashMap::new(),
+            adopt: Vec::new(),
             retired: Vec::new(),
+            order_depth: Vec::new(),
             work: Vec::new(),
             serial: false,
         }
     }
 
-    /// Realtime mode: third-party plugins are created by the host and handed over with
-    /// [`MixEngine::adopt`] instead of being created in `sync` (see the crate docs).
+    /// Realtime mode: every plugin (built-in or third-party, inserts, instruments and clip
+    /// effects) is created by the host and handed over with [`MixEngine::adopt`] instead of being
+    /// created in `sync` (see the crate docs and [`realtime_instance_specs`]).
     pub fn set_external_instances(&mut self, on: bool) {
         self.external = on;
     }
 
     /// Takes instances created off the audio thread; the next render's `sync` places them.
     /// An earlier instance waiting for the same slot is retired.
-    pub fn adopt(&mut self, instances: Vec<PreparedInstance>) {
-        for p in instances {
-            if let Some(old) = self.adopt.insert((p.track, p.slot), p) {
-                self.retired.push(old.plugin);
-            }
-        }
+    ///
+    /// When everything sent before has been placed (the usual case), the engine keeps the
+    /// host's vector as its waiting list and hands the previous, emptied one back through
+    /// [`MixEngine::take_retired`], so a realtime caller neither allocates nor frees here.
+    pub fn adopt(&mut self, mut instances: Vec<PreparedInstance>) {
         // Force a re-sync so waiting slots pick their instance up.
         self.synced = (usize::MAX, usize::MAX, usize::MAX);
+        if self.adopt.is_empty() {
+            std::mem::swap(&mut self.adopt, &mut instances);
+        } else {
+            // Two hand-overs before a sync: merge (this may allocate; F01b's plan protocol
+            // coalesces on the control side instead).
+            for p in instances.drain(..) {
+                match self.adopt.iter_mut().find(|q| q.track == p.track && q.slot == p.slot) {
+                    Some(q) => {
+                        let old = std::mem::replace(q, p);
+                        self.retired.push(old.plugin);
+                    }
+                    None => self.adopt.push(p),
+                }
+            }
+        }
+        self.hand_back(instances);
+    }
+
+    /// Returns an emptied hand-over vector to the host inside the retired list, so its memory is
+    /// freed on the host's thread. The vector is converted in place (a `PreparedInstance` is a
+    /// whole multiple of a `Box<dyn Plugin>` in size and alignment): nothing is allocated.
+    fn hand_back(&mut self, spent: Vec<PreparedInstance>) {
+        const {
+            assert!(size_of::<PreparedInstance>().is_multiple_of(size_of::<Box<dyn Plugin>>()));
+            assert!(align_of::<PreparedInstance>() == align_of::<Box<dyn Plugin>>());
+        }
+        if spent.capacity() == 0 {
+            return;
+        }
+        let buf: Vec<Box<dyn Plugin>> = spent.into_iter().map(|p| p.plugin).collect();
+        if self.retired.capacity() == 0 {
+            self.retired = buf;
+        }
+        // Else the host has not taken the previous list yet (two hand-overs in one callback):
+        // `buf` is freed here. The plan protocol (F01b) returns every buffer instead.
     }
 
     /// Instances taken out of service since the last call (drop them off the audio thread).
-    /// Does not allocate.
+    /// Does not allocate. The vector can be empty and still hold memory (a hand-over vector
+    /// [`MixEngine::adopt`] gives back): a realtime host sends it off the audio thread whenever
+    /// its capacity is not zero, not only when it has elements.
     pub fn take_retired(&mut self) -> Vec<Box<dyn Plugin>> {
         std::mem::take(&mut self.retired)
     }
 
-    /// Every instance this engine holds (strips, instruments, clip effects excluded) plus the
-    /// retired and waiting ones, leaving the engine empty: hand them to another thread to drop
-    /// before replacing the engine.
+    /// Every instance this engine holds (strips, instruments, clip effects) plus the retired and
+    /// waiting ones, leaving the engine empty: hand them to another thread to drop before
+    /// replacing the engine.
     pub fn drain_plugins(&mut self) -> Vec<Box<dyn Plugin>> {
         let mut out = std::mem::take(&mut self.retired);
         for st in self.strips.values_mut() {
             out.extend(st.plugins.iter_mut().filter_map(Option::take).map(|s| s.plugin));
             out.extend(st.instrument.take().map(|s| s.plugin));
+            for fx in st.clip_fx.values_mut() {
+                out.extend(fx.eq.take().into_iter().chain(fx.comp.take()).map(|(p, _)| p));
+            }
         }
-        out.extend(self.adopt.drain().map(|(_, p)| p.plugin));
+        out.extend(self.adopt.drain(..).map(|p| p.plugin));
         self.synced = (usize::MAX, usize::MAX, usize::MAX);
         out
     }
@@ -636,6 +799,10 @@ impl MixEngine {
                     cx.retire(p);
                 }
                 cx.retire(st.instrument.take());
+                for fx in st.clip_fx.values_mut() {
+                    cx.retire_module(fx.eq.take());
+                    cx.retire_module(fx.comp.take());
+                }
             }
         }
         for t in &s.tracks {
@@ -679,13 +846,13 @@ impl MixEngine {
                 strip.sample = None;
             }
             sync_sample(strip, want, s);
+            if t.kind == TrackKind::Audio {
+                sync_clip_fx(strip, t, s, ch, &mut cx);
+            }
         }
         // Instances nobody claimed (the session changed again before they arrived).
-        let leftovers: Vec<(TrackId, usize)> = cx.adopt.keys().copied().collect();
-        for k in leftovers {
-            if let Some(p) = cx.adopt.remove(&k) {
-                cx.retired.push(p.plugin);
-            }
+        while let Some(p) = cx.adopt.pop() {
+            cx.retired.push(p.plugin);
         }
         if !self.external {
             self.retired.clear();
@@ -708,7 +875,7 @@ impl MixEngine {
         let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
         if key != self.synced {
             self.sync(s);
-            self.order = processing_order(s);
+            processing_order(s, &mut self.order, &mut self.order_depth);
             self.synced = key;
         }
     }
@@ -1074,7 +1241,22 @@ fn process_strip(
                             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
                         }
                         render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
-                        let fx = strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(s.sample_rate.as_f64() as f32, nch));
+                        let sr = s.sample_rate.as_f64() as f32;
+                        let mut gain_only;
+                        let fx = if strip.external {
+                            // Realtime: `sync` placed the chain with its modules. A clip without
+                            // one (only a gain, or modules still on their way) uses a chain
+                            // without modules here, which allocates nothing.
+                            match strip.clip_fx.get_mut(&clip.id.0) {
+                                Some(fx) => fx,
+                                None => {
+                                    gain_only = ClipFx::new(sr, nch, false);
+                                    &mut gain_only
+                                }
+                            }
+                        } else {
+                            strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(sr, nch, true))
+                        };
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
                         for (d, c) in strip.buf.iter_mut().zip(strip.clipbuf.iter()) {
@@ -1332,39 +1514,42 @@ impl std::fmt::Write for Key {
 }
 
 impl ClipFx {
-    fn new(sr: f32, ch: usize) -> ClipFx {
-        ClipFx { eq: None, comp: None, gain_db: 0.0, sr, ch }
+    fn new(sr: f32, ch: usize, lazy: bool) -> ClipFx {
+        ClipFx { eq: None, comp: None, eq_on: false, comp_on: false, gain_db: 0.0, sr, ch, lazy }
     }
-    fn make(&self, id: &str) -> Option<Box<dyn Plugin>> {
+    fn make(&self, id: &str) -> Option<ClipModule> {
         soundcraft_dsp::create(id).map(|mut p| {
             p.prepare(self.sr, 16_384, self.ch.max(1));
-            p
+            (p, String::new())
         })
     }
-    /// Modules exist only when one of their parameters is set.
+    /// A module runs only while one of its parameters is set. Offline, modules are made and
+    /// dropped here accordingly; realtime, `sync` places and retires them.
     fn configure<'a>(&mut self, params: impl Iterator<Item = (&'a str, f32)> + Clone) {
         self.gain_db = 0.0;
-        let has_eq = params.clone().any(|(k, _)| k.starts_with("eq."));
-        let has_comp = params.clone().any(|(k, _)| k.starts_with("comp."));
-        if has_eq && self.eq.is_none() {
-            self.eq = self.make("eq_7band");
-        } else if !has_eq {
-            self.eq = None;
-        }
-        if has_comp && self.comp.is_none() {
-            self.comp = self.make("compressor");
-        } else if !has_comp {
-            self.comp = None;
+        self.eq_on = params.clone().any(|(k, _)| k.starts_with("eq."));
+        self.comp_on = params.clone().any(|(k, _)| k.starts_with("comp."));
+        if self.lazy {
+            if self.eq_on && self.eq.is_none() {
+                self.eq = self.make(CLIP_EQ);
+            } else if !self.eq_on {
+                self.eq = None;
+            }
+            if self.comp_on && self.comp.is_none() {
+                self.comp = self.make(CLIP_COMP);
+            } else if !self.comp_on {
+                self.comp = None;
+            }
         }
         for (k, v) in params {
             if let Some(p) = k.strip_prefix("eq.") {
-                if let Some(eq) = &mut self.eq
+                if let Some((eq, _)) = &mut self.eq
                     && eq.param(p) != Some(v)
                 {
                     eq.set_param(p, v);
                 }
             } else if let Some(p) = k.strip_prefix("comp.") {
-                if let Some(c) = &mut self.comp
+                if let Some((c, _)) = &mut self.comp
                     && c.param(p) != Some(v)
                 {
                     c.set_param(p, v);
@@ -1375,10 +1560,10 @@ impl ClipFx {
         }
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        if let Some(eq) = &mut self.eq {
+        if let Some((eq, _)) = self.eq.as_mut().filter(|_| self.eq_on) {
             eq.process(io, frames);
         }
-        if let Some(c) = &mut self.comp {
+        if let Some((c, _)) = self.comp.as_mut().filter(|_| self.comp_on) {
             c.process(io, frames);
         }
         if self.gain_db.abs() > 1e-6 {
@@ -1388,6 +1573,44 @@ impl ClipFx {
             }
         }
     }
+}
+
+/// Brings an audio strip's clip-effect chains in line with its clips: places the modules the
+/// host handed over (realtime), and retires modules whose clip is gone or whose parameters no
+/// longer use them (bypassed clips included), so they are dropped off the audio thread. A
+/// realtime strip also gets its clip buffer and room for [`CLIP_FX_RESERVE`] chains here, when
+/// it is made, instead of when a clip effect is first added during playback.
+fn sync_clip_fx(strip: &mut Strip, t: &Track, s: &Session, ch: usize, cx: &mut SlotCtx<'_>) {
+    strip.external = cx.external;
+    if cx.external {
+        if strip.clipbuf.len() != ch || strip.clipbuf.first().map_or(0, Vec::len) < cx.mb {
+            strip.clipbuf = vec![vec![0.0; cx.mb]; ch];
+        }
+        if strip.clip_fx.capacity() == 0 {
+            strip.clip_fx.reserve(CLIP_FX_RESERVE);
+        }
+    }
+    while let Some((clip, comp, p)) = cx.take_clip_module(t.id) {
+        if p.ch != ch {
+            cx.retired.push(p.plugin);
+            continue;
+        }
+        let fx = strip.clip_fx.entry(clip).or_insert_with(|| ClipFx::new(cx.sr, ch, !cx.external));
+        let module = Some((p.plugin, p.id));
+        let old = if comp { std::mem::replace(&mut fx.comp, module) } else { std::mem::replace(&mut fx.eq, module) };
+        cx.retire_module(old);
+    }
+    strip.clip_fx.retain(|clip, fx| {
+        let exists = t.clips().iter().any(|c| c.id.0 == *clip);
+        let (eq, comp) = if exists { clip_fx_modules(s, *clip) } else { (false, false) };
+        if !eq {
+            cx.retire_module(fx.eq.take());
+        }
+        if !comp {
+            cx.retire_module(fx.comp.take());
+        }
+        exists
+    });
 }
 
 /// Hash of everything `sync`/`processing_order` depend on (tracks, kinds, routing, plugins, sends).
@@ -1620,42 +1843,37 @@ fn strip_format(t: &Track, n: usize) -> ChannelFormat {
     if t.format.channels().min(MAX_CHANNELS) == n { t.format } else { ChannelFormat::for_channels(n) }
 }
 
-/// Audio/instrument tracks first, then auxes ordered so bus producers come before consumers.
-fn processing_order(s: &Session) -> Vec<usize> {
-    let mut order: Vec<usize> =
-        (0..s.tracks.len()).filter(|&i| s.tracks.get(i).is_some_and(|t| !matches!(t.kind, TrackKind::Aux | TrackKind::Folder))).collect();
-    let mut auxes: Vec<usize> =
-        (0..s.tracks.len()).filter(|&i| s.tracks.get(i).is_some_and(|t| matches!(t.kind, TrackKind::Aux | TrackKind::Folder))).collect();
-    // Depth = how many aux hops feed this aux's input bus (bounded; cycles cap out).
-    let depth = |i: usize| -> usize {
-        let mut d = 0;
-        let mut cur = vec![i];
-        for _ in 0..8 {
-            let inputs: Vec<&Route> = cur.iter().filter_map(|&k| s.tracks.get(k)).map(|t| &t.mixer.input).collect();
-            let feeders: Vec<usize> = auxes_feeding(s, &inputs);
-            if feeders.is_empty() {
-                break;
-            }
-            d += 1;
-            cur = feeders;
-        }
-        d
-    };
-    auxes.sort_by_key(|&i| depth(i));
-    order.extend(auxes);
-    order
-}
+/// Longest chain of auxes feeding one another that the processing order tells apart (cycles
+/// cap out here).
+const MAX_AUX_DEPTH: usize = 8;
 
-fn auxes_feeding(s: &Session, inputs: &[&Route]) -> Vec<usize> {
-    s.tracks
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| matches!(t.kind, TrackKind::Aux | TrackKind::Folder))
-        .filter(|(_, t)| {
-            inputs.iter().any(|r| matches!(r, Route::Bus(_)) && (&&t.mixer.output == r || t.mixer.sends.iter().flatten().any(|sn| &&sn.target == r)))
-        })
-        .map(|(i, _)| i)
-        .collect()
+/// Writes the processing order into `order`: audio/instrument tracks first, then auxes ordered so
+/// bus producers come before consumers (by depth, then track order). `depth` is scratch. Both
+/// keep their capacity, so a re-sync allocates only when the track count grew.
+fn processing_order(s: &Session, order: &mut Vec<usize>, depth: &mut Vec<usize>) {
+    let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
+    // `f` feeds aux `t` when it is an aux whose output or a send goes to `t`'s input bus.
+    let feeds = |f: &Track, t: &Track| {
+        let r = &t.mixer.input;
+        is_aux(f) && matches!(r, Route::Bus(_)) && (&f.mixer.output == r || f.mixer.sends.iter().flatten().any(|sn| &sn.target == r))
+    };
+    order.clear();
+    order.extend(s.tracks.iter().enumerate().filter(|(_, t)| !is_aux(t)).map(|(i, _)| i));
+    // Depth = the longest chain of auxes feeding this aux's input bus, capped. Each round extends
+    // every chain by one hop, so after MAX_AUX_DEPTH rounds each depth is min(longest, cap).
+    depth.clear();
+    depth.resize(s.tracks.len(), 0);
+    for _ in 0..MAX_AUX_DEPTH {
+        for (j, t) in s.tracks.iter().enumerate().filter(|(_, t)| is_aux(t)) {
+            let deepest = s.tracks.iter().zip(depth.iter()).filter(|(f, _)| feeds(f, t)).map(|(_, d)| (d + 1).min(MAX_AUX_DEPTH)).max();
+            if let (Some(d), Some(slot)) = (deepest, depth.get_mut(j)) {
+                *slot = (*slot).max(d);
+            }
+        }
+    }
+    for d in 0..=MAX_AUX_DEPTH {
+        order.extend(s.tracks.iter().zip(depth.iter()).enumerate().filter(|(_, (t, dt))| is_aux(t) && **dt == d).map(|(i, _)| i));
+    }
 }
 
 /// Implicit solo: an aux is not muted when a soloed track feeds its input bus.
@@ -2000,15 +2218,12 @@ fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track
 /// Sends each stored param (as mapped by `value`) to the plugin when it changed since last time,
 /// and then marks the slot [`woken`](PluginSlot::woken).
 fn apply_values(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, value: impl Fn(&str, f32) -> f32) {
-    if slot.applied.len() != ins.params.len() {
-        slot.applied = vec![f32::NAN; ins.params.len()];
-    }
     // First pass over a hosted plugin: it has just loaded its own settings, so a stored value equal to
     // the default it reports is not a choice and is left alone. Older sessions store every parameter
     // at that default, often 0, and pushing them over a restored plugin silenced Rhapsody (volume and
     // pan at minimum). Values that differ from the default, and every later change, are pushed.
     let first = std::mem::take(&mut slot.fresh);
-    for ((k, v), last) in ins.params.iter().zip(slot.applied.iter_mut()) {
+    for ((k, v), last) in ins.params.iter().zip(slot.applied.values(ins.params.len()).iter_mut()) {
         let val = value(k, *v);
         if val.to_bits() != last.to_bits() {
             let untouched = first && slot.plugin.info().param(k).is_some_and(|pi| pi.default.to_bits() == val.to_bits());
@@ -2503,7 +2718,7 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
             Some(params) => {
                 let mut tmp = vec![vec![0.0f32; len]; out.len()];
                 render_clip(s, c, range.start, len, &mut tmp, &mut scratch);
-                let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len());
+                let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len(), true);
                 fx.configure(params);
                 let mut done = 0;
                 while done < len {
@@ -2819,6 +3034,82 @@ mod tests {
             pl.clips.push(Clip::audio(id, "dc", SourceId(900), 0, 0, frames as i64));
         }
         t
+    }
+
+    #[test]
+    fn every_builtin_parameter_map_is_tracked_inline() {
+        for info in soundcraft_dsp::plugins() {
+            assert!(info.params.len() <= APPLIED_INLINE, "{}: {} parameters", info.id, info.params.len());
+        }
+        let mut a = Applied::new();
+        assert!(a.values(3).iter().all(|x| x.is_nan()));
+        a.values(3).fill(1.0);
+        assert_eq!(a.values(3), [1.0; 3], "kept while the map's length stays");
+        assert_eq!(a.values(APPLIED_INLINE + 1).len(), APPLIED_INLINE + 1, "a longer map spills to the heap");
+    }
+
+    #[test]
+    fn clip_effect_slots_round_trip_and_never_collide() {
+        for clip in [0u64, 1, 7, 1 << 20] {
+            for comp in [false, true] {
+                let slot = clip_fx_slot(clip, comp).unwrap();
+                assert_eq!(clip_fx_of_slot(slot), Some((clip, comp)));
+                assert_ne!(slot, INSTRUMENT_SLOT);
+            }
+        }
+        assert_eq!(clip_fx_of_slot(INSTRUMENT_SLOT), None);
+        assert_eq!(clip_fx_of_slot(3), None, "insert slots are not clip-effect slots");
+        assert_eq!(clip_fx_slot(u64::MAX, false), None);
+    }
+
+    #[test]
+    fn realtime_specs_list_builtins_and_clip_effects_and_instance_specs_only_hosted_ones() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("room_reverb"));
+        s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.x"));
+        let clip = s.track(t).unwrap().clips()[0].id.0;
+        s.edit.values.insert(format!("clip_fx.{clip}.comp.threshold"), -20.0);
+        let specs = realtime_instance_specs(&s);
+        let slots: Vec<(usize, &str)> = specs.iter().map(|x| (x.slot, x.id.as_str())).collect();
+        assert_eq!(slots, [(0, "room_reverb"), (1, "clap:test.x"), (clip_fx_slot(clip, true).unwrap(), CLIP_COMP)]);
+        assert!(specs.iter().all(|x| x.state.is_none()));
+        assert_eq!(instance_specs(&s).iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["clap:test.x"]);
+    }
+
+    #[test]
+    fn a_realtime_engine_creates_no_builtin_and_plays_adopted_ones() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let mut ins = Insert::new("gain");
+        ins.params.insert("gain".into(), -12.0);
+        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
+        let render = |eng: &mut MixEngine| {
+            let mut out = vec![vec![0.0; 256]; 2];
+            (0..8)
+                .flat_map(|b| {
+                    eng.render(&s, b * 256, 256, &mut out);
+                    out[0].clone()
+                })
+                .collect::<Vec<f32>>()
+        };
+        let realtime = || {
+            let mut eng = MixEngine::new(48_000.0, 256);
+            eng.set_external_instances(true);
+            eng
+        };
+        let reference = render(&mut MixEngine::new(48_000.0, 256));
+        let dry = render(&mut realtime());
+        let tail = |x: &[f32]| peak(x.get(x.len() - 256..).unwrap_or_default());
+        assert!(tail(&dry) > tail(&reference) * 2.0, "nothing adopted: the slot passes audio through");
+        let mut eng = realtime();
+        let spec = realtime_instance_specs(&s).remove(0);
+        let plugin = create_instance(&spec.id, None, 48_000.0, 256, spec.ch).unwrap().plugin;
+        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: spec.id, ch: spec.ch, plugin }]);
+        assert_eq!(render(&mut eng), reference, "the adopted gain plays as the offline engine's own");
+        assert_eq!(eng.take_retired().capacity(), 0, "nothing retired");
+        // The engine keeps the host's (now empty) vector until the next hand-over returns it.
+        eng.adopt(Vec::new());
+        let back = eng.take_retired();
+        assert!(back.is_empty() && back.capacity() > 0, "the emptied hand-over vector comes back to the host");
     }
 
     #[test]
