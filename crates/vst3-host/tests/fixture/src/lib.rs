@@ -907,12 +907,16 @@ impl IAudioProcessorTrait for Synth {
             return kResultOk;
         }
         let frames = d.numSamples.max(0) as usize;
+        #[deny(clippy::undocumented_unsafe_blocks)]
         if self.events {
             // Allocation-free, so hosts can measure their own audio path around it.
+            // SAFETY: IAudioProcessor::process supplies the one output bus checked above.
             let bus = unsafe { &*d.outputs };
             let n = bus.numChannels.max(0) as usize;
+            // SAFETY: The SDK bus has n channel pointers; this fixture negotiates kSample32.
             let table = unsafe { std::slice::from_raw_parts(bus.__field0.channelBuffers32, n) };
             let Some(&first) = table.first() else { return kResultOk };
+            // SAFETY: The SDK provides frames writable f32 samples on the first output channel.
             let out = unsafe { std::slice::from_raw_parts_mut(first, frames) };
             out.fill(0.0);
             let mut w = 0;
@@ -924,20 +928,27 @@ impl IAudioProcessorTrait for Synth {
                     w += 1;
                 }
             };
+            // SAFETY: inputEvents is null or a borrowed IEventList valid for this process call.
             if let Some(list) = unsafe { ComRef::from_raw(d.inputEvents) } {
+                // SAFETY: list is the live SDK interface borrowed above.
                 for i in 0..unsafe { list.getEventCount() } {
+                    // SAFETY: SDK Event contains C scalars and a union, all valid as zero bits; getEvent fills its tagged payload.
                     let mut e: Event = unsafe { std::mem::zeroed() };
+                    // SAFETY: i is within the SDK list and e is writable Event storage.
                     if unsafe { list.getEvent(i, &mut e) } != kResultOk {
                         continue;
                     }
                     let ty = e.r#type;
                     let (code, ch, pitch, id) = if ty == Event_::EventTypes_::kNoteOnEvent as u16 {
+                        // SAFETY: The successful SDK event read has the kNoteOnEvent union tag.
                         let n = unsafe { e.__field0.noteOn };
                         (1.0, n.channel, n.pitch, n.noteId)
                     } else if ty == Event_::EventTypes_::kNoteOffEvent as u16 {
+                        // SAFETY: The successful SDK event read has the kNoteOffEvent union tag.
                         let n = unsafe { e.__field0.noteOff };
                         (2.0, n.channel, n.pitch, n.noteId)
                     } else if ty == Event_::EventTypes_::kPolyPressureEvent as u16 {
+                        // SAFETY: The successful SDK event read has the kPolyPressureEvent union tag.
                         let n = unsafe { e.__field0.polyPressure };
                         (3.0, n.channel, n.pitch, n.noteId)
                     } else {
@@ -946,12 +957,18 @@ impl IAudioProcessorTrait for Synth {
                     put([code, e.sampleOffset as f32, f32::from(ch) * 1000.0 + f32::from(pitch), id as f32]);
                 }
             }
+            // SAFETY: inputParameterChanges is null or a borrowed SDK interface valid in process.
             if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
+                // SAFETY: changes is the live IParameterChanges interface borrowed above.
                 for i in 0..unsafe { changes.getParameterCount() } {
+                    // SAFETY: i is in the SDK changes list; its queue remains borrowed for process.
                     let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
+                    // SAFETY: q is the live IParamValueQueue returned by the SDK interface.
                     let pid = unsafe { q.getParameterId() };
+                    // SAFETY: q remains valid for this process call.
                     for k in 0..unsafe { q.getPointCount() } {
                         let (mut at, mut v) = (0i32, 0f64);
+                        // SAFETY: k is in the SDK queue; at and v are writable output values.
                         if unsafe { q.getPoint(k, &mut at, &mut v) } == kResultOk {
                             put([4.0, at as f32, pid as f32, (v * 1e6).round() as f32]);
                         }
@@ -959,7 +976,9 @@ impl IAudioProcessorTrait for Synth {
                 }
             }
             for &p in table.iter().skip(1) {
+                // SAFETY: This SDK channel has frames writable samples distinct from the first channel (no input buses).
                 let o = unsafe { std::slice::from_raw_parts_mut(p, frames) };
+                // SAFETY: The first SDK output channel remains live and has frames initialized samples.
                 o.copy_from_slice(unsafe { std::slice::from_raw_parts(first, frames) });
             }
             return kResultOk;
