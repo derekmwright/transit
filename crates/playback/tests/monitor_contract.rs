@@ -215,6 +215,22 @@ fn idle_clear_counts_an_overflow_recovery_exactly_once() {
 }
 
 #[test]
+fn the_backlog_gauge_includes_unconsumed_interpolation_history() {
+    for (rate, input_frames, output_frames, remaining) in [(24_000, 1, 1, 1), (44_100, 1000, 100, 909)] {
+        let ring = InputRing::new(1, rate);
+        ring.push(&vec![0.25; input_frames]);
+        let mut output = vec![vec![0.0; output_frames]];
+        ring.pop_into(&mut output, output_frames, 48_000);
+        // The first case retains left; the second retains a prefetched right frame.
+        assert_eq!(ring.buffered_input_frames(), remaining);
+        assert_eq!(ring.telemetry(), MonitorTelemetry::default());
+        ring.clear_monitor();
+        assert_eq!(ring.buffered_input_frames(), 0);
+        assert_eq!(ring.telemetry().discarded_frames, remaining as u64);
+    }
+}
+
+#[test]
 fn concurrent_publication_reads_and_clears_conserve_aligned_ordered_frames() {
     use std::sync::{
         Arc,
