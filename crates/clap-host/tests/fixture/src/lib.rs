@@ -154,10 +154,10 @@ fn on_io_thread(host: *const clap_host, f: impl FnOnce(HostPtr) + Send + 'static
 
 /// `CMD:process-now`, `CMD:process-after:<ms>`, `CMD:flush-now`, `CMD:callback-now`,
 /// `CMD:restart-now:<latency>`, `CMD:restart-at:<process call>:<latency>`,
-/// `CMD:rescan-values:<gain>`. The `-now` requests come from another thread (an "IO" thread),
+/// `CMD:rescan-values:<gain>`, `CMD:rescan-all:<gain>`. The `-now` requests come from another thread (an "IO" thread),
 /// joined before this returns; `process-after` leaves that thread running; `restart-at` asks from
 /// the audio thread (inside `process`); `rescan-values` changes the gain "internally" and calls
-/// `params.rescan` on this (main) thread, and then refuses the "state", so that the host learns of
+/// `params.rescan` (`VALUES` or `ALL`) on this (main) thread, and then refuses the "state", so that the host learns of
 /// the values only through the rescan. True when the command was taken as a state.
 fn requests_command(f: &mut Fx, cmd: &str) -> bool {
     let parts: Vec<&str> = cmd.split(':').collect();
@@ -196,10 +196,11 @@ fn requests_command(f: &mut Fx, cmd: &str) -> bool {
             });
         }
         Some("restart-at") => f.restart_at = num(1).zip(num(2).map(|l| l as u32)),
-        Some("rescan-values") => {
+        Some(which @ ("rescan-values" | "rescan-all")) => {
             f.gain = parts.get(1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(1.0);
             let params = unsafe { host_ext::<clap_host_params>(f.host, CLAP_EXT_PARAMS).as_ref() }.expect("host params");
-            unsafe { (params.rescan.unwrap())(f.host, CLAP_PARAM_RESCAN_VALUES) };
+            let flags = if which == "rescan-all" { CLAP_PARAM_RESCAN_ALL } else { CLAP_PARAM_RESCAN_VALUES };
+            unsafe { (params.rescan.unwrap())(f.host, flags) };
             note(f, &format!("cmd {cmd}"));
             return false;
         }
@@ -271,7 +272,9 @@ unsafe extern "C" fn stop_processing(p: *const clap_plugin) {
 }
 
 unsafe extern "C" fn reset(p: *const clap_plugin) {
-    unsafe { fx(p) }.level = 0.0;
+    let f = unsafe { fx(p) };
+    f.level = 0.0;
+    note(f, "reset");
 }
 
 fn apply(f: &mut Fx, h: &clap_event_header) {
@@ -568,7 +571,7 @@ unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istre
     }
     // The gain plugin takes one command too: `CMD:rescan-values:<gain>`.
     if let Some(cmd) = std::str::from_utf8(&bytes[..got]).ok().and_then(|t| t.strip_prefix("CMD:"))
-        && cmd.starts_with("rescan-values:")
+        && cmd.starts_with("rescan-")
     {
         return requests_command(f, &cmd.to_string());
     }

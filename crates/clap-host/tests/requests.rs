@@ -253,6 +253,105 @@ fn a_values_rescan_is_read_on_main_and_reported_like_an_editor_edit() {
     assert_eq!(p.param("7"), Some(1.0));
     let off = std::thread::spawn(soundcraft_clap_host::service_requests).join().unwrap();
     assert_eq!(off.rescans, 0, "not off the main thread");
-    assert_eq!(ed.idle(), vec![("7".to_string(), 1.25), ("3".to_string(), 0.0)], "re-read values, reported for the session");
+    assert_eq!(ed.idle(), vec![("7".to_string(), 1.25)], "the re-read value that differs from the host's, reported for the session");
     assert!(ed.idle().is_empty(), "once");
+    // The host now holds 1.25. The same value again is no news; a value back to what the host
+    // set before is (review R7: the baseline is the host's view, not the last value read).
+    assert!(!p.load_state(b"CMD:rescan-values:1.25"));
+    assert!(ed.idle().is_empty(), "nothing differs from the host's view");
+    assert!(p.set_param("7", 0.5));
+    assert!(!p.load_state(b"CMD:rescan-values:1.25"));
+    assert_eq!(ed.idle(), vec![("7".to_string(), 1.25)], "differs from the 0.5 the host set");
+    // CLAP_PARAM_RESCAN_ALL re-reads the values too.
+    assert!(!p.load_state(b"CMD:rescan-all:0.75"));
+    assert_eq!(ed.idle(), vec![("7".to_string(), 0.75)]);
+}
+
+/// The fixture's gain applied to a 0.5 input at 48 kHz: 2 ms fades are 96 samples.
+const FADE: usize = 96;
+
+/// Review R1: while the main thread restarts it, the slot outputs silence with a short fade out
+/// from its last output and a fade in when it processes again, never the unprocessed input, and
+/// keeps reporting its latency (delay compensation stays aligned).
+#[test]
+fn a_parked_block_is_silent_with_fades_and_keeps_the_latency() {
+    let (mut p, _reader, _) = new_requests();
+    assert!(p.set_param("7", 0.25));
+    p.set_input_silent(false);
+    let block = |p: &mut Box<dyn Plugin>| {
+        let mut io = vec![vec![0.5f32; BLOCK]; 2];
+        p.process(&mut io, BLOCK);
+        io
+    };
+    let wet = block(&mut p)[0][BLOCK - 1];
+    assert!((wet - 0.125).abs() < 1e-6);
+    assert!(p.load_state(b"CMD:restart-now:32"));
+    let s = soundcraft_clap_host::service_requests();
+    assert_eq!(s.restarts_waiting, 1, "it is processing: the audio side parks it first");
+    let parking = block(&mut p);
+    let parked = block(&mut p);
+    assert_eq!(p.latency(), 5, "the latency stays until the restart is done");
+    let out: Vec<f32> = parking[0].iter().chain(&parked[0]).copied().collect();
+    for (i, &x) in out.iter().enumerate() {
+        let want = if i < FADE { wet * (1.0 - i as f32 / FADE as f32) } else { 0.0 };
+        assert!((x - want).abs() < 1e-6, "sample {i}: {x}, want {want} (a fade out from {wet}, never the 0.5 input)");
+    }
+    assert_eq!(parking[0], parking[1], "every channel");
+    assert_eq!(soundcraft_clap_host::service_requests().restarted, 1);
+    assert_eq!(p.latency(), 32);
+    let a = block(&mut p);
+    let b = block(&mut p);
+    let out: Vec<f32> = a[0].iter().chain(&b[0]).copied().collect();
+    for (i, &x) in out.iter().enumerate() {
+        let want = if i < FADE { wet * i as f32 / FADE as f32 } else { wet };
+        assert!((x - want).abs() < 1e-6, "sample {i}: {x}, want {want} (a fade in)");
+    }
+}
+
+/// Review R4: a restart parked while nothing calls `process` any more (device stopped, insert
+/// bypassed) is completed by the main thread after a bounded wait. CLAP `thread-check.h`: "The
+/// host may mark any OS thread, including the main-thread as the audio-thread", as long as "only
+/// one OS thread is the audio-thread at a time in a plugin instance"; holding the instance makes
+/// the main thread that one thread for `stop_processing`.
+#[test]
+fn a_parked_restart_without_callbacks_completes_on_main_after_a_deadline() {
+    let (mut p, mut reader, base) = new_requests();
+    p.set_input_silent(false);
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK); // in the processing state
+    assert!(p.load_state(b"CMD:restart-now:32"));
+    // The device stops: no more process calls.
+    let first = soundcraft_clap_host::service_requests();
+    assert_eq!((first.restarted, first.restarts_waiting), (0, 1));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut done = 0;
+    while done == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        done = soundcraft_clap_host::service_requests().restarted;
+    }
+    assert_eq!(done, 1, "completed without an audio callback");
+    assert_eq!(p.latency(), 32);
+    let r = Report::read(&mut reader).since(base);
+    let names = r.names();
+    let stop = names.iter().position(|n| *n == "stop_processing").expect("stopped");
+    assert_eq!(&names[stop..stop + 3], ["stop_processing", "deactivate", "activate"], "{names:?}");
+    assert_eq!(r.log[stop].1, r.me, "the main thread stood in as the audio thread");
+    // It processes again when callbacks resume.
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    assert_eq!(Report::read(&mut reader).processes, 2);
+}
+
+/// Review R6: `reset` (stop, seek) always reaches the plug-in, on the audio side, before its next
+/// block, however busy the main thread keeps the instance.
+#[test]
+fn reset_reaches_the_plugin_before_its_next_block() {
+    let (mut p, mut reader, base) = new_requests();
+    p.set_input_silent(false);
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    p.reset();
+    p.process(&mut vec![vec![0.5f32; BLOCK]; 2], BLOCK);
+    let r = Report::read(&mut reader).since(base);
+    let names = r.names();
+    let reset = names.iter().position(|n| *n == "reset").expect("reset");
+    assert_eq!(names[reset + 1], "process", "{names:?}");
+    assert_eq!(r.log[reset].1, r.log[reset + 1].1, "on the thread that processes");
 }

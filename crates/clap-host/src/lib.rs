@@ -35,6 +35,8 @@ pub mod scan;
 #[allow(unsafe_code)]
 mod ffi;
 #[cfg(not(target_arch = "wasm32"))]
+mod gate;
+#[cfg(not(target_arch = "wasm32"))]
 mod plugin;
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
@@ -216,6 +218,8 @@ pub struct Serviced {
     pub restarts_waiting: usize,
     pub callbacks: usize,
     pub rescans: usize,
+    pub restarted_without_audio: usize,
+    pub pending: usize,
     pub other_thread: usize,
 }
 
