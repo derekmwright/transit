@@ -62,8 +62,12 @@ fn move_strip(old: &mut Strip, new: &mut Strip) {
     for (a, b) in [(&mut old.tap, &mut new.tap), (&mut old.tap_pre, &mut new.tap_pre)] {
         if b.is_placeholder() {
             std::mem::swap(a, b);
+        } else {
+            // Longer lines prepared by the plan: the delay continues from the old line's history.
+            b.take_history(a);
         }
     }
+    new.edges = old.edges;
     if old.meter.peaks.len() == new.meter.peaks.len() {
         std::mem::swap(&mut old.meter, &mut new.meter);
     }

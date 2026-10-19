@@ -68,8 +68,8 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, ProcessStatus, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, RouteScratch, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId,
-    TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, RouteScratch, SEND_SLOTS, Session, SourceAudio, Speaker, SurroundPan,
+    Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
@@ -468,6 +468,8 @@ struct Strip {
     /// arrives with plus its own), and its place in the render order.
     pdc_out: usize,
     pdc_pos: usize,
+    /// Each edge's read of the delay lines: 0 the output, 1 + i send i.
+    edges: [EdgeTap; SEND_SLOTS + 1],
     failures: PluginFailures,
     /// Plan mode: the strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that
     /// waits for a move, in a strip whose state moved out, and in legacy engines.
@@ -501,7 +503,14 @@ struct DelayLine {
     cap: Option<usize>,
     /// The ring holds the strip's recent blocks: it was written every block since it was zeroed.
     live: bool,
+    /// Samples of continuous history the ring holds (at most its length).
+    written: usize,
+    /// The line started this block (it was idle): its taps start at their delay, from silence.
+    fresh: bool,
 }
+
+/// Samples over which an edge crossfades from its old delay to a new one.
+const XFADE: usize = 256;
 
 impl DelayLine {
     /// A plan-mode stand-in in a strip shell whose live lines move in with the strip state.
@@ -513,9 +522,15 @@ impl DelayLine {
         self.cap == Some(0) && self.bufs.is_empty()
     }
 
+    /// A delay line serving delays up to `cap` samples, in blocks up to `block`: plan mode
+    /// (`fixed`) never resizes it, a legacy engine's may be replaced by a longer one.
+    fn sized(ch: usize, cap: usize, block: usize, fixed: bool) -> Self {
+        DelayLine { bufs: vec![vec![0.0; cap.saturating_add(block)]; ch], len: cap, cap: fixed.then_some(cap), ..DelayLine::default() }
+    }
+
     /// A plan-mode delay line serving delays up to `cap` samples, in blocks up to `block`.
     fn with_capacity(ch: usize, cap: usize, block: usize) -> Self {
-        DelayLine { bufs: vec![vec![0.0; cap.saturating_add(block)]; ch], idx: 0, len: cap, cap: Some(cap), live: false }
+        Self::sized(ch, cap, block, true)
     }
 
     fn ring(&self) -> usize {
@@ -530,10 +545,29 @@ impl DelayLine {
         if need > self.len { need } else { 0 }
     }
 
+    /// Takes over `old`'s history (its most recent samples, in order), so the delay continues
+    /// across a replacement. Copies only; allocates nothing.
+    fn take_history(&mut self, old: &DelayLine) {
+        let (size, osize) = (self.ring(), old.ring());
+        let n = old.written.min(osize).min(size);
+        for (c, ring) in self.bufs.iter_mut().enumerate() {
+            ring.fill(0.0);
+            let Some(src) = old.bufs.get(c).filter(|_| osize > 0) else { continue };
+            for k in 0..n {
+                if let (Some(d), Some(x)) = (ring.get_mut(size - n + k), src.get((old.idx + osize - n + k) % osize)) {
+                    *d = *x;
+                }
+            }
+        }
+        self.idx = 0;
+        self.written = n;
+        self.live = old.live && n > 0;
+        self.fresh = false;
+    }
+
     /// Control side (legacy engines; a plan-mode line keeps the storage its plan prepared): makes
     /// the line hold delays up to `need` for `ch` channels in blocks up to `block`, sized as a
-    /// plan sizes its lines. It grows (never shrinks) keeping the history it holds, so a delay
-    /// change reads the same samples in both paths.
+    /// plan sizes its lines. It grows (never shrinks) keeping the history it holds.
     fn grow(&mut self, need: usize, ch: usize, block: usize) {
         if self.cap.is_some() {
             return;
@@ -543,24 +577,10 @@ impl DelayLine {
         }
         let need = need.min(MAX_LATENCY);
         if need > self.len || self.bufs.is_empty() {
-            let len = need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY).max(self.len);
-            let size = len.saturating_add(block);
-            let old = self.ring();
-            for ring in self.bufs.iter_mut() {
-                let mut grown = vec![0.0; size];
-                for k in 0..old {
-                    if let (Some(d), Some(x)) = (grown.get_mut(size - old + k), ring.get((self.idx + k) % old)) {
-                        *d = *x;
-                    }
-                }
-                *ring = grown;
-            }
-            if self.bufs.is_empty() {
-                self.bufs = vec![vec![0.0; size]; ch];
-                self.live = false;
-            }
-            self.len = len;
-            self.idx = 0;
+            let len = line_capacity(need).max(self.len);
+            let mut grown = DelayLine::sized(ch, len, block, false);
+            grown.take_history(self);
+            *self = grown;
         }
     }
 
@@ -570,9 +590,11 @@ impl DelayLine {
         if size == 0 || frames > size {
             return;
         }
+        self.fresh = !self.live;
         if !self.live {
             self.clear();
             self.idx = 0;
+            self.written = 0;
             self.live = true;
         }
         let start = self.idx;
@@ -589,6 +611,7 @@ impl DelayLine {
             }
         }
         self.idx = (start + frames) % size;
+        self.written = self.written.saturating_add(frames).min(size);
     }
 
     /// Nothing reads this block delayed: the line is not written, and is zeroed before it is next.
@@ -598,29 +621,82 @@ impl DelayLine {
 
     /// The block just written, `delay` samples late (clamped to the line's longest delay), into
     /// `dst` (each channel resized to `frames`, within its capacity in plan mode).
+    #[cfg(test)]
     fn read(&self, delay: usize, dst: &mut [Vec<f32>], frames: usize) {
+        self.read_x(delay, delay, 0, dst, frames);
+    }
+
+    /// As [`DelayLine::read`], crossfading from delay `from` to delay `to`, `done` samples into the
+    /// crossfade (`from == to`: a plain read).
+    fn read_x(&self, from: usize, to: usize, done: usize, dst: &mut [Vec<f32>], frames: usize) {
         let size = self.ring();
-        let d = delay.min(self.len);
-        let start = if size == 0 { 0 } else { (self.idx + 2 * size - (frames % size) - (d % size)) % size };
+        let (a, b) = (from.min(self.len), to.min(self.len));
+        let base = |d: usize| if size == 0 { 0 } else { (self.idx + 2 * size - (frames % size) - (d % size)) % size };
+        let (sa, sb) = (base(a), base(b));
         for (c, out) in dst.iter_mut().enumerate() {
             out.clear();
             out.resize(frames, 0.0);
             let Some(ring) = self.bufs.get(c).filter(|_| self.live && size > 0) else { continue };
-            let mut i = start;
-            for x in out.iter_mut() {
-                if let Some(r) = ring.get(i) {
-                    *x = *r;
-                }
-                i += 1;
-                if i >= size {
-                    i = 0;
-                }
+            for (i, x) in out.iter_mut().enumerate() {
+                let va = ring.get((sa + i) % size).copied().unwrap_or(0.0);
+                *x = if a == b {
+                    va
+                } else {
+                    let vb = ring.get((sb + i) % size).copied().unwrap_or(0.0);
+                    let g = ((done + i) as f32 / XFADE as f32).min(1.0);
+                    va + (vb - va) * g
+                };
             }
         }
     }
 
     fn clear(&mut self) {
         self.bufs.iter_mut().for_each(|b| b.fill(0.0));
+        self.written = 0;
+    }
+}
+
+/// Capacity of a delay line holding `need` samples: a power of two, at least
+/// [`MIN_DELAY_CAPACITY`], at most [`MAX_LATENCY`] (as plans size theirs).
+fn line_capacity(need: usize) -> usize {
+    need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY)
+}
+
+/// One edge's read of its strip's delay line (F05): the delay it plays now and, while it moves to
+/// a new one, the crossfade. A longer delay waits until the line holds the history it needs (a
+/// delay jump never reads silence the line never held); a shorter one starts at once.
+#[derive(Debug, Clone, Copy, Default)]
+struct EdgeTap {
+    eff: usize,
+    from: usize,
+    left: usize,
+    pre: bool,
+    init: bool,
+}
+
+impl EdgeTap {
+    /// This block's read for target delay `d` on `line` (written this block): (from, to, done).
+    fn step(&mut self, d: usize, pre: bool, line: &DelayLine, frames: usize) -> (usize, usize, usize) {
+        let d = d.min(line.len);
+        if !self.init || self.pre != pre || line.fresh || !line.live {
+            *self = EdgeTap { eff: d, from: d, left: 0, pre, init: true };
+        }
+        if self.left == 0 && d != self.eff && (d < self.eff || line.written >= d.saturating_add(frames)) {
+            self.from = self.eff;
+            self.eff = d;
+            self.left = XFADE;
+        }
+        let r = (self.from, self.eff, XFADE - self.left.min(XFADE));
+        self.left = self.left.saturating_sub(frames);
+        if self.left == 0 {
+            self.from = self.eff;
+        }
+        r
+    }
+
+    /// The longest delay this edge may still read (its current and crossfade-from delays).
+    fn holds(&self) -> usize {
+        if self.init { self.eff.max(self.from) } else { 0 }
     }
 }
 
@@ -703,6 +779,7 @@ impl Strip {
             outbuf: Vec::new(),
             pdc_out: 0,
             pdc_pos: 0,
+            edges: [EdgeTap::default(); SEND_SLOTS + 1],
             failures: PluginFailures::default(),
             generation: SlotGen::VACANT,
             track: 0,
@@ -710,6 +787,48 @@ impl Strip {
             layout: 0,
             meter: StripMeter::default(),
         }
+    }
+}
+
+/// Delay lines for a legacy engine, prepared off the audio thread ([`PreparedLines::new`]) and
+/// taken in on it by [`MixEngine::adopt_lines`], which hands the lines it replaced back in here:
+/// drop it on the control side.
+///
+/// Playback (legacy path) prepares them when [`MixEngine::status`] reports `capacity_exceeded > 0`
+/// (with `required_latency` as the need), and with the session that adds tracks (with the last
+/// need), and sends them with that session to the callback, which calls `adopt_lines` after
+/// `ensure_synced`.
+#[derive(Default)]
+pub struct PreparedLines {
+    lines: Vec<(TrackId, DelayLine, DelayLine)>,
+}
+
+impl PreparedLines {
+    /// Control side: lines holding delays up to `need` samples (rounded up as plans size theirs)
+    /// for every strip of `s`, in blocks up to `max_block` (the engine's), and a pre-fader line
+    /// only for a strip with a pre-fader send.
+    #[must_use]
+    pub fn new(s: &Session, max_block: usize, need: usize) -> Self {
+        let cap = line_capacity(need.min(MAX_LATENCY));
+        let main_ch = main_channels(s);
+        let block = max_block.clamp(16, 16_384);
+        let lines = s
+            .tracks
+            .iter()
+            .map(|t| {
+                let ch = strip_channels(t, main_ch);
+                let pre =
+                    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) { DelayLine::sized(ch, cap, block, false) } else { DelayLine::default() };
+                (t.id, DelayLine::sized(ch, cap, block, false), pre)
+            })
+            .collect();
+        PreparedLines { lines }
+    }
+
+    /// Bytes of sample storage held (what was prepared, or what came back).
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.lines.iter().flat_map(|(_, a, b)| a.bufs.iter().chain(b.bufs.iter())).map(|c| c.len() * size_of::<f32>()).sum()
     }
 }
 
@@ -1160,10 +1279,39 @@ impl MixEngine {
     /// render had to clamp (a plug-in's latency rose past their capacity, see
     /// [`MixEngine::status`]) grow here, keeping their history. A render never grows them on a
     /// thread marked as the audio thread.
+    ///
+    /// On a thread marked as the audio thread ([`mark_audio_thread`]: playback's callback, where
+    /// playback calls this today) it never grows a line: it clamps and counts like a render. A
+    /// new strip gets lines of the smallest capacity, made with its other buffers. The control
+    /// side grows them with [`PreparedLines`] and [`MixEngine::adopt_lines`].
     pub fn ensure_synced(&mut self, s: &Session) {
         self.sync_if_changed(s);
-        if self.plan.is_none() && self.legacy_status.capacity_exceeded > 0 {
+        if self.plan.is_none() && self.legacy_status.capacity_exceeded > 0 && !on_audio_thread() {
             self.size_lines(s);
+        }
+    }
+
+    /// Audio side (legacy engines): takes in the delay lines `lines` prepared off the audio thread
+    /// for a strip whose own are shorter (or missing), each carrying the old line's history over so
+    /// the delay continues; what it replaced goes back into `lines`, to drop on the control side.
+    /// Allocates and frees nothing; copies at most each replaced line's samples. Clears the clamp
+    /// report ([`MixEngine::status`]) when the lines now hold what a render asked for. Call it after
+    /// [`MixEngine::ensure_synced`] for the session the lines were prepared from.
+    pub fn adopt_lines(&mut self, lines: &mut PreparedLines) {
+        let mut holds = usize::MAX;
+        for (track, post, pre) in &mut lines.lines {
+            let Some(st) = self.strips.get_mut(track) else { continue };
+            let ch = st.buf.len();
+            for (new, old) in [(post, &mut st.tap), (pre, &mut st.tap_pre)] {
+                if new.bufs.len() == ch && new.len > old.len {
+                    new.take_history(old);
+                    std::mem::swap(new, old);
+                }
+            }
+            holds = holds.min(st.tap.len);
+        }
+        if holds != usize::MAX && holds >= self.legacy_status.required_latency as usize {
+            self.legacy_status = PlanStatus::default();
         }
     }
 
@@ -1187,20 +1335,34 @@ impl MixEngine {
         }
     }
 
-    /// Sizes every strip's delay lines for the slowest path of `s` with its instances' current
-    /// latency, or for the delay a render last had to clamp if that is more, and clears the
-    /// clamp report. Allocates only to grow a line.
+    /// Sizes the strips' delay lines for the slowest path of `s` with its instances' current
+    /// latency, or for the delay a render last had to clamp if that is more, and clears the clamp
+    /// report. A pre-fader line only for a strip with a pre-fader send. On the audio thread it
+    /// only gives a new strip (no lines yet) the smallest lines, and grows nothing.
     fn size_lines(&mut self, s: &Session) {
-        let strips = &self.strips;
-        let latency = |t: &Track| strips.get(&t.id).map_or(0, |st| strip_latency(t, st));
-        let need = path_need_with(s, &self.route, &mut self.bus_need, &latency).max(self.legacy_status.required_latency as usize);
+        let audio = on_audio_thread();
+        let need = if audio {
+            0
+        } else {
+            let strips = &self.strips;
+            let latency = |t: &Track| strips.get(&t.id).map_or(0, |st| strip_latency(t, st));
+            path_need_with(s, &self.route, &mut self.bus_need, &latency).max(self.legacy_status.required_latency as usize)
+        };
         let mb = self.max_block;
-        for st in self.strips.values_mut() {
+        for t in &s.tracks {
+            let Some(st) = self.strips.get_mut(&t.id) else { continue };
             let ch = st.buf.len();
-            st.tap.grow(need, ch, mb);
-            st.tap_pre.grow(need, ch, mb);
+            let has_pre = t.mixer.sends.iter().flatten().any(|x| x.pre_fader);
+            if !audio || st.tap.bufs.is_empty() {
+                st.tap.grow(need, ch, mb);
+            }
+            if has_pre && (!audio || st.tap_pre.bufs.is_empty()) {
+                st.tap_pre.grow(need, ch, mb);
+            }
         }
-        self.legacy_status = PlanStatus::default();
+        if !audio {
+            self.legacy_status = PlanStatus::default();
+        }
     }
 
     /// Put the strips taken out for processing back into the engine, every one of them so none is
@@ -1470,7 +1632,7 @@ fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, live: boo
 /// line had to clamp (0: none).
 fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) -> usize {
     let MixOut { busses, main, main_fmt, law, main_arrival } = out;
-    let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, .. } = strip;
+    let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, .. } = strip;
     let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
     // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
     let delay_of = |busses: &B, r: &Route| match r {
@@ -1478,28 +1640,32 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
         Route::Bus(b) => busses.bus(*b).filter(|x| at < x.reader).map(|x| x.arrival.saturating_sub(o)),
         _ => None,
     };
-    let (mut post, mut pre_max) = (0usize, 0usize);
-    for snd in t.mixer.sends.iter().flatten() {
+    // Edge 0 is the output, edge 1 + i send i. Each line is written when any edge asks it for a
+    // delay, or still reads (or crossfades from) one.
+    let held = |k: usize| edges.get(k).map_or(0, EdgeTap::holds);
+    let (mut post, mut pre_max, mut held_post, mut held_pre) = (0usize, 0usize, held(0), 0usize);
+    for (i, snd) in t.mixer.sends.iter().enumerate() {
+        let Some(snd) = snd else { continue };
         if let (Route::Bus(_), Some(d)) = (&snd.target, delay_of(busses, &snd.target)) {
             if snd.pre_fader {
                 pre_max = pre_max.max(d);
+                held_pre = held_pre.max(held(i + 1));
             } else {
                 post = post.max(d);
+                held_post = held_post.max(held(i + 1));
             }
         }
     }
     if let Some(d) = delay_of(busses, &t.mixer.output) {
         post = post.max(d);
     }
-    let mut clamped = 0usize;
-    if post > 0 {
-        clamped = clamped.max(tap.fit(post));
+    let clamped = tap.fit(post).max(tap_pre.fit(pre_max));
+    if post.max(held_post) > 0 {
         tap.write(buf, frames);
     } else {
         tap.idle();
     }
-    if pre_max > 0 {
-        clamped = clamped.max(tap_pre.fit(pre_max));
+    if pre_max.max(held_pre) > 0 {
         tap_pre.write(pre, frames);
     } else {
         tap_pre.idle();
@@ -1507,27 +1673,36 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
     if outbuf.len() != buf.len() {
         *outbuf = vec![Vec::new(); buf.len()];
     }
+    // This block's read of edge `k` at delay `d`: `None` for the undelayed signal itself.
+    let mut plan = |k: usize, d: usize, pre_fader: bool| {
+        let line: &DelayLine = if pre_fader { tap_pre } else { tap };
+        let mut spare = EdgeTap::default();
+        let e = edges.get_mut(k).unwrap_or(&mut spare);
+        let (from, to, done) = e.step(d, pre_fader, line, frames);
+        (from != 0 || to != 0).then_some((from, to, done))
+    };
     let src_fmt = strip_format(t, buf.len());
     for (i, snd) in t.mixer.sends.iter().enumerate() {
         let Some(snd) = snd else { continue };
+        let Route::Bus(b) = &snd.target else { continue };
+        let Some(d) = delay_of(busses, &snd.target) else { continue };
+        let read = plan(i + 1, d, snd.pre_fader);
         if snd.mute || muted {
             continue;
         }
-        let Route::Bus(b) = &snd.target else { continue };
-        let Some(d) = delay_of(busses, &snd.target) else { continue };
         let lvl = send_level(t, i, snd.level_db, pos);
         let gain = db_to_gain(lvl);
         if gain <= 0.0 {
             continue;
         }
-        let src: &[Vec<f32>] = match (d, snd.pre_fader) {
-            (0, true) => pre,
-            (0, false) => buf,
-            (d, pre_fader) => {
+        let src: &[Vec<f32>] = match (read, snd.pre_fader) {
+            (None, true) => pre,
+            (None, false) => buf,
+            (Some((from, to, done)), pre_fader) => {
                 if pre_fader {
-                    tap_pre.read(d, outbuf, frames);
+                    tap_pre.read_x(from, to, done, outbuf, frames);
                 } else {
-                    tap.read(d, outbuf, frames);
+                    tap.read_x(from, to, done, outbuf, frames);
                 }
                 outbuf
             }
@@ -1540,11 +1715,12 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
         apply_matrix(src, frames, &mut dst.buf, &m, gain);
     }
     let Some(d) = delay_of(busses, &t.mixer.output) else { return clamped };
-    let src: &[Vec<f32>] = if d == 0 {
-        buf
-    } else {
-        tap.read(d, outbuf, frames);
-        outbuf
+    let src: &[Vec<f32>] = match plan(0, d, false) {
+        None => buf,
+        Some((from, to, done)) => {
+            tap.read_x(from, to, done, outbuf, frames);
+            outbuf
+        }
     };
     let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
         Route::Main => (main, main_fmt),
@@ -5107,5 +5283,21 @@ mod tests {
         // A tap reaching back past the old ring finds silence there, not stale samples.
         line.read(line.len, &mut out, block);
         assert!(out[0].iter().all(|x| *x == 0.0));
+    }
+
+    /// A legacy engine sizes a pre-fader line only for a strip with a pre-fader send.
+    #[test]
+    fn only_strips_with_a_pre_fader_send_get_a_pre_fader_line() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let other = add_dc_track(&mut s, 0.25, 4800);
+        let bus = s.add_bus("B", ChannelFormat::Stereo);
+        let mut send = soundcraft_model::SendSlot::new(Route::Bus(bus));
+        send.pre_fader = true;
+        s.track_mut(t).unwrap().mixer.sends[0] = Some(send);
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.ensure_synced(&s);
+        let (with, without) = (&eng.strips[&t], &eng.strips[&other]);
+        assert!(!with.tap.bufs.is_empty() && !with.tap_pre.bufs.is_empty());
+        assert!(!without.tap.bufs.is_empty() && without.tap_pre.bufs.is_empty(), "no pre-fader send, no pre-fader line");
     }
 }

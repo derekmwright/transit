@@ -734,3 +734,63 @@ fn a_bounce_of_a_looped_bus_holds_no_feedback() {
     assert_eq!(arrivals(&out[0]), vec![AT], "only the source's send, at its own time");
     assert!((out[0][AT] - 0.5).abs() < 1e-4, "no feedback summed in: {}", out[0][AT]);
 }
+
+/// Plan path: a tone through a latency rise, the clamp, `observe` and the recompiled plan with
+/// longer lines: no gap and no step at adoption (the lines carry their history over; a longer
+/// delay waits for its history, then crossfades).
+#[test]
+fn a_plan_with_longer_lines_takes_over_seamlessly() {
+    let mut s = session();
+    let len = 48_000usize * 30;
+    let tone: Vec<f32> = (0..len).map(|i| (i as f32 * 2.0 * std::f32::consts::PI * 100.0 / 48_000.0).sin() * 0.25).collect();
+    s.pool.insert(SourceId(61), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: SR, channels: vec![tone.clone(), tone] })));
+    let dry = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Dry"));
+    let cid = s.new_clip_id();
+    s.track_mut(dry).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(cid, "t", SourceId(61), 0, 0, len as i64));
+    let lat = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Lat"));
+    s.track_mut(lat).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+    let knob = Arc::new(std::sync::atomic::AtomicUsize::new(100));
+    let mut make = |spec: &InstanceSpec, _: soundcraft_mix::SlotGen| {
+        if spec.track == lat && spec.slot == 0 {
+            return Some(NewInstance {
+                plugin: Box::new(Knob { knob: knob.clone(), ring: vec![vec![0.0; 100_000]; 2], w: 0 }),
+                refused_state: false,
+            });
+        }
+        create_instance(&spec.id, spec.state.as_deref(), SR as f32, BLOCK, spec.ch)
+    };
+    MixEngine::force_serial(true);
+    let mut mix = MixEngine::realtime(target());
+    let mut compiler = PlanCompiler::new(target(), PlanLimits::default());
+    let shared = Arc::new(s.clone());
+    let mut env = compiler.compile(Arc::clone(&shared), compiler.active(), PlanGeneration::from_raw(1), &mut make).unwrap();
+    assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+    compiler.reclaim(env);
+    let mut out = vec![vec![0.0f32; BLOCK]; 2];
+    let mut all = Vec::new();
+    for k in 0..500i64 {
+        if k == 60 {
+            knob.store(20_000, std::sync::atomic::Ordering::Relaxed);
+        }
+        if k == 80 {
+            compiler.observe(&mix.status());
+            let mut env = compiler.compile(Arc::clone(&shared), compiler.active(), PlanGeneration::from_raw(2), &mut make).unwrap();
+            assert!(env.plan().is_structural());
+            assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+            compiler.reclaim(env);
+        }
+        mix.render_active(k * BLOCK as i64, BLOCK, &mut out);
+        all.extend_from_slice(&out[0]);
+    }
+    let x = &all[BLOCK * 2..];
+    let step = x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+    assert!(step < 0.02, "a step of {step}");
+    let mut quiet = 0usize;
+    let mut longest = 0usize;
+    for v in x {
+        quiet = if v.abs() < 1e-3 { quiet + 1 } else { 0 };
+        longest = longest.max(quiet);
+    }
+    assert!(longest < 16, "a gap of {longest} samples");
+    assert_eq!(mix.status().capacity_exceeded, 0, "realigned with nothing clamped");
+}

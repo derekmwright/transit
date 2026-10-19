@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
-use soundcraft_mix::{MixEngine, PreparedInstance, mark_audio_thread};
+use soundcraft_mix::{MixEngine, PreparedInstance, PreparedLines, mark_audio_thread};
 use soundcraft_model::{ChannelFormat, Clip, ClipId, Insert, Session, SourceAudio, SourceId, TrackId, TrackKind};
 use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::collections::HashMap;
@@ -231,18 +231,126 @@ fn pulse_track(s: &mut Session, name: &str, level: f32, src: u64) -> TrackId {
     t
 }
 
-/// Rising plug-in latency on the legacy path: rendering never allocates (the delay lines clamp
-/// and report the shortfall); `ensure_synced`, the control-side step, grows them keeping their
-/// history, after which the dry and the latent track line up again.
 #[test]
-fn rising_latency_allocates_nothing_while_rendering_and_realigns_after_the_control_side_grow() {
+fn rising_latency_allocates_nothing_on_the_audio_thread_and_realigns_after_a_control_side_prepare() {
+    for extra in [0usize, 128] {
+        MixEngine::force_serial(true);
+        mark_audio_thread();
+        let mut s = Session::default();
+        s.edit.delay_compensation = true;
+        s.edit.click = false;
+        pulse_track(&mut s, "Dry", 0.25, 31);
+        let lat = pulse_track(&mut s, "Lat", 0.5, 32);
+        let fader = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Fader"));
+        for i in 0..extra {
+            s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(&format!("T{i}")));
+        }
+        s.track_mut(lat).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+        let knob = Arc::new(std::sync::atomic::AtomicUsize::new(100));
+        let mut mix = MixEngine::new(SR, BLOCK);
+        mix.set_external_instances(true);
+        mix.adopt(vec![PreparedInstance { track: lat, slot: 0, id: "gain".into(), ch: 2, plugin: Box::new(VarDelay::new(knob.clone())) }]);
+        mix.ensure_synced(&s);
+        let mut out = vec![vec![0.0f32; BLOCK]; 2];
+        let mut pos = 0i64;
+        let mut tail = Vec::with_capacity(BLOCK * 4096);
+        let mut render = |mix: &mut MixEngine, s: &Session, n: usize, keep: &mut Vec<f32>| {
+            for _ in 0..n {
+                mix.render(s, pos, BLOCK, &mut out);
+                keep.extend_from_slice(&out[0]);
+                pos += BLOCK as i64;
+            }
+        };
+        render(&mut mix, &s, 20, &mut tail);
+        assert_eq!(mix.latency, 100);
+        for target in [5_000usize, 20_000, 100_000, 300_000] {
+            knob.store(target, std::sync::atomic::Ordering::Relaxed);
+            let ((), stats) = measure(|| render(&mut mix, &s, 50, &mut tail));
+            println!("{extra} extra tracks, latency -> {target}: {stats:?}");
+            assert_eq!(stats, AllocStats::default(), "latency {target}: rendering allocates nothing");
+            // A session update arrives (a fader edit): playback's drain calls ensure_synced here.
+            s.track_mut(fader).unwrap().mixer.volume_db -= 0.5;
+            let t = std::time::Instant::now();
+            let ((), sync) = measure(|| mix.ensure_synced(&s));
+            println!("{extra} extra tracks, drain-style ensure_synced at {target}: {sync:?} in {:?}", t.elapsed());
+            assert_eq!(sync, AllocStats::default(), "latency {target}: ensure_synced on the audio thread allocates nothing");
+            // A structural edit (a routing change) re-syncs there too, and grows nothing either.
+            let out = &mut s.track_mut(fader).unwrap().mixer.output;
+            *out = if *out == soundcraft_model::Route::Main { soundcraft_model::Route::None } else { soundcraft_model::Route::Main };
+            let ((), resync) = measure(|| mix.ensure_synced(&s));
+            assert_eq!(resync, AllocStats::default(), "latency {target}: a re-sync on the audio thread allocates nothing");
+        }
+        // Back to 20,000, with no document edit: the clamp is reported...
+        knob.store(20_000, std::sync::atomic::Ordering::Relaxed);
+        render(&mut mix, &s, 4, &mut tail);
+        let short = mix.status();
+        assert!(short.capacity_exceeded > 0 && short.required_latency >= 20_000, "the shortfall is reported: {short:?}");
+        // ...the control side prepares lines for it, and the audio side takes them in.
+        let mut lines = PreparedLines::new(&s, BLOCK, short.required_latency as usize);
+        let ((), adopt) = measure(|| mix.adopt_lines(&mut lines));
+        println!("{extra} extra tracks: adopt_lines {adopt:?}");
+        assert_eq!(adopt, AllocStats::default(), "taking prepared lines in allocates nothing");
+        drop(lines);
+        tail.clear();
+        render(&mut mix, &s, 300, &mut tail);
+        let late = &tail[tail.len() - 4 * PERIOD..];
+        let hits: Vec<f32> = late.iter().copied().filter(|x| x.abs() > 1e-3).collect();
+        assert!(!hits.is_empty(), "the pulses play");
+        assert!(hits.iter().all(|x| (x - 0.75).abs() < 1e-4), "dry and latent pulses coincide again: {hits:?}");
+        assert_eq!(mix.status().capacity_exceeded, 0, "nothing clamped after the prepared lines");
+    }
+}
+
+/// An offline render (a bounce: not the audio thread) grows its own lines when a latency rises
+/// mid-render, and realigns.
+#[test]
+fn an_offline_render_grows_its_lines_when_latency_rises_mid_render() {
+    std::thread::spawn(|| {
+        MixEngine::force_serial(true);
+        let mut s = Session::default();
+        s.edit.delay_compensation = true;
+        s.edit.click = false;
+        pulse_track(&mut s, "Dry", 0.25, 41);
+        let lat = pulse_track(&mut s, "Lat", 0.5, 42);
+        s.track_mut(lat).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
+        let knob = Arc::new(std::sync::atomic::AtomicUsize::new(100));
+        let mut mix = MixEngine::new(SR, BLOCK);
+        mix.set_external_instances(true);
+        mix.adopt(vec![PreparedInstance { track: lat, slot: 0, id: "gain".into(), ch: 2, plugin: Box::new(VarDelay::new(knob.clone())) }]);
+        let mut out = vec![vec![0.0f32; BLOCK]; 2];
+        let mut all = Vec::new();
+        for k in 0..400i64 {
+            if k == 40 {
+                knob.store(20_000, std::sync::atomic::Ordering::Relaxed);
+            }
+            mix.render(&s, k * BLOCK as i64, BLOCK, &mut out);
+            all.extend_from_slice(&out[0]);
+        }
+        let late = &all[all.len() - 4 * PERIOD..];
+        let hits: Vec<f32> = late.iter().copied().filter(|x| x.abs() > 1e-3).collect();
+        assert!(!hits.is_empty() && hits.iter().all(|x| (x - 0.75).abs() < 1e-4), "realigned offline: {hits:?}");
+        assert_eq!(mix.status().capacity_exceeded, 0);
+    })
+    .join()
+    .unwrap();
+}
+
+/// A tone through the legacy path while the latency rises and the prepared lines come in: no
+/// gap and no step (each delay change crossfades; a longer delay waits for its history).
+#[test]
+fn a_latency_rise_and_prepared_lines_are_seamless_on_the_legacy_path() {
     MixEngine::force_serial(true);
     mark_audio_thread();
     let mut s = Session::default();
     s.edit.delay_compensation = true;
     s.edit.click = false;
-    pulse_track(&mut s, "Dry", 0.25, 31);
-    let lat = pulse_track(&mut s, "Lat", 0.5, 32);
+    let len = 48_000usize * 30;
+    let tone: Vec<f32> = (0..len).map(|i| (i as f32 * 2.0 * std::f32::consts::PI * 100.0 / 48_000.0).sin() * 0.25).collect();
+    s.pool.insert(SourceId(51), Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![tone.clone(), tone] })));
+    let dry = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Dry"));
+    let id = s.new_clip_id();
+    s.track_mut(dry).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "t", SourceId(51), 0, 0, len as i64));
+    let lat = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Lat"));
     s.track_mut(lat).unwrap().mixer.inserts[0] = Some(Insert::new("gain"));
     let knob = Arc::new(std::sync::atomic::AtomicUsize::new(100));
     let mut mix = MixEngine::new(SR, BLOCK);
@@ -250,36 +358,33 @@ fn rising_latency_allocates_nothing_while_rendering_and_realigns_after_the_contr
     mix.adopt(vec![PreparedInstance { track: lat, slot: 0, id: "gain".into(), ch: 2, plugin: Box::new(VarDelay::new(knob.clone())) }]);
     mix.ensure_synced(&s);
     let mut out = vec![vec![0.0f32; BLOCK]; 2];
-    let mut pos = 0i64;
-    let mut render = |mix: &mut MixEngine, n: usize, keep: &mut Vec<f32>| {
-        for _ in 0..n {
-            mix.render(&s, pos, BLOCK, &mut out);
-            keep.extend_from_slice(&out[0]);
-            pos += BLOCK as i64;
+    let mut all = Vec::new();
+    for k in 0..500i64 {
+        if k == 60 {
+            knob.store(20_000, std::sync::atomic::Ordering::Relaxed);
         }
-    };
-    let mut tail = Vec::with_capacity(BLOCK * 4096);
-    render(&mut mix, 20, &mut tail);
-    assert_eq!(mix.latency, 100);
-    for target in [5_000usize, 20_000, 100_000, 300_000] {
-        knob.store(target, std::sync::atomic::Ordering::Relaxed);
-        let ((), stats) = measure(|| render(&mut mix, 50, &mut tail));
-        println!("latency -> {target}: mix latency {}, {stats:?}, status {:?}", mix.latency, mix.status());
-        assert_eq!(stats, AllocStats::default(), "latency {target}: rendering allocates nothing");
+        if k == 80 {
+            let mut lines = PreparedLines::new(&s, BLOCK, mix.status().required_latency as usize);
+            mix.adopt_lines(&mut lines);
+        }
+        mix.render(&s, k * BLOCK as i64, BLOCK, &mut out);
+        all.extend_from_slice(&out[0]);
     }
-    knob.store(20_000, std::sync::atomic::Ordering::Relaxed);
-    render(&mut mix, 4, &mut tail);
-    let short = mix.status();
-    assert!(short.capacity_exceeded > 0 && short.required_latency >= 20_000, "the shortfall is reported: {short:?}");
-    // The control-side step (playback's session update) grows the lines.
-    mix.ensure_synced(&s);
-    tail.clear();
-    render(&mut mix, 200, &mut tail);
-    let late = &tail[tail.len() - 4 * PERIOD..];
-    let hits: Vec<f32> = late.iter().copied().filter(|x| x.abs() > 1e-3).collect();
-    assert!(!hits.is_empty(), "the pulses play");
-    assert!(hits.iter().all(|x| (x - 0.75).abs() < 1e-4), "dry and latent pulses coincide again: {hits:?}");
-    assert_eq!(mix.status().capacity_exceeded, 0, "nothing clamped after the grow");
+    assert_seamless(&all[BLOCK * 2..]);
+}
+
+/// No step and no gap in a 100 Hz tone of amplitude 0.25 (as panned): consecutive samples stay
+/// close and the tone never drops out for longer than a zero crossing.
+fn assert_seamless(x: &[f32]) {
+    let step = x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+    assert!(step < 0.02, "a step of {step}");
+    let mut quiet = 0usize;
+    let mut longest = 0usize;
+    for v in x {
+        quiet = if v.abs() < 1e-3 { quiet + 1 } else { 0 };
+        longest = longest.max(quiet);
+    }
+    assert!(longest < 16, "a gap of {longest} samples");
 }
 
 /// A routing change (a send retargeted, a loop as an older file could hold) re-orders the strips
