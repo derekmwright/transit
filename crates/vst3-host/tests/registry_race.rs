@@ -8,6 +8,9 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+/// Plug-ins in the VST3 fixture bundle (gain, synth and the F10 events fixture).
+const FIXTURE_PLUGINS: usize = 3;
+
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -39,7 +42,7 @@ impl Test {
 
     fn assert_fixture(&self, list: &[host::Vst3Descriptor]) {
         let wanted = host::scan_paths(std::slice::from_ref(&self.fixture));
-        assert_eq!(wanted.len(), 2);
+        assert_eq!(wanted.len(), FIXTURE_PLUGINS);
         for d in wanted {
             assert!(list.iter().any(|p| p.id == d.id), "missing {}", d.id);
         }
@@ -84,7 +87,7 @@ fn paused_scan(during: impl FnOnce()) -> Vec<host::Vst3Descriptor> {
 fn a_folder_added_during_a_scan_is_in_the_scan_that_publishes_after_it() {
     let t = Test::new();
     let published = paused_scan(|| {
-        assert_eq!(host::add_search_dir(&t.fixture), 2);
+        assert_eq!(host::add_search_dir(&t.fixture), FIXTURE_PLUGINS);
         assert!(host::cached().is_none(), "registry reads do not wait for publication");
     });
     t.assert_fixture(&published);
@@ -130,7 +133,7 @@ fn late_plugins_join_the_main_scan_cache() {
     let files = t.cache();
     assert_eq!(files.len(), 2, "both initial and late results are persisted");
     let ids: Vec<_> = files.iter().flat_map(|f| f["plugins"].as_array().unwrap()).map(|d| d["id"].as_str().unwrap()).collect();
-    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.len(), FIXTURE_PLUGINS);
     assert!(published.iter().all(|d| ids.contains(&d.id.as_str())));
     assert!(files.iter().any(|f| f["error"].is_string()), "initial failure is retained");
 }
@@ -170,11 +173,11 @@ fn installing_into_an_already_snapshotted_folder_is_published() {
     host::set_extra_dirs(vec![installed.clone()]);
     let published = paused_scan(|| {
         copy_tree(&t.fixture, &installed);
-        assert_eq!(host::add_search_dir(&installed), 2);
+        assert_eq!(host::add_search_dir(&installed), FIXTURE_PLUGINS);
     });
     t.assert_fixture(&published);
     t.assert_fixture(&host::cached().unwrap());
-    assert_eq!(t.cache().iter().flat_map(|f| f["plugins"].as_array().unwrap()).count(), 2);
+    assert_eq!(t.cache().iter().flat_map(|f| f["plugins"].as_array().unwrap()).count(), FIXTURE_PLUGINS);
 }
 
 #[test]
@@ -186,7 +189,7 @@ fn refreshing_an_overlapping_folder_preserves_the_first_id_winner() {
     copy_tree(&t.fixture, &second);
     host::set_extra_dirs(vec![first.clone(), second]);
     let published = paused_scan(|| {
-        assert_eq!(host::add_search_dir(&first), 2);
+        assert_eq!(host::add_search_dir(&first), FIXTURE_PLUGINS);
     });
     t.assert_fixture(&published);
     assert!(published.iter().all(|d| d.path.starts_with(&first)), "refresh reordered duplicate IDs");
