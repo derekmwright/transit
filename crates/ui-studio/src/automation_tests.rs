@@ -986,3 +986,65 @@ fn thin_focused_track_waits_while_a_pass_is_running_on_it() {
     t.key("Space");
     t.frames(3);
 }
+
+// ---- Re-review: undo during a pass, the second touch ----
+
+fn touch_mode(t: &mut T) -> TrackId {
+    let a = t.with_lane();
+    t.app.set_automation_mode(a, AutomationMode::Touch).unwrap();
+    t.frames(3);
+    a
+}
+
+/// Hold the track header's volume and drag it sideways for `n` steps, then release.
+fn touch_drag(t: &mut T, a: TrackId, dx: f32, n: usize) {
+    let v = t.row(a).volume;
+    let (x, y) = ((v[0] + v[2]) / 2.0, (v[1] + v[3]) / 2.0);
+    t.input("ui.drag", json!({"x": x, "y": y, "to_x": x + dx, "to_y": y, "steps": n}));
+    // One synthetic event per frame: let the release arrive.
+    t.frames(n + 5);
+}
+
+#[test]
+fn undoing_a_pass_while_playing_then_stopping_adds_no_thin_step_and_keeps_redo() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    let before = t.undo_len();
+    t.key("Space");
+    touch_drag(&mut t, a, 50.0, 30);
+    let written = t.points(a, &AutoParam::Volume);
+    assert!(written.len() >= 5);
+    assert_eq!(t.undo_len(), before + 1);
+    t.app.run("edit.undo", json!({})).unwrap();
+    t.frames(3);
+    let len = t.undo_len();
+    assert!(t.app.engine.can_redo());
+    t.key("Space");
+    t.frames(3);
+    assert_eq!(t.undo_len(), len, "Stop adds no step: {:?}", t.app.engine.undo_history());
+    assert!(t.app.engine.can_redo(), "the redo stack survives Stop");
+    t.app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume), written, "Redo restores the pass as written");
+}
+
+#[test]
+fn a_thin_that_removes_nothing_leaves_history_and_redo_alone() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    // A still fader: a pass of two points has nothing to thin.
+    let before = t.undo_len();
+    t.key("Space");
+    t.frames(30);
+    t.key("Space");
+    t.frames(3);
+    assert_eq!(t.undo_len(), before + 1, "{:?}", t.app.engine.undo_history());
+    // On demand too: sparse lanes, with a redo step waiting.
+    set_point(&mut t, a, 500_000, -6.0);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert!(t.app.engine.can_redo());
+    t.app.focus(a);
+    let len = t.undo_len();
+    assert_eq!(t.app.thin_focused().unwrap(), 0);
+    assert_eq!(t.undo_len(), len, "no empty Thin step");
+    assert!(t.app.engine.can_redo(), "Redo is still there");
+}

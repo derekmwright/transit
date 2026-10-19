@@ -1260,42 +1260,61 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         }
     }
     if wrote {
-        app.auto.pass_mark = app.engine.undo_pushes();
+        app.auto.pass_mark = app.engine.revision;
     }
+}
+
+/// The tolerance of every thinning (the engine's default, passed explicitly so the dry run agrees).
+const THIN_TOLERANCE: f32 = 0.1;
+
+/// How many points `automation.thin` would remove from `lane` (within `range`), without touching
+/// the document: a thin that removes nothing must not enter the undo history.
+fn removable(lane: Option<&soundcraft_model::AutomationLane>, range: Option<(Samples, Samples)>) -> usize {
+    let Some(l) = lane else { return 0 };
+    let mut part = l.clone();
+    if let Some((a, b)) = range {
+        part.points.retain(|p| p.at >= a && p.at <= b);
+    }
+    part.thin(THIN_TOLERANCE)
 }
 
 /// `automation.thin` with the default tolerance on exactly what a pass wrote: per lane, per written
 /// time span, so hand-drawn points outside it and the track's other lanes stay as they are. It runs
-/// under the pass's merge key; when an edit or a mode change has already closed the pass's undo step
-/// it would be a step of its own, so (with `squash`) it is folded into the pass if the pass is the
-/// newest step, and otherwise left as a separate step named "Thin".
+/// under the pass's merge key. Nothing happens when it would remove nothing, or when an Undo has
+/// taken the pass off the stack (a Thin step would wipe Redo). When an edit or a mode change has
+/// already closed the pass's undo step it would be a step of its own, so (with `squash`) it is
+/// folded into the pass if nothing came after the pass, and otherwise left as a separate step
+/// named "Thin".
 fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
-    let s = app.engine.session_arc();
-    let alive: Vec<TrackId> = tracks.iter().copied().filter(|id| s.track(*id).is_some()).collect();
-    let mut work: Vec<((TrackId, String), Vec<(Samples, Samples)>)> = Vec::new();
-    for id in tracks {
-        let keys: Vec<(TrackId, String)> = app.auto.spans.keys().filter(|k| k.0 == *id).cloned().collect();
-        for k in keys {
-            if let Some(v) = app.auto.spans.remove(&k) {
-                work.push((k, v));
+    let mut plan: Vec<(TrackId, String, Samples, Samples)> = Vec::new();
+    {
+        let s = app.engine.session_arc();
+        for id in tracks {
+            let keys: Vec<(TrackId, String)> = app.auto.spans.keys().filter(|k| k.0 == *id).cloned().collect();
+            for k in keys {
+                let Some(segs) = app.auto.spans.remove(&k) else { continue };
+                let (Some(t), Some(lane)) = (s.track(k.0), Lane::parse(&k.1)) else { continue };
+                for (start, end) in segs.into_iter().filter(|(a, b)| b > a) {
+                    for param in lane.param_ids(t) {
+                        if removable(AutoParam::parse(&param).and_then(|p| t.lane(&p)), Some((start, end))) > 0 {
+                            plan.push((k.0, param, start, end));
+                        }
+                    }
+                }
             }
         }
     }
-    if !app.ui.thin_after_write || alive.is_empty() {
+    // The session handle is dropped: holding it would make every command copy the document.
+    if !app.ui.thin_after_write || plan.is_empty() || app.engine.can_redo() {
         return;
     }
-    let contiguous = app.engine.undo_pushes() == app.auto.pass_mark;
+    let contiguous = app.engine.revision == app.auto.pass_mark;
     let n0 = app.engine.undo_history().len();
     let mut removed = 0;
-    for ((id, lane), segs) in work {
-        let (Some(t), Some(lane)) = (s.track(id), Lane::parse(&lane)) else { continue };
-        for (start, end) in segs.into_iter().filter(|(a, b)| b > a) {
-            for param in lane.param_ids(t) {
-                let p = json!({"tracks": [id.0], "param": param, "start": start, "end": end});
-                if let Ok(r) = app.engine.execute_merged("automation.thin", &p, PASS) {
-                    removed += r["removed"].as_u64().unwrap_or(0) as usize;
-                }
-            }
+    for (id, param, start, end) in plan {
+        let p = json!({"tracks": [id.0], "param": param, "start": start, "end": end, "tolerance": THIN_TOLERANCE});
+        if let Ok(r) = app.engine.execute_merged("automation.thin", &p, PASS) {
+            removed += r["removed"].as_u64().unwrap_or(0) as usize;
         }
     }
     app.auto.thinned = removed;
@@ -1323,7 +1342,14 @@ impl StudioApp {
         if self.pass_on(t) {
             return Err("A write pass is running on this track; stop it first".into());
         }
-        let r = self.run("automation.thin", json!({"tracks": [t.0]}))?;
+        let s = self.engine.session_arc();
+        let any = s.track(t).is_some_and(|tr| tr.automation.iter().any(|l| removable(Some(l), None) > 0));
+        drop(s);
+        if !any {
+            self.status = "Nothing to thin".into();
+            return Ok(0);
+        }
+        let r = self.run("automation.thin", json!({"tracks": [t.0], "tolerance": THIN_TOLERANCE}))?;
         let n = r["removed"].as_u64().unwrap_or(0) as usize;
         self.status = format!("Thinned the automation: {n} point{} removed", if n == 1 { "" } else { "s" });
         Ok(n)
