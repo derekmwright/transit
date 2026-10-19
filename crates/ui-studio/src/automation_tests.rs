@@ -700,7 +700,10 @@ fn grabbing_a_strip_fader_in_read_writes_the_static_value_from_where_it_shows() 
     t.frames(3);
     let f = strip_of(&t, a).fader;
     let before = t.undo_len();
-    t.input("ui.drag", json!({"x": (f[0] + f[2]) / 2.0, "y": (f[1] + f[3]) / 2.0, "to_x": (f[0] + f[2]) / 2.0, "to_y": (f[1] + f[3]) / 2.0 - 10.0, "steps": 5}));
+    t.input(
+        "ui.drag",
+        json!({"x": (f[0] + f[2]) / 2.0, "y": (f[1] + f[3]) / 2.0, "to_x": (f[0] + f[2]) / 2.0, "to_y": (f[1] + f[3]) / 2.0 - 10.0, "steps": 5}),
+    );
     assert_eq!(t.undo_len(), before + 1, "one manual drag, one undo step");
     assert_eq!(t.points(a, &AutoParam::Volume).len(), 2, "Read writes no automation points");
     assert!(t.app.engine.session().track(a).unwrap().mixer.volume_db > -144.0);

@@ -417,6 +417,9 @@ pub struct AutoLayout {
     /// A write pass is recording.
     pub writing: bool,
     pub points_written: usize,
+    /// Points the last thinning removed, and whether a pass ending thins (Automation menu).
+    pub thinned: usize,
+    pub thin_after_write: bool,
 }
 
 #[derive(Debug, Default)]
@@ -715,6 +718,8 @@ pub(crate) fn lanes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl:
     layout.selected = app.auto.selection.clone();
     layout.writing = app.auto.writing;
     layout.points_written = app.auto.points_written;
+    layout.thinned = app.auto.thinned;
+    layout.thin_after_write = app.ui.thin_after_write;
     app.auto.layout = layout;
 }
 
@@ -1135,7 +1140,9 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         .passed
         .iter()
         .copied()
-        .filter(|id| !app.engine.session().track(*id).is_some_and(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch)))
+        .filter(|id| {
+            !app.engine.session().track(*id).is_some_and(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch))
+        })
         .collect();
     if !done.is_empty() {
         app.auto.passed.retain(|id| !done.contains(id));
