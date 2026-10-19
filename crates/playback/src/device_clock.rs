@@ -13,6 +13,10 @@ const FIT_SPACING_NS: u64 = 4_000_000;
 const MIN_FIT_SPAN_NS: u64 = 100_000_000;
 const HORIZON_NS: u64 = 100_000_000;
 const MAX_LOCAL_SPAN: i128 = 1 << 40;
+const MAX_RESIDUAL_NS: f64 = 2_000_000.0;
+// Estimated timestamps can jitter across the previous value. This tolerance is
+// bounded by the existing fit residual policy, not permission to relax that fit.
+const MAX_ESTIMATE_BACKSTEP_NS: i128 = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -332,9 +336,13 @@ impl ClockFitter {
                 self.counts.reordered = self.counts.reordered.saturating_add(1);
                 return Err(Unavailable::Reordered);
             }
+            let callback_backstep = i128::from(previous.stamp.backend_callback_ns) - i128::from(stamp.backend_callback_ns);
+            let frame_backstep = i128::from(previous.stamp.backend_frame_ns) - i128::from(stamp.backend_frame_ns);
+            let estimate_jitter = stamp.quality == Quality::BackendEstimate
+                && previous.stamp.quality == Quality::BackendEstimate
+                && callback_backstep.max(frame_backstep) <= MAX_ESTIMATE_BACKSTEP_NS;
             if stamp.host_callback_ns <= previous.stamp.host_callback_ns
-                || stamp.backend_callback_ns < previous.stamp.backend_callback_ns
-                || stamp.backend_frame_ns < previous.stamp.backend_frame_ns
+                || ((callback_backstep > 0 || frame_backstep > 0) && !estimate_jitter)
                 || observation.nominal_rate != previous.nominal_rate
             {
                 self.counts.discontinuities = self.counts.discontinuities.saturating_add(1);
@@ -402,15 +410,34 @@ impl ClockFitter {
         if !(0.995..=1.005).contains(&(ns_per_frame / nominal_period)) || !(0.995..=1.005).contains(&host_line.slope) {
             return Err(Unavailable::Discontinuity);
         }
-        let residual_ns = host_line.residual + frame_line.residual * host_line.slope;
-        if residual_ns > 2_000_000.0 {
-            return Err(Unavailable::Discontinuity);
-        }
         let origin_delta = frame_line.y0 - host_line.x0;
         if origin_delta.abs() > MAX_LOCAL_SPAN {
             return Err(Unavailable::Arithmetic);
         }
         let offset = host_line.intercept + host_line.slope * (origin_delta as f64 + frame_line.intercept);
+        let residual_ns = if quality == Quality::BackendEstimate {
+            // Callback and frame stamps share the same backend clock error.
+            // Evaluate their paired observation against the composed mapping;
+            // adding the two independent maxima counts that shared error twice.
+            // This is an observed residual, never an ADC/DAC uncertainty bound.
+            let mut residual = 0.0f64;
+            for observation in self.points.iter().flatten() {
+                let stamp = observation.stamp;
+                let backend_delta = i128::from(stamp.backend_frame_ns) - i128::from(stamp.backend_callback_ns);
+                if backend_delta.abs() > MAX_LOCAL_SPAN {
+                    return Err(Unavailable::Arithmetic);
+                }
+                let observed = (i128::from(stamp.host_callback_ns) - host_line.y0) as f64 + host_line.slope * backend_delta as f64;
+                let predicted = offset + ns_per_frame * (i128::from(observation.first_frame) - frame_line.x0) as f64;
+                residual = residual.max((observed - predicted).abs());
+            }
+            residual
+        } else {
+            host_line.residual + frame_line.residual * host_line.slope
+        };
+        if residual_ns > MAX_RESIDUAL_NS {
+            return Err(Unavailable::Discontinuity);
+        }
         let frame_origin = u64::try_from(frame_line.x0).map_err(|_| Unavailable::Arithmetic)?;
         let host_origin = u64::try_from(host_line.y0).map_err(|_| Unavailable::Arithmetic)?;
         let future_frames = (HORIZON_NS as f64 / ns_per_frame).ceil() as u64;

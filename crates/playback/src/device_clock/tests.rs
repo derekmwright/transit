@@ -3,6 +3,73 @@ use super::*;
 use crate::timeline_map::{self, Admission, History, MapError, PlacementError, Rate, Timeline};
 use soundcraft_rt::testing::measure;
 
+#[test]
+fn saved_asio_estimates_keep_a_usable_map_without_claiming_hardware_calibration() {
+    let trace = include_str!("tests/focusrite_asio_trace.csv");
+    for opened in 0..2 {
+        for direction in [Direction::Input, Direction::Output] {
+            let k = key(100 + opened, direction);
+            let (observer, mut observations) = observation_lane(k, 48_000);
+            let mut adapter = CpalObserver::new(observer);
+            let mut fitter = ClockFitter::new(k);
+            let direction_name = if direction == Direction::Input { "input" } else { "output" };
+            let mut count = 0;
+            for line in trace.lines().filter(|line| !line.starts_with('#')) {
+                let fields: Vec<_> = line.split(',').collect();
+                if fields[0].parse::<u64>().unwrap() != opened || fields[1] != direction_name {
+                    continue;
+                }
+                let frames = fields[2].parse::<usize>().unwrap();
+                let callback = instant(fields[3].parse().unwrap());
+                let sample = instant(fields[4].parse().unwrap());
+                let host = fields[5].parse::<u64>().unwrap();
+                match direction {
+                    Direction::Input => {
+                        adapter.input(frames, &cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp { callback, capture: sample }), Some(host))
+                    }
+                    Direction::Output => {
+                        adapter.output(frames, &cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp { callback, playback: sample }), Some(host))
+                    }
+                }
+                let result = fitter.observe(observations.pop().unwrap());
+                if count >= 256 {
+                    let map = result.unwrap_or_else(|error| panic!("open {opened} {direction:?} callback {count}: {error:?}"));
+                    assert_eq!(map.quality, Quality::BackendEstimate);
+                    assert_eq!(map.offset_uncertainty_ns, None, "a working map is not ADC/DAC calibration");
+                    assert!(map.residual_ns <= 2_000_000.0);
+                    assert!(map.host_to_frame(k, host, host).is_ok());
+                }
+                count += 1;
+            }
+            assert_eq!(count, 512);
+        }
+    }
+}
+
+#[test]
+fn estimated_timestamp_jitter_does_not_relax_discontinuity_or_drift_checks() {
+    let k = key(110, Direction::Input);
+    for (quality, backstep, retain) in
+        [(Quality::BackendEstimate, 500_000, true), (Quality::BackendEstimate, 2_000_001, false), (Quality::Measured, 1, false)]
+    {
+        let mut fitter = ClockFitter::new(k);
+        for i in 0..20 {
+            let mut o = observation(k, i);
+            o.stamp.quality = quality;
+            fitter.observe(o).ok();
+        }
+        let mut o = observation(k, 20);
+        o.stamp.quality = quality;
+        let previous = observation(k, 19).stamp;
+        o.stamp.backend_callback_ns = previous.backend_callback_ns - backstep;
+        o.stamp.backend_frame_ns = previous.backend_frame_ns - backstep;
+        assert!(matches!(fitter.observe(o), Err(Unavailable::Discontinuity)));
+        assert!(fitter.map().is_none(), "even a retained estimate must still pass the drift and residual limits");
+        assert_eq!(fitter.len > 0, retain);
+        assert_eq!(fitter.counts().discontinuities, u64::from(!retain));
+    }
+}
+
 fn key(generation: u64, direction: Direction) -> ClockKey {
     ClockKey { generation, domain: generation + 100, direction }
 }

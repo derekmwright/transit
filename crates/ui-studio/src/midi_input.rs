@@ -33,7 +33,7 @@ impl InputView {
                         .collect();
                     let c = status.counts;
                     let mut detail = format!(
-                        "{} open MIDI inputs · {} active routes\nEvents received: {} · delivered: {} · filtered: {}\nCanceled: {} · dropped: {} · refused: {} · recovered: {}",
+                        "{} open MIDI inputs · {} active routes\nEvents received: {} · queued for audio: {} · filtered: {}\nCanceled: {} · dropped: {} · refused: {} · recovered: {}",
                         status.open_inputs, status.routes, c.offered, c.admitted, c.filtered, c.cancelled, c.shed, c.refused, c.recovered
                     );
                     if let Some(error) = status.error {
