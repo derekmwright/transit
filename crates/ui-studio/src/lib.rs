@@ -562,6 +562,7 @@ impl StudioApp {
         let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
+        let plugin_requests = service_plugin_requests();
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
         self.drive_editors();
@@ -595,7 +596,7 @@ impl StudioApp {
         // Autosave only runs on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty();
-        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        ctx.request_repaint_after_secs(if editors || plugin_requests { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
         control::collect_screenshots(self, ctx);
     }
 
@@ -772,6 +773,19 @@ mod keys_tests;
 mod slice5_tests;
 #[cfg(test)]
 mod slice6_tests;
+/// Services what hosted plug-ins asked of the host (audit F08, ADR 0012 G7): CLAP restarts,
+/// callbacks and rescans, VST3 `restartComponent`. Main thread, every frame, also with no player
+/// and no editor open (the instances were created on this thread). Idempotent: the playback
+/// runtime may call the same functions. True while a request is still in progress, so the frame
+/// loop comes back soon instead of after its idle second.
+fn service_plugin_requests() -> bool {
+    let clap = soundcraft_clap_host::service_requests();
+    let vst3 = soundcraft_vst3_host::service_requests();
+    clap.pending + vst3.pending > 0
+}
+
+#[cfg(test)]
+mod plugin_requests_tests;
 #[cfg(test)]
 mod tests;
 

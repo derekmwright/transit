@@ -1164,6 +1164,7 @@ impl SoundApp {
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
         self.note_recent_session();
+        let plugin_requests = service_plugin_requests();
         self.apply_editor_edits();
         bounce::step(self, ctx);
         if !ctx.input(|i| i.pointer.any_down()) {
@@ -1197,7 +1198,7 @@ impl SoundApp {
         // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
-        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        ctx.request_repaint_after_secs(if editors || plugin_requests { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
         control::collect_screenshots(self, ctx);
     }
 
@@ -1333,6 +1334,17 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
     let ins = if slot == soundcraft_mix::INSTRUMENT_SLOT { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
     let name = crate::mix_window::plugin_info(&ins.plugin).map_or(ins.plugin.as_str(), |p| p.name);
     Some(format!("{name} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", t.name))
+}
+
+/// Services what hosted plug-ins asked of the host (audit F08, ADR 0012 G7): CLAP restarts,
+/// callbacks and rescans, VST3 `restartComponent`. Main thread, every frame, also with no player
+/// and no editor open (the instances were created on this thread). Idempotent: the playback
+/// runtime may call the same functions. True while a request is still in progress, so the frame
+/// loop comes back soon instead of after its idle second.
+fn service_plugin_requests() -> bool {
+    let clap = soundcraft_clap_host::service_requests();
+    let vst3 = soundcraft_vst3_host::service_requests();
+    clap.pending + vst3.pending > 0
 }
 
 #[cfg(test)]
