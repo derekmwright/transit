@@ -840,6 +840,14 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
             .map_or(ChannelFormat::Stereo, |t| if t.kind == TrackKind::Aux { t.format } else { ChannelFormat::Stereo });
         r = Route::Bus(s.add_bus(&name.clone(), fmt));
     }
+    let changes: Vec<soundcraft_model::RouteChange> = tracks
+        .iter()
+        .map(|t| {
+            let (track, route) = (*t, r.clone());
+            if input { soundcraft_model::RouteChange::Input { track, route } } else { soundcraft_model::RouteChange::Output { track, route } }
+        })
+        .collect();
+    refuse_loop(s, &format!("track.{key}"), &changes)?;
     for t in &tracks {
         if let Some(tr) = s.track_mut(*t) {
             if input {
@@ -850,6 +858,15 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
         }
     }
     Ok(json!({key: r}))
+}
+
+/// L22: refuses `changes` when they would close a routing loop, naming it. The caller has not
+/// changed the session yet (and `Engine::execute` restores it on any error).
+pub(crate) fn refuse_loop(s: &Session, cmd: &str, changes: &[soundcraft_model::RouteChange]) -> Result<()> {
+    match soundcraft_model::would_create_cycle_all(s, changes) {
+        Some(path) => Err(bad(cmd, format!("that route would create a routing loop: {}", soundcraft_model::describe_cycle(s, &path)))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

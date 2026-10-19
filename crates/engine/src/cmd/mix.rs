@@ -458,8 +458,11 @@ fn send(e: &mut Engine, p: &Value) -> Result<Value> {
     let explicit = slot_of(p, "slot", SEND_SLOTS);
     let s = e.session_mut();
     let bid = s.add_bus(&bus, soundcraft_model::ChannelFormat::Stereo);
-    let tr = s.track_mut(t).ok_or_else(|| bad("mix.send", "no track"))?;
+    let tr = s.track(t).ok_or_else(|| bad("mix.send", "no track"))?;
     let slot = explicit.or_else(|| tr.mixer.sends.iter().position(Option::is_none)).ok_or_else(|| bad("mix.send", "all send slots are in use"))?;
+    let change = soundcraft_model::RouteChange::Send { track: t, slot, route: soundcraft_model::Route::Bus(bid) };
+    super::track::refuse_loop(s, "mix.send", std::slice::from_ref(&change))?;
+    let tr = s.track_mut(t).ok_or_else(|| bad("mix.send", "no track"))?;
     // Re-targeting an existing send keeps its level, pan, mute and pre/post setting.
     let mut sl = match tr.mixer.sends.get(slot).cloned().flatten() {
         Some(old) => SendSlot { target: soundcraft_model::Route::Bus(bid), ..old },
