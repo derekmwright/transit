@@ -470,7 +470,7 @@ fn notes_past_the_clip_end_are_refused_on_add_and_flagged_when_moved_or_loaded()
     t.click_n(t.at(len as f64 + 480.0, 64), 2, json!({}));
     assert_eq!(t.notes().len(), 1, "no note added past the end");
     assert_eq!(t.undo_len(), undo);
-    assert_eq!(t.app.status, "Outside the clip: extend the clip in the arrangement first");
+    assert_eq!(t.app.status, "Outside the clip: drag the clip end to extend");
     assert!(t.app.keys.layout.notes.iter().all(|n| !n.outside));
     // Moving a note past the end is allowed; it is flagged (drawn dimmed and hatched).
     t.app.keys.selection = t.notes();

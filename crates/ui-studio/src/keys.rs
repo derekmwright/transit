@@ -125,11 +125,33 @@ pub enum NoteDrag {
 /// A gesture in progress in the pane.
 #[derive(Debug, Clone)]
 pub enum KeysGesture {
-    Notes { kind: NoteDrag, anchor: Note, press: Pos2, copy: bool, sounding: u8 },
-    Band { press: Pos2, additive: bool },
-    Height { start: f32, press: Pos2 },
-    Ruler { ppq: f32, anchor: f64, press: Pos2 },
-    Keyboard { key_h: f32, anchor: f32, press: Pos2 },
+    Notes {
+        kind: NoteDrag,
+        anchor: Note,
+        press: Pos2,
+        copy: bool,
+        sounding: u8,
+    },
+    Band {
+        press: Pos2,
+        additive: bool,
+    },
+    Height {
+        start: f32,
+        press: Pos2,
+    },
+    Ruler {
+        ppq: f32,
+        anchor: f64,
+        press: Pos2,
+    },
+    Keyboard {
+        key_h: f32,
+        anchor: f32,
+        press: Pos2,
+    },
+    /// Dragging the clip's end in the ruler (slice 6).
+    ClipEnd,
 }
 
 /// One note as last drawn (for `ui.inspect`; scripts click and drag them).
@@ -179,6 +201,8 @@ pub struct KeysLayout {
     /// The clip's start (absolute ticks) and length in ticks.
     pub clip_start_ticks: i64,
     pub clip_ticks: i64,
+    /// The clip-end handle in the ruler (slice 6): drag to lengthen or shorten the clip.
+    pub end_handle: R4,
     pub grid_ticks: Option<i64>,
     pub notes: Vec<NoteRect>,
     /// Instrument/MIDI tracks with no clips, which show the "create a clip" hint (set by the arrangement).
@@ -687,6 +711,7 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     paint_keyboard(app, ui, &map, keyboard);
     keyboard_input(app, ui, &map, keyboard, now);
     ruler_input(app, ui, &map, ruler, &s);
+    clip_end_handle(app, ui, &map, ruler, grid, &cv, clip, &mut layout);
     wheel(app, ui, &map, Rect::from_min_max(pos2(area.min.x, body_top), area.max));
     // Overlays: rubber band, cursor and playhead.
     let p = ui.painter().with_clip_rect(Rect::from_min_max(ruler.min, vel.max));
@@ -1081,7 +1106,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                 let pitch = map.pitch(pos.y);
                 let start = map.floor(map.tick(pos.x));
                 if start >= cv.len {
-                    app.status = "Outside the clip: extend the clip in the arrangement first".into();
+                    app.status = "Outside the clip: drag the clip end to extend".into();
                 } else if (0..=127).contains(&pitch) && start >= 0 {
                     let n = Note {
                         pitch: pitch as u8,
@@ -1384,6 +1409,54 @@ fn ruler_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, ruler: Rect, s: &Ses
     }
     if resp.drag_stopped() {
         app.keys.gesture = None;
+    }
+}
+
+/// Slice 6: the clip's end as a handle in the ruler. Dragging it moves the end, snapped to the
+/// grid (one grid step at least); on release the clip is trimmed or extended there
+/// (`edit.trim_clip`, one undo step), so notes placed past the old end now sound.
+#[allow(clippy::too_many_arguments)]
+fn clip_end_handle(app: &mut StudioApp, ui: &mut Ui, map: &Map, ruler: Rect, grid: Rect, cv: &ClipView, clip: ClipId, layout: &mut KeysLayout) {
+    let x = map.x(cv.len);
+    let h = Rect::from_min_max(pos2(x - 5.0, ruler.min.y), pos2(x + 5.0, ruler.max.y));
+    layout.end_handle = r4(h);
+    if h.max.x < ruler.min.x || h.min.x > ruler.max.x {
+        return;
+    }
+    let resp = ui.interact(h.intersect(ruler), ui.id().with("keys_clip_end"), Sense::click_and_drag());
+    let dragging = matches!(app.keys.gesture, Some(KeysGesture::ClipEnd));
+    let step = map.grid.unwrap_or(PPQ / 4).max(1);
+    let target = ui.input(|i| i.pointer.latest_pos()).map(|p| map.round(map.tick(p.x)).max(step));
+    let p = ui.painter().with_clip_rect(Rect::from_min_max(ruler.min, grid.max));
+    let ink = if resp.hovered() || dragging { TOKENS.accent } else { TOKENS.text_dim };
+    p.add(egui::Shape::convex_polygon(
+        vec![pos2(x - 5.0, ruler.min.y + 4.0), pos2(x + 1.0, ruler.min.y + 4.0), pos2(x + 1.0, ruler.max.y), pos2(x - 5.0, ruler.max.y)],
+        ink,
+        Stroke::NONE,
+    ));
+    if resp.hovered() || dragging {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    }
+    if resp.drag_started() {
+        app.keys.gesture = Some(KeysGesture::ClipEnd);
+    }
+    if dragging && let Some(t) = target {
+        let tx = map.x(t);
+        p.line_segment([pos2(tx, ruler.min.y), pos2(tx, grid.max.y)], Stroke::new(2.0, TOKENS.accent));
+    }
+    let resp = resp.on_hover_text("Drag to change the clip's length");
+    if resp.drag_stopped() && dragging {
+        app.keys.gesture = None;
+        if let Some(t) = target
+            && t != cv.len
+        {
+            let s = app.engine.session();
+            let end = s.tempo.tick_to_samples(cv.c0 + t, s.sample_rate);
+            if app.trim_clip(clip, false, end).is_ok() {
+                let bars = t as f64 / (PPQ * 4) as f64;
+                app.status = format!("Clip length {bars:.2} bars");
+            }
+        }
     }
 }
 
