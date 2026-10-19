@@ -1191,6 +1191,22 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
     let touched: Option<(TrackId, Lane)> = app.mixer.gesture.map(|g| Lane::of_target(g.target)).or(header);
     let touched = touched.filter(|_| held);
     let s = app.engine.session_arc();
+    // Touch stops writing on release: the next touch is a new segment, so the automation between
+    // the touches is not cleared and the written span ends here.
+    let released: Vec<(TrackId, String)> = app
+        .auto
+        .last
+        .keys()
+        .filter(|(id, lane)| {
+            s.track(*id).is_some_and(|t| t.mixer.automation_mode == M::Touch) && !touched.as_ref().is_some_and(|(i, l)| i == id && l.id() == *lane)
+        })
+        .cloned()
+        .collect();
+    for k in released {
+        app.auto.last.remove(&k);
+        app.auto.last_v.remove(&k);
+        app.auto.skipped.remove(&k);
+    }
     let mut writes: Vec<(TrackId, Lane)> = Vec::new();
     for t in &s.tracks {
         let mine = touched.as_ref().filter(|(id, _)| *id == t.id).map(|(_, l)| l.clone());
@@ -1331,6 +1347,14 @@ fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
 }
 
 impl StudioApp {
+    /// The time spans the running pass has written to `t`, over all its lanes (tests).
+    #[cfg(test)]
+    pub(crate) fn pass_spans(&self, t: TrackId) -> Vec<(Samples, Samples)> {
+        let mut v: Vec<_> = self.auto.spans.iter().filter(|(k, _)| k.0 == t).flat_map(|(_, s)| s.iter().copied()).collect();
+        v.sort_unstable();
+        v
+    }
+
     /// A write pass is recording on `t` (Thin Focused Track waits for it).
     pub fn pass_on(&self, t: TrackId) -> bool {
         self.auto.writing && self.auto.passed.contains(&t)

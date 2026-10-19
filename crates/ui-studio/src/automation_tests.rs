@@ -1048,3 +1048,55 @@ fn a_thin_that_removes_nothing_leaves_history_and_redo_alone() {
     assert_eq!(t.undo_len(), len, "no empty Thin step");
     assert!(t.app.engine.can_redo(), "Redo is still there");
 }
+
+/// Hand points every 2,000 samples, alternating -3 and -9 dB.
+fn comb(t: &mut T, a: TrackId) -> Vec<(i64, f32)> {
+    let pts: Vec<(i64, f32)> = (1..=100).map(|k| (k * 2_000, if k % 2 == 0 { -3.0 } else { -9.0 })).collect();
+    for (at, v) in &pts {
+        set_point(t, a, *at, *v);
+    }
+    t.frames(3);
+    pts
+}
+
+#[test]
+fn a_second_touch_leaves_the_automation_between_the_touches_alone() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    let hand = comb(&mut t, a);
+    t.key("Space");
+    touch_drag(&mut t, a, 40.0, 10);
+    let released = t.app.pass_spans(a)[0].1;
+    t.frames(40);
+    touch_drag(&mut t, a, -40.0, 10);
+    let spans = t.app.pass_spans(a);
+    assert_eq!(spans.len(), 2, "two touches, two spans: {spans:?}");
+    let retouched = spans[1].0;
+    assert!(retouched - released > 20_000, "a real gap: {released}..{retouched}");
+    let gap: Vec<_> = hand.iter().filter(|p| p.0 > released + 1_000 && p.0 < retouched - 1_000).copied().collect();
+    assert!(gap.len() >= 8, "{} hand points in the gap", gap.len());
+    let alive = |t: &T| t.points(a, &AutoParam::Volume);
+    for g in &gap {
+        assert!(alive(&t).contains(g), "hand point {g:?} survived the second touch before Stop");
+    }
+    t.key("Space");
+    t.frames(3);
+    for g in &gap {
+        assert!(alive(&t).contains(g), "hand point {g:?} survived the thin");
+    }
+}
+
+#[test]
+fn latch_keeps_writing_after_release_by_design() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    t.app.set_automation_mode(a, AutomationMode::Latch).unwrap();
+    t.frames(3);
+    t.key("Space");
+    touch_drag(&mut t, a, 40.0, 10);
+    let n = t.points(a, &AutoParam::Volume).len();
+    t.frames(60);
+    assert!(t.points(a, &AutoParam::Volume).len() >= n, "Latch goes on writing (or holding) after release");
+    assert_eq!(t.app.pass_spans(a).len(), 1, "one continuous span");
+    t.key("Space");
+}
