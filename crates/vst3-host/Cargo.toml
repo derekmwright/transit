@@ -63,3 +63,7 @@ dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"
 type_complexity = "allow"
+
+[[test]]
+name = "real_plugin_repro"
+harness = false
