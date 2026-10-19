@@ -48,6 +48,7 @@ use vst3::{Class, ComRef, ComWrapper, uid};
 const GAIN_CID: TUID = uid(0x5C0A1D00, 0x11112222, 0x33334444, 0x55556666);
 const GAIN_CTRL_CID: TUID = uid(0x5C0A1D01, 0x11112222, 0x33334444, 0x55556666);
 const SYNTH_CID: TUID = uid(0x5C0A1D02, 0x11112222, 0x33334444, 0x55556666);
+const EVENTS_CID: TUID = uid(0x5C0A1D03, 0x11112222, 0x33334444, 0x55556666);
 
 fn copy_c8(src: &str, dst: &mut [c_char]) {
     for (d, s) in dst.iter_mut().zip(src.bytes().chain(std::iter::once(0))) {
@@ -677,6 +678,8 @@ struct Synth {
     every: std::sync::Mutex<Option<String>>,
     /// `setActive(true)` fails.
     refuse: AtomicBool,
+    /// The events synth (see [`PROBE_PARAM`]).
+    events: bool,
     /// (call, OS thread), each pair once.
     threads: std::sync::Mutex<Vec<(&'static str, usize)>>,
     _live: Live,
@@ -693,6 +696,7 @@ impl Synth {
             armed: std::sync::Mutex::new(None),
             every: std::sync::Mutex::new(None),
             refuse: AtomicBool::new(false),
+            events: false,
             threads: std::sync::Mutex::new(Vec::new()),
             _live: Live::new(&OBJECTS),
         }
@@ -756,11 +760,22 @@ impl Class for Synth {
 /// The synth's hidden parameter that MIDI CC 7 drives.
 const VOLUME_PARAM: ParamID = 1;
 
+/// The events synth ("Fixture Events", F10) is the synth that exposes [`PROBE_PARAM`], maps CC 64 on channel `c`
+/// to parameter `100 + c`, and writes what it receives into its output instead of a level: one
+/// record of four samples per event and per parameter point, in the order it reads them —
+/// `[1 on | 2 off | 3 poly pressure, offset, channel * 1000 + pitch, noteId]` and
+/// `[4, offset, param id, value * 1e6]`. Integers below 2^24 are exact in `f32`.
+/// The parameter the events mode exposes (normalized 0..1).
+const PROBE_PARAM: ParamID = 5;
+
 impl IMidiMappingTrait for Synth {
     unsafe fn getMidiControllerAssignment(&self, bus: i32, channel: i16, ctrl: CtrlNumber, id: *mut ParamID) -> tresult {
         self.note_thread("map");
         if bus == 0 && channel == 0 && i64::from(ctrl) == self.cc.load(Ordering::SeqCst) {
             unsafe { *id = VOLUME_PARAM };
+            kResultOk
+        } else if self.events && bus == 0 && ctrl == 64 && (0..16).contains(&channel) {
+            unsafe { *id = 100 + channel as u32 };
             kResultOk
         } else {
             kResultFalse
@@ -912,6 +927,44 @@ impl IAudioProcessorTrait for Synth {
             }
         }
         let outs = unsafe { channels(&*d.outputs, frames) };
+        if self.events {
+            let mut rec: Vec<f32> = Vec::new();
+            for e in &events {
+                let ty = e.r#type;
+                let (code, ch, pitch, id) = if ty == Event_::EventTypes_::kNoteOnEvent as u16 {
+                    let n = unsafe { e.__field0.noteOn };
+                    (1.0, n.channel, n.pitch, n.noteId)
+                } else if ty == Event_::EventTypes_::kNoteOffEvent as u16 {
+                    let n = unsafe { e.__field0.noteOff };
+                    (2.0, n.channel, n.pitch, n.noteId)
+                } else if ty == Event_::EventTypes_::kPolyPressureEvent as u16 {
+                    let n = unsafe { e.__field0.polyPressure };
+                    (3.0, n.channel, n.pitch, n.noteId)
+                } else {
+                    continue;
+                };
+                rec.extend([code, e.sampleOffset as f32, f32::from(ch) * 1000.0 + f32::from(pitch), id as f32]);
+            }
+            if let Some(changes) = unsafe { ComRef::from_raw(d.inputParameterChanges) } {
+                for i in 0..unsafe { changes.getParameterCount() } {
+                    let Some(q) = (unsafe { ComRef::from_raw(changes.getParameterData(i)) }) else { continue };
+                    let pid = unsafe { q.getParameterId() };
+                    for k in 0..unsafe { q.getPointCount() } {
+                        let (mut at, mut v) = (0i32, 0f64);
+                        if unsafe { q.getPoint(k, &mut at, &mut v) } == kResultOk {
+                            rec.extend([4.0, at as f32, pid as f32, (v * 1e6).round() as f32]);
+                        }
+                    }
+                }
+            }
+            for ch in outs {
+                ch.fill(0.0);
+                for (o, r) in ch.iter_mut().zip(&rec) {
+                    *o = *r;
+                }
+            }
+            return kResultOk;
+        }
         let mut level = f32::from_bits(self.level.load(Ordering::Relaxed));
         let mut out = vec![0.0f32; frames];
         for (i, o) in out.iter_mut().enumerate() {
@@ -953,10 +1006,22 @@ impl IEditControllerTrait for Synth {
         kResultOk
     }
     unsafe fn getParameterCount(&self) -> i32 {
-        0
+        i32::from(self.events)
     }
-    unsafe fn getParameterInfo(&self, _index: i32, _info: *mut ParameterInfo) -> tresult {
-        kInvalidArgument
+    unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
+        if !self.events || index != 0 {
+            return kInvalidArgument;
+        }
+        let i = unsafe { &mut *info };
+        i.id = PROBE_PARAM;
+        copy_c16("Probe", &mut i.title);
+        copy_c16("Probe", &mut i.shortTitle);
+        copy_c16("", &mut i.units);
+        i.stepCount = 0;
+        i.defaultNormalizedValue = 0.0;
+        i.unitId = 0;
+        i.flags = ParameterInfo_::ParameterFlags_::kCanAutomate as i32;
+        kResultOk
     }
     unsafe fn getParamStringByValue(&self, _id: u32, _n: f64, _s: *mut String128) -> tresult {
         kInvalidArgument
@@ -995,10 +1060,11 @@ impl Class for Factory {
     type Interfaces = (IPluginFactory2,);
 }
 
-const CLASSES: [(TUID, &str, &str, &str); 3] = [
+const CLASSES: [(TUID, &str, &str, &str); 4] = [
     (GAIN_CID, "Audio Module Class", "Fixture Gain", "Fx"),
     (GAIN_CTRL_CID, "Component Controller Class", "Fixture Gain", ""),
     (SYNTH_CID, "Audio Module Class", "Fixture Synth", "Instrument|Synth"),
+    (EVENTS_CID, "Audio Module Class", "Fixture Events", "Instrument|Synth"),
 ];
 
 impl IPluginFactoryTrait for Factory {
@@ -1045,6 +1111,8 @@ impl IPluginFactoryTrait for Factory {
             .to_com_ptr::<FUnknown>()
         } else if cid == SYNTH_CID {
             ComWrapper::new(Synth::new()).to_com_ptr::<FUnknown>()
+        } else if cid == EVENTS_CID {
+            ComWrapper::new(Synth { events: true, ..Synth::new() }).to_com_ptr::<FUnknown>()
         } else {
             None
         };
