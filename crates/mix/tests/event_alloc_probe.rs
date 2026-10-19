@@ -60,7 +60,7 @@ fn admission_delivery_revocation_and_panic_allocate_nothing() {
         for round in 0..2u64 {
             for p in 0..40u16 {
                 let src = Source { port: p, channel: (p % 16) as u8, generation: 1 };
-                for cc in [64, 66, 69] {
+                for cc in [64, 66, 67, 69] {
                     let o = mix.queue_event(&ev(src, now + round, Message::Control { cc, value: 127 }, None));
                     outcomes[usize::from(o.accepted())] += 1;
                 }
@@ -114,6 +114,24 @@ fn admission_delivery_revocation_and_panic_allocate_nothing() {
         }
         mix.render_active(pos, BLOCK, &mut out);
         pos += BLOCK as i64;
+        // A live pedal survives a seek, then its nonzero up survives another epoch change.
+        let src = Source { port: 49, channel: 0, generation: 1 };
+        let now = mix.next_frame().0;
+        assert_eq!(mix.queue_event(&ev(src, now, Message::Control { cc: 64, value: 100 }, None)), EventOutcome::Queued);
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += 10_000;
+        mix.set_transport_epoch(TransportEpoch(4));
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        let now = mix.next_frame().0;
+        for k in 0..256 {
+            assert_eq!(mix.queue_event(&ev(src, now + 1000 + k, Message::Control { cc: 1, value: 1 }, None)), EventOutcome::Queued);
+        }
+        assert_eq!(mix.queue_event(&ev(src, now + 20, Message::Control { cc: 64, value: 63 }, Some(TransportEpoch(4)))), EventOutcome::Queued);
+        mix.set_transport_epoch(TransportEpoch(5));
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        mix.revoke_source(49, 1);
         // Stop: release everything, then reset the plug-ins.
         let now = mix.next_frame().0;
         let src = Source { port: 50, channel: 0, generation: 1 };

@@ -18,7 +18,7 @@ impl NoteId {
 pub const CC_SUSTAIN: u8 = 64;
 /// The sostenuto pedal (CC 66).
 pub const CC_SOSTENUTO: u8 = 66;
-/// The soft pedal (CC 67): not tracked per source, but its release survives a host reset.
+/// The soft pedal (CC 67).
 pub const CC_SOFT: u8 = 67;
 /// Hold 2 (CC 69).
 pub const CC_HOLD2: u8 = 69;
@@ -69,10 +69,10 @@ pub enum Message {
     },
 }
 
-/// Is `cc` one of the pedals the mix tracks per source (sustain, sostenuto, hold 2)?
+/// Is `cc` one of the pedals the mix tracks per source (sustain, sostenuto, soft, hold 2)?
 #[must_use]
 pub const fn is_pedal(cc: u8) -> bool {
-    matches!(cc, CC_SUSTAIN | CC_SOSTENUTO | CC_HOLD2)
+    matches!(cc, CC_SUSTAIN | CC_SOSTENUTO | CC_SOFT | CC_HOLD2)
 }
 
 impl Message {
@@ -90,14 +90,13 @@ impl Message {
     }
 
     /// What a plug-in host keeps through its own `reset` (and delivers on the next `process`):
-    /// the release class, a note-on with velocity 0, and the soft pedal (CC 67) going up. A reset
+    /// the release class and a note-on with velocity 0. A reset
     /// that dropped these would leave a sustain or note hanging at the plug-in, since the mix has
     /// already freed what it held.
     #[must_use]
     pub const fn survives_reset(&self) -> bool {
         match *self {
             Message::NoteOn { velocity: 0, .. } => true,
-            Message::Control { cc: CC_SOFT, value } => value < 64,
             _ => self.is_release(),
         }
     }
@@ -170,7 +169,7 @@ mod tests {
         let n = NoteId::NONE;
         assert!(Message::NoteOff { key: 60, velocity: 0, id: n }.is_release());
         assert!(!Message::NoteOn { key: 60, velocity: 1, id: n }.is_release());
-        for cc in [64, 66, 69] {
+        for cc in [64, 66, 67, 69] {
             assert!(Message::Control { cc, value: 0 }.is_release());
             assert!(Message::Control { cc, value: 63 }.is_release());
             assert!(!Message::Control { cc, value: 64 }.is_release());

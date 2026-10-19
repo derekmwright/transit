@@ -17,10 +17,11 @@
 //!
 //! **Delivery**, before the instrument's `process`: controller chase, then the clips (as
 //! [`Source::CLIP`], through the same note and pedal table), then the queue entries due in the
-//! block at `due − block start`. Pedals are tracked per source: any value above 0 holds, 0
-//! releases. The plug-in gets the maximum of the holders' current values, evaluated in due order:
-//! down when the first holder appears, 0 when the last one leaves, and every change of the
-//! maximum in between (one holder's half-pedal values pass through exactly). The mix assigns
+//! block at `due − block start`. Pedals are tracked per source: values >= 64 hold, values < 64
+//! release. The plug-in gets the maximum of the holders' current values, evaluated in due order:
+//! down when the first holder appears, the final holder's exact up value when it leaves, and
+//! every change of the maximum in between. A100/B60/A0/B0 emits 100/0: B's unmatched ups emit
+//! nothing and occupy no holder. One source's 127/90/70/0 passes through exactly. The mix assigns
 //! every note a voice id of its own ([`PluginEvent::note_id`]), so two sources' notes on one key
 //! stay apart.
 //!
@@ -36,8 +37,8 @@
 //!   `process` ([`Message::survives_reset`]).
 //! - Locate or loop wrap during playback is [`MixEngine::set_transport_epoch`] plus the position
 //!   jump in [`MixEngine::render_active`]: only the clips' notes and pedals are released and
-//!   queued clip-derived events cancelled. Live notes and pedals keep sounding; a clip's CC 121
-//!   (the controller chase) is followed by the pedals other sources hold, sent down again.
+//!   queued clip-derived events cancelled. Live notes and pedals keep sounding: CC 121 is
+//!   suppressed on channels with remaining pedal holders, avoiding an up-then-down glitch.
 //! - The legacy [`MixEngine::render`] does not deliver queued events (it renders the legacy
 //!   strips, not the plan's instruments): events need [`MixEngine::render_active`]. An engine
 //!   without an adopted plan refuses every event ([`EventOutcome::NoInstrument`]).
@@ -437,7 +438,7 @@ struct PedalEntry {
     cc: u8,
     /// Its down was delivered: it counts as a holder, at `value`.
     down: bool,
-    /// The source's delivered pedal value (1..=127 while it holds).
+    /// The source's delivered pedal value (64..=127 while it holds).
     value: u8,
     /// Pedal-downs queued and not yet delivered.
     downs: u16,
@@ -453,11 +454,12 @@ fn pedal_kind(cc: u8) -> usize {
     match cc {
         CC_SUSTAIN => 0,
         CC_SOSTENUTO => 1,
-        _ => 2,
+        soundcraft_dsp::event::CC_SOFT => 2,
+        _ => 3,
     }
 }
 
-const PEDALS: [u8; 3] = [CC_SUSTAIN, CC_SOSTENUTO, soundcraft_dsp::event::CC_HOLD2];
+const PEDALS: [u8; 4] = [CC_SUSTAIN, CC_SOSTENUTO, soundcraft_dsp::event::CC_SOFT, soundcraft_dsp::event::CC_HOLD2];
 
 /// The last source to move a channel's bend or pressure, and whether it left it neutral.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,9 +478,9 @@ pub(crate) struct InstrumentEvents {
     notes: [NoteEntry; MAX_OPEN],
     pedals: [PedalEntry; MAX_PEDALS],
     /// Per channel and pedal kind: the sources whose down was delivered.
-    holders: [[u8; 3]; 16],
+    holders: [[u8; 4]; 16],
     /// Per channel and pedal kind: the value the plug-in last got (the maximum over holders).
-    sent: [[u8; 3]; 16],
+    sent: [[u8; 4]; 16],
     /// Per channel: bend, then channel pressure.
     writers: [[Option<Writer>; 2]; 16],
     next_voice: u32,
@@ -500,8 +502,8 @@ impl InstrumentEvents {
             non_release: 0,
             notes: [NO_NOTE; MAX_OPEN],
             pedals: [NO_PEDAL; MAX_PEDALS],
-            holders: [[0; 3]; 16],
-            sent: [[0; 3]; 16],
+            holders: [[0; 4]; 16],
+            sent: [[0; 4]; 16],
             writers: [[None; 2]; 16],
             next_voice: 0,
             status: EventStatus::default(),
@@ -624,8 +626,8 @@ impl InstrumentEvents {
                 self.release_note(n, due, source, transport, message, st);
                 Admit::Queued
             }
-            // Any value above 0 holds the pedal (half-pedal values pass through); 0 releases it.
-            Message::Control { cc, value } if is_pedal(cc) && value > 0 => {
+            // MIDI's switch threshold controls ownership, while continuous values pass through.
+            Message::Control { cc, value } if is_pedal(cc) && value >= 64 => {
                 if !room {
                     return Admit::Shed(Shed::QueueFull);
                 }
@@ -793,23 +795,23 @@ impl InstrumentEvents {
         }
     }
 
-    /// Source entry `n` moves its pedal to `value` (0: up, which frees the entry). Per (channel,
+    /// Source entry `n` moves its pedal to `value` (<64: up, which frees the entry). Per (channel,
     /// pedal kind) the plug-in gets the maximum over the holders: down when the first holder
-    /// appears, 0 when the last one leaves, and every change of that maximum in between, so one
-    /// holder's half-pedal values pass through exactly. Unchanged output is absorbed (counted).
+    /// appears, the exact up value when the last one leaves, and every change of that maximum
+    /// in between. One holder's continuous values pass through. Unchanged output is absorbed (counted).
     fn pedal_set(&mut self, plugin: &mut dyn Plugin, offset: u32, n: usize, value: u8) {
         let Some(p) = self.pedals.get(n).copied() else { return };
         let ch = p.source.channel & 0x0F;
         let kind = pedal_kind(p.cc);
         if let Some(count) = self.holders.get_mut(usize::from(ch)).and_then(|h| h.get_mut(kind)) {
-            if value > 0 && !p.down {
+            if value >= 64 && !p.down {
                 *count = count.saturating_add(1);
-            } else if value == 0 && p.down {
+            } else if value < 64 && p.down {
                 *count = count.saturating_sub(1);
             }
         }
         if let Some(p) = self.pedals.get_mut(n) {
-            if value > 0 {
+            if value >= 64 {
                 p.down = true;
                 p.value = value;
             } else {
@@ -817,7 +819,7 @@ impl InstrumentEvents {
             }
         }
         let holding = |q: &&PedalEntry| q.used && q.down && q.cc == p.cc && q.source.channel & 0x0F == ch;
-        let out = self.pedals.iter().filter(holding).map(|q| q.value).max().unwrap_or(0);
+        let out = self.pedals.iter().filter(holding).map(|q| q.value).max().unwrap_or(value);
         let Some(sent) = self.sent.get_mut(usize::from(ch)).and_then(|s| s.get_mut(kind)) else { return };
         if *sent == out {
             self.status.absorbed_pedal_edges = self.status.absorbed_pedal_edges.saturating_add(1);
@@ -827,17 +829,17 @@ impl InstrumentEvents {
         }
     }
 
-    /// Reset all controllers on `channel`, then the pedals other sources still hold, down again
-    /// at their current value.
+    /// A channel-wide reset would irreversibly release voices sustained by other sources.
+    /// Its source's pedals have already been lifted through the OR; skip CC 121 while any
+    /// holder remains. Re-sending down after CC 121 cannot restore the released voices.
     fn deliver_reset(&mut self, plugin: &mut dyn Plugin, offset: u32, channel: u8, value: u8) {
-        self.send(plugin, offset, channel, PluginEvent::NO_ID, Message::Control { cc: CC_RESET_CONTROLLERS, value });
         let ch = usize::from(channel & 0x0F);
-        let held = self.holders.get(ch).copied().unwrap_or_default();
-        let sent = self.sent.get(ch).copied().unwrap_or_default();
-        for ((cc, h), v) in PEDALS.into_iter().zip(held).zip(sent) {
-            if h > 0 {
-                self.send(plugin, offset, channel, PluginEvent::NO_ID, Message::Control { cc, value: v });
-            }
+        if self.holders.get(ch).is_some_and(|h| h.iter().any(|&n| n > 0)) {
+            return;
+        }
+        self.send(plugin, offset, channel, PluginEvent::NO_ID, Message::Control { cc: CC_RESET_CONTROLLERS, value });
+        if let Some(sent) = self.sent.get_mut(ch) {
+            *sent = [0; 4];
         }
     }
 
@@ -883,8 +885,9 @@ impl InstrumentEvents {
                     if let Some(p) = self.pedals.get_mut(usize::from(n)) {
                         p.downs = p.downs.saturating_sub(1);
                     }
-                    self.pedal_set(plugin, offset, usize::from(n), value.max(1));
+                    self.pedal_set(plugin, offset, usize::from(n), value);
                 }
+                (Action::Up(n), Message::Control { value, .. }) => self.pedal_set(plugin, offset, usize::from(n), value),
                 (Action::Up(n), _) => self.pedal_set(plugin, offset, usize::from(n), 0),
                 (Action::Reset, Message::Control { value, .. }) => self.deliver_reset(plugin, offset, q.source.channel, value),
                 (_, m) => self.deliver_plain(plugin, offset, q.source, m),
@@ -967,8 +970,8 @@ impl InstrumentEvents {
             }
         }
         self.pedals = [NO_PEDAL; MAX_PEDALS];
-        self.holders = [[0; 3]; 16];
-        self.sent = [[0; 3]; 16];
+        self.holders = [[0; 4]; 16];
+        self.sent = [[0; 4]; 16];
         self.writers = [[None; 2]; 16];
     }
 
@@ -1040,7 +1043,7 @@ impl InstrumentEvents {
         match message {
             Message::Control { cc, value } if is_pedal(cc) => {
                 let open = self.pedals.iter().position(|p| p.used && p.source == source && p.cc == cc);
-                match (open, value > 0) {
+                match (open, value >= 64) {
                     (Some(n), _) => self.pedal_set(plugin, offset, n, value),
                     (None, true) => {
                         let Some(n) = self.free_pedal() else {
