@@ -418,8 +418,10 @@ impl StudioApp {
         let velocity = self.ui.keys.velocity.clamp(1, 127);
         self.keys.auditions += 1;
         self.keys.last_audition = Some((pitch, velocity));
-        if let Some(p) = &self.player {
-            p.note(track, pitch, velocity);
+        if let Some(p) = &self.player
+            && self.player_requests.result(&mut self.status, p.note(track, pitch, velocity)).is_none()
+        {
+            return;
         }
         self.keys.held.push((track, pitch, now + 0.15));
     }
@@ -430,8 +432,10 @@ impl StudioApp {
         for (t, pitch, at) in std::mem::take(&mut self.keys.held) {
             if pointer_down || now < at {
                 keep.push((t, pitch, at));
-            } else if let Some(p) = &self.player {
-                p.note(t, pitch, 0);
+            } else if let Some(p) = &self.player
+                && self.player_requests.result(&mut self.status, p.note(t, pitch, 0)).is_none()
+            {
+                keep.push((t, pitch, at));
             }
         }
         self.keys.held = keep;
@@ -1251,7 +1255,7 @@ fn drag_update(app: &mut StudioApp, ui: &Ui, map: &Map, now: f64) {
     }
     if let Some((old, new)) = play {
         if let (Some(p), Some(t)) = (&app.player, app.keys_track()) {
-            p.note(t, old, 0);
+            app.player_requests.result(&mut app.status, p.note(t, old, 0));
         }
         app.keys.held.retain(|h| h.1 != old);
         app.audition(new, now);

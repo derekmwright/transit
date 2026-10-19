@@ -90,7 +90,8 @@ fn renderer(app: &mut SoundApp, ctx: &egui::Context) {
     }
     let t = Tokens::current();
     let fmt = app.engine.session().main_format();
-    let peaks: Vec<f32> = app.player.as_ref().map(|p| p.meters().main.peaks).unwrap_or_default();
+    let peaks: Vec<f32> =
+        app.player.as_ref().and_then(|p| app.player_requests.result(&mut app.ui.status, p.meters())).map(|m| m.main.peaks).unwrap_or_default();
     let objects: Vec<(String, f32, f32, f32)> = app
         .engine
         .session()

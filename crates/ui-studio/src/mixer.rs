@@ -681,7 +681,7 @@ impl StudioApp {
     /// Remove a device; its editor window closes first.
     pub fn remove_device(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
         if let Some(p) = &self.player {
-            p.close_editor(t, slot);
+            self.player_requests.result(&mut self.status, p.close_editor(t, slot)).ok_or_else(|| self.status.clone())?;
         }
         self.ui.plugin_windows.retain(|k| *k != (t, slot));
         self.run("mix.insert_remove", json!({"track": t.0, "slot": slot}))
@@ -696,7 +696,7 @@ impl StudioApp {
         }
         let key = (t, soundcraft_mix::INSTRUMENT_SLOT);
         if let Some(p) = &self.player {
-            p.close_editor(key.0, key.1);
+            self.player_requests.result(&mut self.status, p.close_editor(key.0, key.1)).ok_or_else(|| self.status.clone())?;
         }
         self.ui.plugin_windows.retain(|k| *k != key);
         self.editors.retain(|e| e.key != key);

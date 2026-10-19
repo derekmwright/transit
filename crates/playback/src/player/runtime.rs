@@ -181,6 +181,9 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn requested_session(&self) -> &Arc<Session> {
         &self.requested
     }
+    pub(super) fn failure_signal(&self) -> plan_bridge::RuntimeIdentity {
+        self.control.sessions.bridge.runtime_identity()
+    }
     pub fn faulted(&self) -> bool {
         self.control.sessions.faulted() || self.sources.faulted()
     }
@@ -285,8 +288,18 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn editor_set_param(&mut self, track: TrackId, slot: usize, id: &str, value: f32) {
         self.handles.set_param(track, slot, id, value);
     }
-    pub fn capture_states(&mut self) -> PluginStates {
-        self.handles.capture_states()
+    /// Capture only for the exact immutable document whose plan was confirmed.
+    /// The caller may already have edited its document without submitting it here;
+    /// comparing only the most recent request would then corrupt replacement state.
+    /// Internal latency refreshes preserve this document lineage, including refusal.
+    pub fn capture_states(&mut self, expected: &Arc<Session>) -> Result<PluginStates, PlayerError> {
+        if self.faulted() {
+            return Err(PlayerError::Faulted);
+        }
+        if !Arc::ptr_eq(expected, &self.requested) || self.confirmed != Some(self.control.sessions.bridge.active()) {
+            return Err(PlayerError::SessionPending);
+        }
+        Ok(self.handles.capture_states())
     }
     pub fn idle_editors(&mut self) -> Vec<EditorEdit> {
         self.handles.idle()

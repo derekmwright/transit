@@ -1,17 +1,21 @@
 //! Prepared callback integration. This is exercised before replacing the device
 //! adapter: ownership, command budgets and render-ahead boundaries are shared.
+use super::{AudioPorts, sources};
+#[cfg(test)]
 use super::{Control, endpoints};
 use crate::{Shared, action_lane, device_clock::ClockKey, plan_bridge, timeline_map};
+#[cfg(test)]
 use soundcraft_mix::{PlanLimits, RenderTarget};
 use soundcraft_time::{MAX_POSITION, Range, Samples};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum Command {
     Play { from: Samples, end: Option<Samples>, looped: Option<Range> },
     Locate(Samples),
     Recording(bool),
+    Note(soundcraft_mix::InstrumentEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +23,7 @@ pub enum ActionResult {
     Applied,
     InvalidPosition,
     Timeline(timeline_map::MapError),
+    Event(soundcraft_mix::EventOutcome),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +45,6 @@ struct Transport {
     looped: Option<Range>,
     loop_engaged: bool,
     discard_pending: bool,
-    flush_releases: bool,
     timeline_fault: Option<timeline_map::MapError>,
 }
 
@@ -68,7 +72,7 @@ impl Transport {
                     self.end = end;
                     self.loop_engaged = looped.is_some_and(|r| from < r.end);
                     self.discard_pending = true;
-                    live.reset();
+                    live.set_transport_epoch(soundcraft_mix::TransportEpoch(self.epoch));
                 })
             }
             action_lane::Event::Action { payload: Command::Locate(at), .. } => {
@@ -79,12 +83,15 @@ impl Transport {
                     self.render_position = at;
                     self.loop_engaged = self.looped.is_some_and(|r| at < r.end);
                     self.discard_pending = true;
-                    live.reset();
+                    live.set_transport_epoch(soundcraft_mix::TransportEpoch(self.epoch));
                 })
             }
             action_lane::Event::Action { payload: Command::Recording(on), .. } => {
                 self.recording = on;
                 Ok(())
+            }
+            action_lane::Event::Action { payload: Command::Note(event), .. } => {
+                return ActionResult::Event(live.queue_event(&event));
             }
             action_lane::Event::Stop { .. } => {
                 let result = self.change(None, false, None);
@@ -92,7 +99,7 @@ impl Transport {
                 self.end = None;
                 self.loop_engaged = false;
                 self.discard_pending = true;
-                self.flush_releases = true;
+                live.set_transport_epoch(soundcraft_mix::TransportEpoch(self.epoch));
                 live.reset();
                 if let Ok(position) = self.timeline.position() {
                     self.render_position = position.sample;
@@ -101,7 +108,6 @@ impl Transport {
             }
             action_lane::Event::AllNotesOff { .. } => {
                 live.all_notes_off();
-                self.flush_releases = true;
                 Ok(())
             }
         };
@@ -132,6 +138,7 @@ impl Transport {
 pub(super) struct Audio {
     pub(super) plans: plan_bridge::Audio,
     pub(super) actions: action_lane::Audio<Command, ActionResult>,
+    pub(super) sources: sources::Audio,
     transport: Transport,
     shared: Arc<Shared>,
     pending: usize,
@@ -142,9 +149,35 @@ pub(super) struct Audio {
     faulted: bool,
     /// An escaped panic may own a heap payload. Retain it with the audio holder
     /// until main reclaims that holder; do not destroy it during error handling.
-    panic_payload: Option<Box<dyn std::any::Any + Send>>,
+    panic_payload: RetainedPanic,
 }
 
+/// Payload ownership follows Audio back to Main. This separate field wrapper
+/// also protects partial moves in test/retirement paths; Audio itself remains
+/// movable into its matching endpoint bundle.
+struct RetainedPanic(Option<Box<dyn std::any::Any + Send>>);
+impl Drop for RetainedPanic {
+    fn drop(&mut self) {
+        if let Some(payload) = self.0.take()
+            && let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+        {
+            std::mem::forget(secondary);
+        }
+    }
+}
+
+pub(super) struct InitError {
+    pub(super) error: timeline_map::MapError,
+    // A failed initialization returns every endpoint to main for retirement.
+    pub(super) ports: Box<AudioPorts<Command, ActionResult>>,
+}
+impl std::fmt::Debug for InitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitError").field("error", &self.error).finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
 pub(super) fn pair(
     target: RenderTarget,
     limits: PlanLimits,
@@ -152,14 +185,44 @@ pub(super) fn pair(
     device_rate: u32,
     shared: Arc<Shared>,
 ) -> Result<(Control<Command, ActionResult>, Audio), timeline_map::MapError> {
-    let rate = timeline_map::Rate::new(u64::from(target.sample_rate), u64::from(device_rate))?;
-    let timeline = timeline_map::Timeline::new(key, 0, 0, 0, rate)?;
     let (control, plans, actions) = endpoints(target, limits);
-    Ok((
-        control,
-        Audio {
-            plans,
-            actions,
+    let (_, sources) = sources::pair(&control.sessions.bridge).map_err(|_| timeline_map::MapError::Arithmetic)?;
+    Audio::from_ports(AudioPorts { plans, actions, sources }, key, device_rate, shared).map(|audio| (control, audio)).map_err(|failure| failure.error)
+}
+
+impl Audio {
+    pub(super) fn fault(&mut self) {
+        self.faulted = true;
+        self.plans.fault();
+        self.actions.fault();
+        self.sources.fault();
+        self.shared.playing.store(false, Ordering::Relaxed);
+    }
+    /// Construct on main from the owner's exact endpoint bundle, before starting
+    /// a callback. No second compiler, action lane or source registry is created.
+    pub(super) fn from_ports(
+        ports: AudioPorts<Command, ActionResult>,
+        key: ClockKey,
+        device_rate: u32,
+        shared: Arc<Shared>,
+    ) -> Result<Self, InitError> {
+        let target = ports.plans.engine().active().target;
+        let init = || {
+            if target.device.0 != key.generation {
+                return Err(timeline_map::MapError::WrongGeneration);
+            }
+            let rate = timeline_map::Rate::new(u64::from(target.sample_rate), u64::from(device_rate))?;
+            let timeline = timeline_map::Timeline::new(key, 0, 0, 0, rate)?;
+            Ok::<_, timeline_map::MapError>((rate, timeline))
+        };
+        let (rate, timeline) = match init() {
+            Ok(value) => value,
+            Err(error) => return Err(InitError { error, ports: Box::new(ports) }),
+        };
+        Ok(Self {
+            plans: ports.plans,
+            actions: ports.actions,
+            sources: ports.sources,
             shared,
             pending: 0,
             read: 0.0,
@@ -167,7 +230,7 @@ pub(super) fn pair(
             device_rate,
             speed: 1000,
             faulted: false,
-            panic_payload: None,
+            panic_payload: RetainedPanic(None),
             transport: Transport {
                 timeline,
                 history: timeline_map::History::default(),
@@ -180,14 +243,16 @@ pub(super) fn pair(
                 looped: None,
                 loop_engaged: false,
                 discard_pending: false,
-                flush_releases: false,
                 timeline_fault: None,
             },
-        },
-    ))
-}
+        })
+    }
 
-impl Audio {
+    /// Main only, after callback quiescence. Retained panic payloads are dropped
+    /// here; plugin and session owners travel back through RuntimeControl::retire.
+    pub(super) fn into_ports(self) -> AudioPorts<Command, ActionResult> {
+        AudioPorts { plans: self.plans, actions: self.actions, sources: self.sources }
+    }
     fn consumed(&mut self, frames: usize) -> Result<(), timeline_map::MapError> {
         self.transport.consumed(frames, &self.shared)?;
         if self.transport.playing
@@ -198,9 +263,9 @@ impl Audio {
             self.transport.change(Some(end), false, None)?;
             self.transport.end = None;
             self.transport.render_position = end;
-            self.transport.flush_releases = true;
             self.pending = 0;
             self.read = 0.0;
+            self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(self.transport.epoch));
             self.plans.reset();
             self.shared.position.store(end, Ordering::Relaxed);
             self.shared.playing.store(false, Ordering::Relaxed);
@@ -209,20 +274,30 @@ impl Audio {
     }
 
     fn service_actions(&mut self, budget: &mut action_lane::Budget) {
+        let source_report = self.sources.service(budget, &mut self.plans, &mut |port, generation, live| {
+            live.revoke_source(port, generation);
+            Ok(())
+        });
+        if source_report.faulted {
+            self.faulted = true;
+            self.plans.fault();
+        }
         let transport = &mut self.transport;
-        let report = self.actions.service(budget, &mut self.plans, &mut |event, live| transport.command(event, live));
+        let sources = &self.sources;
+        let report = self.actions.service(budget, &mut self.plans, &mut |event, live| {
+            if let action_lane::Event::Action { payload: Command::Note(note), .. } = event
+                && !sources.permits(note.source.port, note.source.generation)
+            {
+                return ActionResult::Event(soundcraft_mix::EventOutcome::RevokedSource);
+            }
+            transport.command(event, live)
+        });
         self.faulted |= report.faulted || self.transport.timeline_fault.is_some();
         if std::mem::take(&mut self.transport.discard_pending) {
             self.pending = 0;
             self.read = 0.0;
         }
         self.shared.playing.store(self.transport.playing && !self.faulted, Ordering::Relaxed);
-    }
-
-    fn flush_releases(&mut self) {
-        if std::mem::take(&mut self.transport.flush_releases) {
-            self.plans.flush_releases(self.plans.engine().max_block());
-        }
     }
 
     fn render_next(&mut self, quantum: usize) -> Result<(), timeline_map::MapError> {
@@ -232,6 +307,11 @@ impl Audio {
             && let Some(range) = state.looped
             && state.render_position >= range.end
         {
+            // The previous pending block has been consumed before render_next.
+            // Timeline already advanced through that wrap; preserve its precise
+            // consumed position/iteration when issuing the new event identity.
+            state.change(None, state.playing, state.looped)?;
+            self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(state.epoch));
             state.render_position = range.start;
         }
         let mut frames = quantum.clamp(1, self.plans.engine().max_block());
@@ -246,19 +326,16 @@ impl Audio {
             if state.render_position >= end {
                 state.change(Some(end), false, None)?;
                 state.end = None;
+                self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(state.epoch));
                 self.plans.reset();
-                state.flush_releases = true;
             } else {
                 frames = frames.min(usize::try_from(end - state.render_position).map_err(|_| timeline_map::MapError::Arithmetic)?);
             }
         }
         self.plans.set_processing(!state.playing, state.recording, self.shared.editors_open.load(Ordering::Relaxed));
-        let sounding = state.playing || self.plans.hosted() || self.plans.monitoring() || self.shared.editors_open.load(Ordering::Relaxed);
-        if sounding {
-            self.plans.render(state.render_position, frames);
-        } else {
-            self.plans.clear_meters();
-        }
+        // The mixer owns each processor's suspension rules. A completed note
+        // release does not prove that its envelope or any downstream tail ended.
+        self.plans.render(state.render_position, frames);
         self.pending = frames;
         if state.playing {
             state.render_position =
@@ -285,7 +362,7 @@ impl Audio {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(RenderError::Timeline(error)),
                 Err(payload) => {
-                    self.panic_payload = Some(payload);
+                    self.panic_payload.0 = Some(payload);
                     Some(RenderError::Panicked)
                 }
             }
@@ -299,6 +376,7 @@ impl Audio {
             self.shared.playing.store(false, Ordering::Relaxed);
             self.plans.fault();
             self.actions.fault();
+            self.sources.fault();
             // Keep returning work under the SAME callback budgets. No plugin calls
             // or successful urgent acknowledgments are fabricated after failure.
             self.actions.service(actions, &mut self.plans, &mut |_, _| ActionResult::Timeline(timeline_map::MapError::Invalid));
@@ -328,7 +406,6 @@ impl Audio {
         if self.faulted {
             return Ok(());
         }
-        self.flush_releases();
         let speed = self.shared.speed.load(Ordering::Relaxed).clamp(100, 4000);
         if speed != self.speed {
             let rate = timeline_map::Rate::new(u64::from(self.sample_rate) * u64::from(speed), u64::from(self.device_rate) * 1000)?;
@@ -336,6 +413,7 @@ impl Audio {
             self.transport.timeline.change(epoch, None, rate, self.transport.playing, self.transport.looped.map(|r| (r.start, r.end)))?;
             self.transport.rate = rate;
             self.transport.epoch = epoch;
+            self.plans.processing().set_transport_epoch(soundcraft_mix::TransportEpoch(epoch));
             self.speed = speed;
         }
         let step = f64::from(self.sample_rate) / f64::from(self.device_rate) * f64::from(speed) / 1000.0;
@@ -352,11 +430,8 @@ impl Audio {
                 if self.faulted {
                     break 'frames;
                 }
-                self.flush_releases();
                 self.render_next(quantum)?;
             }
-            let sounding =
-                self.transport.playing || self.plans.hosted() || self.plans.monitoring() || self.shared.editors_open.load(Ordering::Relaxed);
             let output = self.plans.output();
             let index = self.read.floor() as usize;
             let fraction = (self.read - index as f64) as f32;
@@ -366,7 +441,7 @@ impl Audio {
                 let b = if index + 1 < self.pending { buffer.and_then(|v| v.get(index + 1)).copied().unwrap_or(a) } else { a };
                 a + (b - a) * fraction
             };
-            if sounding {
+            {
                 if output.len() > 2 && channels < output.len() {
                     let (mut left, mut right) = (0.0f32, 0.0f32);
                     for (channel, &(l, r)) in self.plans.fold().iter().enumerate().take(output.len()) {
@@ -394,7 +469,6 @@ impl Audio {
             return Ok(());
         }
         self.consumed(consumed)?;
-        self.flush_releases();
         Ok(())
     }
 }

@@ -3,7 +3,7 @@ use serde_json::json;
 use soundcraft_ui_egui::{Services, SoundApp};
 
 #[test]
-fn the_audio_device_choice_is_kept_only_when_it_is_applied() {
+fn invalid_or_recording_device_changes_preserve_the_applied_choice() {
     let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
     let before = app.ui.audio.clone();
 
@@ -17,8 +17,12 @@ fn the_audio_device_choice_is_kept_only_when_it_is_applied() {
     let err = app.run("ui.audio_device", json!({"buffer_size": 256, "output": "Elsewhere"})).unwrap_err();
     assert!(err.contains("stop recording"), "{err}");
     assert_eq!(app.ui.audio, before, "refused while recording: the saved choice stays the open device's");
-    app.engine.transport.recording = false;
+}
 
+#[test]
+#[ignore = "opens a physical audio device; run explicitly when the device is available"]
+fn applying_an_audio_choice_reopens_the_device() {
+    let mut app = SoundApp::new(soundcraft_engine::Engine::default(), None, Services::default());
     // Opens the chosen device, or the default, or a silent clock without one.
     let r = app.run("ui.audio_device", json!({"buffer_size": 256})).unwrap();
     assert_eq!(app.ui.audio.buffer_size, Some(256));

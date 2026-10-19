@@ -214,8 +214,13 @@ struct Counters {
 }
 
 /// Identity of this actual pair, independent of numeric device/plan generations.
+#[derive(Clone)]
 pub(super) struct RuntimeIdentity(Arc<Counters>);
 impl RuntimeIdentity {
+    /// A terminal device error can close admission without Main or the holder.
+    pub(super) fn fault(&self) {
+        self.0.faulted.store(true, Ordering::Release);
+    }
     pub(super) fn faulted(&self) -> bool {
         self.0.faulted.load(Ordering::Acquire)
     }
@@ -283,7 +288,9 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
         hosted: false,
         monitoring: false,
     };
-    let mut mix = MixEngine::realtime(target);
+    // The device adapter issues a fresh, checked device generation before it
+    // constructs a runtime. Same-target plans keep this engine incarnation.
+    let mut mix = MixEngine::realtime_with_events(target, soundcraft_mix::EngineEpoch(target.device.0), soundcraft_mix::EventLimits::default());
     mix.metronome = true;
     (
         Control {
@@ -459,6 +466,19 @@ pub struct Processing<'a> {
 }
 
 impl Processing<'_> {
+    pub fn queue_event(&mut self, event: &soundcraft_mix::InstrumentEvent) -> soundcraft_mix::EventOutcome {
+        if self.audio.faulted() { soundcraft_mix::EventOutcome::Faulted } else { self.audio.mix.queue_event(event) }
+    }
+    pub fn set_transport_epoch(&mut self, epoch: soundcraft_mix::TransportEpoch) {
+        if !self.audio.faulted() {
+            self.audio.mix.set_transport_epoch(epoch);
+        }
+    }
+    pub fn revoke_source(&mut self, port: u16, generation: u64) {
+        if !self.audio.faulted() {
+            self.audio.mix.revoke_source(port, generation);
+        }
+    }
     /// Refuse subsequent work immediately if a handler detects an unrecoverable
     /// runtime error. This cannot change plan identity or invoke processor code.
     pub fn fault(&mut self) {

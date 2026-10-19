@@ -283,7 +283,7 @@ impl StudioApp {
     /// first; refused while recording (the take would be cut), leaving `ui.audio` as it was.
     pub fn apply_audio(&mut self, cfg: AudioConfig) -> Result<(), String> {
         validate(&cfg)?;
-        if self.engine.transport.recording {
+        if self.recording_active() {
             self.status = REFUSED_RECORDING.into();
             return Err(REFUSED_RECORDING.into());
         }
@@ -324,7 +324,7 @@ impl StudioApp {
 
     /// The window's Reconnect: reopen the same choices (a device came back, a driver changed).
     pub fn reconnect_audio_devices(&mut self) {
-        if self.engine.transport.recording {
+        if self.recording_active() {
             self.status = REFUSED_RECORDING.into();
             return;
         }
@@ -440,7 +440,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let systems = app.audio_devices.systems.clone().unwrap_or_default();
     let mut draft = app.audio_devices.draft.clone();
     let mut lay = AudioDevicesLayout { open: true, systems: systems.iter().map(|s| s.name.clone()).collect(), ..Default::default() };
-    let recording = app.engine.transport.recording;
+    let recording = app.recording_active();
     let audio_on = app.player.is_some() || app.audio_devices.fake.is_some();
     let (mut apply, mut reconnect, mut rescan, mut panel) = (false, false, false, false);
     let mut open = true;

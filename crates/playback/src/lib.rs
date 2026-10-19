@@ -1,26 +1,19 @@
 //! Realtime playback through the system audio device (cpal: CoreAudio, WASAPI, ALSA/Pulse/
 //! PipeWire via ALSA, JACK, WebAudio).
 //!
-//! The UI thread owns a [`Player`]; the audio callback runs the [`MixEngine`] and a snapshot of
-//! the session (`Arc<Session>`) that the UI swaps whenever the document changes. Both live in a
-//! holder the callback only ever `try_lock`s, so the player can take them back at drop. Commands
-//! go to the callback through a channel; position and meters come back through atomics and a
-//! `try_lock`ed snapshot, so the callback never blocks. When no device is available the player
-//! falls back to a silent clock thread so the transport, meters and automation still run.
+//! [`Player`] owns prepared plans, bounded action ingress and Main-thread plug-in
+//! handles. The callback borrows its anchored audio state and never prepares or
+//! reclaims a session. Requests return admission identities; [`Player::poll_notices`]
+//! and recovery frontiers report application or refusal. Position follows consumed
+//! output frames. Native clock fitting runs independently of the UI.
 //!
-//! Surround: the device is opened with as many output channels as it offers, up to the width of
-//! the session's main format. Main channels (SMPTE/WAV order) go to device channels in order; when
-//! the device has fewer channels than the main mix, the mix is folded down to stereo (ITU-R
-//! BS.775) on the first two device channels.
+//! Call [`Player::idle`] on the creating thread for plug-in service and reclamation,
+//! and drain notices regularly to return request credits. The explicit silent
+//! fallback preserves elapsed frame debt without claiming a hardware clock.
 //!
-//! Plugins and threads: hosted third-party plugins (CLAP/VST3) are created, given their stored
-//! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
-//! travel to the audio thread together with the session snapshot that needs them; the mix
-//! engine adopts them (see `soundcraft_mix`'s crate docs). Instances the engine retires, and the
-//! session snapshots the callback replaces, come back on return channels and are dropped on the UI
-//! thread ([`Player::idle`]). Plugin editors are driven, and plugin states for saving read
-//! ([`Player::capture_states`]), on the UI thread
-//! through handles taken from each instance before it leaves ([`Player::open_editor`]).
+//! Main mix channels follow SMPTE/WAV order; fewer device channels fold to stereo
+//! using ITU-R BS.775. Plug-ins and editor/state handles remain Main-owned through
+//! callback quiescence. [`LegacyPlayer`] remains solely for transition regressions.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod action_lane;
@@ -35,6 +28,7 @@ pub mod telemetry;
 pub mod timeline_map;
 
 pub use devices::AudioConfig;
+pub use player::{ActionResult, Player, PlayerCommand, PlayerError, PlayerNotice};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
@@ -240,7 +234,7 @@ fn render_held(holder: &Mutex<Option<AudioState>>, fault: &Fault, shared: &Share
 
 /// State the audio callback renders from (inside a [`Holder`]).
 struct AudioState {
-    /// A caught unwind is owned here until Player teardown on its owner thread.
+    /// A caught unwind is owned here until LegacyPlayer teardown on its owner thread.
     panic_payload: Option<Box<dyn std::any::Any + Send>>,
     rx: Receiver<Cmd>,
     shared: Arc<Shared>,
@@ -279,7 +273,7 @@ impl Drop for AudioState {
     fn drop(&mut self) {
         // The holder is anchored on control until callback quiescence. Isolate
         // arbitrary payload cleanup before any plug-in fields are destroyed,
-        // including when Player itself is being dropped during an unwind.
+        // including when LegacyPlayer itself is being dropped during an unwind.
         if let Some(payload) = self.panic_payload.take()
             && let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
         {
@@ -643,7 +637,8 @@ impl Side {
 }
 
 /// The transport and audio device.
-pub struct Player {
+#[doc(hidden)]
+pub struct LegacyPlayer {
     shared: Arc<Shared>,
     fault: Arc<Fault>,
     /// The block count last seen while playing, and since when.
@@ -666,14 +661,14 @@ pub struct Player {
     pub device_buffer: Option<u32>,
     /// True when no audio device could be opened (silent clock).
     pub silent: bool,
-    /// The input opened with the output, on ASIO ([`Player::open_input`]).
+    /// The input opened with the output, on ASIO ([`LegacyPlayer::open_input`]).
     input: Mutex<HeldInput>,
     /// Native fitting is independent of the UI; control owns service cancellation.
     clock: Mutex<Option<device_clock::MaintainedClock>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Drop for Player {
+impl Drop for LegacyPlayer {
     /// Takes the audio state (and so every plugin instance) back from the callback and drops it
     /// here, then closes the stream, then collects what was retired before.
     fn drop(&mut self) {
@@ -707,16 +702,16 @@ impl Drop for Player {
     }
 }
 
-impl Player {
+impl LegacyPlayer {
     /// Open the default output device. Never fails: without a device it runs a silent clock.
-    pub fn new(session: Arc<Session>) -> Player {
-        Player::with_config(session, &AudioConfig::default())
+    pub fn new(session: Arc<Session>) -> LegacyPlayer {
+        LegacyPlayer::with_config(session, &AudioConfig::default())
     }
 
     /// Open the output device `cfg` chooses (system, device, rate, buffer size), falling back to the
     /// defaults for whatever is unavailable. Never fails: without a device it runs a silent clock.
-    pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Player {
-        let p = Player::open(Arc::clone(&session), cfg);
+    pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> LegacyPlayer {
+        let p = LegacyPlayer::open(Arc::clone(&session), cfg);
         p.side().return_old_sessions(&p.tx);
         // Hand the initial session's third-party plugins over.
         p.update_session(session);
@@ -739,7 +734,7 @@ impl Player {
         }
     }
 
-    /// Done with the input from [`Player::open_input`]: its takes are finished. One opened with
+    /// Done with the input from [`LegacyPlayer::open_input`]: its takes are finished. One opened with
     /// the output stays open (closing it while the output runs is what must not happen) for the
     /// next `open_input`; any other closes.
     pub fn close_input(&self, mut r: record::Recorder) {
@@ -767,7 +762,7 @@ impl Player {
         self.side.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn open(session: Arc<Session>, cfg: &AudioConfig) -> Player {
+    fn open(session: Arc<Session>, cfg: &AudioConfig) -> LegacyPlayer {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -857,7 +852,7 @@ impl Player {
                                 "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}",
                                 buffer.map_or("default".to_string(), |n| n.to_string())
                             );
-                            return Player {
+                            return LegacyPlayer {
                                 shared,
                                 fault,
                                 #[cfg(not(target_arch = "wasm32"))]
@@ -881,13 +876,13 @@ impl Player {
                 log::warn!("no usable audio stream; using a silent clock");
                 let (tx, rx) = channel();
                 let (gtx, grx) = channel();
-                Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
+                LegacyPlayer::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
                 let (tx, rx) = channel();
                 let (gtx, grx) = channel();
-                Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
+                LegacyPlayer::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
             }
         }
     }
@@ -899,9 +894,9 @@ impl Player {
         rate: u32,
         side: Mutex<Side>,
         gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
+    ) -> LegacyPlayer {
         let s = Arc::new(Session::new("Untitled", soundcraft_time::SampleRate::new(rate).unwrap_or_default()));
-        Player::silent_clock_with(shared, tx, rx, s, side, gtx)
+        LegacyPlayer::silent_clock_with(shared, tx, rx, s, side, gtx)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -912,7 +907,7 @@ impl Player {
         session: Arc<Session>,
         side: Mutex<Side>,
         gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
+    ) -> LegacyPlayer {
         let rate = session.sample_rate.hz();
         let device_rate = f64::from(rate);
         let state: Holder = Arc::new(Mutex::new(Some(AudioState::new(rx, Arc::clone(&shared), session, device_rate, gtx))));
@@ -940,14 +935,14 @@ impl Player {
         if let Err(e) = spawn {
             log::warn!("clock thread failed: {e}");
         }
-        Player::silent(shared, fault, tx, side, state, rate)
+        LegacyPlayer::silent(shared, fault, tx, side, state, rate)
     }
 
     /// A silent player around `state`, shared with whatever renders it (the clock thread, or
     /// nothing).
     #[cfg(not(target_arch = "wasm32"))]
-    fn silent(shared: Arc<Shared>, fault: Arc<Fault>, tx: Sender<Cmd>, side: Mutex<Side>, state: Holder, rate: u32) -> Player {
-        Player {
+    fn silent(shared: Arc<Shared>, fault: Arc<Fault>, tx: Sender<Cmd>, side: Mutex<Side>, state: Holder, rate: u32) -> LegacyPlayer {
+        LegacyPlayer {
             shared,
             fault,
             watch: Mutex::new(None),
@@ -973,8 +968,8 @@ impl Player {
         session: Arc<Session>,
         side: Mutex<Side>,
         _gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
-        Player {
+    ) -> LegacyPlayer {
+        LegacyPlayer {
             shared,
             fault: Arc::default(),
             tx,
@@ -1131,7 +1126,7 @@ impl Player {
         self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Observed scheduling state of this Player's output worker. A new Player owns a fresh
+    /// Observed scheduling state of this LegacyPlayer's output worker. A new LegacyPlayer owns a fresh
     /// observation; the previous device generation's success cannot carry into it.
     /// Reads backend state on the caller; performs no OS registration or log parsing.
     pub fn thread_priority(&self) -> scheduling::WorkerPriority {
@@ -1140,7 +1135,7 @@ impl Player {
 
     /// Lifetime callback durations, nominal budget overruns, backend errors and render-silence reasons.
     /// Nonblocking and allocation-free; independent fields may straddle a callback. A newly
-    /// opened Player starts from zero. See [`telemetry::CallbackTelemetry`] for measurement limits.
+    /// opened LegacyPlayer starts from zero. See [`telemetry::CallbackTelemetry`] for measurement limits.
     pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
         self.fault.telemetry.snapshot()
     }
@@ -1271,7 +1266,7 @@ impl OutputCallback {
     }
 
     /// One device callback scope, shared by all scratch conversion chunks. The prepared
-    /// Player integration uses this token; it must never be reconstructed inside a chunk.
+    /// LegacyPlayer integration uses this token; it must never be reconstructed inside a chunk.
     fn fill_with<T: cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         data: &mut [T],
@@ -1774,7 +1769,7 @@ mod tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
-        let player = Player::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
+        let player = LegacyPlayer::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let plugin = ThreadLog { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log) };
         tx.send(Cmd::Session(
@@ -2021,7 +2016,7 @@ mod tests {
         });
         once.recv().unwrap();
         assert!(log.lock().unwrap().iter().any(|(w, _)| *w == "process"), "sanity: the instance was processed");
-        let player = Player::silent(shared, fault, tx, Mutex::new(Side::new(48_000.0, grx)), state, 48_000);
+        let player = LegacyPlayer::silent(shared, fault, tx, Mutex::new(Side::new(48_000.0, grx)), state, 48_000);
         drop(player);
         device.join().unwrap();
         let log = log.lock().unwrap();
@@ -2094,7 +2089,7 @@ mod tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
-        let player = Player::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
+        let player = LegacyPlayer::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
         let dropped_on = Arc::new(std::sync::Mutex::new(None));
         let payload_dropped_on = Arc::new(Mutex::new(None));
         let plugin = PanicLog {
@@ -2187,7 +2182,7 @@ mod tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
-        let player = Player::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
+        let player = LegacyPlayer::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let plugin = SlowLog { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log) };
         tx.send(Cmd::Session(
@@ -2244,7 +2239,7 @@ mod tests {
             tx.send(Cmd::Session(Arc::clone(&s), vec![late])).unwrap();
         }
         tx.send(Cmd::Stop).unwrap();
-        let player = Player::silent(shared, fault, tx, Mutex::new(Side::new(48_000.0, grx)), holder, 48_000);
+        let player = LegacyPlayer::silent(shared, fault, tx, Mutex::new(Side::new(48_000.0, grx)), holder, 48_000);
         let (held, fault, shared) = (Arc::clone(&player.state), Arc::clone(&player.fault), Arc::clone(&player.shared));
         let heap = std::thread::spawn(move || {
             let mut out = [1.0; 8];
@@ -2542,7 +2537,7 @@ mod tests {
         }
     }
 
-    fn silent_player() -> Player {
+    fn silent_player() -> LegacyPlayer {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
@@ -2552,7 +2547,7 @@ mod tests {
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
-        Player::silent_clock(shared, tx, rx, 48_000, Mutex::new(Side::new(48_000.0, grx)), gtx)
+        LegacyPlayer::silent_clock(shared, tx, rx, 48_000, Mutex::new(Side::new(48_000.0, grx)), gtx)
     }
 
     #[test]
@@ -2567,7 +2562,7 @@ mod tests {
     fn wasapi_workers_publish_observed_priority() {
         let config = AudioConfig { system: Some("WASAPI".into()), ..AudioConfig::default() };
         for _ in 0..3 {
-            let player = Player::with_config(Arc::new(Session::default()), &config);
+            let player = LegacyPlayer::with_config(Arc::new(Session::default()), &config);
             assert!(!player.silent, "requires an actual output device");
             let recorder = record::Recorder::open_with(&config).unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

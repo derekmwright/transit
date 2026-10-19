@@ -1,0 +1,609 @@
+//! Device facade for the prepared runtime. All factories, editors and reclamation
+//! belong to this creating-thread owner; the device borrows only its audio holder.
+use super::audio::{ActionResult, Audio, Command};
+use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
+use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputCallback, OutputTrouble, PluginStates, Shared};
+use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
+use soundcraft_mix::{Arrival, DeviceGeneration, Due, EngineEpoch, InstrumentEvent, Message, NoteId, PlanLimits, RenderTarget, Source};
+use soundcraft_model::{Session, TrackId};
+use soundcraft_time::{Range, Samples};
+use std::cell::{Cell, RefCell, RefMut};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+
+type Owner = RuntimeControl<Command, ActionResult>;
+type Holder = Arc<Mutex<Option<Audio>>>;
+pub type PlayerNotice = Notice<Command, ActionResult>;
+
+/// Main-thread facade. RuntimeControl deliberately makes this type !Send/!Sync.
+/// The remaining native lifecycle migration moves stream/writer joins off main;
+/// it does not move this owner or its plug-ins to that worker.
+pub struct Player {
+    shared: Arc<Shared>,
+    fault: Arc<Fault>,
+    failure_signal: Option<plan_bridge::RuntimeIdentity>,
+    owner: RefCell<Option<Owner>>,
+    state: Holder,
+    stream: Option<cpal::Stream>,
+    input: RefCell<HeldInput>,
+    clock: RefCell<Option<device_clock::MaintainedClock>>,
+    origin: device_clock::HostOrigin,
+    epoch: EngineEpoch,
+    audition: Option<sources::Token>,
+    arrival: Cell<u64>,
+    initial_error: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    watch: RefCell<Option<(u64, std::time::Instant)>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    silent_worker: Option<std::thread::JoinHandle<()>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    silent_stop: Arc<AtomicBool>,
+    pub device_name: String,
+    pub device_rate: u32,
+    pub device_channels: u16,
+    pub device_buffer: Option<u32>,
+    pub silent: bool,
+}
+
+impl Player {
+    pub fn new(session: Arc<Session>) -> Self {
+        Self::with_config(session, &AudioConfig::default())
+    }
+
+    /// Device failure falls back to an explicitly silent runtime. Initialization
+    /// or identity exhaustion instead returns a faulted facade that rejects work.
+    pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Self {
+        match Self::open(Arc::clone(&session), cfg) {
+            Ok(player) => player,
+            Err(error) => {
+                log::warn!("audio output unavailable: {error}");
+                Self::silent_runtime(session, error)
+            }
+        }
+    }
+
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            position: AtomicI64::new(0),
+            playing: AtomicBool::new(false),
+            speed: AtomicU32::new(1000),
+            meters: Mutex::new(MeterSnapshot::default()),
+            editors_open: AtomicBool::new(false),
+        })
+    }
+
+    fn empty(rate: u32) -> Self {
+        Self {
+            shared: Self::shared(),
+            fault: Arc::default(),
+            failure_signal: None,
+            owner: RefCell::new(None),
+            state: Arc::new(Mutex::new(None)),
+            stream: None,
+            input: RefCell::new(HeldInput::No),
+            clock: RefCell::new(None),
+            origin: device_clock::HostOrigin::default(),
+            epoch: EngineEpoch(0),
+            audition: None,
+            arrival: Cell::new(0),
+            initial_error: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            watch: RefCell::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            silent_worker: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            silent_stop: Arc::new(AtomicBool::new(false)),
+            device_name: "No audio device (silent)".into(),
+            device_rate: rate,
+            device_channels: 0,
+            device_buffer: None,
+            silent: true,
+        }
+    }
+
+    /// The stream clock is allocated BEFORE the engine; its exact generation is
+    /// shared by the target, event identity, and consumed-output timeline.
+    fn prepare(session: Arc<Session>, device_rate: u32) -> Result<(Self, device_clock::CallbackClock), String> {
+        let (callback_clock, reader) = device_clock::stream_clock(device_clock::Direction::Output, device_rate)?;
+        let key = reader.key();
+        let target = RenderTarget { device: DeviceGeneration(key.generation), sample_rate: session.sample_rate.hz(), max_block: 512 };
+        let mut player = Self::empty(device_rate);
+        player.epoch = EngineEpoch(key.generation);
+        player.origin = reader.host_origin();
+        let (mut owner, ports) = Owner::new(session, None, target, PlanLimits::default()).map_err(|e| e.to_string())?;
+        let audition = match owner.register_source(sources::AUDITION_PORT) {
+            Ok(token) => token,
+            Err(error) => {
+                owner.retire(ports);
+                return Err(error.to_string());
+            }
+        };
+        owner.service();
+        if owner.faulted() {
+            owner.retire(ports);
+            return Err("initial audio plan preparation faulted".into());
+        }
+        let audio = match Audio::from_ports(ports, key, device_rate, Arc::clone(&player.shared)) {
+            Ok(audio) => audio,
+            Err(failure) => {
+                owner.retire(*failure.ports);
+                return Err(format!("invalid output timeline: {:?}", failure.error));
+            }
+        };
+        *player.state.lock().unwrap_or_else(PoisonError::into_inner) = Some(audio);
+        player.failure_signal = Some(owner.failure_signal());
+        *player.owner.get_mut() = Some(owner);
+        player.audition = Some(audition);
+        *player.clock.get_mut() =
+            device_clock::MaintainedClock::start(reader).map_err(|error| log::warn!("output clock maintenance unavailable: {error}")).ok();
+        Ok((player, callback_clock))
+    }
+
+    fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        let want_channels = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
+        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), want_channels, cfg)?;
+        let duplex = crate::input_with_output(system, || device.default_input_config().is_ok_and(|c| record::input_usable(&c)));
+        let mut attempts = vec![config.clone()];
+        if config.buffer_size != cpal::BufferSize::Default {
+            attempts.push(cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..config });
+        }
+        let mut error = "no usable output stream".to_owned();
+        for config in attempts {
+            let (mut player, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0)?;
+            *player.input.get_mut() = if duplex {
+                match record::Recorder::build_on(&device, config.sample_rate.0, config.buffer_size) {
+                    Ok(recorder) => HeldInput::Held(Some(recorder)),
+                    Err(error) => HeldInput::Failed(format!("the audio input did not open with the output ({error})")),
+                }
+            } else if system == devices::ASIO_SYSTEM {
+                HeldInput::Failed("the ASIO output has no usable input".into())
+            } else {
+                HeldInput::No
+            };
+            let built = match format {
+                cpal::SampleFormat::I8 => build_output::<i8>(&device, &config, &player, clock),
+                cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &player, clock),
+                cpal::SampleFormat::I24 => build_output::<cpal::I24>(&device, &config, &player, clock),
+                cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &player, clock),
+                cpal::SampleFormat::I64 => build_output::<i64>(&device, &config, &player, clock),
+                cpal::SampleFormat::U8 => build_output::<u8>(&device, &config, &player, clock),
+                cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &player, clock),
+                cpal::SampleFormat::U32 => build_output::<u32>(&device, &config, &player, clock),
+                cpal::SampleFormat::U64 => build_output::<u64>(&device, &config, &player, clock),
+                cpal::SampleFormat::F32 => build_output::<f32>(&device, &config, &player, clock),
+                cpal::SampleFormat::F64 => build_output::<f64>(&device, &config, &player, clock),
+                _ => return Err(format!("unsupported device sample format: {format}")),
+            };
+            let stream = match built {
+                Ok(stream) => stream,
+                Err(failure) => {
+                    error = failure.to_string();
+                    continue;
+                }
+            };
+            player.stream = Some(stream);
+            if let HeldInput::Held(Some(recorder)) = player.input.get_mut()
+                && let Err(failure) = recorder.start()
+            {
+                // Keep the already-built ASIO direction owned until output closes;
+                // removing it here could rebuild the shared driver's buffers.
+                log::warn!("audio input did not start: {failure}");
+                error = failure.to_string();
+                continue;
+            }
+            let started = player.stream.as_ref().ok_or("output stream disappeared")?.play();
+            if let Err(failure) = started {
+                error = failure.to_string();
+                continue;
+            }
+            player.device_name = name.clone();
+            player.device_channels = config.channels;
+            player.device_buffer = match config.buffer_size {
+                cpal::BufferSize::Fixed(n) => Some(n),
+                cpal::BufferSize::Default => None,
+            };
+            player.silent = false;
+            return Ok(player);
+        }
+        Err(error)
+    }
+
+    fn silent_runtime(session: Arc<Session>, error: String) -> Self {
+        let rate = session.sample_rate.hz();
+        let (mut player, _clock) = match Self::prepare(session, rate) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let mut player = Self::empty(rate);
+                player.initial_error = Some(format!("{error}; silent runtime failed: {failure}"));
+                player.fault.failed.store(true, Ordering::Release);
+                return player;
+            }
+        };
+        // A timer-driven fallback never claims a physical output clock map.
+        *player.clock.get_mut() = None;
+        player.initial_error = Some(error);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (holder, shared, fault, stop) =
+                (Arc::clone(&player.state), Arc::clone(&player.shared), Arc::clone(&player.fault), Arc::clone(&player.silent_stop));
+            let failure_signal = player.failure_signal.clone();
+            let spawn = std::thread::Builder::new().name("soundcraft-silent-clock".into()).spawn(move || {
+                let mut callback = OutputCallback::new(2, rate);
+                let mut data = vec![0.0f32; 16_384];
+                let mut last = std::time::Instant::now();
+                let mut pacer = SilentPacer::default();
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(10));
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let now = std::time::Instant::now();
+                    let frames = pacer.advance(now - last, rate, data.len() / 2);
+                    last = now;
+                    let Some(frames) = frames else {
+                        if let Some(signal) = &failure_signal {
+                            signal.fault();
+                        }
+                        fault.failed.store(true, Ordering::Release);
+                        shared.playing.store(false, Ordering::Release);
+                        break;
+                    };
+                    let len = frames * 2;
+                    fault.beats.fetch_add(1, Ordering::Relaxed);
+                    if let Some(data) = data.get_mut(..len) {
+                        callback.fill_with(data, |buffer, plans, actions| {
+                            render_held(&holder, &fault, &shared, buffer, 2, plans, actions);
+                        });
+                    }
+                }
+            });
+            match spawn {
+                Ok(worker) => player.silent_worker = Some(worker),
+                Err(error) => {
+                    player.fault.failed.store(true, Ordering::Release);
+                    if let Some(owner) = player.owner.get_mut() {
+                        owner.fault();
+                    }
+                    player.initial_error = Some(format!("silent clock did not start: {error}"));
+                }
+            }
+        }
+        player
+    }
+
+    fn owner(&self) -> Result<RefMut<'_, Owner>, PlayerError> {
+        let owner = self.owner.try_borrow_mut().map_err(|_| PlayerError::Busy)?;
+        let mut owner = RefMut::filter_map(owner, Option::as_mut).map_err(|_| PlayerError::Faulted)?;
+        if self.fault.failed.load(Ordering::Acquire) || self.fault.gone.load(Ordering::Acquire) {
+            owner.fault();
+        }
+        Ok(owner)
+    }
+    pub fn initial_error(&self) -> Option<&str> {
+        self.initial_error.as_deref()
+    }
+    pub fn update_session(&self, session: Arc<Session>) -> Result<SessionRequestId, PlayerError> {
+        self.owner()?.update_session(session)
+    }
+    pub fn set_input(&self, input: Arc<record::InputRing>) -> Result<SessionRequestId, PlayerError> {
+        self.owner()?.set_input(Some(input))
+    }
+    pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.send_action(Command::Play { from, end, looped }, true)
+    }
+    pub fn locate(&self, at: Samples) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.send_action(Command::Locate(at), true)
+    }
+    pub fn set_recording(&self, on: bool) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.send_action(Command::Recording(on), false)
+    }
+    pub fn stop(&self) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.stop()
+    }
+    pub fn all_notes_off(&self) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.all_notes_off()
+    }
+    pub fn note(&self, track: TrackId, pitch: u8, velocity: u8) -> Result<action_lane::Sequence, PlayerError> {
+        if pitch > 127 || velocity > 127 {
+            return Err(PlayerError::InvalidNote);
+        }
+        let mut owner = self.owner()?;
+        let token = self.audition.ok_or(PlayerError::Faulted)?;
+        if !owner.source_admitted(token) {
+            return Err(PlayerError::Faulted);
+        }
+        let target = owner.binding(track, soundcraft_mix::INSTRUMENT_SLOT).ok_or(PlayerError::NoInstrument)?;
+        let sequence = self.arrival.get().checked_add(1).ok_or(PlayerError::SequenceExhausted)?;
+        self.arrival.set(sequence);
+        let message = if velocity == 0 {
+            Message::NoteOff { key: pitch, velocity: 0, id: NoteId::NONE }
+        } else {
+            Message::NoteOn { key: pitch, velocity, id: NoteId::NONE }
+        };
+        owner.send_note(
+            Command::Note(InstrumentEvent {
+                engine: self.epoch,
+                target,
+                due: Due::Next,
+                transport: None,
+                source: Source { port: token.port(), channel: 0, generation: token.generation() },
+                message,
+                arrival: Arrival { host_ns: self.origin.now_ns().unwrap_or(0), sequence },
+            }),
+            if velocity == 0 { action_lane::NoteKind::Off } else { action_lane::NoteKind::On },
+        )
+    }
+    /// Stop / All Notes Off acknowledgments are monotonic frontiers. An admitted
+    /// urgent request is applied only once its corresponding frontier reaches it.
+    pub fn recovery_progress(&self) -> Result<(action_lane::Sequence, action_lane::Sequence), PlayerError> {
+        Ok(self.owner()?.recovery_progress())
+    }
+    pub fn poll_notices(&self, out: &mut [Option<PlayerNotice>]) -> Result<usize, PlayerError> {
+        Ok(self.owner()?.poll_notices(out))
+    }
+    pub fn service(&self) -> Result<ServiceReport, PlayerError> {
+        let mut owner = self.owner()?;
+        if self.fault.failed.load(Ordering::Acquire) || self.fault.gone.load(Ordering::Acquire) {
+            owner.fault();
+        }
+        Ok(owner.service())
+    }
+    pub fn idle(&self) -> Result<Vec<EditorEdit>, PlayerError> {
+        self.service()?;
+        let mut owner = self.owner()?;
+        let edits = owner.idle_editors();
+        self.shared.editors_open.store(owner.any_editor_open(), Ordering::Relaxed);
+        Ok(edits)
+    }
+    /// Refuse a save until the exact caller snapshot has a confirmed active plan.
+    pub fn capture_states(&self, expected: &Arc<Session>) -> Result<PluginStates, PlayerError> {
+        self.owner()?.capture_states(expected)
+    }
+    pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
+        self.owner().is_ok_and(|owner| owner.has_editor(track, slot))
+    }
+    pub fn open_editor(&self, track: TrackId, slot: usize) -> Result<(), String> {
+        self.owner().map_err(|e| e.to_string())?.open_editor(track, slot)?;
+        self.shared.editors_open.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    pub fn close_editor(&self, track: TrackId, slot: usize) -> Result<(), PlayerError> {
+        self.owner()?.close_editor(track, slot);
+        Ok(())
+    }
+    pub fn close_editors(&self) -> Result<(), PlayerError> {
+        self.owner()?.close_editors();
+        self.shared.editors_open.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+    pub fn editor_open(&self, track: TrackId, slot: usize) -> bool {
+        self.owner().is_ok_and(|owner| owner.editor_open(track, slot))
+    }
+    pub fn any_editor_open(&self) -> bool {
+        self.shared.editors_open.load(Ordering::Relaxed)
+    }
+    pub fn editor_set_param(&self, track: TrackId, slot: usize, id: &str, value: f32) -> Result<(), PlayerError> {
+        self.owner()?.editor_set_param(track, slot, id, value);
+        Ok(())
+    }
+    pub fn set_speed(&self, speed: f32) {
+        let value = if speed.is_finite() { (speed.clamp(0.1, 4.0) * 1000.0) as u32 } else { 1000 };
+        self.shared.speed.store(value, Ordering::Relaxed);
+    }
+    pub fn speed(&self) -> f32 {
+        self.shared.speed.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+    pub fn position(&self) -> Samples {
+        self.shared.position.load(Ordering::Relaxed)
+    }
+    pub fn is_playing(&self) -> bool {
+        self.shared.playing.load(Ordering::Relaxed)
+    }
+    pub fn copy_meters(&self, out: &mut MeterSnapshot) -> Result<(), PlayerError> {
+        self.owner()?.copy_meters(out);
+        Ok(())
+    }
+    pub fn meters(&self) -> Result<MeterSnapshot, PlayerError> {
+        let mut out = MeterSnapshot::default();
+        self.copy_meters(&mut out)?;
+        Ok(out)
+    }
+    pub fn thread_priority(&self) -> scheduling::WorkerPriority {
+        scheduling::observe(self.stream.as_ref())
+    }
+    pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
+        self.fault.telemetry.snapshot()
+    }
+    pub fn clock_report(&self) -> Option<device_clock::ClockReport> {
+        self.clock.try_borrow_mut().ok()?.as_mut().map(device_clock::MaintainedClock::report)
+    }
+    pub fn trouble(&self) -> Option<OutputTrouble> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let stalled = self
+            .watch
+            .try_borrow_mut()
+            .is_ok_and(|mut seen| crate::stalled(&mut seen, self.fault.beats.load(Ordering::Relaxed), self.is_playing() && !self.silent));
+        #[cfg(target_arch = "wasm32")]
+        let stalled = false;
+        let trouble = self.fault.trouble(stalled);
+        if trouble.is_some()
+            && let Ok(mut owner) = self.owner()
+        {
+            owner.fault();
+        }
+        trouble
+    }
+    pub fn open_input(&self, config: &AudioConfig) -> Result<record::Recorder, String> {
+        let mut input = self.input.try_borrow_mut().map_err(|_| "input transition is busy")?;
+        match &mut *input {
+            HeldInput::No => record::Recorder::open_with(config),
+            HeldInput::Held(slot) => {
+                let recorder = slot.take().ok_or("audio input is already open")?;
+                recorder.monitor.clear_monitor();
+                Ok(recorder)
+            }
+            HeldInput::Failed(error) => Err(error.clone()),
+        }
+    }
+    /// On refusal the caller retains its recorder, including the device handle.
+    pub fn close_input(&self, recorder: &mut Option<record::Recorder>) -> Result<(), PlayerError> {
+        let mut input = self.input.try_borrow_mut().map_err(|_| PlayerError::Busy)?;
+        if matches!(*input, HeldInput::Held(Some(_))) && recorder.is_some() {
+            return Err(PlayerError::Busy);
+        }
+        if recorder.as_ref().is_some_and(record::Recorder::has_pending_take) {
+            return Err(PlayerError::RecordingActive);
+        }
+        let Some(recorder) = recorder.take() else { return Ok(()) };
+        if let HeldInput::Held(slot @ None) = &mut *input {
+            *slot = Some(recorder);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        use cpal::traits::StreamTrait;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.silent_stop.store(true, Ordering::Release);
+            if let Some(worker) = &self.silent_worker {
+                worker.thread().unpark();
+            }
+        }
+        if let Some(stream) = &self.stream {
+            let _ = stream.pause();
+        }
+        // This retains the existing synchronous quiescence barrier until G6's
+        // lifecycle owner is wired. A pause alone is never treated as quiescence.
+        let audio = self.state.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let (Some(owner), Some(audio)) = (self.owner.get_mut().take(), audio) {
+            owner.retire(audio.into_ports());
+        }
+        // Callback closures now hold only an empty holder. Driver teardown cannot
+        // become the last owner of plug-ins, plans or retained panic payloads.
+        let input = std::mem::replace(self.input.get_mut(), HeldInput::No);
+        drop(input);
+        drop(self.stream.take());
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(worker) = self.silent_worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn render_held(
+    holder: &Mutex<Option<Audio>>,
+    fault: &Fault,
+    shared: &Shared,
+    out: &mut [f32],
+    channels: usize,
+    plans: &mut plan_bridge::CallbackBudget,
+    actions: &mut action_lane::Budget,
+) -> bool {
+    let mut held = match holder.try_lock() {
+        Ok(held) => held,
+        Err(TryLockError::Poisoned(poison)) => {
+            fault.failed.store(true, Ordering::Release);
+            poison.into_inner()
+        }
+        Err(TryLockError::WouldBlock) => {
+            fault.telemetry.contention_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
+            out.fill(0.0);
+            return true;
+        }
+    };
+    let Some(audio) = held.as_mut() else {
+        fault.telemetry.unavailable_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
+        out.fill(0.0);
+        return false;
+    };
+    if fault.failed.load(Ordering::Acquire) || fault.gone.load(Ordering::Acquire) {
+        audio.fault();
+    }
+    if audio.fill(out, channels, plans, actions).is_err() {
+        fault.failed.store(true, Ordering::Release);
+    }
+    if fault.failed.load(Ordering::Acquire) || fault.gone.load(Ordering::Acquire) {
+        shared.playing.store(false, Ordering::Relaxed);
+        fault.telemetry.fault_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
+    }
+    true
+}
+
+fn build_output<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    player: &Player,
+    mut clock: device_clock::CallbackClock,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    use cpal::traits::DeviceTrait;
+    let channels = usize::from(config.channels).max(1);
+    let rate = config.sample_rate.0;
+    let mut output = OutputCallback::new(channels, rate);
+    let (holder, shared, fault) = (Arc::clone(&player.state), Arc::clone(&player.shared), Arc::clone(&player.fault));
+    let error = error_callback(Arc::clone(&player.fault), Arc::clone(&player.shared), player.failure_signal.clone());
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            crate::mark_audio_thread();
+            let started = telemetry::Timer::start();
+            let frames = data.len() / channels;
+            clock.cpal.output(frames, info, clock.origin.now_ns());
+            fault.beats.fetch_add(1, Ordering::Relaxed);
+            output.fill_with(data, |buffer, plans, actions| {
+                render_held(&holder, &fault, &shared, buffer, channels, plans, actions);
+            });
+            output.timing.record(&fault.telemetry, frames, rate, started.elapsed());
+        },
+        error,
+        None,
+    )
+}
+
+/// Virtual fallback pacing, not a physical device clock. Keep sub-frame time
+/// and bounded-work backlog rather than rounding/dropping them on every wake.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct SilentPacer {
+    scaled_nanoseconds: u128,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl SilentPacer {
+    fn advance(&mut self, elapsed: std::time::Duration, rate: u32, limit: usize) -> Option<usize> {
+        let added = elapsed.as_nanos().checked_mul(u128::from(rate))?;
+        let total = self.scaled_nanoseconds.checked_add(added)?;
+        let frames = (total / 1_000_000_000).min(limit as u128) as usize;
+        self.scaled_nanoseconds = total.checked_sub((frames as u128).checked_mul(1_000_000_000)?)?;
+        Some(frames)
+    }
+}
+
+/// Registered directly with the backend. Device loss must revoke admission even
+/// when no further render callback or Main service occurs. No logging/formatting.
+fn error_callback(
+    fault: Arc<Fault>,
+    shared: Arc<Shared>,
+    signal: Option<plan_bridge::RuntimeIdentity>,
+) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |error| {
+        crate::mark_audio_thread();
+        let gone = matches!(error, cpal::StreamError::DeviceNotAvailable);
+        if gone {
+            if let Some(signal) = &signal {
+                signal.fault();
+            }
+            fault.gone.store(true, Ordering::Release);
+            shared.playing.store(false, Ordering::Release);
+        }
+        fault.telemetry.error(gone);
+    }
+}
+
+#[cfg(test)]
+mod tests;

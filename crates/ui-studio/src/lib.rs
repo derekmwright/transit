@@ -200,6 +200,7 @@ struct EditorWanted {
 pub struct StudioApp {
     pub engine: Engine,
     pub player: Option<Player>,
+    player_requests: host::PlayerRequests,
     /// Input capture, opened on first record.
     pub recorder: Option<soundcraft_playback::record::Recorder>,
     /// Synthetic recorder output for tests that must not open an input device.
@@ -276,6 +277,7 @@ impl StudioApp {
         StudioApp {
             engine,
             player,
+            player_requests: host::PlayerRequests::default(),
             recorder: None,
             #[cfg(test)]
             finished_test_takes: None,
@@ -390,7 +392,7 @@ impl StudioApp {
         }
         if id.starts_with("session.save") || id.starts_with("file.bounce") || matches!(id, "track.bounce" | "track.commit") {
             // Third-party plugins keep state the session can't see: store it first.
-            self.capture_plugin_states();
+            self.capture_plugin_states()?;
         }
         // Any edit command (selection included) ends a header selection; `focus_header` sets it
         // again after its own `edit.select`.
@@ -398,6 +400,10 @@ impl StudioApp {
             self.tracks_selected_by_header = false;
         }
         let replacing = matches!(id, "session.new" | "session.open" | "session.close" | "session.revert");
+        if replacing && self.recording_active() {
+            self.stop_play();
+            self.close_autosave();
+        }
         let (restore, mode) = {
             let m = self.engine.session().edit.edit_mode;
             (self.slip_override(id), m)
@@ -464,7 +470,7 @@ impl StudioApp {
             return Err("plugin folders can't be changed over the control channel".into());
         }
         let audio_changed = ns.audio != self.ui.audio;
-        if audio_changed && self.engine.transport.recording {
+        if audio_changed && self.recording_active() {
             return Err(audio_devices::REFUSED_RECORDING.into());
         }
         if let Some(pace) = pace {
@@ -480,7 +486,7 @@ impl StudioApp {
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {
             if let Some(p) = &self.player {
-                p.close_editor(key.0, key.1);
+                self.player_requests.result(&mut self.status, p.close_editor(key.0, key.1));
             }
             self.editors.retain(|e| e.key != *key);
         }
@@ -506,8 +512,10 @@ impl StudioApp {
 
     /// Close a plug-in editor window (or stop waiting for it to open).
     pub fn close_editor(&mut self, key: (TrackId, usize)) {
-        if let Some(p) = &self.player {
-            p.close_editor(key.0, key.1);
+        if let Some(p) = &self.player
+            && self.player_requests.result(&mut self.status, p.close_editor(key.0, key.1)).is_none()
+        {
+            return;
         }
         self.editors.retain(|e| e.key != key);
         self.ui.plugin_windows.retain(|k| *k != key);
@@ -568,11 +576,16 @@ impl StudioApp {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.engine.transport.playing
+        self.player.as_ref().map_or(self.engine.transport.playing, Player::is_playing)
     }
 
     /// Current transport position: the playhead while playing, else the cursor.
     pub fn position(&self) -> Samples {
+        if let Some(p) = &self.player
+            && p.is_playing()
+        {
+            return p.position();
+        }
         if self.engine.transport.playing { self.engine.transport.position } else { self.cursor() }
     }
 
@@ -600,6 +613,7 @@ impl StudioApp {
         let plugin_requests = service_plugin_requests();
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
+        self.poll_player();
         self.drive_editors();
         theme::probe_fonts(ctx);
         let wheeling = self.drive_wheel(ctx, now) | self.drive_tempo_wheel(ctx, now);
@@ -615,10 +629,17 @@ impl StudioApp {
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         automation::write_pass(self, ctx);
-        if self.engine.revision != self.last_rev {
-            self.last_rev = self.engine.revision;
-            if let Some(p) = &self.player {
-                p.update_session(self.engine.session_arc());
+        if self.engine.revision != self.last_rev
+            && self.player_requests.play.is_none()
+            && self.player_requests.locate.is_none()
+            && self.player_requests.recording.is_none()
+        {
+            let admitted = self
+                .player
+                .as_ref()
+                .is_none_or(|p| self.player_requests.result(&mut self.status, p.update_session(self.engine.session_arc())).is_some());
+            if admitted {
+                self.last_rev = self.engine.revision;
             }
         }
         self.autosave_changes();
@@ -632,7 +653,10 @@ impl StudioApp {
         // Autosave only runs on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty();
-        ctx.request_repaint_after_secs(if editors || plugin_requests { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
+        ctx.request_repaint_after_secs(
+            if editors || plugin_requests || self.player_requests.pending() { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt),
+        );
+        self.player_requests.show_error(&mut self.status);
         control::collect_screenshots(self, ctx);
     }
 

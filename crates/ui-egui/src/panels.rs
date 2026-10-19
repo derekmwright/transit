@@ -480,7 +480,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                             && let Some(p) = &app.player
                         {
                             if open {
-                                p.close_editor(tid, slot);
+                                app.player_requests.result(&mut app.ui.status, p.close_editor(tid, slot));
                             } else if let Err(e) = p.open_editor(tid, slot) {
                                 app.ui.status = format!("{}: {e}", info.name);
                             }
@@ -540,7 +540,7 @@ fn plugin_windows(app: &mut SoundApp, ctx: &egui::Context) {
                                 );
                                 if let Some(pl) = &app.player {
                                     // Keep the plugin's own editor in step.
-                                    pl.editor_set_param(tid, slot, p.id, x);
+                                    app.player_requests.result(&mut app.ui.status, pl.editor_set_param(tid, slot, p.id, x));
                                 }
                             }
                             let _ = resp;

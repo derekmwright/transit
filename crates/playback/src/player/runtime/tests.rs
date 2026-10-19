@@ -21,6 +21,7 @@ fn session() -> Arc<Session> {
 struct Latency {
     inner: Box<dyn Plugin>,
     value: Arc<AtomicUsize>,
+    state: u8,
 }
 impl Plugin for Latency {
     fn info(&self) -> &'static PluginInfo {
@@ -44,6 +45,10 @@ impl Plugin for Latency {
     fn latency(&self) -> usize {
         self.value.load(Ordering::Relaxed)
     }
+    fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
+        let state = self.state;
+        Some(Box::new(move || Some(vec![state])))
+    }
 }
 fn setup(limits: PlanLimits) -> (RuntimeControl<u8, u8>, AudioPorts<u8, u8>, Arc<AtomicUsize>) {
     let (mut runtime, mut ports) = RuntimeControl::new(session(), None, target(), limits).unwrap();
@@ -53,7 +58,7 @@ fn setup(limits: PlanLimits) -> (RuntimeControl<u8, u8>, AudioPorts<u8, u8>, Arc
         let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch).unwrap();
         handles.capture(
             (spec.track, spec.slot, generation),
-            NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value) }), refused_state: false },
+            NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0xa1 }), refused_state: false },
         )
     });
     runtime.handles.refresh(&mut runtime.control.sessions);
@@ -464,5 +469,60 @@ fn a_panicking_factory_payload_destructor_cannot_escape_control_service() {
     assert!(result.is_ok(), "payload cleanup must not escape the preparation boundary");
     assert!(ports.plans.faulted());
     assert!(runtime.sources.faulted());
+    runtime.retire(ports);
+}
+
+#[test]
+fn state_capture_tracks_the_callers_document_through_preparation_and_adoption() {
+    let (mut runtime, mut ports, value) = setup(PlanLimits::default());
+    let original = Arc::clone(runtime.requested_session());
+    assert_eq!(runtime.capture_states(&original).unwrap().first().unwrap().2, [0xa1]);
+    let mut replacement = (*original).clone();
+    replacement.tracks.last_mut().unwrap().mixer.inserts[0] = Some(Insert::new("invert"));
+    let replacement = Arc::new(replacement);
+    // A UI edit can precede the next update_session call.
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending));
+    runtime.update_session(Arc::clone(&replacement)).unwrap();
+    assert_eq!(runtime.capture_states(&original), Err(PlayerError::SessionPending));
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending));
+    let handles = &mut runtime.handles;
+    runtime.control.service(&mut |spec, generation| {
+        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch).unwrap();
+        handles.capture(
+            (spec.track, spec.slot, generation),
+            NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0xb2 }), refused_state: false },
+        )
+    });
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending));
+    adopt(&mut ports.plans);
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending), "wait for main to confirm bindings");
+    runtime.service();
+    assert_eq!(runtime.capture_states(&replacement).unwrap().first().unwrap().2, [0xb2]);
+    assert_eq!(runtime.capture_states(&original), Err(PlayerError::SessionPending));
+    runtime.fault();
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::Faulted));
+    runtime.retire(ports);
+}
+
+#[test]
+fn rejected_document_cannot_capture_its_predecessor_but_a_failed_internal_refresh_can_save() {
+    let (mut runtime, mut ports, latency) = setup(PlanLimits { delay_samples: 1024, ..PlanLimits::default() });
+    let original = Arc::clone(runtime.requested_session());
+    latency.store(20_000, Ordering::Relaxed);
+    render(&mut ports.plans);
+    assert!(runtime.service().latency_refresh.is_some());
+    assert_eq!(runtime.capture_states(&original).unwrap().first().unwrap().2, [0xa1]);
+    runtime.service();
+    ports.plans.return_pending(&mut plan_bridge::callback_scope());
+    runtime.service();
+    assert!(matches!(runtime.requested_state().1, RequestState::Finished(SessionOutcome::Rejected(_))));
+    assert_eq!(runtime.capture_states(&original).unwrap().first().unwrap().2, [0xa1]);
+    let replacement = Arc::new((*original).clone());
+    runtime.update_session(Arc::clone(&replacement)).unwrap();
+    runtime.service();
+    ports.plans.return_pending(&mut plan_bridge::callback_scope());
+    runtime.service();
+    assert!(matches!(runtime.requested_state().1, RequestState::Finished(SessionOutcome::Rejected(_))));
+    assert_eq!(runtime.capture_states(&replacement), Err(PlayerError::SessionPending));
     runtime.retire(ports);
 }

@@ -64,10 +64,15 @@ fn audition(app: &mut SoundApp, want: Option<(TrackId, u8, u8)>) {
     }
     if let Some(player) = &app.player {
         if let Some((t, p)) = app.midi.audition {
-            player.note(t, p, 0);
+            if app.player_requests.result(&mut app.ui.status, player.note(t, p, 0)).is_none() {
+                return;
+            }
+            app.midi.audition = None;
         }
-        if let Some((t, p, v)) = want {
-            player.note(t, p, v);
+        if let Some((t, p, v)) = want
+            && app.player_requests.result(&mut app.ui.status, player.note(t, p, v)).is_none()
+        {
+            return;
         }
     }
     app.midi.audition = want.map(|(t, p, _)| (t, p));

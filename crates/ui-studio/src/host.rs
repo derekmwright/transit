@@ -30,22 +30,41 @@ impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.clear_clip_latches();
         if let Some(p) = &self.player {
-            p.update_session(self.engine.session_arc());
-            p.play(from, end, looped);
+            if self.player_requests.result(&mut self.status, p.update_session(self.engine.session_arc())).is_none() {
+                return;
+            }
+            self.last_rev = self.engine.revision;
+            let Some(sequence) = self.player_requests.result(&mut self.status, p.play(from, end, looped)) else { return };
+            self.player_requests.play = Some(sequence);
+            self.status = "Play pending".into();
         } else {
             self.sim = Some((from, end, looped));
+            self.engine.transport.playing = true;
+            self.engine.transport.position = from;
         }
-        self.engine.transport.playing = true;
-        self.engine.transport.position = from;
     }
 
     pub(crate) fn stop_play(&mut self) {
         if let Some(p) = &self.player {
             // Half-speed is a separate command. Stop must not leave that rate for the next Play.
             p.set_speed(1.0);
-            p.stop();
+            let stopped = self.player_requests.result(&mut self.status, p.stop());
+            if let Some(sequence) = stopped {
+                self.player_requests.stop = Some(sequence);
+                self.player_requests.play = None;
+                self.player_requests.recording = None;
+                self.status = "Stop pending".into();
+            }
+            if self.recording_active() {
+                self.finish_recording();
+            }
+            return;
         }
-        if self.engine.transport.recording {
+        self.complete_stop();
+    }
+
+    fn complete_stop(&mut self) {
+        if self.recording_active() {
             self.finish_recording();
         }
         self.sim = None;
@@ -81,10 +100,7 @@ impl StudioApp {
             }
         };
         self.lost_shown = 0;
-        if let Some(p) = &self.player {
-            p.set_recording(true);
-        }
-        self.engine.transport.recording = true;
+        self.engine.transport.recording = self.player.is_none();
         self.begin_pass(takes);
     }
 
@@ -150,6 +166,17 @@ impl StudioApp {
     fn plan_recording(&mut self, takes: Vec<soundcraft_engine::io::Take>, pass: Option<Samples>) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        if let Some(p) = &self.player {
+            if !p.is_playing() && self.player_requests.play.is_none() {
+                self.finish_recording();
+                return;
+            }
+            let Some(sequence) = self.player_requests.result(&mut self.status, p.set_recording(true)) else {
+                self.finish_recording();
+                return;
+            };
+            self.player_requests.recording = Some(sequence);
+        }
         if let Some(root) = self.autosave_dir.clone() {
             self.queue_autosave(root);
         }
@@ -158,6 +185,9 @@ impl StudioApp {
     /// Arm the input for the record-enabled tracks; a session never saved records into its
     /// autosave folder. Returns the takes it records.
     fn arm_recorder(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
+        if self.recorder_failed {
+            return Err(self.status.clone());
+        }
         let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
         let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
         let Some(r) = &mut self.recorder else { return Err("no audio input device".into()) };
@@ -175,22 +205,31 @@ impl StudioApp {
 
     /// Reads every live third-party plugin's state and stores it on its insert
     /// (`mix.insert_state`), so saves, bounces and autosaves include it.
-    pub fn capture_plugin_states(&mut self) {
-        let Some(p) = &self.player else { return };
-        for (t, slot, data) in p.capture_states() {
+    pub fn capture_plugin_states(&mut self) -> Result<(), String> {
+        let Some(p) = &self.player else { return Ok(()) };
+        let states = p.capture_states(&self.engine.session_arc());
+        self.store_plugin_states(states)
+    }
+
+    fn store_plugin_states(&mut self, states: Result<soundcraft_playback::PluginStates, soundcraft_playback::PlayerError>) -> Result<(), String> {
+        let states = self.player_requests.result(&mut self.status, states).ok_or_else(|| self.status.clone())?;
+        for (t, slot, data) in states {
             let slot = if slot == soundcraft_mix::INSTRUMENT_SLOT { json!("instrument") } else { json!(slot) };
             let state = soundcraft_model::b64::encode(&data);
             if let Err(e) = self.engine.execute("mix.insert_state", &json!({"track": t.0, "slot": slot, "state": state})) {
-                log::warn!("storing plugin state: {e}");
+                self.status = format!("Cannot store plugin state: {e}");
+                return Err(self.status.clone());
             }
         }
+        Ok(())
     }
 
     /// Parameter edits made in plugin editors go into the session (one undo step per gesture).
     /// Calls `Player::idle`, which hosted editors need every frame (E7).
     pub(crate) fn apply_editor_edits(&mut self) {
         let Some(p) = &self.player else { return };
-        for (t, slot, param, value) in p.idle() {
+        let Some(edits) = self.player_requests.result(&mut self.status, p.idle()) else { return };
+        for (t, slot, param, value) in edits {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
             }
@@ -208,8 +247,9 @@ impl StudioApp {
             return;
         }
         self.last_autosave = Some(std::time::Instant::now());
-        self.capture_plugin_states();
-        self.autosave_to(&dir);
+        if self.capture_plugin_states().is_ok() {
+            self.autosave_to(&dir);
+        }
     }
 
     /// Autosave a modified session within a second of every change, also while recording. The
@@ -258,13 +298,12 @@ impl StudioApp {
     /// Done with the open session. Unsaved changes stay in its autosave folder for the next
     /// launch, unless the user quit with Quit; a take still recording is finished and always stays.
     pub fn close_autosave(&mut self) {
-        let recording = self.engine.transport.recording;
+        let recording = self.recording_active();
         if recording {
             self.stop_play();
         }
         let keep = self.engine.is_dirty() && (recording || !self.quit_requested);
-        if keep {
-            self.capture_plugin_states();
+        if keep && self.capture_plugin_states().is_ok() {
             self.write_autosave();
         }
         self.release_autosave(keep);
@@ -290,7 +329,7 @@ impl StudioApp {
 
     /// Replace the open session with unsaved work an earlier run left behind.
     pub fn recover(&mut self, left: &soundcraft_engine::autosave::Leftover) {
-        if self.engine.transport.recording {
+        if self.recording_active() {
             self.status = "Stop recording before recovering other work.".into();
             return;
         }
@@ -318,10 +357,42 @@ impl StudioApp {
     /// keeps an input it opened with the output (ASIO) and closes any other. Must run before the
     /// player is dropped (E5).
     pub fn close_input(&mut self) {
-        let Some(r) = self.recorder.take() else { return };
-        match &self.player {
-            Some(p) => p.close_input(r),
-            None => drop(r),
+        if self.recording_active() {
+            self.finish_recording();
+        }
+        if let Some(p) = &self.player {
+            self.player_requests.result(&mut self.status, p.close_input(&mut self.recorder));
+        } else {
+            self.recorder = None;
+        }
+    }
+
+    pub(crate) fn recording_active(&self) -> bool {
+        self.engine.transport.recording
+            || self.take_plan.is_some()
+            || self.recorder.as_ref().is_some_and(soundcraft_playback::record::Recorder::has_pending_take)
+    }
+
+    pub(crate) fn poll_player(&mut self) {
+        let Some(p) = &self.player else { return };
+        let polled = p.poll_notices(&mut self.player_requests.notices);
+        let count = self.player_requests.result(&mut self.status, polled);
+        let mut collect = false;
+        for index in 0..count.unwrap_or(0).min(self.player_requests.notices.len()) {
+            if let Some(notice) = self.player_requests.notices.get_mut(index).and_then(Option::take) {
+                collect |= self.player_requests.notice(notice, &mut self.status, &mut self.engine.transport.recording);
+            }
+        }
+        let stopped = self
+            .player_requests
+            .result(&mut self.status, p.recovery_progress())
+            .is_some_and(|frontiers| self.player_requests.recovery(frontiers, &mut self.status));
+        if stopped && !p.is_playing() {
+            self.engine.transport.position = p.position();
+            self.complete_stop();
+        }
+        if collect && self.recording_active() {
+            self.finish_recording();
         }
     }
 
@@ -347,7 +418,7 @@ impl StudioApp {
             }
             Err(e) => {
                 self.recorder_failed = true;
-                self.status = format!("No audio input: {e}");
+                self.player_requests.fail(&mut self.status, format!("No audio input: {e}"));
             }
         }
     }
@@ -362,7 +433,7 @@ impl StudioApp {
             OutputTrouble::Gone => (format!("“{name}” was disconnected"), "Plug it back in, then use Audio › Reconnect Device."),
             OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Audio › Reconnect Device."),
         };
-        let (recording, playing) = (self.engine.transport.recording, self.engine.transport.playing);
+        let (recording, playing) = (self.recording_active(), self.engine.transport.playing);
         if recording || playing {
             self.stop_play();
         }
@@ -377,7 +448,7 @@ impl StudioApp {
 
     /// Stop recording, keeping the take, when the input device or the disk fails.
     pub(crate) fn watch_input(&mut self) {
-        let recording = self.engine.transport.recording;
+        let recording = self.recording_active();
         let Some(r) = &mut self.recorder else { return };
         let Some(trouble) = r.trouble() else {
             let lost = r.lost_ms();
@@ -407,7 +478,7 @@ impl StudioApp {
 
     /// Reopen audio with editors closed before teardown. Never interrupt a recording.
     pub fn reconnect_audio(&mut self) {
-        if self.engine.transport.recording {
+        if self.recording_active() {
             self.status = crate::audio_devices::REFUSED_RECORDING.into();
             return;
         }
@@ -427,14 +498,23 @@ impl StudioApp {
         let cfg = self.ui.audio.clone();
         if let Some(f) = &mut self.audio_devices.fake {
             let trace = std::rc::Rc::clone(&f.trace);
-            crate::audio_connection::replace(&mut f.connection, &mut f.input, || crate::audio_connection::FakeConnection::new(cfg.clone(), trace));
+            if let Err(error) =
+                crate::audio_connection::replace(&mut f.connection, &mut f.input, || crate::audio_connection::FakeConnection::new(cfg.clone(), trace))
+            {
+                self.player_requests.fail(&mut self.status, error);
+                return;
+            }
             f.reopened.push(cfg);
         } else {
             let session = self.engine.session_arc();
-            crate::audio_connection::replace(&mut self.player, &mut self.recorder, || {
+            if let Err(error) = crate::audio_connection::replace(&mut self.player, &mut self.recorder, || {
                 soundcraft_playback::devices::release_asio_device_cache();
                 Player::with_config(session, &cfg)
-            });
+            }) {
+                self.player_requests.fail(&mut self.status, error);
+                return;
+            }
+            self.player_requests.reset();
         }
         if self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm) {
             self.ensure_input();
@@ -443,12 +523,16 @@ impl StudioApp {
     }
 
     fn finish_recording(&mut self) {
-        self.engine.transport.recording = false;
-        if let Some(p) = &self.player {
-            p.set_recording(false);
+        if self.player.is_none() {
+            self.engine.transport.recording = false;
+        }
+        if let Some(p) = &self.player
+            && let Some(sequence) = self.player_requests.result(&mut self.status, p.set_recording(false))
+        {
+            self.player_requests.recording = Some(sequence);
         }
         let plan = self.take_plan.take();
-        let finished = self.recorder.as_mut().map(soundcraft_playback::record::Recorder::finish);
+        let finished = self.recorder.as_mut().filter(|r| r.has_pending_take()).map(soundcraft_playback::record::Recorder::finish);
         // Tests substitute only the device's finished files; placement and stop ordering stay real.
         #[cfg(test)]
         let finished = finished.or_else(|| self.finished_test_takes.take());
@@ -546,13 +630,17 @@ impl StudioApp {
         if !self.is_playing() {
             return;
         }
-        if let Some(p) = &self.player {
-            p.locate(at);
+        if let Some(p) = &self.player
+            && let Some(sequence) = self.player_requests.result(&mut self.status, p.locate(at))
+        {
+            self.player_requests.locate = Some(sequence);
         }
         if let Some(sim) = &mut self.sim {
             sim.0 = at;
         }
-        self.engine.transport.position = at;
+        if self.player.is_none() {
+            self.engine.transport.position = at;
+        }
     }
 
     pub(crate) fn handle_transport(&mut self, dt: f32) {
@@ -561,10 +649,16 @@ impl StudioApp {
             match r {
                 TransportRequest::ResetSession => {
                     if let Some(p) = &self.player {
-                        p.stop();
-                        p.set_recording(false);
+                        if let Some(sequence) = self.player_requests.result(&mut self.status, p.stop()) {
+                            self.player_requests.stop = Some(sequence);
+                        }
+                        if let Some(sequence) = self.player_requests.result(&mut self.status, p.set_recording(false)) {
+                            self.player_requests.recording = Some(sequence);
+                        }
                         p.set_speed(1.0);
-                        p.locate(self.engine.transport.position);
+                        if let Some(sequence) = self.player_requests.result(&mut self.status, p.locate(self.engine.transport.position)) {
+                            self.player_requests.locate = Some(sequence);
+                        }
                     }
                     self.sim = None;
                     // The old capture belongs to the replaced document, never to the new one.
@@ -585,7 +679,7 @@ impl StudioApp {
                     self.engine.transport.position = self.cursor();
                 }
                 TransportRequest::Play => {
-                    if !self.is_playing() {
+                    if !self.is_playing() && self.player_requests.play.is_none() {
                         self.play_from_cursor();
                     }
                 }
@@ -604,14 +698,14 @@ impl StudioApp {
                 }
                 TransportRequest::Pause => self.stop_play(),
                 TransportRequest::TogglePlay => {
-                    if self.is_playing() {
+                    if self.is_playing() || self.player_requests.play.is_some() {
                         self.stop_play();
                     } else {
                         self.play_from_cursor();
                     }
                 }
                 TransportRequest::Record => {
-                    if self.engine.transport.recording {
+                    if self.recording_active() {
                         self.stop_play();
                     } else {
                         self.start_recording();
@@ -636,9 +730,13 @@ impl StudioApp {
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {
                     if let Some(p) = &self.player {
-                        p.all_notes_off();
+                        if let Some(sequence) = self.player_requests.result(&mut self.status, p.all_notes_off()) {
+                            self.player_requests.release = Some(sequence);
+                            self.status = "All MIDI notes off pending".into();
+                        }
+                    } else {
+                        self.status = "All MIDI notes off".into();
                     }
-                    self.status = "All MIDI notes off".into();
                 }
             }
         }
@@ -649,12 +747,11 @@ impl StudioApp {
             if ended {
                 p.set_speed(1.0);
             }
-            if self.engine.transport.playing {
-                self.engine.transport.position = p.position();
-            }
+            self.engine.transport.playing = playing;
+            self.engine.transport.position = p.position();
             let now = self.last_frame.unwrap_or_default();
             if now - self.last_meter_poll >= 1.0 / 20.0 {
-                p.copy_meters(&mut self.meter_snapshot);
+                self.player_requests.result(&mut self.status, p.copy_meters(&mut self.meter_snapshot));
                 self.last_meter_poll = now;
             }
             let snap = &self.meter_snapshot;
@@ -670,8 +767,8 @@ impl StudioApp {
             }
             let main = snap.main.peak;
             feed_meter(&mut self.main_meter, main, 0.0, dt);
-            if ended {
-                self.stop_play();
+            if ended && self.player_requests.stop.is_none() {
+                self.complete_stop();
             }
         } else if let Some((pos, end, looped)) = &mut self.sim {
             let sr = self.engine.session().sample_rate.as_f64();
@@ -730,3 +827,133 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
     let ins = if slot == soundcraft_mix::INSTRUMENT_SLOT { t.instrument.as_ref() } else { t.mixer.inserts.get(slot)?.as_ref() }?;
     Some(format!("{} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", ins.plugin, t.name))
 }
+
+/// Admission is separate from callback application. Storage is reused every frame,
+/// including idle frames, so terminal results always return admission credits.
+pub(crate) struct PlayerRequests {
+    notices: [Option<soundcraft_playback::PlayerNotice>; 64],
+    pub(crate) play: Option<soundcraft_playback::action_lane::Sequence>,
+    pub(crate) locate: Option<soundcraft_playback::action_lane::Sequence>,
+    stop: Option<soundcraft_playback::action_lane::Sequence>,
+    release: Option<soundcraft_playback::action_lane::Sequence>,
+    pub(crate) recording: Option<soundcraft_playback::action_lane::Sequence>,
+    error: Option<String>,
+}
+
+impl Default for PlayerRequests {
+    fn default() -> Self {
+        Self { notices: [None; 64], play: None, locate: None, stop: None, release: None, recording: None, error: None }
+    }
+}
+
+impl PlayerRequests {
+    pub(crate) fn reset(&mut self) {
+        let error = self.error.take();
+        *self = Self { error, ..Self::default() };
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.play.is_some() || self.locate.is_some() || self.stop.is_some() || self.release.is_some() || self.recording.is_some()
+    }
+
+    pub(crate) fn fail(&mut self, status: &mut String, message: String) {
+        log::warn!("{message}");
+        let error = self.error.get_or_insert_with(String::new);
+        if !error.is_empty() {
+            error.push_str("; ");
+        }
+        error.push_str(&message);
+        status.clone_from(error);
+    }
+
+    pub(crate) fn result<T>(&mut self, status: &mut String, result: Result<T, soundcraft_playback::PlayerError>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if error == soundcraft_playback::PlayerError::Faulted {
+                    self.reset();
+                }
+                self.fail(status, error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Returns true when a refused start requires collecting an armed take.
+    pub(crate) fn notice(&mut self, notice: soundcraft_playback::PlayerNotice, status: &mut String, recording: &mut bool) -> bool {
+        use soundcraft_playback::{ActionResult, PlayerCommand, PlayerNotice, action_lane::Outcome, player::SessionOutcome};
+        match notice {
+            PlayerNotice::Session(n) => {
+                if let SessionOutcome::Rejected(reason) = n.outcome {
+                    self.fail(status, format!("Audio session {} rejected: {reason:?}", n.request.get()));
+                }
+            }
+            PlayerNotice::Action(r) => {
+                let applied = r.outcome == Outcome::Applied
+                    && matches!(
+                        r.handler_result,
+                        Some(
+                            ActionResult::Applied
+                                | ActionResult::Event(
+                                    soundcraft_mix::EventOutcome::Queued
+                                        | soundcraft_mix::EventOutcome::QueuedLate { .. }
+                                        | soundcraft_mix::EventOutcome::ReleaseAdvanced { .. }
+                                        | soundcraft_mix::EventOutcome::Coalesced
+                                )
+                        )
+                    );
+                if self.locate == Some(r.sequence) {
+                    self.locate = None;
+                }
+                let play = self.play == Some(r.sequence);
+                let record = self.recording == Some(r.sequence);
+                if play {
+                    self.play = None;
+                    if applied && status == "Play pending" {
+                        *status = "Playing".into();
+                    }
+                }
+                if record {
+                    self.recording = None;
+                    if applied && let PlayerCommand::Recording(on) = r.payload {
+                        *recording = on;
+                    }
+                }
+                if !applied && !matches!(r.outcome, Outcome::Stopped | Outcome::NotesReleased) {
+                    self.fail(status, format!("Audio action {} refused: {:?} ({:?})", r.sequence.get(), r.outcome, r.handler_result));
+                }
+                return (play || record) && !applied && self.stop.is_none();
+            }
+        }
+        false
+    }
+
+    pub(crate) fn recovery(
+        &mut self,
+        frontiers: (soundcraft_playback::action_lane::Sequence, soundcraft_playback::action_lane::Sequence),
+        status: &mut String,
+    ) -> bool {
+        let stopped = self.stop.is_some_and(|s| frontiers.0 >= s);
+        if stopped {
+            self.stop = None;
+            if status == "Stop pending" {
+                *status = "Stopped".into();
+            }
+        }
+        if self.release.is_some_and(|s| frontiers.1 >= s) {
+            self.release = None;
+            *status = "All MIDI notes off".into();
+        }
+        stopped
+    }
+
+    pub(crate) fn show_error(&mut self, status: &mut String) {
+        if let Some(error) = self.error.take() {
+            *status = error;
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "player_tests.rs"]
+mod player_tests;

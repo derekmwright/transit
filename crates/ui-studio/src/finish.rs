@@ -404,7 +404,7 @@ impl StudioApp {
         if f.source != "main" {
             p["source"] = json!(f.source);
         }
-        self.capture_plugin_states();
+        self.capture_plugin_states()?;
         match soundcraft_engine::cmd::bounce_job(&self.engine, &p) {
             Ok(job) => {
                 self.finish.job = Some(job);

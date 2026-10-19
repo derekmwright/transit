@@ -19,10 +19,10 @@ mod runtime;
 pub use runtime::{AudioPorts, Retirement, RuntimeControl, ServiceReport};
 pub mod sources;
 
-// Integration fixture first; the device adapter switches to this implementation
-// once its event and shutdown plumbing is complete.
-#[cfg(test)]
 mod audio;
+pub use audio::{ActionResult, Command as PlayerCommand};
+mod device;
+pub use device::{Player, PlayerNotice};
 
 pub const SESSION_REQUESTS: usize = 64;
 
@@ -36,7 +36,12 @@ impl SessionRequestId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerError {
+    Busy,
+    RecordingActive,
+    InvalidNote,
+    NoInstrument,
     SessionBackpressure,
+    SessionPending,
     Action(action_lane::SendError),
     Source(sources::Error),
     NoSession,
@@ -47,6 +52,11 @@ pub enum PlayerError {
 impl std::fmt::Display for PlayerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RecordingActive => f.write_str("finish and collect the recording before returning its input device"),
+            Self::Busy => f.write_str("audio control is busy servicing a reentrant request"),
+            Self::InvalidNote => f.write_str("MIDI pitch and velocity must be below 128"),
+            Self::NoInstrument => f.write_str("the requested instrument has no active binding"),
+            Self::SessionPending => f.write_str("the audio session is still updating; try saving again after it applies"),
             Self::SessionBackpressure => f.write_str("session request results must be collected before another update"),
             Self::Action(error) => write!(f, "audio action was not admitted: {error:?}"),
             Self::Source(error) => write!(f, "MIDI source was not admitted: {error}"),

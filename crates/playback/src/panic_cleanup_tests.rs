@@ -66,7 +66,7 @@ impl Drop for Adversary {
     }
 }
 
-fn rig(payload_panics: bool, plugin_panics: bool) -> (Player, Log, Arc<AtomicUsize>) {
+fn rig(payload_panics: bool, plugin_panics: bool) -> (LegacyPlayer, Log, Arc<AtomicUsize>) {
     let mut session = Session::default();
     let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
     session.track_mut(track).unwrap().instrument = Some(Insert::new("clap:review.panic"));
@@ -98,11 +98,11 @@ fn rig(payload_panics: bool, plugin_panics: bool) -> (Player, Log, Arc<AtomicUsi
     .unwrap();
     tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     state.lock().unwrap().as_mut().unwrap().drain();
-    let player = Player::silent(shared, Arc::new(Fault::default()), tx, Mutex::new(Side::new(48_000.0, grx)), state, 48_000);
+    let player = LegacyPlayer::silent(shared, Arc::new(Fault::default()), tx, Mutex::new(Side::new(48_000.0, grx)), state, 48_000);
     (player, log, calls)
 }
 
-fn callbacks(player: &Player, count: usize, device_error: bool) -> AllocStats {
+fn callbacks(player: &LegacyPlayer, count: usize, device_error: bool) -> AllocStats {
     let (held, fault, shared) = (Arc::clone(&player.state), Arc::clone(&player.fault), Arc::clone(&player.shared));
     std::thread::spawn(move || {
         let mut output = OutputCallback::new(2, 48_000);
@@ -162,7 +162,7 @@ fn payload_drop_must_not_escape_player_teardown() {
     assert_eq!(*log.lock().unwrap(), [None; 3]);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(player)));
     assert_eq!(*log.lock().unwrap(), [Some(std::thread::current().id()); 3]);
-    assert!(result.is_ok(), "retained payload destructor panic escaped Player::drop");
+    assert!(result.is_ok(), "retained payload destructor panic escaped LegacyPlayer::drop");
 }
 
 #[test]

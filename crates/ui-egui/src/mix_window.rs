@@ -46,7 +46,7 @@ pub fn separate_closed(app: &mut SoundApp) {
 pub(crate) fn content(app: &mut SoundApp, ui: &mut Ui) {
     let ids: Vec<TrackId> = app.engine.session().tracks.iter().filter(|x| !x.hidden && x.kind != TrackKind::Video).map(|x| x.id).collect();
     // Per-channel peaks for multichannel meters (read once per frame).
-    let snap = app.player.as_ref().filter(|_| app.meters_live()).map(|p| p.meters());
+    let snap = app.player.as_ref().filter(|_| app.meters_live()).and_then(|p| app.player_requests.result(&mut app.ui.status, p.meters()));
     egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
@@ -679,7 +679,7 @@ pub fn instrument_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         {
             if p.editor_open(id, slot) {
                 if ui.button("Close Plugin Editor").clicked() {
-                    p.close_editor(id, slot);
+                    app.player_requests.result(&mut app.ui.status, p.close_editor(id, slot));
                     ui.close();
                 }
             } else if ui.button("Open Plugin Editor").clicked() {

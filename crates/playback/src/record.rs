@@ -490,6 +490,12 @@ impl Recorder {
         self.clock.as_mut().map(crate::device_clock::MaintainedClock::report)
     }
 
+    /// A prepared or active take must be finalized and collected before handing
+    /// this input back to its device owner.
+    pub fn has_pending_take(&self) -> bool {
+        self.writer.is_some()
+    }
+
     pub fn finish(&mut self) -> Takes {
         self.shared.stop_capture();
         self.shared.wait_for_capture();

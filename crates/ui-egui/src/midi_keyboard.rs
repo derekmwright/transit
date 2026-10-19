@@ -187,8 +187,9 @@ fn start(app: &mut SoundApp, pitch: u8) -> Held {
         *n += 1;
         if *n == 1
             && let Some(player) = &app.player
+            && app.player_requests.result(&mut app.ui.status, player.note(*t, pitch, velocity)).is_none()
         {
-            player.note(*t, pitch, velocity);
+            *n = 0;
         }
     }
     if app.ui.midi_keyboard.step {
@@ -203,8 +204,11 @@ fn stop(app: &mut SoundApp, held: Held) {
         *n = n.saturating_sub(1);
         if *n == 0 {
             app.keyboard.sounding.remove(&(t, held.pitch));
-            if let Some(player) = &app.player {
-                player.note(t, held.pitch, 0);
+            if let Some(player) = &app.player
+                && app.player_requests.result(&mut app.ui.status, player.note(t, held.pitch, 0)).is_none()
+                && let Some(sequence) = app.player_requests.result(&mut app.ui.status, player.all_notes_off())
+            {
+                app.player_requests.release = Some(sequence);
             }
         }
     }
