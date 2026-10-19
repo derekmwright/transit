@@ -415,7 +415,47 @@ impl Control {
     }
 }
 
+/// Borrowed processing controls for an action handler. It cannot adopt, retire or
+/// replace the engine while an exact-plan action is being dispatched.
+///
+/// ```compile_fail
+/// use soundcraft_playback::plan_bridge::{CallbackBudget, Processing};
+/// fn adopt_during_action(view: &mut Processing<'_>, budget: &mut CallbackBudget) {
+///     view.service(budget, true);
+/// }
+/// ```
+/// ```compile_fail
+/// use soundcraft_playback::plan_bridge::{Audio, Processing};
+/// fn swap_runtime(view: &mut Processing<'_>, foreign: &mut Audio) {
+///     std::mem::swap(view, foreign);
+/// }
+/// ```
+pub struct Processing<'a> {
+    audio: &'a mut Audio,
+}
+
+impl Processing<'_> {
+    pub fn set_processing(&mut self, monitor_only: bool, recording: bool, editors_open: bool) {
+        self.audio.set_processing(monitor_only, recording, editors_open);
+    }
+    pub fn reset(&mut self) {
+        self.audio.reset();
+    }
+    pub fn all_notes_off(&mut self) {
+        self.audio.all_notes_off();
+    }
+    pub fn flush_releases(&mut self, frames: usize) {
+        self.audio.flush_releases(frames);
+    }
+    pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
+        self.audio.live_note(track, pitch, velocity);
+    }
+}
+
 impl Audio {
+    pub(super) fn processing(&mut self) -> Processing<'_> {
+        Processing { audio: self }
+    }
     pub(super) fn matches_runtime(&self, identity: &RuntimeIdentity) -> bool {
         Arc::ptr_eq(&self.counters, &identity.0)
     }

@@ -50,6 +50,8 @@ pub enum SendError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Match this result to the admitted request by `sequence`, never by receipt order.
+/// Independent note/transport lanes can complete in a different order.
 pub struct Receipt<T: Copy> {
     pub sequence: Sequence,
     pub payload: T,
@@ -297,21 +299,23 @@ impl<T: Copy> Control<T> {
 }
 
 impl State {
-    fn urgent<T: Copy>(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>)) {
+    fn urgent<T: Copy>(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>) -> bool) {
         if stop {
             self.seen_stop = sequence;
         } else {
             self.seen_release = self.seen_release.max(sequence);
         }
         self.faulted = true;
-        apply(if stop { Event::Stop { sequence } } else { Event::AllNotesOff { sequence } });
-        self.faulted = false;
+        self.faulted = !apply(if stop { Event::Stop { sequence } } else { Event::AllNotesOff { sequence } });
+        if self.faulted {
+            return;
+        }
         if stop {
             self.shared.applied_stop.store(sequence.0, Ordering::Release);
         }
         self.shared.applied_release.store(self.seen_stop.max(self.seen_release).0, Ordering::Release);
     }
-    fn recover<T: Copy>(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>)) -> bool {
+    fn recover<T: Copy>(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>) -> bool) -> bool {
         if self.faulted {
             return true;
         }
@@ -327,6 +331,9 @@ impl State {
             }
             budget.stop_serviced = true;
             self.urgent(true, stop, apply);
+            if self.faulted {
+                return true;
+            }
         }
         if new_release && release > self.seen_stop {
             if budget.release_serviced {
@@ -366,7 +373,7 @@ impl State {
         notes: bool,
         budget: &mut Budget,
         active: PlanGeneration,
-        apply: &mut impl FnMut(Event<T>),
+        apply: &mut impl FnMut(Event<T>) -> bool,
     ) -> Service {
         let mut result = Service::default();
         if !self.recover(budget, apply) {
@@ -407,8 +414,10 @@ impl State {
             lane.pending = Some(Pending { finished: Some(Outcome::Faulted), ..pending });
             if outcome == Outcome::Applied {
                 self.faulted = true;
-                apply(Event::Action { sequence: pending.entry.sequence, payload: pending.entry.payload });
-                self.faulted = false;
+                self.faulted = !apply(Event::Action { sequence: pending.entry.sequence, payload: pending.entry.payload });
+                if self.faulted {
+                    continue;
+                }
                 result.applied += 1;
             }
             lane.pending = Some(Pending { finished: Some(outcome), ..pending });
@@ -421,14 +430,39 @@ impl State {
 impl<T: Copy> Audio<T> {
     /// The paired bridge supplies both generation and permanent fault state. A foreign
     /// runtime, even with equal numeric generations, permanently refuses this lane.
-    pub fn service(&mut self, budget: &mut Budget, bridge: &plan_bridge::Audio, apply: &mut impl FnMut(Event<T>)) -> Service {
+    pub fn service(
+        &mut self,
+        budget: &mut Budget,
+        bridge: &mut plan_bridge::Audio,
+        apply: &mut impl FnMut(Event<T>, &mut plan_bridge::Processing<'_>),
+    ) -> Service {
         if !bridge.matches_runtime(&self.runtime) || bridge.engine().faulted() {
             self.state.faulted = true;
         }
-        self.service_generation(budget, bridge.engine().active().generation, apply)
+        let active = bridge.engine().active().generation;
+        let Self { state, notes, actions, runtime } = self;
+        let mut dispatch = |event| {
+            // The restricted view cannot change these. Recheck at each dispatch so
+            // future view extensions cannot silently invalidate prerequisite checks.
+            if !bridge.matches_runtime(runtime) || bridge.engine().faulted() || bridge.engine().active().generation != active {
+                return false;
+            }
+            apply(event, &mut bridge.processing());
+            true
+        };
+        let mut result = state.service_lane(notes, true, budget, active, &mut dispatch);
+        if !result.recovery_deferred {
+            result.combine(state.service_lane(actions, false, budget, active, &mut dispatch));
+        }
+        result
     }
     // Private fixture seam; production callers cannot bypass runtime/fault validation.
+    #[cfg(test)]
     fn service_generation(&mut self, budget: &mut Budget, active: PlanGeneration, apply: &mut impl FnMut(Event<T>)) -> Service {
+        let apply = &mut |event| {
+            apply(event);
+            true
+        };
         let mut result = self.state.service_lane(&mut self.notes, true, budget, active, apply);
         if !result.recovery_deferred {
             result.combine(self.state.service_lane(&mut self.actions, false, budget, active, apply));

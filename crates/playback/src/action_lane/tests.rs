@@ -152,20 +152,44 @@ fn stop_absorbs_an_older_release_after_the_release_budget_was_spent() {
 
 #[test]
 fn production_service_rejects_a_foreign_runtime_even_with_equal_numeric_generations() {
-    let (first_control, first_audio) = bridge();
-    let (second_control, second_audio) = bridge();
+    let (first_control, mut first_audio) = bridge();
+    let (second_control, mut second_audio) = bridge();
     assert_eq!(first_audio.engine().active(), second_audio.engine().active());
     let (mut control, mut audio) = action_lane::pair(&first_control);
     control.send_action(1, None).unwrap();
     control.send_note(2, super::NoteKind::Off).unwrap();
-    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), &second_audio, &mut |_| panic!("wrong runtime")));
+    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), &mut second_audio, &mut |_, _| panic!("wrong runtime")));
     assert!(stats.is_zero());
     assert!(result.faulted);
     control.send_action(3, None).unwrap();
-    assert!(audio.service(&mut super::callback_scope(), &first_audio, &mut |_| panic!("fault must be permanent")).faulted);
+    assert!(audio.service(&mut super::callback_scope(), &mut first_audio, &mut |_, _| panic!("fault must be permanent")).faulted);
     assert!(control.retire(audio).iter().all(|r| r.outcome == Outcome::Faulted));
     first_control.retire(first_audio);
     second_control.retire(second_audio);
+}
+
+#[test]
+fn production_handler_mutates_the_checked_bridge_without_heap_work() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair(&plan_control);
+    control.send_action(1, None).unwrap();
+    let mut called = 0;
+    let (result, stats) = measure(|| {
+        audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |event, bridge| {
+            assert!(matches!(event, Event::Action { payload: 1, .. }));
+            bridge.set_processing(true, true, true);
+            bridge.reset();
+            bridge.live_note(soundcraft_model::TrackId(1), 60, 100);
+            called += 1;
+        })
+    });
+    assert!(!result.faulted);
+    assert!(stats.is_zero());
+    assert_eq!(called, 1);
+    assert!(plan_audio.engine().monitor_only && plan_audio.engine().recording && plan_audio.engine().no_suspend);
+    assert_eq!(control.reclaim().unwrap().outcome, Outcome::Applied);
+    assert!(control.retire(audio).is_empty());
+    plan_control.retire(plan_audio);
 }
 
 #[test]

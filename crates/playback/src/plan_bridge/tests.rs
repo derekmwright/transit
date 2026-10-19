@@ -380,7 +380,7 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     actions.send_action(1u8, Some(audio.engine().active().generation)).unwrap();
     actions.send_note(2u8, crate::action_lane::NoteKind::Off).unwrap();
     let (result, stats) = measure(|| {
-        action_audio.service(&mut crate::action_lane::callback_scope(), &audio, &mut |_| panic!("torn bridge must refuse action handlers"))
+        action_audio.service(&mut crate::action_lane::callback_scope(), &mut audio, &mut |_, _| panic!("torn bridge must refuse action handlers"))
     });
     assert!(stats.is_zero());
     assert!(result.faulted);
@@ -583,4 +583,76 @@ fn a_rejected_plan_cannot_replace_output_input_fold_or_meter_owners() {
     assert_eq!(meters.main, previous_meters.main);
     assert_eq!(meters.tracks, previous_meters.tracks);
     control.retire(audio);
+}
+
+#[test]
+fn public_stop_handler_reaches_the_plugin_before_ack_and_faults_both_classes_on_unwind() {
+    use crate::action_lane::{self, Event, NoteKind, Outcome};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for panic in [false, true] {
+        let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+        let mut session = Session::default();
+        let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        session.track_mut(track).unwrap().instrument = Some(Insert::new("clap:test.stop"));
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let fault = Arc::new(AtomicBool::new(false));
+        control.request(Arc::new(session), None);
+        control
+            .prepare(&mut |spec, _| {
+                let mut inner = soundcraft_dsp::create("gain")?;
+                inner.prepare(48_000.0, 512, spec.ch);
+                Some(NewInstance {
+                    plugin: Box::new(Tracked { inner, drops: Arc::clone(&drops), panic_sample: None, panic_processing: Some(Arc::clone(&fault)) }),
+                    refused_state: false,
+                })
+            })
+            .unwrap();
+        adopt(&mut audio);
+        control.poll();
+        audio.set_processing(false, true, false);
+        let (mut actions, mut lane) = action_lane::pair(&control);
+        let stop = actions.stop().unwrap();
+        actions.send_action(1, None).unwrap();
+        actions.send_note(2, NoteKind::On).unwrap();
+        fault.store(panic, Ordering::Relaxed);
+        let mut stopped = false;
+        let mut handler = |event, bridge: &mut plan_bridge::Processing<'_>| {
+            if matches!(event, Event::Stop { .. }) {
+                bridge.all_notes_off();
+                bridge.set_processing(true, false, false);
+                stopped = true;
+                assert_eq!(actions.recovery_progress().0.get(), 0, "no acknowledgement before handler returns");
+            }
+        };
+        if panic {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    lane.service(&mut action_lane::callback_scope(), &mut audio, &mut handler)
+                }))
+                .is_err(),
+                "the actual plugin must be called inside service"
+            );
+            assert!(!stopped);
+            assert_eq!(actions.recovery_progress().0.get(), 0);
+            let (report, stats) =
+                measure(|| lane.service(&mut action_lane::callback_scope(), &mut audio, &mut |_, _| panic!("faulted handler replay")));
+            assert!(report.faulted);
+            assert!(stats.is_zero());
+            let receipts = actions.retire(lane);
+            assert_eq!(receipts.len(), 2);
+            assert!(receipts.iter().all(|r| r.outcome == Outcome::Faulted));
+        } else {
+            let (report, stats) = measure(|| lane.service(&mut action_lane::callback_scope(), &mut audio, &mut handler));
+            assert!(!report.faulted);
+            assert!(stats.is_zero());
+            assert!(stopped && !audio.engine().recording && audio.engine().monitor_only);
+            assert_eq!(actions.recovery_progress().0, stop);
+            let receipts = actions.retire(lane);
+            assert_eq!(receipts.len(), 2);
+            assert!(receipts.iter().all(|r| r.outcome == Outcome::Applied));
+        }
+        fault.store(false, Ordering::Relaxed);
+        control.retire(audio);
+        assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
+    }
 }
