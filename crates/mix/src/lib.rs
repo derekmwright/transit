@@ -78,6 +78,8 @@ use std::sync::Arc;
 mod active;
 mod compile;
 mod plan;
+#[cfg(test)]
+mod plan_tests;
 
 pub use compile::{CompileError, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
 pub use plan::{
