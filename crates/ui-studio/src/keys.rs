@@ -8,7 +8,7 @@
 //! lane sets velocity. Every edit is a `midi.*` / `event.*` command, one undo step per gesture.
 //! Notes are addressed by index and indices shift after each edit (plan 06, section 1), so the
 //! selection is kept as note values and resolved to indices again before each command.
-//! Zoom, scroll, snap, pane height and the audition switch are view state: [`KeysPrefs`] in
+//! Zoom, scroll, snap, pane height, new-note velocity and the audition switch are view state: [`KeysPrefs`] in
 //! [`crate::UiState`] and [`KeysState`] here, never the document.
 
 use crate::StudioApp;
@@ -101,8 +101,14 @@ pub struct KeysPrefs {
     /// Play notes on the clip's instrument as they are placed, clicked or dragged.
     pub audition: bool,
     pub snap: Snap,
-    /// Velocity of new notes: the last one set (Ableton).
+    /// Explicit velocity for new notes and audition; note edits never change it.
+    #[serde(deserialize_with = "read_velocity")]
     pub velocity: u8,
+}
+
+fn read_velocity<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let value: i64 = serde::Deserialize::deserialize(d)?;
+    Ok(value.clamp(1, 127) as u8)
 }
 
 impl Default for KeysPrefs {
@@ -188,6 +194,8 @@ pub struct KeysLayout {
     pub snap_menu: Vec<MenuItem>,
     pub quantize: R4,
     pub audition: R4,
+    pub new_note_velocity: R4,
+    pub use_selected_velocity: R4,
     pub ruler: R4,
     pub keyboard: R4,
     pub grid: R4,
@@ -401,12 +409,13 @@ impl StudioApp {
         self.keys.clip.and_then(|c| clip_view(self.engine.session(), c)).map(|v| v.notes).unwrap_or_default()
     }
 
-    /// Play `pitch` on the clip's instrument (when the audition switch is on).
-    pub fn audition(&mut self, pitch: u8, velocity: u8, now: f64) {
+    /// Play `pitch` at the toolbar velocity (when the audition switch is on).
+    pub fn audition(&mut self, pitch: u8, now: f64) {
         if !self.ui.keys.audition {
             return;
         }
         let Some(track) = self.keys_track() else { return };
+        let velocity = self.ui.keys.velocity.clamp(1, 127);
         self.keys.auditions += 1;
         self.keys.last_audition = Some((pitch, velocity));
         if let Some(p) = &self.player {
@@ -799,9 +808,8 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     let p = ui.painter();
     p.line_segment([pos2(x + 8.0, r.min.y + 7.0), pos2(x + 8.0, r.max.y - 7.0)], Stroke::new(1.0, TOKENS.line));
     p.rect_filled(Rect::from_center_size(pos2(x + 22.0, r.center().y), vec2(8.0, 8.0)), crate::theme::RADIUS_SM, theme::rgb(color));
-    p.text(pos2(x + 32.0, r.center().y), Align2::LEFT_CENTER, title, FontId::proportional(11.5), TOKENS.text_dim);
 
-    // Right side, right to left: Audition, Quantize, Grid.
+    // Right side, right to left: Audition, Quantize, Grid, velocity and its eyedropper.
     let mut rx = r.max.x - 8.0;
     let mut button = |ui: &mut Ui, w: f32, salt: &str| {
         let b = Rect::from_min_max(pos2(rx - w, r.min.y + 4.0), pos2(rx, r.max.y - 4.0));
@@ -862,6 +870,43 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
             }
         }
     });
+
+    // Copy only a single, still-existing selection: a stale or mixed selection is ambiguous.
+    let selected = match app.keys.selection.as_slice() {
+        [note] if cv.notes.contains(note) => Some(note.velocity),
+        _ => None,
+    };
+    let b = Rect::from_min_max(pos2(rx - 24.0, r.min.y + 4.0), pos2(rx, r.max.y - 4.0));
+    rx -= 30.0;
+    let resp = ui.add_enabled_ui(selected.is_some(), |ui| ui.put(b, egui::Button::new(""))).inner;
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, selected.is_some(), "Use selected note's velocity"));
+    // Original code-drawn eyedropper; no image asset or font glyph.
+    let p = ui.painter();
+    let c = b.center();
+    let ink = if selected.is_some() { TOKENS.text } else { TOKENS.text_dim };
+    let stroke = Stroke::new(1.4, ink);
+    p.line_segment([c + vec2(-6.0, 6.0), c + vec2(-4.0, 2.0)], stroke);
+    p.add(egui::Shape::closed_line(vec![c + vec2(-4.0, 2.0), c + vec2(2.0, -4.0), c + vec2(4.0, -2.0), c + vec2(-2.0, 4.0)], stroke));
+    p.line_segment([c + vec2(0.0, -6.0), c + vec2(6.0, 0.0)], stroke);
+    p.line_segment([c + vec2(3.0, -3.0), c + vec2(6.0, -6.0)], Stroke::new(3.0, ink));
+    layout.use_selected_velocity = r4(b);
+    if resp.on_hover_text("Use selected note's velocity for new notes and audition (select one note)").clicked()
+        && let Some(velocity) = selected
+    {
+        app.ui.keys.velocity = velocity.clamp(1, 127);
+    }
+
+    let field = Rect::from_min_max(pos2(rx - 44.0, r.min.y + 4.0), pos2(rx, r.max.y - 4.0));
+    ui.push_id("keys_new_note_velocity", |ui| {
+        let resp = ui.put(field, egui::DragValue::new(&mut app.ui.keys.velocity).range(1..=127).speed(1));
+        layout.new_note_velocity = r4(resp.rect);
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "New note velocity"));
+        resp.on_hover_text("New note velocity (1–127): used for drawing and audition. Drag or click to type.");
+    });
+    rx -= 150.0;
+    ui.painter().text(pos2(rx, r.center().y), Align2::LEFT_CENTER, "New note velocity", FontId::proportional(11.5), TOKENS.text);
+    let title_rect = Rect::from_min_max(pos2(x + 32.0, r.min.y), pos2((rx - 8.0).max(x + 32.0), r.max.y));
+    ui.painter().with_clip_rect(title_rect).text(title_rect.left_center(), Align2::LEFT_CENTER, title, FontId::proportional(11.5), TOKENS.text_dim);
 }
 
 /// The pane's top edge: drag to change its height.
@@ -1101,7 +1146,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                 app.keys.selection = vec![notes[i]];
                 let _ = app.keys_delete();
             }
-            // Double-click empty grid: a note in that cell, one grid long, at the last velocity.
+            // Double-click empty grid: a note in that cell, one grid long, at the toolbar velocity.
             None => {
                 let pitch = map.pitch(pos.y);
                 let start = map.floor(map.tick(pos.x));
@@ -1118,7 +1163,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                     };
                     if let Ok(sel) = app.keys_add(&[n]) {
                         app.keys.selection = sel;
-                        app.audition(n.pitch, n.velocity, now);
+                        app.audition(n.pitch, now);
                     }
                 }
             }
@@ -1136,7 +1181,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                 } else {
                     app.keys.selection = vec![n];
                 }
-                app.audition(n.pitch, n.velocity, now);
+                app.audition(n.pitch, now);
             }
             None => {
                 if !mods.shift {
@@ -1170,7 +1215,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                     NoteDrag::Move
                 };
                 if kind == NoteDrag::Move {
-                    app.audition(n.pitch, n.velocity, now);
+                    app.audition(n.pitch, now);
                 }
                 app.keys.gesture = Some(KeysGesture::Notes { kind, anchor: n, press, copy: mods.command, sounding: n.pitch });
             }
@@ -1199,17 +1244,17 @@ fn drag_update(app: &mut StudioApp, ui: &Ui, map: &Map, now: f64) {
             let ds = ((press.y - pos.y) / map.kh).round() as i64;
             let pitch = (i64::from(anchor.pitch) + ds).clamp(0, 127) as u8;
             if pitch != *sounding {
-                play = Some((*sounding, pitch, anchor.velocity));
+                play = Some((*sounding, pitch));
                 *sounding = pitch;
             }
         }
     }
-    if let Some((old, new, v)) = play {
+    if let Some((old, new)) = play {
         if let (Some(p), Some(t)) = (&app.player, app.keys_track()) {
             p.note(t, old, 0);
         }
         app.keys.held.retain(|h| h.1 != old);
-        app.audition(new, v, now);
+        app.audition(new, now);
     }
 }
 
@@ -1218,7 +1263,7 @@ fn finish(app: &mut StudioApp, ui: &Ui, map: &Map, vel: Rect, notes: &[Note], la
     let preview = preview(app, ui, map, vel, notes);
     let Some(g) = app.keys.gesture.take() else { return };
     match g {
-        KeysGesture::Notes { kind, anchor, .. } => {
+        KeysGesture::Notes { kind, .. } => {
             let Some((pairs, copy)) = preview else { return };
             match kind {
                 NoteDrag::Move => {
@@ -1239,11 +1284,6 @@ fn finish(app: &mut StudioApp, ui: &Ui, map: &Map, vel: Rect, notes: &[Note], la
                 NoteDrag::Resize | NoteDrag::Velocity | NoteDrag::Lane => {
                     if let Ok(sel) = app.keys_edit(&pairs) {
                         app.keys.selection = sel;
-                    }
-                    if kind != NoteDrag::Resize
-                        && let Some((_, b)) = pairs.iter().find(|(a, _)| *a == anchor)
-                    {
-                        app.ui.keys.velocity = b.velocity;
                     }
                 }
             }
@@ -1358,7 +1398,7 @@ fn keyboard_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, kb: Rect, now: f6
             // Played even with the audition switch off: the keyboard is an instrument.
             let on = app.ui.keys.audition;
             app.ui.keys.audition = true;
-            app.audition(pitch as u8, app.ui.keys.velocity, now);
+            app.audition(pitch as u8, now);
             app.ui.keys.audition = on;
         }
     }

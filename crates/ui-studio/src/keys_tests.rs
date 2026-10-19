@@ -252,7 +252,7 @@ fn alt_drag_and_the_velocity_lane_set_velocity_in_one_step() {
     let n = t.notes();
     assert_eq!((n[0].velocity, n[0].start, n[0].pitch), (120, 0, 60), "Alt+drag up 30 points: +20");
     assert_eq!(t.undo_len(), undo + 1);
-    assert_eq!(t.app.ui.keys.velocity, 120, "the next note uses the last velocity");
+    assert_eq!(t.app.ui.keys.velocity, 100, "editing a note leaves the new-note velocity alone");
     // The velocity lane: drag the stem to about a quarter height.
     let l = t.app.keys.layout.clone();
     let stem = l.notes[0].vel_rect;
@@ -266,10 +266,104 @@ fn alt_drag_and_the_velocity_lane_set_velocity_in_one_step() {
     t.click((stem[0] + 1.0, y));
     let v = t.notes()[0].velocity;
     assert!((98..=102).contains(&v), "lane click set {v}");
-    // A new note takes the last velocity.
+    // A new note uses the independent toolbar preference.
     t.click_n(t.at(1000.0, 64), 2, json!({}));
     let new = t.notes().into_iter().find(|n| n.pitch == 64).unwrap();
-    assert_eq!(new.velocity, v);
+    assert_eq!(new.velocity, 100);
+}
+
+#[test]
+fn new_note_velocity_field_survives_note_edits_and_drives_drawing_and_audition() {
+    let mut t = T::open();
+    t.add(60, 0, 480);
+    let before = serde_json::to_value(t.app.engine.session()).unwrap();
+    let undo = t.undo_len();
+    // Edit the actual toolbar field, rather than assigning the preference in the test.
+    t.click(mid(t.app.keys.layout.new_note_velocity));
+    t.key("A", json!({"cmd": true}));
+    t.input("ui.text", json!({"text": "87"}));
+    t.key("Enter", json!({}));
+    assert_eq!(t.app.ui.keys.velocity, 87);
+    assert_eq!(t.undo_len(), undo);
+    assert_eq!(serde_json::to_value(t.app.engine.session()).unwrap(), before);
+
+    let grab = t.at(200.0, 60);
+    t.drag(grab, (grab.0, grab.1 + 148.5), json!({"alt": true}));
+    assert_eq!(t.notes()[0].velocity, 1, "reproduce the near-silent edited note");
+    assert_eq!(t.app.ui.keys.velocity, 87, "Alt+drag must not change the field");
+    // Selecting the quiet note auditions at the field's velocity without adopting its velocity.
+    t.click(mid(t.note_rect(60, 0)));
+    assert_eq!(t.app.keys.last_audition, Some((60, 87)));
+    assert_eq!(t.app.ui.keys.velocity, 87);
+    // Both velocity-lane dragging and clicking leave the preference alone, too.
+    let l = t.app.keys.layout.clone();
+    let stem = l.notes[0].vel_rect;
+    let y = l.velocity[3] - (l.velocity[3] - l.velocity[1] - 6.0) * 32.0 / 127.0;
+    t.drag((stem[0] + 1.0, stem[3] - 1.0), (stem[0] + 1.0, y), json!({}));
+    assert!((30..=34).contains(&t.notes()[0].velocity));
+    assert_eq!(t.app.ui.keys.velocity, 87);
+    t.click((stem[0] + 1.0, l.velocity[3] - 0.1));
+    assert_eq!(t.notes()[0].velocity, 1);
+    assert_eq!(t.app.ui.keys.velocity, 87);
+
+    t.click_n(t.at(1000.0, 64), 2, json!({}));
+    assert_eq!(t.notes().iter().find(|n| n.pitch == 64).unwrap().velocity, 87);
+    assert_eq!(t.app.keys.last_audition, Some((64, 87)));
+    // Moving an existing quiet note auditions its new pitch at the same toolbar velocity.
+    let grab = t.at(200.0, 60);
+    t.drag(grab, (grab.0, grab.1 - t.app.ui.keys.key_h), json!({}));
+    assert_eq!(t.app.keys.last_audition, Some((61, 87)));
+    assert_eq!(t.notes().iter().find(|n| n.pitch == 61).unwrap().velocity, 1);
+    let kb = t.app.keys.layout.keyboard;
+    t.click(((kb[0] + kb[2]) / 2.0, t.at(0.0, 65).1));
+    assert_eq!(t.app.keys.last_audition, Some((65, 87)));
+}
+
+#[test]
+fn velocity_eyedropper_requires_one_selected_note_and_is_ui_state_only() {
+    let mut t = T::open();
+    t.add(60, 0, 480);
+    t.add(64, 960, 480);
+    t.app.run("midi.note_edit", json!({"clip": t.clip.0, "index": 0, "velocity": 37})).unwrap();
+    t.frames(2);
+    t.click(mid(t.app.keys.layout.use_selected_velocity));
+    assert_eq!(t.app.ui.keys.velocity, 100, "no selection: disabled");
+    t.click(mid(t.note_rect(60, 0)));
+    let before = serde_json::to_value(t.app.engine.session()).unwrap();
+    let undo = t.undo_len();
+    assert_eq!(t.app.ui.keys.velocity, 100, "selection alone never copies");
+    t.click(mid(t.app.keys.layout.use_selected_velocity));
+    assert_eq!(t.app.ui.keys.velocity, 37, "explicit eyedropper copies the selected note");
+    assert_eq!(t.undo_len(), undo);
+    assert_eq!(serde_json::to_value(t.app.engine.session()).unwrap(), before);
+    t.app.run("ui.set", json!({"keys": {"velocity": 87}})).unwrap();
+    t.key("A", json!({"cmd": true}));
+    assert_eq!(t.selected(), 2);
+    t.click(mid(t.app.keys.layout.use_selected_velocity));
+    assert_eq!(t.app.ui.keys.velocity, 87, "multiple notes: disabled");
+}
+
+#[test]
+fn new_note_velocity_defaults_bounds_and_control_updates_preserve_other_tool_settings() {
+    let mut t = T::open();
+    let old: crate::UiState = serde_json::from_value(json!({"keys": {"snap": "1/8"}})).unwrap();
+    assert_eq!(old.keys.velocity, 100, "old ui.json without velocity gets the default");
+    t.app.run("ui.set", json!({"keys": {"snap": "1/8", "audition": false}})).unwrap();
+    for (value, expected) in [(-10, 1), (0, 1), (1, 1), (87, 87), (127, 127), (128, 127), (300, 127)] {
+        t.app.run("ui.set", json!({"keys": {"velocity": value}})).unwrap();
+        assert_eq!(t.app.ui.keys.velocity, expected);
+        assert_eq!(t.app.ui.keys.snap, Snap::Eighth);
+        assert!(!t.app.ui.keys.audition);
+        assert!(t.app.keys_shown());
+        assert_eq!(t.app.inspect(&t.ctx)["ui"]["keys"]["velocity"], json!(expected));
+        let saved = serde_json::to_vec(&t.app.ui).unwrap();
+        let restored: crate::UiState = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.keys.velocity, expected);
+    }
+    for value in [json!("bad"), json!(null), json!(1.5)] {
+        assert!(t.app.run("ui.set", json!({"keys": {"velocity": value}})).is_err());
+        assert_eq!(t.app.ui.keys.velocity, 127, "invalid updates are atomic");
+    }
 }
 
 #[test]
@@ -433,7 +527,7 @@ impl T {
 #[test]
 fn an_audition_releases_by_itself_with_the_mouse_still_and_on_focus_loss_or_a_tab_switch() {
     let mut t = T::open();
-    t.app.audition(60, 100, t.time);
+    t.app.audition(60, t.time);
     let delay = t.frame_with(None);
     assert!(delay <= std::time::Duration::from_millis(50), "a repaint is requested while a note is held: {delay:?}");
     assert_eq!(t.app.keys.layout.sounding, vec![60]);
@@ -444,13 +538,13 @@ fn an_audition_releases_by_itself_with_the_mouse_still_and_on_focus_loss_or_a_ta
     }
     assert!(t.app.keys.layout.sounding.is_empty(), "released without any event");
     // Focus loss releases at once.
-    t.app.audition(61, 100, t.time);
+    t.app.audition(61, t.time);
     t.frame_with(None);
     assert_eq!(t.app.keys.layout.sounding, vec![61]);
     t.frame_with(Some(false));
     assert!(t.app.keys.layout.sounding.is_empty(), "released on focus loss");
     // A tab switch (pane hidden) releases too.
-    t.app.audition(62, 100, t.time);
+    t.app.audition(62, t.time);
     t.frame_with(None);
     t.app.ui.keys.show = false;
     t.frame_with(None);

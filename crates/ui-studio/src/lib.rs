@@ -434,7 +434,7 @@ impl StudioApp {
         let mut cur = serde_json::to_value(&self.ui).map_err(|e| e.to_string())?;
         if let (Some(obj), Some(patch)) = (cur.as_object_mut(), p.as_object()) {
             for (k, v) in patch {
-                if k == "audio"
+                if matches!(k.as_str(), "audio" | "keys")
                     && let (Some(current), Some(fields)) = (obj.get_mut(k).and_then(Value::as_object_mut), v.as_object())
                 {
                     current.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));

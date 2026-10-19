@@ -117,10 +117,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("transit-ui-prefs-{}", std::process::id()));
         let path = dir.join("ui.json");
         let mut ui = soundcraft_ui_studio::UiState { track_height: 60.0, ..Default::default() };
+        ui.keys.velocity = 87;
         ui.plugin_windows.push((soundcraft_engine::model::TrackId(1), 0));
         save_ui(&path, &ui).unwrap();
         let back = load_ui(&path).unwrap().unwrap();
         assert_eq!(back.track_height, 60.0);
+        assert_eq!(back.keys.velocity, 87, "new-note velocity is saved in ui.json");
         assert!(back.plugin_windows.is_empty(), "open editors are not remembered");
         std::fs::remove_dir_all(dir).unwrap();
     }
