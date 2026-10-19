@@ -6,7 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const OBSERVATIONS: usize = 128;
-const FIT_POINTS: usize = 32;
+const FIT_POINTS: usize = 64;
+// Retain a time span rather than the most recent N callbacks. Small ASIO buffers
+// can repeat the same millisecond tick; a few adjacent callbacks cannot fit its rate.
+const FIT_SPACING_NS: u64 = 4_000_000;
+const MIN_FIT_SPAN_NS: u64 = 100_000_000;
 const HORIZON_NS: u64 = 100_000_000;
 const MAX_LOCAL_SPAN: i128 = 1 << 40;
 
@@ -154,6 +158,9 @@ pub struct FitCounts {
     pub stale_generation: u64,
     pub reordered: u64,
     pub discontinuities: u64,
+    /// A complete window failed the slope/residual policy. History is retained so
+    /// startup noise does not repeatedly reset the estimator before it can converge.
+    pub rejected_fits: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -260,6 +267,14 @@ impl ClockMap {
         self.frame_window(frame)?;
         Ok(frame)
     }
+    /// The supported device-frame range, including the bounded future projection.
+    /// Historical coverage follows the retained observation span (normally at least
+    /// 248 ms once full). Place captures on control as observations arrive and retain
+    /// the resulting placement with the take; never defer mapping until a disk writer
+    /// wakes. Missing coverage is explicit, even if session history still exists.
+    pub fn frame_range(&self) -> std::ops::RangeInclusive<u64> {
+        self.first_frame..=self.last_frame
+    }
     pub fn estimated_rate(&self) -> f64 {
         1e9 / self.ns_per_frame
     }
@@ -318,13 +333,23 @@ impl ClockFitter {
                 return Err(Unavailable::Reordered);
             }
             if stamp.host_callback_ns <= previous.stamp.host_callback_ns
-                || stamp.backend_callback_ns <= previous.stamp.backend_callback_ns
-                || stamp.backend_frame_ns <= previous.stamp.backend_frame_ns
+                || stamp.backend_callback_ns < previous.stamp.backend_callback_ns
+                || stamp.backend_frame_ns < previous.stamp.backend_frame_ns
                 || observation.nominal_rate != previous.nominal_rate
             {
                 self.counts.discontinuities = self.counts.discontinuities.saturating_add(1);
                 self.invalidate();
                 return Err(Unavailable::Discontinuity);
+            }
+        }
+        // Keep the newest observation, replacing the provisional tail until it is
+        // at least 4 ms after its anchor. Every callback still goes through the above
+        // monotonicity checks; coarse equal backend ticks are valid observations.
+        if self.len >= 2 {
+            let previous = self.points.get(self.len - 1).copied().flatten();
+            let anchor = self.points.get(self.len - 2).copied().flatten();
+            if previous.zip(anchor).is_some_and(|(p, a)| p.stamp.host_callback_ns - a.stamp.host_callback_ns < FIT_SPACING_NS) {
+                self.len -= 1;
             }
         }
         if self.len == FIT_POINTS {
@@ -343,8 +368,10 @@ impl ClockFitter {
             }
             Err(Unavailable::WarmingUp) => Err(Unavailable::WarmingUp),
             Err(error) => {
-                self.counts.discontinuities = self.counts.discontinuities.saturating_add(1);
-                self.invalidate();
+                self.counts.rejected_fits = self.counts.rejected_fits.saturating_add(1);
+                // Do not publish a questionable fit, but retain the bounded window.
+                // A short-span fit failure must not prevent a longer-span recovery.
+                self.map = None;
                 Err(error)
             }
         }
@@ -360,6 +387,11 @@ impl ClockFitter {
             *host = (i128::from(observation.stamp.backend_callback_ns), i128::from(observation.stamp.host_callback_ns));
             quality = quality.min(observation.stamp.quality);
             uncertainty = uncertainty.zip(observation.stamp.offset_uncertainty_ns).map(|(a, b)| a.max(b));
+        }
+        let first = self.points.first().copied().flatten().ok_or(Unavailable::WarmingUp)?;
+        let last = self.points.get(self.len.saturating_sub(1)).copied().flatten().ok_or(Unavailable::WarmingUp)?;
+        if last.stamp.host_callback_ns - first.stamp.host_callback_ns < MIN_FIT_SPAN_NS {
+            return Err(Unavailable::WarmingUp);
         }
         let frame_line = Line::fit(frames.get(..self.len).ok_or(Unavailable::Arithmetic)?)?;
         let host_line = Line::fit(hosts.get(..self.len).ok_or(Unavailable::Arithmetic)?)?;
@@ -390,7 +422,7 @@ impl ClockFitter {
             key: self.key,
             revision: self.revision,
             quality,
-            offset_uncertainty_ns: uncertainty,
+            offset_uncertainty_ns: if quality == Quality::Measured { uncertainty } else { None },
             residual_ns,
             frame_origin,
             host_origin,

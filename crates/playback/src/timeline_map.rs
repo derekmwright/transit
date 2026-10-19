@@ -2,7 +2,7 @@
 //! ordinal is deliberately absent. The caller supplies the phase at the converter's
 //! consumed output, including its named SRC delay; mix PDC must not be subtracted again.
 
-use crate::device_clock::ClockKey;
+use crate::device_clock::{ClockKey, Direction};
 use soundcraft_time::MAX_POSITION;
 
 pub const SEGMENTS: usize = 64;
@@ -116,7 +116,7 @@ pub struct Timeline {
 
 impl Timeline {
     pub fn new(key: ClockKey, transport: u64, output: u64, sample: i64, rate: Rate) -> Result<Self, MapError> {
-        if !(-MAX_POSITION..=MAX_POSITION).contains(&sample) {
+        if key.direction != Direction::Output || !(-MAX_POSITION..=MAX_POSITION).contains(&sample) {
             return Err(MapError::Invalid);
         }
         Ok(Self {
@@ -132,6 +132,10 @@ impl Timeline {
     }
     /// A seek/start/stop/speed edit is one transaction at the next consumed output frame.
     /// A strictly newer transport identity prevents old events from acquiring a new meaning.
+    /// Loop policy: while playing, a seek at/past the loop end normalizes into the
+    /// loop on the next advance, counting skipped loop lengths from a new iteration
+    /// epoch. Seeking before the loop start plays through into it. Stopped seeks do
+    /// not wrap. A seek resets iteration before applying that normalization.
     pub fn change(&mut self, transport: u64, seek: Option<i64>, rate: Rate, playing: bool, loop_range: Option<(i64, i64)>) -> Result<(), MapError> {
         if transport <= self.transport {
             return Err(MapError::WrongGeneration);
@@ -262,7 +266,7 @@ impl Default for History {
 
 impl History {
     pub fn push(&mut self, segment: Segment) -> Result<(), MapError> {
-        if segment.end_output <= segment.first_output {
+        if segment.key.direction != Direction::Output || segment.end_output <= segment.first_output {
             return Err(MapError::Invalid);
         }
         segment.session_at(segment.first_output)?;
@@ -332,6 +336,9 @@ pub fn place_host_event(
     history: &History,
     now: u64,
 ) -> Result<Placement, PlacementError> {
+    if expected_output.direction != Direction::Output {
+        return Err(PlacementError::Clock(crate::device_clock::Unavailable::WrongClock));
+    }
     let output_frame = clock.host_to_frame(expected_output, host_ns, now).map_err(PlacementError::Clock)?;
     let (session, loop_iteration) = history.locate(expected_output, transport, output_frame).map_err(PlacementError::Timeline)?;
     Ok(Placement { original_host_ns: host_ns, output_frame, session, loop_iteration, clock_revision: clock.revision })
