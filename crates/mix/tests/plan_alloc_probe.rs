@@ -371,3 +371,45 @@ fn seek_stop_and_a_volume_only_plan_allocate_nothing() {
     });
     assert_eq!(stop, AllocStats::default(), "stop");
 }
+
+/// F05: path-based delay compensation reads every edge from the strip's prepared delay lines.
+/// Latent auxes in a cascade, pre- and post-fader sends, a lookahead change (more delay at
+/// runtime), a send flipped pre/post and a reroute that keeps the render order all render with
+/// no allocation on the audio thread, and the lines hold the delay (nothing clamped).
+#[test]
+fn path_based_delay_compensation_allocates_nothing() {
+    let (mut s, t, _) = session_with_clip();
+    s.edit.delay_compensation = true;
+    let mut comp = builtin("compressor");
+    comp.params.insert("lookahead".into(), 5.0);
+    let (b1, b2) = (BusId(601), BusId(602));
+    for (id, n) in [(b1, "B1"), (b2, "B2")] {
+        s.busses.push(Bus { id, name: n.into(), format: ChannelFormat::Stereo });
+    }
+    let a1 = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, None);
+    let a2 = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, None);
+    for (a, input, out) in [(a1, b1, Route::Bus(b2)), (a2, b2, Route::Main)] {
+        let tr = s.track_mut(a).unwrap();
+        tr.mixer.input = Route::Bus(input);
+        tr.mixer.output = out;
+        tr.mixer.inserts[0] = Some(comp.clone());
+    }
+    let send = |to: BusId, pre: bool| {
+        let mut x = soundcraft_model::SendSlot::new(Route::Bus(to));
+        x.pre_fader = pre;
+        Some(x)
+    };
+    s.track_mut(t).unwrap().mixer.sends[0] = send(b1, false);
+    s.track_mut(t).unwrap().mixer.sends[1] = send(b2, true);
+    let mut rig = Rig::new(&s);
+    no_cost("unchanged", &rig.edit(&s));
+    s.track_mut(a2).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("lookahead".into(), 10.0);
+    no_cost("longer lookahead", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.sends[1].as_mut().unwrap().pre_fader = false;
+    no_cost("send to post-fader", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.output = Route::Bus(b2);
+    let e = rig.edit(&s);
+    no_cost("reroute the dry path into the cascade", &e);
+    assert_eq!(e.status.capacity_exceeded, 0, "the prepared lines hold every path's delay");
+    assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the session plays");
+}

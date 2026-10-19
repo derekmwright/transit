@@ -345,3 +345,57 @@ fn an_inactive_aux_keeps_its_latency_across_a_structural_plan() {
     steps.push(s.clone());
     assert_parity("inactive aux latency", &steps, 6);
 }
+
+/// F05: path-based delay compensation in both paths, sample for sample: a lookahead cascade of
+/// auxes, pre- and post-fader sends, a chain deeper than eight auxes declared in reverse, a
+/// latent instrument, a lookahead change at runtime, and a routing loop (an older session) added
+/// and removed.
+#[test]
+fn path_based_delay_compensation_matches_todays_path() {
+    let mut s = Session::default();
+    s.edit.delay_compensation = true;
+    let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);
+    let b = add_audio(&mut s, ChannelFormat::Mono, 2, 0.05);
+    let mut la = builtin("compressor");
+    la.params.insert("lookahead".into(), 5.0);
+    let chain: Vec<BusId> = (0..10).map(|i| BusId(920 + i)).collect();
+    for (i, id) in chain.iter().enumerate() {
+        s.busses.push(Bus { id: *id, name: format!("C{i}"), format: ChannelFormat::Stereo });
+    }
+    let mut auxes = Vec::new();
+    for i in (0..10).rev() {
+        let x = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, None);
+        let tr = s.track_mut(x).unwrap();
+        tr.mixer.input = Route::Bus(chain[i]);
+        tr.mixer.output = if i == 9 { Route::Main } else { Route::Bus(chain[i + 1]) };
+        if i % 3 == 0 {
+            tr.mixer.inserts[0] = Some(la.clone());
+        }
+        auxes.push(x);
+    }
+    auxes.reverse();
+    s.track_mut(a).unwrap().mixer.sends[0] = send(chain[0], false);
+    s.track_mut(a).unwrap().mixer.sends[1] = send(chain[4], true);
+    s.track_mut(b).unwrap().mixer.inserts[0] = Some(builtin("maximizer"));
+    s.track_mut(b).unwrap().mixer.sends[0] = send(chain[7], false);
+    let inst = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    let mut seq = Sequence::default();
+    seq.notes.push(Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 4000 });
+    let cid = s.new_clip_id();
+    let tr = s.track_mut(inst).unwrap();
+    tr.playlist_mut().unwrap().clips.push(Clip::midi(cid, "n", 0, 96_000, seq));
+    tr.instrument = Some(builtin("subtractive_synth"));
+    tr.mixer.inserts[0] = Some(la.clone());
+    tr.mixer.output = Route::Bus(chain[2]);
+    let mut steps = vec![s.clone()];
+    // Longer lookahead deep in the chain (latency changes, structure does not).
+    s.track_mut(auxes[6]).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("lookahead".into(), 9.0);
+    steps.push(s.clone());
+    // A loop, as an older file could hold: the last aux feeds the first one's bus.
+    s.track_mut(auxes[9]).unwrap().mixer.sends[0] = send(chain[0], false);
+    steps.push(s.clone());
+    s.track_mut(auxes[9]).unwrap().mixer.sends[0] = None;
+    s.track_mut(a).unwrap().mixer.sends[1].as_mut().unwrap().pre_fader = false;
+    steps.push(s.clone());
+    assert_parity("path-based delay compensation", &steps, 24);
+}

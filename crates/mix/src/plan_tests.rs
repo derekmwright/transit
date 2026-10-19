@@ -194,7 +194,7 @@ fn digest(eng: &MixEngine) -> Vec<u64> {
     d.push(p.tables.cells.len() as u64);
     for st in &p.tables.strips {
         d.extend([st.generation.get(), st.id.0, st.buf.as_ptr() as usize as u64, st.held.as_ptr() as usize as u64, st.latency as u64]);
-        d.extend([st.align.len as u64, st.align.idx as u64, st.align.bufs.as_ptr() as usize as u64]);
+        d.extend([st.tap.len as u64, st.tap.idx as u64, st.tap.bufs.as_ptr() as usize as u64, u64::from(st.tap.live)]);
         d.extend(st.held.iter().map(|x| u64::from(*x)));
         let slots = st.plugins.iter().chain(std::iter::once(&st.instrument)).chain(st.clip_fx.0.iter().flat_map(|(_, fx)| [&fx.eq, &fx.comp]));
         for s in slots {
@@ -1146,7 +1146,7 @@ fn a_hint_sizes_every_strip_below_it_once_and_is_dropped_when_it_does_not_fit() 
     rig.publish(&s);
     let cap = |rig: &Rig, t: TrackId| {
         let p = rig.eng.plan.as_deref().unwrap();
-        p.tables.strips[p.tables.strip_of(t).unwrap()].align.cap
+        p.tables.strips[p.tables.strip_of(t).unwrap()].tap.cap
     };
     // Status without a clamp changes nothing.
     rig.comp.observe(&PlanStatus { required_latency: 40_000, ..PlanStatus::default() });

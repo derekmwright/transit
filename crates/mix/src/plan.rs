@@ -11,7 +11,7 @@
 //!
 //! [`PlanCompiler`]: crate::PlanCompiler
 
-use super::{APPLIED_INLINE, BusId, BusTable, ChannelFormat, PluginSlot, SampleSource, Session, SourceAudio, Strip, StripMeter, TrackId};
+use super::{APPLIED_INLINE, BusTable, ChannelFormat, PluginSlot, SampleSource, Session, SourceAudio, Strip, StripMeter, TrackId};
 use soundcraft_dsp::Plugin;
 use std::sync::Arc;
 
@@ -164,8 +164,6 @@ pub(crate) struct PlanTables {
     pub(crate) main: Vec<Vec<f32>>,
     pub(crate) main_fmt: ChannelFormat,
     pub(crate) main_meter: StripMeter,
-    /// Scratch for the busses an aux returns onto (capacity: the aux count).
-    pub(crate) aux_fed: Vec<BusId>,
 }
 
 impl PlanTables {

@@ -59,7 +59,7 @@ fn move_strip(old: &mut Strip, new: &mut Strip) {
     new.gr = old.gr;
     new.latency = old.latency;
     new.failures = old.failures;
-    for (a, b) in [(&mut old.align, &mut new.align), (&mut old.align_pre, &mut new.align_pre), (&mut old.out_extra, &mut new.out_extra)] {
+    for (a, b) in [(&mut old.tap, &mut new.tap), (&mut old.tap_pre, &mut new.tap_pre)] {
         if b.is_placeholder() {
             std::mem::swap(a, b);
         }
@@ -349,7 +349,7 @@ impl MixEngine {
         };
         let ActivePlan { session, tables, status, .. } = plan;
         let s: &Session = session;
-        let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, aux_fed, .. } = tables;
+        let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, .. } = tables;
         let (phase1, aux_end) = (*phase1, *aux_end);
         let main_fmt = *main_fmt;
         if pos != self.last_end && !self.monitor_only {
@@ -363,9 +363,7 @@ impl MixEngine {
         }
         self.last_end = pos.saturating_add(frames as i64);
         for (_, b) in busses.0.iter_mut() {
-            for c in b.buf.iter_mut() {
-                c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-            }
+            b.clear(frames);
         }
         for c in main.iter_mut() {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -404,23 +402,20 @@ impl MixEngine {
                 }
             }
         }
-        let lmax_t =
-            if pdc { p1.iter().filter(|st| track(st).is_some_and(|t| live(t) && !is_aux(t))).map(|st| st.latency).max().unwrap_or(0) } else { 0 };
-        let lmax_a = if pdc { auxes.iter().map(|st| st.latency).max().unwrap_or(0) } else { 0 };
-        self.track_latency = lmax_t;
-        self.latency = lmax_t + lmax_a + lmax_m;
-        self.aux_latency = lmax_a;
-        aux_fed.clear();
-        if pdc {
-            for t in s.tracks.iter().filter(|t| is_aux(t) && live(t)) {
-                if let Route::Bus(b) = &t.mixer.output
-                    && !aux_fed.contains(b)
-                    && aux_fed.len() < aux_fed.capacity()
-                {
-                    aux_fed.push(*b);
-                }
+        // Forward pass in render order (the table order): phase-1 strips, then the auxes.
+        let mut main_arrival = 0usize;
+        for (at, st) in p1.iter_mut().enumerate() {
+            if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
+                pdc_visit(t, st, at, busses, &mut main_arrival, pdc);
             }
         }
+        for (k, st) in auxes.iter_mut().enumerate() {
+            if let Some(t) = track(st).filter(|t| live(t)) {
+                pdc_visit(t, st, phase1.saturating_add(k), busses, &mut main_arrival, pdc);
+            }
+        }
+        self.main_arrival = main_arrival;
+        self.latency = main_arrival.saturating_add(lmax_m);
         let law = self.pan_law;
         let mut exceeded = |need: usize, st: &Strip| {
             if need > 0 {
@@ -431,41 +426,19 @@ impl MixEngine {
         };
         for st in p1.iter_mut() {
             let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) else { continue };
-            let ch = st.buf.len();
-            let need = st.align.set(lmax_t.saturating_sub(st.latency), ch);
-            exceeded(need, st);
-            st.align.process(&mut st.buf, frames);
-            if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
-                let need = st.align_pre.set(lmax_t.saturating_sub(st.latency), ch);
-                exceeded(need, st);
-                st.align_pre.process(&mut st.pre, frames);
-            }
-            let waits = match &t.mixer.output {
-                Route::Main => true,
-                Route::Bus(b) => aux_fed.contains(b),
-                _ => false,
-            };
-            let need = st.out_extra.set(if waits { lmax_a } else { 0 }, ch);
-            exceeded(need, st);
-        }
-        for st in p1.iter_mut() {
-            let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) else { continue };
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
-            route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law });
+            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law, main_arrival });
+            exceeded(need, st);
         }
         // Phase 2: auxes in dependency order (they read busses).
         for st in auxes.iter_mut() {
             let Some(t) = track(st).filter(|t| live(t)) else { continue };
             process_strip(s, t, st, &*busses, &live_in, pos, frames, any_solo);
-            let ch = st.buf.len();
-            let need = st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
-            exceeded(need, st);
-            st.align.process(&mut st.buf, frames);
-            st.out_extra.set(0, ch);
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
-            route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law });
+            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law, main_arrival });
+            exceeded(need, st);
         }
         // Master faders process the main mix, in track order.
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);

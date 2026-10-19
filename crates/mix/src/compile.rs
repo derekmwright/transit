@@ -110,18 +110,12 @@ struct Shadow {
 }
 
 impl Shadow {
-    /// The longest insert chain latency of any strip (allocates nothing).
-    fn max_latency(&self) -> usize {
-        self.strips
+    /// The latency of a track's instrument and inserts in this plan.
+    fn track_latency(&self, track: TrackId) -> usize {
+        self.slots
             .iter()
-            .map(|st| {
-                self.slots
-                    .iter()
-                    .filter(|((t, _), sl)| *t == st.track && sl.kind == CellKind::Insert)
-                    .fold(0usize, |a, (_, sl)| a.saturating_add(sl.latency))
-            })
-            .max()
-            .unwrap_or(0)
+            .filter(|((t, _), sl)| *t == track && matches!(sl.kind, CellKind::Insert | CellKind::Instrument))
+            .fold(0usize, |a, (_, sl)| a.saturating_add(sl.latency))
     }
 
     /// The live strip of `track` a new strip of this shape takes over (its index), if any.
@@ -187,6 +181,8 @@ pub struct PlanCompiler {
     closing: bool,
     /// A torn envelope came back: the engine is faulted and the active plan is what it still owns.
     faulted: Option<Vec<SlotBinding>>,
+    /// Routing loops the last compiled session was loaded with (logged when they change).
+    loops: Vec<RouteCycle>,
 }
 
 /// The planned content of one slot cell.
@@ -235,14 +231,14 @@ fn add(a: usize, b: usize) -> Result<usize, CompileError> {
 }
 
 /// Bytes one strip's prepared storage takes: `buf`, `pre`, `outbuf` and `clipbuf` (channels ×
-/// block each), `scratch` (block), three delay lines (channels × `cap`; 0 when the strip keeps
-/// its live lines), its insert positions (filled or not), its clip-effect entries, the held-note
+/// block each), `scratch` (block), two delay lines (channels × (`cap` + block); 0 when the strip
+/// keeps its live lines), its insert positions (filled or not), its clip-effect entries, the held-note
 /// capacity, its meter, and the strip itself.
 pub(crate) fn strip_bytes(ch: usize, block: usize, cap: usize, inserts: usize, clips: usize) -> Result<usize, CompileError> {
     let f = size_of::<f32>();
     let bufs = mul(mul(mul(ch, block)?, 4)?, f)?;
     let scratch = mul(block, f)?;
-    let delays = mul(mul(mul(ch, cap)?, 3)?, f)?;
+    let delays = if cap == 0 { 0 } else { mul(mul(mul(ch, add(cap, block)?)?, 2)?, f)? };
     let slots = mul(inserts, size_of::<Option<PluginSlot>>())?;
     let entries = mul(clips, size_of::<(u64, ClipFx)>())?;
     let held = 128 * size_of::<u8>();
@@ -291,19 +287,18 @@ fn measure(s: &Session, l: &PlanLimits, block: usize, cap_of: &dyn Fn(&Track, us
 /// The strip index of each track in render order: live tracks other than auxes (processing
 /// order), every aux and folder (dependency order), then the rest in track order. Also the
 /// number of each of the first two groups.
-fn render_rows(s: &Session) -> (Vec<usize>, usize, usize) {
+fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>) {
     let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
     let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
     let mut order = Vec::new();
-    let mut depth = Vec::new();
-    processing_order(s, &mut order, &mut depth);
+    let loops = processing_order(s, &mut order);
     let track = |i: &usize| s.tracks.get(*i);
     let mut rows: Vec<usize> = order.iter().copied().filter(|i| track(i).is_some_and(|t| live(t) && !is_aux(t))).collect();
     let phase1 = rows.len();
     rows.extend(order.iter().copied().filter(|i| track(i).is_some_and(is_aux)));
     let aux_end = rows.len();
     rows.extend((0..s.tracks.len()).filter(|i| track(i).is_some_and(|t| !is_aux(t) && !live(t))));
-    (rows, phase1, aux_end)
+    (rows, phase1, aux_end, loops)
 }
 
 impl PlanCompiler {
@@ -322,6 +317,7 @@ impl PlanCompiler {
             hints: HashMap::new(),
             closing: false,
             faulted: None,
+            loops: Vec::new(),
         }
     }
 
@@ -449,8 +445,9 @@ impl PlanCompiler {
     /// format-required) thread; it gets the [`SlotGen`] the instance will carry, so playback can
     /// bind handles to it before it is published.
     ///
-    /// Every count and the prepared bytes are checked before anything is allocated, with the
-    /// delay the active instances are known to need. Fresh instances can report more latency
+    /// Every count, and the prepared bytes without delay lines, are checked before anything is
+    /// allocated; the bytes with the delay lines are checked once the route graph has given the
+    /// delay the active instances are known to need (its walk allocates scratch). Fresh instances can report more latency
     /// than that; if the larger delay lines then exceed the limits, the plan fails after `make`
     /// ran, and those instances are dropped here and reported by [`PlanCompiler::take_released`].
     pub fn compile(
@@ -479,7 +476,15 @@ impl PlanCompiler {
             return Err(CompileError::TargetMismatch { compiler: self.target });
         }
         let block = self.target.block();
-        let need = self.active.max_latency();
+        // Every count, and the bytes with the smallest delay lines (a lower bound), before anything
+        // is allocated: walking the route graph below allocates its scratch.
+        let least = |t: &Track, ch: usize| match self.strip_cap(t, ch, 0, false) {
+            (_, true) => 0,
+            (cap, false) => cap,
+        };
+        measure(&session, &self.limits, block, &least)?;
+        // Path-based (F05): the slowest path into any summing point bounds every edge's delay.
+        let need = path_need(&session, &|t: &Track| self.active.track_latency(t.id));
         let sized = |me: &Self, hints: bool| {
             let cap_of = |t: &Track, ch: usize| match me.strip_cap(t, ch, need, hints) {
                 (_, true) => 0,
@@ -498,7 +503,12 @@ impl PlanCompiler {
         }
 
         let id = PlanIdentity { generation: next, base, target: self.target };
-        let (desc, rows, phase1, aux_end, specs) = self.describe(&session, need);
+        let (desc, rows, phase1, aux_end, specs, loops) = self.describe(&session, need);
+        // A session loaded with a routing loop: say so once, not on every plan.
+        if loops != self.loops {
+            log_loops(&session, &loops);
+            self.loops = loops;
+        }
         if self.active.desc.as_ref() == Some(&desc) {
             let plan = PreparedPlan {
                 id,
@@ -551,10 +561,10 @@ impl PlanCompiler {
     /// The structure `s` needs: its description, the strips' tracks in render order (with the
     /// sizes of the first two groups), and the instance specs by slot.
     #[allow(clippy::type_complexity)]
-    fn describe(&self, s: &Session, need: usize) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>) {
+    fn describe(&self, s: &Session, need: usize) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>, Vec<RouteCycle>) {
         let main_ch = main_channels(s);
         let specs: HashMap<(TrackId, usize), InstanceSpec> = realtime_instance_specs(s).into_iter().map(|x| ((x.track, x.slot), x)).collect();
-        let (rows, phase1, aux_end) = render_rows(s);
+        let (rows, phase1, aux_end, loops) = render_rows(s);
         let mut desc = Desc { main: Some(s.main_format()), ..Desc::default() };
         for (r, &ti) in rows.iter().enumerate() {
             let Some(t) = s.tracks.get(ti) else { continue };
@@ -590,7 +600,7 @@ impl PlanCompiler {
         for b in &s.busses {
             desc.busses.push((b.id, b.format));
         }
-        (desc, rows, phase1, aux_end, specs)
+        (desc, rows, phase1, aux_end, specs, loops)
     }
 
     /// Decides, for one slot, between moving the active one, leaving it absent, and a fresh one.
@@ -740,11 +750,19 @@ impl PlanCompiler {
             SlotPlan::Fresh(_) => p.latency,
             SlotPlan::Absent => 0,
         };
-        let need1 = per_strip
+        // Each track's planned instrument and insert latency, then the slowest path (F05).
+        let planned: HashMap<TrackId, usize> = per_strip
             .iter()
-            .map(|(_, _, ps, _)| ps.iter().filter(|p| p.kind == CellKind::Insert).fold(0usize, |a, p| a.saturating_add(latency_of(p, self))))
-            .max()
-            .unwrap_or(0);
+            .filter_map(|(ti, _, ps, _)| {
+                let t = s.tracks.get(*ti)?;
+                let l = ps
+                    .iter()
+                    .filter(|p| matches!(p.kind, CellKind::Insert | CellKind::Instrument))
+                    .fold(0usize, |a, p| a.saturating_add(latency_of(p, self)));
+                Some((t.id, l))
+            })
+            .collect();
+        let need1 = path_need(s, &|t: &Track| planned.get(&t.id).copied().unwrap_or(0));
         let need = need0.max(need1);
         if need > need0 {
             // Fresh instances need longer lines than measured before they existed: check again.
@@ -765,7 +783,6 @@ impl PlanCompiler {
         let mut attach = Vec::new();
         let mut shadow = Shadow { desc: None, ..Shadow::default() };
         let mut strip_moves = Vec::new();
-        let mut aux = 0usize;
         desc.strips.clear();
         for (si, (ti, layout, _, clips)) in per_strip.iter().enumerate() {
             let Some(t) = s.tracks.get(*ti) else { continue };
@@ -781,10 +798,9 @@ impl PlanCompiler {
             st.clipbuf = vec![vec![0.0; block]; ch];
             st.external = true;
             // A strip that keeps its live lines gets placeholders: the move brings the lines.
-            let line = || if keep { DelayLine::placeholder() } else { DelayLine::with_capacity(ch, cap) };
-            st.align = line();
-            st.align_pre = line();
-            st.out_extra = line();
+            let line = || if keep { DelayLine::placeholder() } else { DelayLine::with_capacity(ch, cap, block) };
+            st.tap = line();
+            st.tap_pre = line();
             st.outbuf = (0..ch).map(|_| Vec::with_capacity(block)).collect();
             st.track = u16::try_from(*ti).unwrap_or(u16::MAX);
             st.id = t.id;
@@ -807,9 +823,6 @@ impl PlanCompiler {
                     }
                 },
             };
-            if matches!(t.kind, TrackKind::Aux | TrackKind::Folder) {
-                aux += 1;
-            }
             let region = if si < phase1 {
                 0
             } else if si < aux_end {
@@ -885,17 +898,13 @@ impl PlanCompiler {
         let mut tracks: Vec<(TrackId, u16)> = tables.strips.iter().enumerate().map(|(i, st)| (st.id, i as u16)).collect();
         tracks.sort_unstable();
         tables.tracks = tracks.into_boxed_slice();
-        let mut busses: Vec<(BusId, BusBuf)> = s
-            .busses
-            .iter()
-            .map(|b| (b.id, BusBuf { fmt: b.format, buf: vec![vec![0.0; block]; b.format.channels().clamp(1, MAX_CHANNELS)] }))
-            .collect();
+        let mut busses: Vec<(BusId, BusBuf)> =
+            s.busses.iter().map(|b| (b.id, BusBuf::new(b.format, vec![vec![0.0; block]; b.format.channels().clamp(1, MAX_CHANNELS)]))).collect();
         busses.sort_by_key(|(id, _)| *id);
         busses.dedup_by_key(|(id, _)| *id);
         tables.busses = BusTable(busses);
         tables.main = vec![vec![0.0; block]; main_ch];
         tables.main_meter = StripMeter { peaks: vec![0.0; main_ch], ..StripMeter::default() };
-        tables.aux_fed = Vec::with_capacity(aux.max(1));
         shadow.cells = cells.len();
         tables.cells = cells.into_boxed_slice();
         shadow.tracks = tables.tracks.clone();

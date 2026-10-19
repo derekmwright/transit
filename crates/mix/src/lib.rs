@@ -68,7 +68,7 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, ProcessStatus, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, Session, SourceAudio, Speaker, SurroundPan, Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
@@ -276,6 +276,27 @@ impl StripMeter {
 struct BusBuf {
     fmt: ChannelFormat,
     buf: Vec<Vec<f32>>,
+    /// Delay compensation, this block: the latency every signal summed onto the bus is aligned
+    /// to (the slowest path into it), so what reads the bus starts at this latency.
+    arrival: usize,
+    /// Render position of the first strip that reads the bus this block (`usize::MAX`: none).
+    /// A strip at or after it writing here is a routing loop's feedback edge: it is dropped.
+    reader: usize,
+}
+
+impl BusBuf {
+    fn new(fmt: ChannelFormat, buf: Vec<Vec<f32>>) -> Self {
+        BusBuf { fmt, buf, arrival: 0, reader: usize::MAX }
+    }
+
+    /// Silence the block and forget the last block's delay-compensation pass.
+    fn clear(&mut self, frames: usize) {
+        for c in self.buf.iter_mut() {
+            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
+        self.arrival = 0;
+        self.reader = usize::MAX;
+    }
 }
 
 /// Where strips find the busses they read and write: a map in legacy engines, a table sorted
@@ -433,14 +454,19 @@ struct Strip {
     /// The engine takes its instances from the host ([`MixEngine::set_external_instances`]):
     /// clip-effect modules come from `sync`, never from the render.
     external: bool,
-    /// Total latency of the active inserts (samples).
+    /// Total latency of the instrument and the active inserts (samples).
     latency: usize,
-    /// Delay compensation: align this strip with the slowest one (post- and pre-fader paths),
-    /// plus extra delay for direct-to-main outputs so they line up with aux returns.
-    align: DelayLine,
-    align_pre: DelayLine,
-    out_extra: DelayLine,
+    /// Delay compensation (F05): the post-fader and the pre-fader signal, read back by each edge
+    /// the strip feeds at that edge's own delay, so every path into a summing point arrives with
+    /// the slowest one.
+    tap: DelayLine,
+    tap_pre: DelayLine,
+    /// Scratch for one delayed edge (channels x block).
     outbuf: Vec<Vec<f32>>,
+    /// Delay compensation, this block: the latency at the strip's output (the latency its input
+    /// arrives with plus its own), and its place in the render order.
+    pdc_out: usize,
+    pdc_pos: usize,
     failures: PluginFailures,
     /// Plan mode: the strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that
     /// waits for a move, in a strip whose state moved out, and in legacy engines.
@@ -459,77 +485,135 @@ struct Strip {
 /// at most this, whatever its plugins claim, so a bogus value can't stall offline renders.
 const MAX_LATENCY: usize = 1 << 20;
 
-/// A multichannel delay line (samples), resized only when the delay changes.
+/// A multichannel multi-tap delay line: a strip writes each block once, and every edge it feeds
+/// (its output, each send) reads it back at its own delay. The ring holds one block more than the
+/// longest delay, so a tap of up to `len` samples reads the block just written.
 #[derive(Default)]
 struct DelayLine {
     bufs: Vec<Vec<f32>>,
+    /// Next write position in the ring.
     idx: usize,
+    /// Longest delay a tap can read.
     len: usize,
-    /// Plan mode: `bufs` were sized off the audio thread to this declared capacity and are never
+    /// Plan mode: `bufs` were sized off the audio thread for this longest delay and are never
     /// resized; a longer delay is clamped to it.
     cap: Option<usize>,
+    /// The ring holds the strip's recent blocks: it was written every block since it was zeroed.
+    live: bool,
 }
 
 impl DelayLine {
     /// A plan-mode stand-in in a strip shell whose live lines move in with the strip state.
     fn placeholder() -> Self {
-        DelayLine { bufs: Vec::new(), idx: 0, len: 0, cap: Some(0) }
+        DelayLine { cap: Some(0), ..DelayLine::default() }
     }
 
     fn is_placeholder(&self) -> bool {
         self.cap == Some(0) && self.bufs.is_empty()
     }
 
-    /// A plan-mode delay line with `cap` samples of storage per channel.
-    fn with_capacity(ch: usize, cap: usize) -> Self {
-        DelayLine { bufs: vec![vec![0.0; cap]; ch], idx: 0, len: 0, cap: Some(cap) }
+    /// A plan-mode delay line serving delays up to `cap` samples, in blocks up to `block`.
+    fn with_capacity(ch: usize, cap: usize, block: usize) -> Self {
+        DelayLine { bufs: vec![vec![0.0; cap.saturating_add(block)]; ch], idx: 0, len: cap, cap: Some(cap), live: false }
     }
 
-    /// Sets the delay. Returns the delay asked for when a plan-mode line had to clamp it to its
-    /// capacity, else 0.
-    fn set(&mut self, len: usize, ch: usize) -> usize {
-        let len = len.min(MAX_LATENCY);
+    fn ring(&self) -> usize {
+        self.bufs.first().map_or(0, Vec::len)
+    }
+
+    /// Makes the line serve delays up to `need` for `ch` channels in blocks up to `block`. A
+    /// legacy line grows (never shrinks); a plan-mode line keeps its storage. Returns the delay
+    /// asked for when a plan-mode line has to clamp it to its capacity, else 0.
+    fn reserve(&mut self, need: usize, ch: usize, block: usize) -> usize {
+        let need = need.min(MAX_LATENCY);
         if let Some(cap) = self.cap {
-            let fit = len.min(cap);
-            if fit != self.len {
-                self.len = fit;
-                self.idx = 0;
-                for b in &mut self.bufs {
-                    b.iter_mut().take(fit).for_each(|x| *x = 0.0);
-                }
-            }
-            return if len > cap { len } else { 0 };
+            return if need > cap { need } else { 0 };
         }
-        if len != self.len || self.bufs.len() != ch {
+        if self.bufs.len() != ch || self.ring() < self.len.saturating_add(block) {
+            *self = DelayLine::default();
+        }
+        if need > self.len {
+            // Sized as a plan sizes its lines, and grown keeping the history it holds, so a
+            // delay change reads the same samples in both paths.
+            let len = need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY);
+            let size = len.saturating_add(block);
+            let old = self.ring();
+            for ring in self.bufs.iter_mut() {
+                let mut grown = vec![0.0; size];
+                for k in 0..old {
+                    if let (Some(d), Some(x)) = (grown.get_mut(size - old + k), ring.get((self.idx + k) % old)) {
+                        *d = *x;
+                    }
+                }
+                *ring = grown;
+            }
+            if self.bufs.is_empty() {
+                self.bufs = vec![vec![0.0; size]; ch];
+                self.live = false;
+            }
             self.len = len;
             self.idx = 0;
-            self.bufs = vec![vec![0.0; len]; ch];
         }
         0
     }
-    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        if self.len == 0 {
+
+    /// Appends one block. A line that was idle is zeroed first, so no stale audio comes back.
+    fn write(&mut self, src: &[Vec<f32>], frames: usize) {
+        let size = self.ring();
+        if size == 0 || frames > size {
             return;
         }
+        if !self.live {
+            self.clear();
+            self.idx = 0;
+            self.live = true;
+        }
         let start = self.idx;
-        for (c, ch) in io.iter_mut().enumerate() {
-            let Some(ring) = self.bufs.get_mut(c) else { continue };
+        for (ring, ch) in self.bufs.iter_mut().zip(src.iter()) {
             let mut i = start;
-            for x in ch.iter_mut().take(frames) {
+            for x in ch.iter().take(frames) {
                 if let Some(r) = ring.get_mut(i) {
-                    std::mem::swap(r, x);
+                    *r = *x;
                 }
                 i += 1;
-                if i >= self.len {
+                if i >= size {
                     i = 0;
                 }
             }
         }
-        self.idx = (start + frames) % self.len.max(1);
+        self.idx = (start + frames) % size;
     }
+
+    /// Nothing reads this block delayed: the line is not written, and is zeroed before it is next.
+    fn idle(&mut self) {
+        self.live = false;
+    }
+
+    /// The block just written, `delay` samples late (clamped to the line's longest delay), into
+    /// `dst` (each channel resized to `frames`, within its capacity in plan mode).
+    fn read(&self, delay: usize, dst: &mut [Vec<f32>], frames: usize) {
+        let size = self.ring();
+        let d = delay.min(self.len);
+        let start = if size == 0 { 0 } else { (self.idx + 2 * size - (frames % size) - (d % size)) % size };
+        for (c, out) in dst.iter_mut().enumerate() {
+            out.clear();
+            out.resize(frames, 0.0);
+            let Some(ring) = self.bufs.get(c).filter(|_| self.live && size > 0) else { continue };
+            let mut i = start;
+            for x in out.iter_mut() {
+                if let Some(r) = ring.get(i) {
+                    *x = *r;
+                }
+                i += 1;
+                if i >= size {
+                    i = 0;
+                }
+            }
+        }
+    }
+
     fn clear(&mut self) {
-        let len = self.len;
-        self.bufs.iter_mut().for_each(|b| b.iter_mut().take(len).for_each(|x| *x = 0.0));
+        self.bufs.iter_mut().for_each(|b| b.fill(0.0));
     }
 }
 
@@ -607,10 +691,11 @@ impl Strip {
             clipbuf: Vec::new(),
             external: false,
             latency: 0,
-            align: DelayLine::default(),
-            align_pre: DelayLine::default(),
-            out_extra: DelayLine::default(),
+            tap: DelayLine::default(),
+            tap_pre: DelayLine::default(),
             outbuf: Vec::new(),
+            pdc_out: 0,
+            pdc_pos: 0,
             failures: PluginFailures::default(),
             generation: SlotGen::VACANT,
             track: 0,
@@ -637,18 +722,13 @@ pub struct MixEngine {
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
     order: Vec<usize>,
-    /// Current total compensation delay (samples) of the main mix: the slowest track and aux
-    /// returns, and the master faders' inserts.
+    /// Current total compensation delay (samples) of the main mix: the slowest path into it
+    /// (instruments, inserts, auxes and busses along the way), plus the master faders' inserts.
     pub latency: usize,
-    /// Delay already applied to audio written onto busses: the slowest track insert.
-    /// A bus render drops this so the bus lines up with the timeline. The extra delay
-    /// that lines direct outputs up with aux returns stays in `latency` and is removed
-    /// only from the main mix.
-    track_latency: usize,
-    /// Busses an aux returns onto, and the latency of the slowest aux return: audio written onto
-    /// such a bus waits for it, so a bounce of the bus drops it as well.
-    aux_fed: Vec<BusId>,
-    aux_latency: usize,
+    /// The slowest path into the main mix (before the master faders), this block.
+    main_arrival: usize,
+    /// Fingerprint of the routing the order was computed for.
+    route_key: Option<usize>,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
     /// Transport stopped: only monitored inputs sound (no clips).
@@ -668,8 +748,6 @@ pub struct MixEngine {
     adopt: Vec<PreparedInstance>,
     /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
     retired: Vec<Box<dyn Plugin>>,
-    /// Scratch for `processing_order` (aux depths), reused so a re-sync does not allocate.
-    order_depth: Vec<usize>,
     /// Ownership workspace reused for parallel strip processing.
     work: Vec<(usize, Strip)>,
     /// Render every strip on the calling thread (tests compare it with the parallel render).
@@ -772,9 +850,8 @@ impl MixEngine {
             synced: (0, 0, 0),
             order: Vec::new(),
             latency: 0,
-            track_latency: 0,
-            aux_fed: Vec::new(),
-            aux_latency: 0,
+            main_arrival: 0,
+            route_key: None,
             input: Vec::new(),
             monitor_only: false,
             recording: false,
@@ -783,7 +860,6 @@ impl MixEngine {
             external: false,
             adopt: Vec::new(),
             retired: Vec::new(),
-            order_depth: Vec::new(),
             work: Vec::new(),
             serial: false,
             plan: None,
@@ -912,9 +988,10 @@ impl MixEngine {
             }
             s.held.clear();
             s.chase = true;
-            s.align.clear();
-            s.align_pre.clear();
-            s.out_extra.clear();
+            s.tap.clear();
+            s.tap_pre.clear();
+            s.tap.idle();
+            s.tap_pre.idle();
         }
         self.meters.clear();
         self.main_meter = StripMeter::default();
@@ -1048,7 +1125,7 @@ impl MixEngine {
         }
         for b in &s.busses {
             let n = b.format.channels().clamp(1, MAX_CHANNELS);
-            let bus = self.busses.entry(b.id).or_insert_with(|| BusBuf { fmt: b.format, buf: Vec::new() });
+            let bus = self.busses.entry(b.id).or_insert_with(|| BusBuf::new(b.format, Vec::new()));
             bus.fmt = b.format;
             if bus.buf.len() != n {
                 bus.buf = vec![vec![0.0; mb]; n];
@@ -1064,7 +1141,13 @@ impl MixEngine {
         let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
         if key != self.synced {
             self.sync(s);
-            processing_order(s, &mut self.order, &mut self.order_depth);
+            // The order changes only with the routing: an insert edit keeps it (and allocates nothing).
+            let route = route_fingerprint(s);
+            if self.route_key != Some(route) {
+                let loops = processing_order(s, &mut self.order);
+                log_loops(s, &loops);
+                self.route_key = Some(route);
+            }
             self.synced = key;
         }
     }
@@ -1096,9 +1179,7 @@ impl MixEngine {
         self.last_end = pos.saturating_add(frames as i64);
         self.ensure_synced(s);
         for b in self.busses.values_mut() {
-            for c in b.buf.iter_mut() {
-                c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-            }
+            b.clear(frames);
         }
         for c in &mut self.main {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -1140,9 +1221,9 @@ impl MixEngine {
             self.order = order;
             std::panic::resume_unwind(panic);
         }
-        // Delay compensation: align every strip to the slowest. Direct-to-main outputs also wait
-        // for the slowest aux return. Aux latency has to be read before those outputs are routed,
-        // or the first block (and a one-block bounce probe) still sees zero.
+        // Delay compensation (F05), path by path: every signal summed onto a bus or the main mix
+        // arrives with the slowest path into it. Aux latency has to be read before anything is
+        // routed, or the first block (and a one-block bounce probe) still sees zero.
         let pdc = s.edit.delay_compensation;
         if pdc {
             for t in s.tracks.iter().filter(|t| is_aux(t) && !t.inactive) {
@@ -1162,40 +1243,21 @@ impl MixEngine {
                 }
             }
         }
-        let lmax_t = if pdc { work.iter().map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
-        let lmax_a =
-            if pdc { self.strips.iter().filter(|(id, _)| s.track(**id).is_some_and(is_aux)).map(|(_, st)| st.latency).max().unwrap_or(0) } else { 0 };
-        self.track_latency = lmax_t;
-        self.latency = lmax_t + lmax_a + lmax_m;
-        // An aux that returns onto a bus delays it by the slowest aux return, so the tracks routed
-        // to that bus wait as well (as the ones routed to the main mix do) and the bus lines up.
-        self.aux_latency = lmax_a;
-        self.aux_fed.clear();
-        if pdc {
-            for t in s.tracks.iter().filter(|t| is_aux(t) && live(t)) {
-                if let Route::Bus(b) = &t.mixer.output
-                    && !self.aux_fed.contains(b)
-                {
-                    self.aux_fed.push(*b);
-                }
+        // Forward pass in render order: phase-1 strips, then the auxes.
+        let mut main_arrival = 0usize;
+        for (at, (i, st)) in work.iter_mut().enumerate() {
+            if let Some(t) = s.tracks.get(*i) {
+                pdc_visit(t, st, at, &mut self.busses, &mut main_arrival, pdc);
             }
         }
-        for (i, st) in work.iter_mut() {
-            let Some(t) = s.tracks.get(*i) else { continue };
-            let ch = st.buf.len();
-            st.align.set(lmax_t.saturating_sub(st.latency), ch);
-            st.align.process(&mut st.buf, frames);
-            if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
-                st.align_pre.set(lmax_t.saturating_sub(st.latency), ch);
-                st.align_pre.process(&mut st.pre, frames);
+        let auxes = order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| live(t) && is_aux(t));
+        for (at, t) in (work.len()..).zip(auxes) {
+            if let Some(st) = self.strips.get_mut(&t.id) {
+                pdc_visit(t, st, at, &mut self.busses, &mut main_arrival, pdc);
             }
-            let waits = match &t.mixer.output {
-                Route::Main => true,
-                Route::Bus(b) => self.aux_fed.contains(b),
-                _ => false,
-            };
-            st.out_extra.set(if waits { lmax_a } else { 0 }, ch);
         }
+        self.main_arrival = main_arrival;
+        self.latency = main_arrival.saturating_add(lmax_m);
         for (i, st) in work.iter_mut() {
             if let Some(t) = s.tracks.get(*i) {
                 self.route_strip(t, st, pos, frames);
@@ -1220,10 +1282,6 @@ impl MixEngine {
                 self.order = order;
                 std::panic::resume_unwind(panic);
             }
-            let ch = st.buf.len();
-            st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
-            st.align.process(&mut st.buf, frames);
-            st.out_extra.set(0, ch);
             self.route_strip(t, &mut st, pos, frames);
             self.strips.insert(t.id, st);
         }
@@ -1258,10 +1316,10 @@ impl MixEngine {
         self.main_meter.measure(&self.main, frames, 0.0);
     }
 
-    /// The delay-compensation latency written onto `bus`: the slowest track insert, plus the
-    /// slowest aux return when an aux returns onto this bus.
+    /// The delay-compensation latency of what was summed onto `bus` in the last block: the
+    /// slowest path into it.
     fn bus_latency(&self, bus: BusId) -> usize {
-        self.track_latency + if self.aux_fed.contains(&bus) { self.aux_latency } else { 0 }
+        self.busses.get(&bus).map_or(0, |b| b.arrival)
     }
 
     /// Copy one rendered block of `bus` into `out`. A missing bus stays silent.
@@ -1287,7 +1345,8 @@ impl MixEngine {
         let m = self.meters.entry(t.id).or_default();
         m.measure(&strip.buf, frames, strip.gr);
         m.plugin_failures = strip.failures;
-        let mix = MixOut { busses: &mut self.busses, main: &mut self.main, main_fmt: self.main_fmt, law: self.pan_law };
+        let mix =
+            MixOut { busses: &mut self.busses, main: &mut self.main, main_fmt: self.main_fmt, law: self.pan_law, main_arrival: self.main_arrival };
         route_into(t, strip, pos, frames, mix);
     }
 }
@@ -1298,63 +1357,146 @@ struct MixOut<'a, B: Busses + ?Sized> {
     main: &'a mut [Vec<f32>],
     main_fmt: ChannelFormat,
     law: PanLaw,
+    /// The slowest path into the main mix this block ([`pdc_visit`]).
+    main_arrival: usize,
+}
+
+/// Delay compensation, forward pass (F05): visits one live strip at render position `at`, after
+/// every strip before it. The strip's input arrives with the latency of the bus it reads; its
+/// output adds its own latency (when `pdc`); every bus and the main mix it feeds then waits for
+/// the slowest of its sources. A strip writing a bus already read this block (a routing loop's
+/// feedback, from an older session) does not count: [`route_into`] drops that edge.
+fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, busses: &mut B, main_arrival: &mut usize, pdc: bool) {
+    let mut arrive = 0usize;
+    if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
+        && let Route::Bus(b) = &t.mixer.input
+        && let Some(x) = busses.bus_mut(*b)
+    {
+        x.reader = x.reader.min(at);
+        arrive = x.arrival;
+    }
+    let out = arrive.saturating_add(if pdc { st.latency } else { 0 });
+    st.pdc_out = out;
+    st.pdc_pos = at;
+    let mut feed = |r: &Route| match r {
+        Route::Main => *main_arrival = (*main_arrival).max(out),
+        Route::Bus(b) => {
+            if let Some(x) = busses.bus_mut(*b).filter(|x| at < x.reader) {
+                x.arrival = x.arrival.max(out);
+            }
+        }
+        _ => {}
+    };
+    feed(&t.mixer.output);
+    for snd in t.mixer.sends.iter().flatten() {
+        if matches!(snd.target, Route::Bus(_)) {
+            feed(&snd.target);
+        }
+    }
 }
 
 /// Send and pan a processed (and metered) strip into the busses / main mix.
-fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) {
-    let MixOut { busses, main, main_fmt, law } = out;
-    {
-        let src_fmt = strip_format(t, strip.buf.len());
-        for (i, snd) in t.mixer.sends.iter().enumerate() {
-            let Some(snd) = snd else { continue };
-            if snd.mute || strip.muted {
-                continue;
+///
+/// Each edge (the output, each send) is delayed by the latency of its summing point minus the
+/// strip's own ([`pdc_visit`]), read from the strip's delay lines. An edge into a bus already read
+/// this block is a routing loop's feedback and is dropped. Returns the longest delay a plan-mode
+/// line had to clamp (0: none).
+fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) -> usize {
+    let MixOut { busses, main, main_fmt, law, main_arrival } = out;
+    let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, .. } = strip;
+    let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
+    // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
+    let delay_of = |busses: &B, r: &Route| match r {
+        Route::Main => Some(main_arrival.saturating_sub(o)),
+        Route::Bus(b) => busses.bus(*b).filter(|x| at < x.reader).map(|x| x.arrival.saturating_sub(o)),
+        _ => None,
+    };
+    let (mut post, mut pre_max) = (0usize, 0usize);
+    for snd in t.mixer.sends.iter().flatten() {
+        if let (Route::Bus(_), Some(d)) = (&snd.target, delay_of(busses, &snd.target)) {
+            if snd.pre_fader {
+                pre_max = pre_max.max(d);
+            } else {
+                post = post.max(d);
             }
-            let lvl = send_level(t, i, snd.level_db, pos);
-            let gain = db_to_gain(lvl);
-            let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
-            let Route::Bus(b) = &snd.target else { continue };
-            let Some(dst) = busses.bus_mut(*b) else { continue };
-            if gain <= 0.0 {
-                continue;
-            }
-            // Mono sends use the send's own pan; stereo sends go straight to L/R.
-            let stereo = if src.len() == 1 { [snd.pan, 0.0] } else { [-1.0, 1.0] };
-            let surround = snd.surround.as_ref().or(if snd.follow_main_pan { t.mixer.surround.as_ref() } else { None });
-            let m = build_matrix(src_fmt, src.len(), dst.fmt, dst.buf.len(), &PanSpec { stereo, surround }, law);
-            apply_matrix(src, frames, &mut dst.buf, &m, gain);
-        }
-        let src: &[Vec<f32>] = match &t.mixer.output {
-            Route::Main | Route::Bus(_) if strip.out_extra.len > 0 => {
-                if strip.outbuf.len() != strip.buf.len() {
-                    strip.outbuf = vec![Vec::new(); strip.buf.len()];
-                }
-                for (d, src) in strip.outbuf.iter_mut().zip(strip.buf.iter()) {
-                    d.clear();
-                    d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
-                }
-                strip.out_extra.process(&mut strip.outbuf, frames);
-                &strip.outbuf
-            }
-            _ => &strip.buf,
-        };
-        let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
-            Route::Main => (main, main_fmt),
-            Route::Bus(b) => match busses.bus_mut(*b) {
-                Some(d) => (&mut d.buf, d.fmt),
-                None => return,
-            },
-            _ => return,
-        };
-        let mut start = 0;
-        while start < frames {
-            let (at, end) = pan_segment(t, pos, start, frames);
-            let spec = PanSpec { stereo: [pan_at(t, 0, at), pan_at(t, 1, at)], surround: t.mixer.surround.as_ref() };
-            let m = build_matrix(src_fmt, src.len(), dst_fmt, dst.len(), &spec, law);
-            apply_matrix_span(src, start..end, dst, &m, 1.0);
-            start = end;
         }
     }
+    if let Some(d) = delay_of(busses, &t.mixer.output) {
+        post = post.max(d);
+    }
+    let block = buf.first().map_or(0, Vec::len);
+    let mut clamped = 0usize;
+    if post > 0 {
+        clamped = clamped.max(tap.reserve(post, buf.len(), block));
+        tap.write(buf, frames);
+    } else {
+        tap.idle();
+    }
+    if pre_max > 0 {
+        clamped = clamped.max(tap_pre.reserve(pre_max, pre.len(), block));
+        tap_pre.write(pre, frames);
+    } else {
+        tap_pre.idle();
+    }
+    if outbuf.len() != buf.len() {
+        *outbuf = vec![Vec::new(); buf.len()];
+    }
+    let src_fmt = strip_format(t, buf.len());
+    for (i, snd) in t.mixer.sends.iter().enumerate() {
+        let Some(snd) = snd else { continue };
+        if snd.mute || muted {
+            continue;
+        }
+        let Route::Bus(b) = &snd.target else { continue };
+        let Some(d) = delay_of(busses, &snd.target) else { continue };
+        let lvl = send_level(t, i, snd.level_db, pos);
+        let gain = db_to_gain(lvl);
+        if gain <= 0.0 {
+            continue;
+        }
+        let src: &[Vec<f32>] = match (d, snd.pre_fader) {
+            (0, true) => pre,
+            (0, false) => buf,
+            (d, pre_fader) => {
+                if pre_fader {
+                    tap_pre.read(d, outbuf, frames);
+                } else {
+                    tap.read(d, outbuf, frames);
+                }
+                outbuf
+            }
+        };
+        let Some(dst) = busses.bus_mut(*b) else { continue };
+        // Mono sends use the send's own pan; stereo sends go straight to L/R.
+        let stereo = if src.len() == 1 { [snd.pan, 0.0] } else { [-1.0, 1.0] };
+        let surround = snd.surround.as_ref().or(if snd.follow_main_pan { t.mixer.surround.as_ref() } else { None });
+        let m = build_matrix(src_fmt, src.len(), dst.fmt, dst.buf.len(), &PanSpec { stereo, surround }, law);
+        apply_matrix(src, frames, &mut dst.buf, &m, gain);
+    }
+    let Some(d) = delay_of(busses, &t.mixer.output) else { return clamped };
+    let src: &[Vec<f32>] = if d == 0 {
+        buf
+    } else {
+        tap.read(d, outbuf, frames);
+        outbuf
+    };
+    let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
+        Route::Main => (main, main_fmt),
+        Route::Bus(b) => match busses.bus_mut(*b) {
+            Some(d) => (&mut d.buf, d.fmt),
+            None => return clamped,
+        },
+        _ => return clamped,
+    };
+    let mut start = 0;
+    while start < frames {
+        let (at, end) = pan_segment(t, pos, start, frames);
+        let spec = PanSpec { stereo: [pan_at(t, 0, at), pan_at(t, 1, at)], surround: t.mixer.surround.as_ref() };
+        let m = build_matrix(src_fmt, src.len(), dst_fmt, dst.len(), &spec, law);
+        apply_matrix_span(src, start..end, dst, &m, 1.0);
+        start = end;
+    }
+    clamped
 }
 
 /// Source → trim → inserts → (pre-fader copy) → mute/fader for one strip. Independent of other
@@ -1512,7 +1654,8 @@ fn process_strip<B: Busses + ?Sized>(
         }
     }
     let mut gr = 0.0f32;
-    let mut latency = 0usize;
+    // A latent instrument delays its track like an insert does (G8).
+    let mut latency = strip.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
@@ -2057,37 +2200,76 @@ fn strip_format(t: &Track, n: usize) -> ChannelFormat {
     if t.format.channels().min(MAX_CHANNELS) == n { t.format } else { ChannelFormat::for_channels(n) }
 }
 
-/// Longest chain of auxes feeding one another that the processing order tells apart (cycles
-/// cap out here).
-const MAX_AUX_DEPTH: usize = 8;
-
-/// Writes the processing order into `order`: audio/instrument tracks first, then auxes ordered so
-/// bus producers come before consumers (by depth, then track order). `depth` is scratch. Both
-/// keep their capacity, so a re-sync allocates only when the track count grew.
-fn processing_order(s: &Session, order: &mut Vec<usize>, depth: &mut Vec<usize>) {
+/// Writes the processing order into `order`: every track other than an aux or folder in track
+/// order, then the auxes and folders in routing order (each after every strip feeding it, at any
+/// depth: by the depth of the session's route graph, then track order). Returns the loops the
+/// graph had to break (a session from an older file): the render drops their feedback edges.
+fn processing_order(s: &Session, order: &mut Vec<usize>) -> Vec<RouteCycle> {
     let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
-    // `f` feeds aux `t` when it is an aux whose output or a send goes to `t`'s input bus.
-    let feeds = |f: &Track, t: &Track| {
-        let r = &t.mixer.input;
-        is_aux(f) && matches!(r, Route::Bus(_)) && (&f.mixer.output == r || f.mixer.sends.iter().flatten().any(|sn| &sn.target == r))
-    };
+    let layers = s.route_graph().layering();
     order.clear();
     order.extend(s.tracks.iter().enumerate().filter(|(_, t)| !is_aux(t)).map(|(i, _)| i));
-    // Depth = the longest chain of auxes feeding this aux's input bus, capped. Each round extends
-    // every chain by one hop, so after MAX_AUX_DEPTH rounds each depth is min(longest, cap).
-    depth.clear();
-    depth.resize(s.tracks.len(), 0);
-    for _ in 0..MAX_AUX_DEPTH {
-        for (j, t) in s.tracks.iter().enumerate().filter(|(_, t)| is_aux(t)) {
-            let deepest = s.tracks.iter().zip(depth.iter()).filter(|(f, _)| feeds(f, t)).map(|(_, d)| (d + 1).min(MAX_AUX_DEPTH)).max();
-            if let (Some(d), Some(slot)) = (deepest, depth.get_mut(j)) {
-                *slot = (*slot).max(d);
+    order.extend(layers.order().into_iter().filter(|&i| s.tracks.get(i).is_some_and(is_aux)));
+    layers.loops
+}
+
+/// Logs the routing loops a session was loaded with (once per routing change).
+fn log_loops(s: &Session, loops: &[RouteCycle]) {
+    for l in loops {
+        log::warn!("mix: routing loop {} in the session; rendering without its feedback edge", l.describe(s));
+    }
+}
+
+/// Hash of the routing (`processing_order` depends on nothing else).
+fn route_fingerprint(s: &Session) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for t in &s.tracks {
+        t.kind.hash(&mut h);
+        t.mixer.input.hash(&mut h);
+        t.mixer.output.hash(&mut h);
+        t.mixer.sends.len().hash(&mut h);
+        for snd in &t.mixer.sends {
+            snd.as_ref().map(|x| &x.target).hash(&mut h);
+        }
+    }
+    for b in &s.busses {
+        b.id.hash(&mut h);
+    }
+    h.finish() as usize
+}
+
+/// The longest delay compensation can ask of any edge of `s`: the slowest path into any bus or
+/// the main mix, with `latency` giving each track's own (instrument and inserts). Control thread
+/// (it allocates): plans size their delay lines with it.
+fn path_need(s: &Session, latency: &dyn Fn(&Track) -> usize) -> usize {
+    let layers = s.route_graph().layering();
+    let mut bus_at: HashMap<BusId, usize> = HashMap::new();
+    let mut read: Vec<BusId> = Vec::new();
+    let mut need = 0usize;
+    let live = |t: &Track| !(t.kind == TrackKind::Master || t.kind == TrackKind::Vca);
+    for i in layers.order() {
+        let Some(t) = s.tracks.get(i).filter(|t| live(t)) else { continue };
+        let mut arrive = 0;
+        if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
+            && let Route::Bus(b) = &t.mixer.input
+        {
+            read.push(*b);
+            arrive = bus_at.get(b).copied().unwrap_or(0);
+        }
+        let out = arrive.saturating_add(latency(t));
+        need = need.max(out);
+        let targets = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target));
+        for r in targets {
+            if let Route::Bus(b) = r
+                && !read.contains(b)
+            {
+                let e = bus_at.entry(*b).or_default();
+                *e = (*e).max(out);
             }
         }
     }
-    for d in 0..=MAX_AUX_DEPTH {
-        order.extend(s.tracks.iter().zip(depth.iter()).enumerate().filter(|(_, (t, dt))| is_aux(t) && **dt == d).map(|(i, _)| i));
-    }
+    need.min(MAX_LATENCY)
 }
 
 /// Implicit solo: an aux is not muted when a soloed track feeds its input bus.
@@ -4572,7 +4754,8 @@ mod tests {
             eng.adopt(vec![PreparedInstance { track, slot: 0, id: "clap:test.latent".into(), ch: 1, plugin: Box::new(Latent(gain)) }]);
         }
         render_block(&mut eng, &s, 0);
-        assert_eq!((eng.track_latency, eng.latency), (MAX_LATENCY, 2 * MAX_LATENCY));
+        // Both strips feed the main mix in parallel: the slowest path is one capped latency.
+        assert_eq!(eng.latency, MAX_LATENCY);
     }
 
     #[test]
