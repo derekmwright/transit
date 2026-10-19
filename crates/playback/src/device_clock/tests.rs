@@ -349,6 +349,30 @@ fn minimum_span_window_horizon_and_quality_are_enforced_in_both_directions() {
 }
 
 #[test]
+fn measured_quality_does_not_invent_a_missing_uncertainty_bound() {
+    for direction in [Direction::Input, Direction::Output] {
+        let k = key(43, direction);
+        let mut fit = ClockFitter::new(k);
+        for i in 0..32 {
+            let mut value = observation(k, i);
+            if i == 5 {
+                value.stamp.offset_uncertainty_ns = None;
+            }
+            let result = fit.observe(value);
+            if i >= 10 {
+                let map = result.unwrap();
+                assert_eq!(map.quality, Quality::Measured);
+                assert_eq!(map.offset_uncertainty_ns, None, "one unknown bound makes the window unknown");
+            }
+        }
+        for i in 32..100 {
+            fit.observe(observation(k, i)).unwrap();
+        }
+        assert_eq!(fit.map().unwrap().offset_uncertainty_ns, Some(7), "unknown observation has aged out");
+    }
+}
+
+#[test]
 fn noisy_and_millisecond_quantized_cpal_clocks_converge_and_retain_delayed_capture_coverage() {
     for direction in [Direction::Input, Direction::Output] {
         for (length, rate) in [(32, 48_000), (64, 48_000), (512, 48_000), (64, 96_000)] {
