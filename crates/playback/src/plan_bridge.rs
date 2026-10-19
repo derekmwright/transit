@@ -320,6 +320,7 @@ impl Control {
         });
         if let Ok(report) = self.status_rx.pop()
             && report.generation == self.compiler.active()
+            && !self.compiler.faulted()
         {
             self.compiler.observe(&report.status);
             self.status = Some(report);
@@ -330,6 +331,9 @@ impl Control {
     /// Prepare only with a returned credit. Errors leave the active plan untouched; the
     /// failed request is consumed and can be corrected/resubmitted by the caller.
     pub fn prepare(&mut self, make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>) -> Result<bool, CompileError> {
+        if self.compiler.faulted() {
+            return Err(CompileError::Faulted);
+        }
         if self.port.credits() == 0 {
             return Ok(false);
         }
@@ -356,6 +360,10 @@ impl Control {
 
     pub fn active(&self) -> PlanGeneration {
         self.compiler.active()
+    }
+    /// A torn adoption permanently faults this pair. Retire it on control after quiescence.
+    pub fn faulted(&self) -> bool {
+        self.compiler.faulted()
     }
     pub fn active_bindings(&self) -> Vec<SlotBinding> {
         self.compiler.active_bindings()

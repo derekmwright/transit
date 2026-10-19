@@ -357,6 +357,15 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     let report = control.poll().unwrap();
     assert!(report.torn);
     assert_eq!(report.state, EnvelopeState::Pending);
+    assert!(control.faulted());
+    assert!(control.pending_bindings().is_none());
+    let issued = control.issued;
+    control.request(Arc::new(session(ChannelFormat::Stereo)), Some(InputRing::new(2, 48_000)));
+    let (result, stats) = measure(|| control.prepare(&mut |_, _| panic!("factory must not run after torn adoption")));
+    assert!(matches!(result, Err(CompileError::Faulted)));
+    assert!(stats.is_zero(), "fault refusal must precede allocating playback storage or consuming the request");
+    assert_eq!(control.issued, issued);
+    assert!(control.latest.is_some());
     let released = control.retire(audio);
     assert_eq!(released, live);
     assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
