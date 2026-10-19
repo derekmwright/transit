@@ -12,6 +12,9 @@
 //! Other events use the remaining 256 slots. A note-on the table cannot hold is refused
 //! (`NotesFull`), and so is a pedal-down (`PedalsFull`): nothing is delivered untracked.
 //!
+//! A re-strike (a second note-on for an open note) carries the old voice's off, so it is charged
+//! two of those slots.
+//!
 //! **Delivery**, before the instrument's `process`: controller chase, then the clips (as
 //! [`Source::CLIP`], through the same note and pedal table), then the queue entries due in the
 //! block at `due − block start`. Pedals are tracked per source; the plug-in sees the OR across
@@ -371,6 +374,9 @@ struct Queued {
     transport: Option<TransportEpoch>,
     message: Message,
     action: Action,
+    /// Its charge against the non-release budget: 0 for a release, 2 for a note-on that will
+    /// re-strike (it carries the old voice's off), else 1.
+    cost: u8,
 }
 
 /// One open note: from the admission of its first note-on until its release is delivered.
@@ -498,10 +504,10 @@ impl InstrumentEvents {
                 return false;
             }
         } else {
-            if self.non_release >= NON_RELEASE_CAP || self.queue.len() >= QUEUE_CAP {
+            if self.non_release + usize::from(q.cost) > NON_RELEASE_CAP || self.queue.len() >= QUEUE_CAP {
                 return false;
             }
-            self.non_release += 1;
+            self.non_release += usize::from(q.cost);
         }
         let at = self.queue.partition_point(|e| e.due <= q.due);
         self.queue.insert(at, q);
@@ -537,9 +543,7 @@ impl InstrumentEvents {
                 // A cancelled release leaves its entry open: the caller releases it.
                 Action::Off(_) | Action::Up(_) | Action::Reset | Action::Plain => {}
             }
-            if !q.action.is_release() {
-                *non_release = non_release.saturating_sub(1);
-            }
+            *non_release = non_release.saturating_sub(usize::from(q.cost));
             false
         });
     }
@@ -554,12 +558,14 @@ impl InstrumentEvents {
 
     /// Admits one event due at `due` (already validated and clamped by the engine).
     fn admit(&mut self, due: u64, source: Source, transport: Option<TransportEpoch>, message: Message, st: &mut EventStatus) -> Admit {
-        let q = |action| Queued { due, source, transport, message, action };
+        let q = |action| Queued { due, source, transport, message, action, cost: 1 };
         let room = self.non_release < NON_RELEASE_CAP;
         match message {
             Message::NoteOn { key, id, .. } => {
                 let open = self.notes.iter().position(|e| e.matches(&source, key, id) && !e.release_queued);
-                if !room {
+                // A second on for an open entry re-strikes: it is charged for the off it carries.
+                let cost: u8 = if open.is_some() { 2 } else { 1 };
+                if self.non_release + usize::from(cost) > NON_RELEASE_CAP {
                     return Admit::Shed(Shed::QueueFull);
                 }
                 let n = match open {
@@ -572,7 +578,7 @@ impl InstrumentEvents {
                         n
                     }
                 };
-                if !self.push(q(Action::On(n as u8))) {
+                if !self.push(Queued { cost, ..q(Action::On(n as u8)) }) {
                     if open.is_none()
                         && let Some(e) = self.notes.get_mut(n)
                     {
@@ -698,7 +704,7 @@ impl InstrumentEvents {
         } else {
             due
         };
-        self.push(Queued { due, source, transport, message, action: Action::Off(n as u8) });
+        self.push(Queued { due, source, transport, message, action: Action::Off(n as u8), cost: 0 });
     }
 
     /// Queues pedal entry `n`'s release, never before its last pedal-down.
@@ -711,7 +717,7 @@ impl InstrumentEvents {
         } else {
             due
         };
-        self.push(Queued { due, source, transport, message, action: Action::Up(n as u8) });
+        self.push(Queued { due, source, transport, message, action: Action::Up(n as u8), cost: 0 });
     }
 
     /// A voice id no open note uses (at most `MAX_OPEN + 1` probes).
@@ -860,8 +866,8 @@ impl InstrumentEvents {
                 (_, m) => self.deliver_plain(plugin, offset, q.source, m),
             }
         }
-        let released = self.queue.get(..k).map_or(0, |d| d.iter().filter(|q| q.action.is_release()).count());
-        self.non_release = self.non_release.saturating_sub(k - released);
+        let charged: usize = self.queue.get(..k).map_or(0, |d| d.iter().map(|q| usize::from(q.cost)).sum());
+        self.non_release = self.non_release.saturating_sub(charged);
         self.queue.drain(..k);
     }
 

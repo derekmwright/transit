@@ -828,3 +828,30 @@ fn an_inactive_instrument_keeps_nothing_pending() {
     rig.render(1);
 }
 
+/// Review F10-4d: a re-strike's off is charged with its note-on, two slots, against the
+/// non-release budget.
+#[test]
+fn a_re_strike_is_charged_two_slots() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(src, now, on(60)), EventOutcome::Queued);
+    rig.render(1);
+    let now = rig.mix.next_frame().0;
+    // 255 of the 256 non-release slots.
+    for k in 0..255u64 {
+        assert_eq!(rig.send(src, now + 1000 + k, cc(1, 1)), EventOutcome::Queued);
+    }
+    assert_eq!(rig.send(src, now, on(60)), EventOutcome::Refused(Shed::QueueFull), "a re-strike needs two slots");
+    assert_eq!(rig.send(src, now, on(61)), EventOutcome::Queued, "a new note needs one");
+    rig.render(8);
+    // Delivered: the budget is back, and a re-strike fits.
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(src, now, on(60)), EventOutcome::Queued);
+    rig.render(1);
+    assert_eq!(rig.mix.event_status().restrikes, 1);
+    rig.mix.reset();
+    rig.render(1);
+    assert_eq!(every_on_has_its_off(&rig.heard_by(1)), 3);
+}
+
