@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod arrange;
+pub mod automation;
 pub mod browser;
 pub mod control;
 pub mod devices;
@@ -100,6 +101,13 @@ pub struct UiState {
     /// Edit > Undo History is open (view state, not saved).
     #[serde(skip)]
     pub show_history: bool,
+    /// Tracks whose automation lanes are shown (slice 7, the A toggle), and the lanes open on
+    /// them with their heights. View state of the open session, never in the document; the lanes
+    /// as drawn are in `ui.inspect`'s `automation`.
+    #[serde(skip)]
+    pub auto_shown: Vec<TrackId>,
+    #[serde(skip)]
+    pub auto_lanes: Vec<automation::LaneView>,
 }
 
 impl Default for UiState {
@@ -128,6 +136,8 @@ impl Default for UiState {
             count_in: false,
             takes_open: Vec::new(),
             show_history: false,
+            auto_shown: Vec::new(),
+            auto_lanes: Vec::new(),
         }
     }
 }
@@ -238,6 +248,8 @@ pub struct StudioApp {
     pub telemetry: telemetry::TelemetryState,
     /// Slice 6: the name being typed, the bounce dialog and job, take lanes, the undo history.
     pub finish: finish::FinishState,
+    /// Slice 7: the automation lanes' gesture, point selection, write pass and last layout.
+    pub auto: automation::AutoState,
 }
 
 impl StudioApp {
@@ -287,6 +299,7 @@ impl StudioApp {
             shortcuts_window: menus::ShortcutsLayout::default(),
             telemetry: telemetry::TelemetryState::default(),
             finish: finish::FinishState::default(),
+            auto: automation::AutoState::default(),
         }
     }
 
@@ -369,6 +382,10 @@ impl StudioApp {
                     // Collapsed groups and open take lanes belong to the session that was open.
                     self.ui.collapsed.clear();
                     self.ui.takes_open.clear();
+                    self.ui.auto_shown.clear();
+                    self.ui.auto_lanes.clear();
+                    self.auto.selection.clear();
+                    self.auto.highlight = None;
                     self.finish.rename = None;
                 }
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
@@ -403,6 +420,8 @@ impl StudioApp {
         (ns.cursor, ns.cursor_track, ns.focus_track) = (self.ui.cursor, self.ui.cursor_track, self.ui.focus_track);
         ns.collapsed = std::mem::take(&mut self.ui.collapsed);
         ns.takes_open = std::mem::take(&mut self.ui.takes_open);
+        ns.auto_shown = std::mem::take(&mut self.ui.auto_shown);
+        ns.auto_lanes = std::mem::take(&mut self.ui.auto_lanes);
         let before = std::mem::replace(&mut self.ui, ns);
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {
@@ -521,7 +540,8 @@ impl StudioApp {
         self.drive_editors();
         theme::probe_fonts(ctx);
         let wheeling = self.drive_wheel(ctx, now);
-        if !wheeling && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
+        // A write pass (slice 7) holds its merge until Stop.
+        if !wheeling && !automation::passing(self) && !ctx.input(|i| i.pointer.any_down()) && !ctx.egui_wants_keyboard_input() {
             self.engine.end_merge();
         }
         self.watch_output();
@@ -529,6 +549,7 @@ impl StudioApp {
         finish::step_bounce(self, ctx);
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
+        automation::write_pass(self, ctx);
         if self.engine.revision != self.last_rev {
             self.last_rev = self.engine.revision;
             if let Some(p) = &self.player {
@@ -623,6 +644,7 @@ impl StudioApp {
         ui.set_style(ctx.global_style());
         finish::rename_keys(self, &ctx); // slice 6: a name being typed owns Escape and Enter
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
+        automation::shortcuts(self, &ctx); // slice 7: selected points take Delete before clips
         groups::shortcuts(self, &ctx);
         browser::shortcuts(self, &ctx);
         finish::shortcuts(self, &ctx);
@@ -701,11 +723,14 @@ impl StudioApp {
             "shortcuts": self.shortcuts_window,
             "telemetry": self.telemetry.layout,
             "finish": self.finish.inspect(),
+            "automation": self.auto.layout,
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }
 }
 
+#[cfg(test)]
+mod automation_tests;
 #[cfg(test)]
 mod browser_tests;
 #[cfg(test)]

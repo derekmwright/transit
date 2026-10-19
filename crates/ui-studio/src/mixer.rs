@@ -72,6 +72,12 @@ pub struct SendRow {
     pub remove: R4,
     /// The pre/post toggle (device chain only; strips have it in the row's right-click menu).
     pub pre: R4,
+    /// Slice 7: the send's mute toggle and whether it is muted.
+    pub mute: R4,
+    pub muted: bool,
+    /// Slice 7: the send's pan (device chain only) and what it shows.
+    pub pan: R4,
+    pub pan_text: String,
 }
 
 /// One dropdown or menu entry as last drawn (for `ui.inspect`; scripts click them).
@@ -520,6 +526,7 @@ impl StudioApp {
             Target::Fader(id) => s.track(id).map(|tr| tr.mixer.volume_db),
             Target::Pan(id) => s.track(id).map(|tr| balance_of(&tr.mixer.pan)),
             Target::Send(id, slot) => s.track(id)?.mixer.sends.get(slot)?.as_ref().map(|x| x.level_db),
+            Target::SendPan(id, slot) => s.track(id)?.mixer.sends.get(slot)?.as_ref().map(|x| x.pan),
         }
     }
 
@@ -538,6 +545,12 @@ impl StudioApp {
             Target::Pan(id) => {
                 let key = key.map_or_else(|| format!("pan:{}", id.0), str::to_string);
                 self.set_balance_keyed(id, v, &key)
+            }
+            Target::SendPan(id, slot) => {
+                let key = key.map_or_else(|| format!("sendpan:{}:{slot}", id.0), str::to_string);
+                self.engine
+                    .execute_merged("mix.send_level", &json!({"track": id.0, "slot": slot, "pan": v.clamp(-1.0, 1.0)}), &key)
+                    .map_err(|e| e.to_string())
             }
         }
     }
@@ -561,15 +574,15 @@ impl StudioApp {
     /// The nudges of one wheel gesture are one undo step.
     fn wheel_nudge(&mut self, t: Target, notches: f32, shift: bool, rect: Rect, now: f64) {
         let Some(cur) = self.value_of(t) else { return };
-        let step = match (t, shift) {
-            (Target::Pan(_), false) => fine::WHEEL_PAN,
-            (Target::Pan(_), true) => fine::WHEEL_PAN_FINE,
-            (_, false) => fine::WHEEL_DB,
-            (_, true) => fine::WHEEL_DB_FINE,
+        let step = match (t.is_pan(), shift) {
+            (true, false) => fine::WHEEL_PAN,
+            (true, true) => fine::WHEEL_PAN_FINE,
+            (false, false) => fine::WHEEL_DB,
+            (false, true) => fine::WHEEL_DB_FINE,
         };
-        let (lo, hi) = if matches!(t, Target::Pan(_)) { (-1.0, 1.0) } else { (fine::DB_MIN, fine::DB_MAX) };
+        let (lo, hi) = if t.is_pan() { (-1.0, 1.0) } else { (fine::DB_MIN, fine::DB_MAX) };
         let v = fine::nudge(cur, notches, step).clamp(lo, hi);
-        if self.mixer.wheel.map(|w| w.target) != Some(t) {
+        if self.mixer.wheel.map(|w| w.target) != Some(t) && !crate::automation::passing(self) {
             self.engine.end_merge();
         }
         self.mixer.wheel = Some(fine::WheelMerge { target: t, rect, last: now });
@@ -586,7 +599,9 @@ impl StudioApp {
             return true;
         }
         self.mixer.wheel = None;
-        self.engine.end_merge();
+        if !crate::automation::passing(self) {
+            self.engine.end_merge();
+        }
         false
     }
 
@@ -751,6 +766,11 @@ impl StudioApp {
     }
 
     /// Pre-fader or post-fader (`mix.send_level {pre_fader}`).
+    /// A send's mute (slice 7): one undo step.
+    pub fn set_send_mute(&mut self, t: TrackId, slot: usize, mute: bool) -> Result<Value, String> {
+        self.run("mix.send_level", json!({"track": t.0, "slot": slot, "mute": mute}))
+    }
+
     pub fn set_send_pre(&mut self, t: TrackId, slot: usize, pre: bool) -> Result<Value, String> {
         self.run("mix.send_level", json!({"track": t.0, "slot": slot, "pre_fader": pre}))
     }
@@ -1109,11 +1129,14 @@ pub(crate) fn send_row(
     let lr = Rect::from_min_max(pos2(xb.min.x - if wide { 50.0 } else { 24.0 }, r.min.y), pos2(xb.min.x, r.max.y));
     // The bar along the bottom is its own control; the text hit rects stop above it.
     let above = |q: Rect| Rect::from_min_max(q.min, pos2(q.max.x, q.max.y - BAR_H));
+    // Slice 7: the send's mute, left of the level, and in the device chain its pan.
+    let mb = Rect::from_min_max(pos2(lr.min.x - 14.0, r.min.y + 1.0), pos2(lr.min.x - 1.0, r.max.y - BAR_H));
     let pr = Rect::from_min_max(
-        pos2(lr.min.x - if wide { 34.0 } else { 0.0 }, r.min.y + 2.0),
-        pos2(lr.min.x - if wide { 4.0 } else { 0.0 }, r.max.y - 3.0),
+        pos2(mb.min.x - if wide { 34.0 } else { 0.0 }, r.min.y + 2.0),
+        pos2(mb.min.x - if wide { 4.0 } else { 0.0 }, r.max.y - 3.0),
     );
-    let mut tr = Rect::from_min_max(r.min, pos2(pr.min.x - 1.0, r.max.y));
+    let pnr = Rect::from_min_max(pos2(pr.min.x - if wide { 32.0 } else { 0.0 }, r.min.y), pos2(pr.min.x - if wide { 2.0 } else { 0.0 }, r.max.y));
+    let mut tr = Rect::from_min_max(r.min, pos2(pnr.min.x - 1.0, r.max.y));
     if !wide && snd.pre_fader {
         p.text(pos2(tr.min.x + 7.0, tr.center().y), Align2::CENTER_CENTER, "P", FontId::proportional(9.5), TOKENS.text_dim);
         tr.min.x += 12.0;
@@ -1174,6 +1197,50 @@ pub(crate) fn send_row(
             let _ = app.set_send_pre(id, slot, !snd.pre_fader);
         }
         row.pre = r4(pr);
+    }
+    // Mute: one undo step (`mix.send_level {mute}`).
+    let resp = ui.interact(mb.intersect(clip), ui.id().with(("send_mute", salt)), Sense::click());
+    let fill = if snd.mute {
+        TOKENS.mute
+    } else if resp.hovered() {
+        TOKENS.button_hover
+    } else {
+        TOKENS.button
+    };
+    p.rect_filled(mb, crate::theme::RADIUS_SM, fill);
+    p.text(mb.center(), Align2::CENTER_CENTER, "M", FontId::proportional(9.0), if snd.mute { theme::text_on(TOKENS.mute) } else { TOKENS.text_dim });
+    if resp.on_hover_text(if snd.mute { "Unmute this send" } else { "Mute this send" }).clicked() {
+        let _ = app.set_send_mute(id, slot, !snd.mute);
+    }
+    row.mute = r4(mb);
+    row.muted = snd.mute;
+    // Pan (device chain): drag, wheel, double-click to type, Alt-click to center. The mix pans a
+    // mono track's send only (a stereo source keeps its sides).
+    if wide {
+        let pt = Target::SendPan(id, slot);
+        let text = fine::pan_text(snd.pan);
+        let hot = app.mixer.gesture.is_some_and(|g| g.target == pt);
+        p.rect_filled(above(pnr).shrink2(vec2(0.0, 1.0)), crate::theme::RADIUS_SM, TOKENS.panel_raised);
+        readout(
+            app,
+            ui,
+            &p,
+            clip,
+            Readout {
+                target: pt,
+                salt: 1,
+                draw: above(pnr),
+                hit: above(pnr),
+                text: text.clone(),
+                edit_text: text.clone(),
+                font: theme::mono(ui.ctx(), 10.0),
+                color: if hot { TOKENS.accent } else { TOKENS.text },
+                align: Align2::CENTER_CENTER,
+                drag: true,
+            },
+        );
+        row.pan = r4(above(pnr));
+        row.pan_text = text;
     }
     // Level. The thin bar along the bottom is the control: drag up or right to raise it, like the
     // fader (fourth-root law); double-click, Alt-click, Ctrl-click and Delete reset it to 0 dB;
@@ -1783,15 +1850,12 @@ fn edit_field(app: &mut StudioApp, ui: &mut Ui, draw: Rect, id: egui::Id, font: 
     }
     if resp.lost_focus() {
         if enter {
-            let v = if matches!(e.target, Target::Pan(_)) { fine::parse_pan(&e.text) } else { fine::parse_db(&e.text) };
+            let v = if e.target.is_pan() { fine::parse_pan(&e.text) } else { fine::parse_db(&e.text) };
             match v {
                 Some(v) => {
                     let _ = app.set_value(e.target, v);
                 }
-                None => {
-                    app.status =
-                        format!("\"{}\" is not a {}", e.text.trim(), if matches!(e.target, Target::Pan(_)) { "pan position" } else { "level" })
-                }
+                None => app.status = format!("\"{}\" is not a {}", e.text.trim(), if e.target.is_pan() { "pan position" } else { "level" }),
             }
         }
         return;
@@ -1815,9 +1879,12 @@ fn control(app: &mut StudioApp, ui: &Ui, resp: &egui::Response, t: Target, heigh
     }
     if drag {
         if resp.drag_started() {
-            app.engine.end_merge();
+            // A write pass (slice 7) holds one undo step for the pass and the drags in it.
+            if !crate::automation::passing(app) {
+                app.engine.end_merge();
+            }
             app.mixer.wheel = None;
-            let raw = app.value_of(t).map_or(0.0, |v| if matches!(t, Target::Pan(_)) { v } else { db_to_k(v) });
+            let raw = app.value_of(t).map_or(0.0, |v| if t.is_pan() { v } else { db_to_k(v) });
             app.mixer.gesture = Some(MixGesture { target: t, raw, height });
         }
         if resp.dragged()
@@ -1836,14 +1903,15 @@ fn control(app: &mut StudioApp, ui: &Ui, resp: &egui::Response, t: Target, heigh
                 Target::Fader(_) => -step.y / g.height,
                 Target::Send(..) => (step.x - step.y) / 150.0,
                 Target::Pan(_) => -step.y / 100.0,
+                Target::SendPan(..) => (step.x - step.y) / 100.0,
             };
-            let (lo, hi) = if matches!(t, Target::Pan(_)) { (-1.0, 1.0) } else { (0.0, 1.0) };
+            let (lo, hi) = if t.is_pan() { (-1.0, 1.0) } else { (0.0, 1.0) };
             g.raw = (g.raw + per_px * ratio).clamp(lo, hi);
             app.mixer.gesture = Some(g);
             let slow = now_delta < fine::SLOW_PT && !mods.shift;
             let v = match t {
-                Target::Pan(_) if slow => fine::snap_pan(g.raw),
-                Target::Pan(_) => g.raw,
+                Target::Pan(_) | Target::SendPan(..) if slow => fine::snap_pan(g.raw),
+                Target::Pan(_) | Target::SendPan(..) => g.raw,
                 Target::Fader(_) => {
                     let db = k_to_db(g.raw);
                     if slow { fine::snap_db(db, &fine::DB_MARKS) } else { db }

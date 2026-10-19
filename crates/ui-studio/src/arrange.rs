@@ -58,6 +58,9 @@ pub struct TrackRow {
     pub collapsed: bool,
     pub disclosure: R4,
     pub summary_bars: usize,
+    /// Slice 7: the A toggle (show the track's automation lanes) and whether they are shown.
+    pub automation: R4,
+    pub automation_shown: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -111,17 +114,17 @@ pub struct ArrangeState {
 
 /// Timeline mapping: x ↔ samples, from the session's shared zoom (`edit.zoom`).
 #[derive(Clone, Copy)]
-struct Map {
-    x0: f32,
-    scroll: Samples,
-    spp: f64,
+pub(crate) struct Map {
+    pub(crate) x0: f32,
+    pub(crate) scroll: Samples,
+    pub(crate) spp: f64,
 }
 
 impl Map {
-    fn x(&self, at: Samples) -> f32 {
+    pub(crate) fn x(&self, at: Samples) -> f32 {
         self.x0 + ((at - self.scroll) as f64 / self.spp) as f32
     }
-    fn at(&self, x: f32) -> Samples {
+    pub(crate) fn at(&self, x: f32) -> Samples {
         self.scroll + (f64::from(x - self.x0) * self.spp).round() as Samples
     }
 }
@@ -130,7 +133,7 @@ impl Map {
 pub const TAKE_H: f32 = 22.0;
 
 /// Row geometry: each row's top (content coordinates, before scrolling) and full height. A row is
-/// the track's lane (`rh`) plus its take lanes when they are shown.
+/// the track's lane (`rh`) plus its take lanes when they are shown, then its automation lanes.
 pub(crate) struct RowGeo {
     pub tops: Vec<f32>,
     pub heights: Vec<f32>,
@@ -143,7 +146,7 @@ impl RowGeo {
         let mut heights = Vec::with_capacity(rows.len());
         let mut acc = 0.0;
         for t in rows {
-            let h = rh + takes_shown(app, t) as f32 * TAKE_H;
+            let h = rh + takes_shown(app, t) as f32 * TAKE_H + crate::automation::lanes_height(app, t);
             tops.push(acc);
             heights.push(h);
             acc += h;
@@ -163,7 +166,7 @@ impl RowGeo {
 }
 
 /// How many take lanes a track shows: all its playlists when it has several and they are open.
-fn takes_shown(app: &StudioApp, t: &Track) -> usize {
+pub(crate) fn takes_shown(app: &StudioApp, t: &Track) -> usize {
     if t.playlists.len() > 1 && app.ui.takes_open.contains(&t.id) { t.playlists.len() } else { 0 }
 }
 
@@ -261,6 +264,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     crate::keys::lane_hints(app, ui, tl, &layout.tracks);
     timeline_input(app, ui, &s, map, tl, &rows, &geo, &layout);
     takes(app, ui, &s, map, tl, list, &rows, &geo, &layout);
+    let vscroll = app.arrange.vscroll;
+    crate::automation::lanes(app, ui, &s, map, tl, list, &rows, &geo, vscroll);
     ruler_input(app, ui, map, ruler);
     overlays(app, ui, &s, map, ruler, tl, &rows, &geo);
     scroll_and_zoom(app, ui, map, full, tl, content_h);
@@ -279,7 +284,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let tx = r.min.x + indent + tri;
     p.rect_filled(Rect::from_min_size(pos2(r.min.x + indent, r.min.y), vec2(5.0, r.height())), 0.0, theme::rgb(t.color));
     p.line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, TOKENS.line));
-    let name_rect = Rect::from_min_max(pos2(tx + 12.0, r.min.y + 4.0), pos2(r.max.x - 92.0, r.min.y + 20.0));
+    let name_rect = Rect::from_min_max(pos2(tx + 12.0, r.min.y + 4.0), pos2(r.max.x - 114.0, r.min.y + 20.0));
     row.name_rect = r4(Rect::from_min_max(pos2(name_rect.min.x - 4.0, name_rect.min.y - 2.0), pos2(name_rect.max.x, name_rect.max.y + 2.0)));
     p.with_clip_rect(name_rect.intersect(list)).text(name_rect.left_center(), Align2::LEFT_CENTER, &t.name, FontId::proportional(13.0), TOKENS.text);
     let kind = match t.kind {
@@ -326,6 +331,24 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     row.arm = toggle(app, "R", m.record_arm, TOKENS.record, "mix.record_arm", records);
     row.solo = toggle(app, "S", m.solo, TOKENS.solo, "mix.solo", true);
     row.mute = toggle(app, "M", m.mute, TOKENS.mute, "mix.mute", true);
+    // Slice 7: A shows the track's automation lanes (Ableton's automation toggle). View state.
+    let shown = app.ui.auto_shown.contains(&t.id);
+    let b = Rect::from_min_size(pos2(x - 20.0, r.min.y + 5.0), vec2(19.0, 16.0));
+    let resp = ui.interact(b.intersect(list), ui.id().with(("auto_toggle", t.id.0)), Sense::click());
+    let fill = if shown {
+        TOKENS.accent
+    } else if resp.hovered() {
+        TOKENS.button_hover
+    } else {
+        TOKENS.button
+    };
+    p.rect_filled(b, crate::theme::RADIUS_SM, fill);
+    p.text(b.center(), Align2::CENTER_CENTER, "A", FontId::proportional(11.0), if shown { theme::text_on(TOKENS.accent) } else { TOKENS.text });
+    if resp.on_hover_text(if shown { "Hide automation" } else { "Show automation" }).clicked() {
+        app.toggle_automation(t.id);
+    }
+    row.automation = r4(b);
+    row.automation_shown = shown;
     // Volume readout: drag sideways to change, double-click for 0 dB.
     let vol = Rect::from_min_size(pos2(r.max.x - 72.0, r.min.y + 23.0), vec2(66.0, 15.0));
     row.volume = r4(vol);
@@ -364,7 +387,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     }
     // Name area: click selects the track (Shift ranges, Ctrl adds); a drag moves it (slice 2c);
     // right-click opens the track menu.
-    let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 92.0, r.max.y));
+    let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 114.0, r.max.y));
     let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click_and_drag());
     if resp.clicked() {
         let m = ui.input(|i| i.modifiers);

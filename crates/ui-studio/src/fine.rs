@@ -36,15 +36,23 @@ pub enum Target {
     Fader(TrackId),
     Pan(TrackId),
     Send(TrackId, usize),
+    /// A send's pan (slice 7; the mix pans only a mono source's send).
+    SendPan(TrackId, usize),
 }
 
 impl Target {
+    /// A pan control (-1..1), as opposed to a level in dB.
+    pub fn is_pan(self) -> bool {
+        matches!(self, Target::Pan(_) | Target::SendPan(..))
+    }
+
     /// Identifies the control (for widget ids).
     pub fn salt(self) -> (u8, u64, usize) {
         match self {
             Target::Fader(t) => (0, t.0, 0),
             Target::Pan(t) => (1, t.0, 0),
             Target::Send(t, s) => (2, t.0, s),
+            Target::SendPan(t, s) => (3, t.0, s),
         }
     }
 
@@ -54,6 +62,7 @@ impl Target {
             Target::Fader(t) => format!("wheel:fader:{}", t.0),
             Target::Pan(t) => format!("wheel:pan:{}", t.0),
             Target::Send(t, s) => format!("wheel:send:{}:{s}", t.0),
+            Target::SendPan(t, s) => format!("wheel:sendpan:{}:{s}", t.0),
         }
     }
 }

@@ -12,6 +12,7 @@ publish = false
 soundcraft-time.workspace = true
 soundcraft-midi.workspace = true
 soundcraft-model.workspace = true
+soundcraft-dsp.workspace = true
 soundcraft-mix.workspace = true
 soundcraft-engine.workspace = true
 soundcraft-playback.workspace = true

@@ -30,10 +30,13 @@ pub enum Scope {
     Dialog,
     /// A track or clip name being typed in place (slice 6).
     Rename,
+    /// Automation lanes with points selected (slice 7).
+    Automation,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 7] = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Browser, Scope::Mixer, Scope::Dialog, Scope::Rename];
+    pub const ALL: [Scope; 8] =
+        [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Automation, Scope::Browser, Scope::Mixer, Scope::Dialog, Scope::Rename];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -44,6 +47,7 @@ impl Scope {
             Scope::Mixer => "Mixer",
             Scope::Dialog => "Dialogs",
             Scope::Rename => "Name field",
+            Scope::Automation => "Automation",
         }
     }
 }
@@ -108,6 +112,9 @@ pub enum Action {
     BrowserAddFolder,
     DialogConfirm,
     DialogCancel,
+    ToggleAutomation,
+    DeletePoints,
+    DeselectPoints,
 }
 
 /// One row: an action on a key in a scope.
@@ -229,6 +236,14 @@ pub const TABLE: &[Shortcut] = &[
     row(A::Group, "Group Tracks", CMD, Key::G, S::Arrangement, "Ableton (Logic's Cmd+Shift+D makes a stack instead)."),
     row(A::TrackUp, "Move Track Up", ALT, Key::ArrowUp, S::Arrangement, "Ours."),
     row(A::TrackDown, "Move Track Down", ALT, Key::ArrowDown, S::Arrangement, "Ours."),
+    row(
+        A::ToggleAutomation,
+        "Show Automation",
+        NONE,
+        Key::A,
+        S::Arrangement,
+        "Ableton (Automation Mode); here for the focused track. Logic's A shows all tracks' lanes.",
+    ),
     // Mixer and device chain.
     row(A::ResetControl, "Reset Control Under Pointer", NONE, Key::Delete, S::Mixer, "Ableton (Delete resets a hovered control)."),
     row(A::ResetControl, "Reset Control Under Pointer", NONE, Key::Backspace, S::Mixer, "Same as Delete."),
@@ -249,6 +264,10 @@ pub const TABLE: &[Shortcut] = &[
     row(A::NotesLater, "Move Later by the Grid", NONE, Key::ArrowRight, S::PianoRoll, "All DAWs."),
     row(A::NotesDelete, "Delete Notes", NONE, Key::Delete, S::PianoRoll, "All DAWs."),
     row(A::NotesDelete, "Delete Notes", NONE, Key::Backspace, S::PianoRoll, "Same as Delete."),
+    // Automation lanes (slice 7): only while points are selected, before the arrangement's Delete.
+    row(A::DeletePoints, "Delete Selected Points", NONE, Key::Delete, S::Automation, "All DAWs. Without selected points Delete takes clips."),
+    row(A::DeletePoints, "Delete Selected Points", NONE, Key::Backspace, S::Automation, "Same as Delete."),
+    row(A::DeselectPoints, "Deselect Points", NONE, Key::Escape, S::Automation, "Ours; a click on a clip or empty lane does the same."),
     // Browser.
     row(A::BrowserCancel, "Cancel Drag or Add Folder", NONE, Key::Escape, S::Browser, "Ours."),
     row(A::BrowserAddFolder, "Add the Typed Folder", NONE, Key::Enter, S::Browser, "In the Add Folder field."),

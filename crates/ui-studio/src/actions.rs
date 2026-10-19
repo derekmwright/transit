@@ -28,6 +28,7 @@ impl StudioApp {
 
     /// Click on a clip: select it (`additive` adds it to or removes it from the selection).
     pub fn click_clip(&mut self, clip: ClipId, additive: bool) {
+        self.auto.selection.clear();
         if let Some((t, _)) = self.engine.session().find_clip(clip) {
             self.ui.focus_track = Some(t);
         }
@@ -58,6 +59,7 @@ impl StudioApp {
     /// Click on empty timeline: deselect the clips, select the track and put the cursor there.
     /// While playing, the playhead jumps there too (Ableton).
     pub fn click_empty(&mut self, track: Option<TrackId>, at: Samples) {
+        self.auto.selection.clear();
         let at = at.max(0);
         let params = match track {
             Some(t) => json!({"tracks": [t.0], "start": at}),

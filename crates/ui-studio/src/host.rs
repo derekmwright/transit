@@ -13,7 +13,7 @@
 //!
 //! Adapted, and marked where: play and record start at the cursor, not at the edit selection
 //! (plan 06, L6); the stop-time insertion and scroll edits that read `soundcraft-ui-egui`'s view
-//! state are left out; the automation write pass is deferred (plan 06, section 3).
+//! state are left out. The automation write pass is in [`crate::automation::write_pass`] (slice 7).
 
 use crate::{MeterDisplay, StudioApp};
 use serde_json::json;
@@ -548,6 +548,8 @@ impl StudioApp {
                     self.ui.cursor_track = None;
                     self.ui.focus_track = None;
                     self.mixer.gesture = None;
+                    self.auto.gesture = None;
+                    self.auto.selection.clear();
                     self.engine.transport.position = self.cursor();
                 }
                 TransportRequest::Play => {
