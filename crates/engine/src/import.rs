@@ -97,7 +97,7 @@ impl Staging {
         let mut over = waiting.saturating_sub(self.max_finished);
         let mut idle_jobs: Vec<(Duration, u64)> = self.jobs.iter().filter_map(|(id, j)| idle(j).map(|d| (d, *id))).collect();
         // Longest idle first.
-        idle_jobs.sort_by(|a, b| b.0.cmp(&a.0));
+        idle_jobs.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (d, id) in idle_jobs {
             let stale = d >= self.ttl;
             let crowded = over > 0 && d >= self.grace;
