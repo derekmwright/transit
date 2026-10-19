@@ -43,7 +43,7 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "fla
 rustfft = "6"
 # Session bundles (one file holding a session and its audio, for the browser): stored entries only.
 zip = { version = "9", default-features = false }
-cpal = "0.16"
+cpal = "=0.16.0"
 # Publication protocol depends on bounded single-element push/pop; review every version bump.
 rtrb = "=0.4.0"
 
@@ -81,3 +81,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 debug = 0
+
+[patch.crates-io]
+# Reviewed WASAPI registration lifetime and typed per-worker observation; see CPAL PR #1406.
+cpal = { git = "https://github.com/derekmwright/cpal", rev = "59ffcf7444fd3401711a90b9108402004dc750bb" }

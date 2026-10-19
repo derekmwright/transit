@@ -26,6 +26,7 @@
 pub mod devices;
 pub mod publication;
 pub mod record;
+pub mod scheduling;
 pub mod telemetry;
 
 pub use devices::AudioConfig;
@@ -1082,7 +1083,14 @@ impl Player {
         self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    /// Lifetime callback durations, deadline overruns, backend errors and render-silence reasons.
+    /// Observed scheduling state of this Player's output worker. A new Player owns a fresh
+    /// observation; the previous device generation's success cannot carry into it.
+    /// Reads backend state on the caller; performs no OS registration or log parsing.
+    pub fn thread_priority(&self) -> scheduling::WorkerPriority {
+        scheduling::observe(self._stream.as_ref())
+    }
+
+    /// Lifetime callback durations, nominal budget overruns, backend errors and render-silence reasons.
     /// Nonblocking and allocation-free; independent fields may straddle a callback. A newly
     /// opened Player starts from zero. See [`telemetry::CallbackTelemetry`] for measurement limits.
     pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
@@ -2426,6 +2434,41 @@ mod tests {
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
         Player::silent_clock(shared, tx, rx, 48_000, Mutex::new(Side::new(48_000.0, grx)), gtx)
+    }
+
+    #[test]
+    fn absent_output_and_input_never_claim_observed_priority() {
+        assert_eq!(silent_player().thread_priority(), scheduling::WorkerPriority::NoWorker);
+        assert_eq!(record::Recorder::detached("no input").thread_priority(), scheduling::WorkerPriority::NoWorker);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires real default WASAPI input/output; output is silent and input is not recorded"]
+    fn wasapi_workers_publish_observed_priority() {
+        let config = AudioConfig { system: Some("WASAPI".into()), ..AudioConfig::default() };
+        for _ in 0..3 {
+            let player = Player::with_config(Arc::new(Session::default()), &config);
+            assert!(!player.silent, "requires an actual output device");
+            let recorder = record::Recorder::open_with(&config).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (player.callback_telemetry().callbacks < 2 || recorder.thread_priority() == scheduling::WorkerPriority::Pending)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(player.callback_telemetry().callbacks >= 2);
+            assert_eq!(player.thread_priority(), scheduling::WorkerPriority::MmcssAudio);
+            assert_eq!(recorder.thread_priority(), scheduling::WorkerPriority::MmcssAudio);
+            let observed = match player._stream.as_ref().unwrap().as_inner() {
+                cpal::platform::StreamInner::Wasapi(stream) => stream.thread_priority_observation(),
+                #[cfg(feature = "asio")]
+                cpal::platform::StreamInner::Asio(_) => panic!("test requested WASAPI"),
+            };
+            drop(recorder);
+            drop(player);
+            assert_eq!(observed.status(), cpal::platform::WasapiThreadPriorityStatus::Released);
+        }
     }
 
     #[test]

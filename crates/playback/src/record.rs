@@ -294,6 +294,19 @@ fn input_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::Suppor
 }
 
 impl Recorder {
+    /// Observed scheduling state of this input worker generation. A configured feature is
+    /// not evidence of successful registration; unsupported backends report Unobserved.
+    pub fn thread_priority(&self) -> crate::scheduling::WorkerPriority {
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            crate::scheduling::observe(self._stream.as_ref())
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            crate::scheduling::WorkerPriority::NoWorker
+        }
+    }
+
     /// Open the default input device. Errors when there is none (the caller shows a message).
     pub fn open() -> Result<Recorder, String> {
         Recorder::open_with(&crate::AudioConfig::default())
