@@ -14,6 +14,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "automation.clear",
     "edit.paste_clip_effects",
     "edit.paste_clip_gain",
+    "edit.squash_undo", // studio UI composite helper; old UI has no composite steps
     "event.midi_note",
     "file.bounce_stems",
     "markers.next",
