@@ -862,7 +862,7 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     let current = app.ui.keys.snap;
     egui::Popup::menu(&resp).width(90.0).show(|ui| {
         for snap in Snap::ALL {
-            let item = ui.add(egui::Button::selectable(snap == current, snap.label()));
+            let item = crate::menus::check_button(ui, snap == current, snap.label());
             layout.snap_menu.push(MenuItem::at(ui, snap.label().into(), snap.label().into(), item.rect));
             if item.clicked() {
                 app.ui.keys.snap = snap;

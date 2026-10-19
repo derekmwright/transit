@@ -1074,7 +1074,7 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
             if value == NEW_FX || value == REMOVE_UNUSED {
                 ui.separator();
             }
-            let b = ui.add(egui::Button::selectable(label == current, label.as_str()));
+            let b = crate::menus::check_button(ui, label == current, label.as_str());
             menu.push(MenuItem::at(ui, label.clone(), value.clone(), b.rect));
             if b.clicked() {
                 picked = Some(value.clone());

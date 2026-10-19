@@ -11,6 +11,7 @@ struct T {
     app: StudioApp,
     ctx: egui::Context,
     time: f64,
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 fn mid(r: [f32; 4]) -> (f32, f32) {
@@ -38,7 +39,7 @@ impl Drop for Dir {
 impl T {
     fn new() -> T {
         let app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
-        let mut t = T { app, ctx: egui::Context::default(), time: 0.0 };
+        let mut t = T { app, ctx: egui::Context::default(), time: 0.0, shapes: Vec::new() };
         t.frames(3);
         t
     }
@@ -58,6 +59,7 @@ impl T {
                 app.ui(ui);
             });
             out.textures_delta.clear();
+            self.shapes = out.shapes;
         }
     }
 
@@ -837,6 +839,102 @@ fn thin_after_write_off_keeps_the_dense_pass_and_the_menu_toggles_it() {
     let n = t.app.thin_focused().unwrap();
     assert!(n > 0);
     assert_eq!(t.undo_len(), before + 1);
+}
+
+#[test]
+fn automation_menu_check_gutter_keeps_painted_icon_clear_of_aligned_labels() {
+    for appearance in [crate::theme::Appearance::Dark, crate::theme::Appearance::Light] {
+        for scale in [1.0, 1.25, 2.0] {
+            let mut t = T::new();
+            t.app.ui.appearance = appearance;
+            t.ctx.set_pixels_per_point(scale);
+            t.frames(3);
+            let menu = t.app.arrange.bar_menu.iter().find(|m| m.label == "Automation").unwrap().rect;
+            t.click(mid(menu));
+            let (checked_text, icons) = menu_ink(&t, "Thin after write");
+            assert_eq!(icons.len(), 1, "one check icon: {appearance:?}, {scale}");
+            let icon = icons[0];
+            assert!(!icon.intersects(checked_text), "check {icon:?} overlaps text {checked_text:?}");
+            assert!(checked_text.left() - icon.right() >= 3.0, "a visible point-sized gap");
+            let (plain_text, _) = menu_ink(&t, "Thin Focused Track");
+            assert!((plain_text.left() - checked_text.left()).abs() < 0.01, "plain and checked labels align");
+            let on = t.app.arrange.bar_menu.iter().find(|m| m.label == "Thin after write").unwrap().rect;
+            t.click(mid(on));
+            assert!(!t.app.ui.thin_after_write);
+            t.click(mid(menu));
+            let (unchecked_text, icons) = menu_ink(&t, "Thin after write");
+            assert!(icons.is_empty(), "unchecked has no check icon");
+            assert_eq!(checked_text, unchecked_text, "toggling keeps the label in place");
+        }
+    }
+}
+
+/// Read the painted rectangles, so the assertions cover the actual button layout.
+fn menu_ink(t: &T, label: &str) -> (egui::Rect, Vec<egui::Rect>) {
+    let r = t.app.arrange.bar_menu.iter().find(|m| m.label == label).unwrap().rect;
+    let row = egui::Rect::from_min_max(egui::pos2(r[0], r[1]), egui::pos2(r[2], r[3]));
+    fn visit(shape: &egui::Shape, row: egui::Rect, label: &str, text: &mut Option<egui::Rect>, icons: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    visit(shape, row, label, text, icons);
+                }
+            }
+            egui::Shape::Text(s) if s.galley.text() == label && row.contains(s.pos) => {
+                *text = Some(s.galley.rect.translate(s.pos.to_vec2()));
+            }
+            egui::Shape::Mesh(m) if row.contains_rect(m.calc_bounds()) => icons.push(m.calc_bounds()),
+            _ => {}
+        }
+    }
+    let mut text = None;
+    let mut icons = Vec::new();
+    for shape in &t.shapes {
+        visit(&shape.shape, row, label, &mut text, &mut icons);
+    }
+    (text.expect("the menu label was painted"), icons)
+}
+
+#[test]
+fn view_menu_gutter_keeps_shortcuts_and_submenu_labels_aligned() {
+    let mut t = T::new();
+    let menu = t.app.arrange.bar_menu.iter().find(|m| m.label == "View").unwrap().rect;
+    t.click(mid(menu));
+    let (browser, icons) = menu_ink(&t, "Browser");
+    for icon in icons {
+        assert!(!icon.intersects(browser));
+    }
+    for name in ["Mixer", "Devices", "Full Mixer Window", "Appearance"] {
+        let (text, _) = menu_ink(&t, name);
+        assert!((text.left() - browser.left()).abs() < 0.01, "{name} shares the state column");
+    }
+    // Shortcuts stay against the right side of each full-width row.
+    let mut right_edges = Vec::new();
+    fn shortcuts(shape: &egui::Shape, labels: &[String], edges: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    shortcuts(shape, labels, edges);
+                }
+            }
+            egui::Shape::Text(s) if labels.iter().any(|label| label == s.galley.text()) => {
+                edges.push(s.pos.x + s.galley.rect.right());
+            }
+            _ => {}
+        }
+    }
+    let labels = [
+        crate::shortcuts::Action::ToggleBrowser,
+        crate::shortcuts::Action::ToggleMixer,
+        crate::shortcuts::Action::ToggleDevices,
+        crate::shortcuts::Action::FullMixer,
+    ]
+    .map(crate::shortcuts::label);
+    for shape in &t.shapes {
+        shortcuts(&shape.shape, &labels, &mut right_edges);
+    }
+    assert_eq!(right_edges.len(), 4);
+    assert!(right_edges.iter().all(|x| (*x - right_edges[0]).abs() < 1.0), "shortcuts align: {right_edges:?}");
 }
 
 #[test]

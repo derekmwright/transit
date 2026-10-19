@@ -418,7 +418,7 @@ pub fn plugin_menu(
         ui.label(egui::RichText::new(text).color(TOKENS.text_dim).size(10.5));
     };
     let mut item = |ui: &mut Ui, id: &str, label: &str, picked: &mut Option<String>| {
-        let b = ui.add(egui::Button::selectable(current == Some(id), label));
+        let b = crate::menus::check_button(ui, current == Some(id), label);
         menu.push(MenuItem::at(ui, label.to_string(), id.to_string(), b.rect));
         if b.clicked() {
             *picked = Some(id.to_string());

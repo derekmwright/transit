@@ -1036,7 +1036,7 @@ fn lane_header(
                     ui.label(egui::RichText::new(&sec).small().color(TOKENS.text_dim));
                     section = sec;
                 }
-                let b = ui.add(egui::Button::selectable(id == lid, label.as_str()));
+                let b = crate::menus::check_button(ui, id == lid, label.as_str());
                 menu.push(MenuItem::at(ui, label.clone(), id.clone(), b.rect));
                 if b.clicked() {
                     picked = Some(id);
@@ -1072,7 +1072,7 @@ fn lane_header(
         let mut picked = None;
         egui::Popup::menu(&resp).width(120.0).show(|ui| {
             for m in MODES {
-                let b = ui.add(egui::Button::selectable(m == mode, mode_label(m)));
+                let b = crate::menus::check_button(ui, m == mode, mode_label(m));
                 menu.push(MenuItem::at(ui, mode_label(m).into(), m.label().into(), b.rect));
                 if b.clicked() {
                     picked = Some(m);

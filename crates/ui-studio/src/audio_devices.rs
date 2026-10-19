@@ -406,13 +406,13 @@ fn choose<T: Clone + PartialEq>(
     };
     let r = ui.add_enabled_ui(enabled, |ui| {
         egui::ComboBox::from_id_salt(("audio_devices", key)).selected_text(&text).width(360.0).show_ui(ui, |ui| {
-            let b = ui.selectable_label(value.is_none(), SYSTEM_DEFAULT);
+            let b = crate::menus::check_button(ui, value.is_none(), SYSTEM_DEFAULT);
             items.push(MenuItem::at(ui, SYSTEM_DEFAULT.into(), key.into(), b.rect));
             if b.clicked() {
                 *value = None;
             }
             for (v, t) in options {
-                let b = ui.selectable_label(value.as_ref() == Some(v), t);
+                let b = crate::menus::check_button(ui, value.as_ref() == Some(v), t);
                 items.push(MenuItem::at(ui, t.clone(), key.into(), b.rect));
                 if b.clicked() {
                     *value = Some(v.clone());

@@ -155,13 +155,13 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 let auto_menu = ui.menu_button("Automation", |ui| {
                     // Follow-ups: a preference, not the document.
                     let on = app.ui.thin_after_write;
-                    let b = check_button(ui, on, "Thin after write".into());
+                    let b = check_button(ui, on, "Thin after write");
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin after write".into(), String::new(), b.rect));
                     if b.clicked() {
                         app.ui.thin_after_write = !on;
                         ui.close();
                     }
-                    let b = ui.add_enabled(app.focus_track().is_some_and(|t| !app.pass_on(t)), egui::Button::new("Thin Focused Track"));
+                    let b = ui.add_enabled(app.focus_track().is_some_and(|t| !app.pass_on(t)), menu_button("Thin Focused Track"));
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin Focused Track".into(), String::new(), b.rect));
                     if b.clicked() {
                         let _ = app.thin_focused();
@@ -177,7 +177,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ("Devices", A::ToggleDevices, &mut u.show_devices),
                         ("Full Mixer Window", A::FullMixer, &mut u.mixer_full),
                     ] {
-                        let b = check_button_with(ui, *flag, name.into(), Some(label(action)));
+                        let b = check_button_with(ui, *flag, name, Some(label(action)));
                         view_items.push(crate::mixer::MenuItem::at(ui, name.into(), String::new(), b.rect));
                         if b.clicked() {
                             *flag = !*flag;
@@ -186,10 +186,10 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     }
                     ui.separator();
                     // Appearance: System follows the OS; kept in `UiState` (slice 5).
-                    let sub = ui.menu_button("Appearance", |ui| {
+                    let sub = ui.menu_button(menu_contents("Appearance"), |ui| {
                         for a in crate::theme::Appearance::ALL {
                             let on = app.ui.appearance == a;
-                            let b = check_button(ui, on, a.label().into());
+                            let b = check_button(ui, on, a.label());
                             view_items.push(crate::mixer::MenuItem::at(ui, a.label().into(), "appearance".into(), b.rect));
                             if b.clicked() {
                                 app.ui.appearance = a;
@@ -211,7 +211,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         (if cycle { "Cycle Off" } else { "Cycle On" }, A::Cycle, "options.loop_playback", json!({"value": !cycle})),
                     ];
                     for (text, action, id, p) in items {
-                        if ui.add(egui::Button::new(text).shortcut_text(label(action))).clicked() {
+                        if ui.add(menu_button(text).shortcut_text(label(action))).clicked() {
                             let _ = app.run(id, p);
                             ui.close();
                         }
@@ -219,7 +219,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     ui.separator();
                     // Slice 6: a preference, not the document.
                     let on = app.ui.count_in;
-                    let b = check_button(ui, on, "Count-in (1 bar)".into());
+                    let b = check_button(ui, on, "Count-in (1 bar)");
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Count-in (1 bar)".into(), String::new(), b.rect));
                     if b.clicked() {
                         app.ui.count_in = !on;
@@ -624,21 +624,31 @@ pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
     app.shortcuts_window = layout;
 }
 
-/// A menu entry that is checked when `on`: the label is indented so the check icon (Lucide Check,
-/// not a text glyph) has the gutter, and every entry's text lines up checked or not.
-fn check_button(ui: &mut egui::Ui, on: bool, text: String) -> egui::Response {
+/// A fixed point-sized state column, followed by egui's point-sized icon spacing.
+/// Keep this slot even for unchecked items and ordinary commands in the same menu.
+const MENU_CHECK_SIZE: f32 = 12.0;
+
+fn menu_contents(text: impl Into<egui::WidgetText>) -> (egui::Atom<'static>, egui::WidgetText) {
+    (egui::Atom::custom(egui::Id::new("menu_check"), egui::Vec2::splat(MENU_CHECK_SIZE)), text.into())
+}
+
+fn menu_button(text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
+    egui::Button::new(menu_contents(text))
+}
+
+/// Menu and popover choices use an icon in the state column, never a text glyph.
+pub(crate) fn check_button(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
     check_button_with(ui, on, text, None)
 }
 
-fn check_button_with(ui: &mut egui::Ui, on: bool, text: String, shortcut: Option<String>) -> egui::Response {
-    let mut b = egui::Button::new(format!("   {text}"));
+fn check_button_with(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>, shortcut: Option<String>) -> egui::Response {
+    let mut b = menu_button(text);
     if let Some(s) = shortcut {
         b = b.shortcut_text(s);
     }
-    let resp = ui.add(b);
-    if on {
-        let c = egui::pos2(resp.rect.min.x + 12.0, resp.rect.center().y);
-        crate::icons::paint(ui.painter(), c, crate::icons::Icon::Check, 12.0, ui.visuals().text_color());
+    let resp = b.atom_ui(ui);
+    if on && let Some(gutter) = resp.rect(egui::Id::new("menu_check")) {
+        crate::icons::paint(ui.painter(), gutter.center(), crate::icons::Icon::Check, MENU_CHECK_SIZE, ui.visuals().text_color());
     }
-    resp
+    resp.response
 }
