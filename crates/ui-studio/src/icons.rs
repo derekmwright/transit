@@ -23,6 +23,7 @@ pub enum Icon {
     ChevronDown,
     Plus,
     Remove,
+    Check,
     Power,
     OpenEditor,
     Star,
@@ -37,7 +38,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 19] = [
+    pub const ALL: [Icon; 20] = [
         Icon::Rewind,
         Icon::Stop,
         Icon::Play,
@@ -47,6 +48,7 @@ impl Icon {
         Icon::ChevronDown,
         Icon::Plus,
         Icon::Remove,
+        Icon::Check,
         Icon::Power,
         Icon::OpenEditor,
         Icon::Star,
@@ -71,6 +73,7 @@ impl Icon {
             Icon::ChevronDown => "chevron-down",
             Icon::Plus => "plus",
             Icon::Remove => "x",
+            Icon::Check => "check",
             Icon::Power => "power",
             Icon::OpenEditor => "external-link",
             Icon::Star => "star",
@@ -95,6 +98,7 @@ impl Icon {
             Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Icon::Plus => include_bytes!("../assets/icons/plus.svg"),
             Icon::Remove => include_bytes!("../assets/icons/x.svg"),
+            Icon::Check => include_bytes!("../assets/icons/check.svg"),
             Icon::Power => include_bytes!("../assets/icons/power.svg"),
             Icon::OpenEditor => include_bytes!("../assets/icons/external-link.svg"),
             Icon::Star | Icon::StarFilled => include_bytes!("../assets/icons/star.svg"),
@@ -183,6 +187,17 @@ pub fn paint_in(p: &egui::Painter, r: Rect, icon: Icon, color: Color32) {
     paint(p, r.center(), icon, ICON.min(r.width()).min(r.height()), color);
 }
 
+/// An icon and a text label side by side, the pair centered in `r` (or, with `left`, starting
+/// 4 points in from its left edge), both in `color`: a "+ Send" style button.
+pub fn paint_labeled(p: &egui::Painter, r: Rect, left: bool, icon: Icon, size: f32, label: &str, font: egui::FontId, color: Color32) {
+    let galley = p.layout_no_wrap(label.to_string(), font, color);
+    let gap = 4.0;
+    let w = size + gap + galley.size().x;
+    let x0 = if left { r.min.x + 4.0 } else { r.center().x - w / 2.0 };
+    paint(p, pos2(x0 + size / 2.0, r.center().y), icon, size, color);
+    p.galley(pos2(x0 + size + gap, r.center().y - galley.size().y / 2.0), galley, color);
+}
+
 /// The shared helper: an icon on the type scale, in the current text color.
 pub fn icon(ui: &mut Ui, icon: Icon) -> Response {
     let (r, resp) = ui.allocate_exact_size(vec2(ICON, ICON), Sense::hover());
@@ -221,5 +236,38 @@ mod tests {
         assert!(px(Icon::Play).a() > 200);
         assert!(px(Icon::StarFilled).a() > 200);
         assert_eq!(px(Icon::Star).a(), 0);
+    }
+
+    /// A symbol-only button or a check mark is an icon (ADR 0010), never a text character: no
+    /// non-test source file may hold a string literal that is just a glyph, or one that starts
+    /// with a glyph and a space ("check Name"). `shortcuts.rs` spells key names, so "+" there is
+    /// a key, not a button.
+    #[test]
+    fn symbols_are_icons_not_text_glyphs() {
+        const GLYPHS: [&str; 16] = [
+            "+", "\u{d7}", "\u{2715}", "\u{2713}", "\u{2714}", "\u{25be}", "\u{25b8}", "\u{25bc}", "\u{25b6}", "\u{25b2}", "\u{22ef}", "\u{22ee}",
+            "\u{2212}", "\u{2304}", "\u{203a}", "\u{2039}",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || name.ends_with("tests.rs") || name == "icons.rs" || name == "shortcuts.rs" {
+                continue;
+            }
+            for (n, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for g in GLYPHS {
+                    if line.contains(&format!("\"{g}\"")) || line.contains(&format!("\"{g} ")) {
+                        found.push(format!("{name}:{}: {}", n + 1, code));
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "symbol text instead of an icon:\n{}", found.join("\n"));
     }
 }
