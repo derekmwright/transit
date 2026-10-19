@@ -68,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
         // `rate` is for tests: an item prepared at a rate other than the session's can never be
         // committed (the commit asks for a re-import), so the session rate is the only useful one.
         cmd!(query "file.prepare_import", "Prepare Audio Import", [], None, "{path, rate?: session rate} -> {id}: decode and resample on a worker thread", always, prepare_import),
-        cmd!(query "file.import_progress", "Audio Import Progress", [], None, "{id?} -> {id, name, state: queued|running|done|failed, progress: 0-100, error?, frames?, channels?, duration?} (no id: {imports: [..]})", always, import_progress),
+        cmd!(query "file.import_progress", "Audio Import Progress", [], None, "{id?} -> {id, name, state: queued|running|done|failed|expired, progress: 0-100, error?, frames?, channels?, duration?} (no id: {imports: [..]})", always, import_progress),
         cmd!(query "file.import_cancel", "Cancel Audio Import", [], None, "{id} -> {canceled}", always, |e, p| {
             let id = p.get("id").and_then(Value::as_u64).ok_or_else(|| bad("file.import_cancel", "`id` required"))?;
             Ok(json!({"canceled": e.imports.cancel(id)}))

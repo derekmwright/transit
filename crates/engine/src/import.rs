@@ -120,6 +120,11 @@ impl Staging {
     /// jobs go past the time limit, and the longest idle ones go when more than the count limit
     /// wait (after a short grace). A job never polled, a queued one and a running one stay. Never
     /// called from a worker thread.
+    ///
+    /// The cap is advisory, not a hard bound: a job never polled by id never expires, and no job
+    /// does while the caller's polls are more than [`AWAY`] apart. An abandoned batch holds its
+    /// decoded audio until it is canceled or the session is replaced, and expired entries (small,
+    /// the audio is freed) stay in the map until canceled.
     fn expire(&mut self) {
         let Some(at) = self.last_poll else { return };
         let idle = |j: &Job| match (j.state, j.seen) {

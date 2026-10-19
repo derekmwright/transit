@@ -346,3 +346,20 @@ fn a_commit_without_a_track_replays_on_a_fresh_engine_with_the_same_track_clip_a
     assert_eq!(clips(&f, ftid), clips(&e, tid));
     assert_eq!(clips(&f, ftid), vec![(480, 24_000, "Lead Vox".to_string())]);
 }
+
+#[test]
+fn a_caller_away_longer_than_the_limit_loses_nothing_when_it_returns() {
+    let d = Dir::new("away-reset");
+    let (mut e, _) = engine_with_track();
+    let path = d.file("tone.wav", &wav(1, 48_000, 480));
+    e.imports.set_limits(Duration::from_millis(100), 32, Duration::from_secs(30));
+    let (a, b) = (prepare(&mut e, &path), prepare(&mut e, &path));
+    wait(&mut e, a);
+    wait(&mut e, b);
+    e.imports.all();
+    // Away for longer than the engine's `AWAY` (5 s), then back, polling only the first item.
+    std::thread::sleep(Duration::from_millis(5_300));
+    e.imports.progress(a);
+    e.imports.progress(a);
+    assert_eq!(e.imports.progress(b).unwrap()["state"], "done", "the idle clocks restarted on return");
+}
