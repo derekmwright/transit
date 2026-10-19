@@ -197,9 +197,13 @@ impl SessionControl {
                             SessionOutcome::Applied { generation: published.generation }
                         }
                         EnvelopeState::Rejected { reason, .. } => SessionOutcome::Rejected(SessionFailure::Adoption(reason)),
-                        EnvelopeState::Pending => {
-                            SessionOutcome::Rejected(if shutdown { SessionFailure::Shutdown } else { SessionFailure::NotAdopted })
-                        }
+                        EnvelopeState::Pending => SessionOutcome::Rejected(if self.bridge.faulted() {
+                            SessionFailure::Faulted
+                        } else if shutdown {
+                            SessionFailure::Shutdown
+                        } else {
+                            SessionFailure::NotAdopted
+                        }),
                     }
                 };
                 self.finish(published.id, outcome);

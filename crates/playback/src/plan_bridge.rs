@@ -15,7 +15,7 @@ use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::Samples;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Playback-owned sample/meter storage cap per publication, in addition to PlanLimits.
 const PLAYBACK_BYTES: usize = 16 << 20;
@@ -205,6 +205,7 @@ pub(super) fn callback_scope() -> CallbackBudget {
 
 #[derive(Default)]
 struct Counters {
+    faulted: AtomicBool,
     published: AtomicU64,
     admitted: AtomicU64,
     deferred: AtomicU64,
@@ -337,7 +338,7 @@ impl Control {
     /// Prepare only with a returned credit. Errors leave the active plan untouched; the
     /// failed request is consumed and can be corrected/resubmitted by the caller.
     pub fn prepare(&mut self, make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>) -> Result<bool, CompileError> {
-        if self.compiler.faulted() {
+        if self.faulted() {
             return Err(CompileError::Faulted);
         }
         if self.port.credits() == 0 {
@@ -374,9 +375,10 @@ impl Control {
         self.issued
     }
 
-    /// A torn adoption permanently faults this pair. Retire it on control after quiescence.
+    /// A torn adoption or callback fault permanently faults this pair. Retire it on
+    /// control after quiescence; ordinary admission must stop even before a return arrives.
     pub fn faulted(&self) -> bool {
-        self.compiler.faulted()
+        self.compiler.faulted() || self.counters.faulted.load(Ordering::Acquire)
     }
     pub fn active_bindings(&self) -> Vec<SlotBinding> {
         self.compiler.active_bindings()
@@ -447,6 +449,11 @@ pub struct Processing<'a> {
 }
 
 impl Processing<'_> {
+    /// Refuse subsequent work immediately if a handler detects an unrecoverable
+    /// runtime error. This cannot change plan identity or invoke processor code.
+    pub fn fault(&mut self) {
+        self.audio.fault();
+    }
     pub fn set_processing(&mut self, monitor_only: bool, recording: bool, editors_open: bool) {
         self.audio.set_processing(monitor_only, recording, editors_open);
     }
@@ -489,6 +496,9 @@ impl Audio {
     /// Attempt at most one publication per device callback, only at a drained boundary.
     /// `ready` is false while old render-ahead samples still need their old layout/fold.
     pub fn service(&mut self, budget: &mut CallbackBudget, ready: bool) -> publication::Service {
+        if self.faulted() {
+            return self.return_pending(budget);
+        }
         if budget.serviced || !ready {
             self.deferred(budget);
             return publication::Service::Empty;
@@ -534,28 +544,35 @@ impl Audio {
     pub fn engine(&self) -> &MixEngine {
         &self.mix
     }
+    /// Publish permanent callback failure without invoking or destroying processors.
+    pub fn fault(&mut self) {
+        self.counters.faulted.store(true, Ordering::Release);
+    }
+    pub fn faulted(&self) -> bool {
+        self.mix.faulted() || self.counters.faulted.load(Ordering::Acquire)
+    }
     pub fn set_processing(&mut self, monitor_only: bool, recording: bool, editors_open: bool) {
         self.mix.monitor_only = monitor_only;
         self.mix.recording = recording;
         self.mix.no_suspend = editors_open;
     }
     pub fn reset(&mut self) {
-        if !self.mix.faulted() {
+        if !self.faulted() {
             self.mix.reset();
         }
     }
     pub fn all_notes_off(&mut self) {
-        if !self.mix.faulted() {
+        if !self.faulted() {
             self.mix.all_notes_off();
         }
     }
     pub fn flush_releases(&mut self, frames: usize) {
-        if !self.mix.faulted() {
+        if !self.faulted() {
             self.mix.flush_releases(frames);
         }
     }
     pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
-        if !self.mix.faulted() {
+        if !self.faulted() {
             self.mix.live_note(track, pitch, velocity);
         }
     }
@@ -574,6 +591,13 @@ impl Audio {
 
     /// Render into the prepared output storage. Frames are capped at the fixed target block.
     pub fn render(&mut self, position: Samples, frames: usize) {
+        if self.faulted() {
+            for channel in &mut self.buffers.output {
+                channel.iter_mut().take(frames).for_each(|sample| *sample = 0.0);
+            }
+            self.clear_meters();
+            return;
+        }
         let target = self.mix.active().target;
         let frames = frames.min(target.max_block as usize);
         if let Some(input) = &self.buffers.input {

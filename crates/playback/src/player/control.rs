@@ -76,12 +76,18 @@ impl<T: Copy, R: Copy> Control<T, R> {
     }
 
     pub fn stop(&mut self) -> Result<Sequence, PlayerError> {
+        if self.sessions.faulted() {
+            return Err(PlayerError::Faulted);
+        }
         let sequence = self.actions.stop().map_err(PlayerError::Action)?;
         self.waiting.clear(); // stop() produced a receipt for every reserved action.
         Ok(sequence)
     }
 
     pub fn all_notes_off(&mut self) -> Result<Sequence, PlayerError> {
+        if self.sessions.faulted() {
+            return Err(PlayerError::Faulted);
+        }
         self.actions.all_notes_off().map_err(PlayerError::Action)
     }
 

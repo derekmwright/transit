@@ -21,6 +21,13 @@ pub enum ActionResult {
     Timeline(timeline_map::MapError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderError {
+    Timeline(timeline_map::MapError),
+    HandlerFault,
+    Panicked,
+}
+
 struct Transport {
     timeline: timeline_map::Timeline,
     history: timeline_map::History,
@@ -100,6 +107,7 @@ impl Transport {
         };
         if let Err(error) = result {
             self.timeline_fault = Some(error);
+            live.fault();
         }
         result.map_or_else(ActionResult::Timeline, |()| ActionResult::Applied)
     }
@@ -132,6 +140,9 @@ pub(super) struct Audio {
     device_rate: u32,
     speed: u32,
     faulted: bool,
+    /// An escaped panic may own a heap payload. Retain it with the audio holder
+    /// until main reclaims that holder; do not destroy it during error handling.
+    panic_payload: Option<Box<dyn std::any::Any + Send>>,
 }
 
 pub(super) fn pair(
@@ -156,6 +167,7 @@ pub(super) fn pair(
             device_rate,
             speed: 1000,
             faulted: false,
+            panic_payload: None,
             transport: Transport {
                 timeline,
                 history: timeline_map::History::default(),
@@ -264,6 +276,45 @@ impl Audio {
         channels: usize,
         plans: &mut plan_bridge::CallbackBudget,
         actions: &mut action_lane::Budget,
+    ) -> Result<(), RenderError> {
+        let was_faulted = self.faulted || self.plans.faulted();
+        let mut error = if was_faulted {
+            None
+        } else {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.fill_inner(out, channels, plans, actions))) {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(RenderError::Timeline(error)),
+                Err(payload) => {
+                    self.panic_payload = Some(payload);
+                    Some(RenderError::Panicked)
+                }
+            }
+        };
+        if !was_faulted && error.is_none() && (self.faulted || self.plans.faulted()) {
+            error = Some(self.transport.timeline_fault.map_or(RenderError::HandlerFault, RenderError::Timeline));
+        }
+        if was_faulted || error.is_some() {
+            self.faulted = true;
+            self.transport.playing = false;
+            self.shared.playing.store(false, Ordering::Relaxed);
+            self.plans.fault();
+            self.actions.fault();
+            // Keep returning work under the SAME callback budgets. No plugin calls
+            // or successful urgent acknowledgments are fabricated after failure.
+            self.actions.service(actions, &mut self.plans, &mut |_, _| ActionResult::Timeline(timeline_map::MapError::Invalid));
+            self.plans.return_pending(plans);
+            self.plans.clear_meters();
+            out.fill(0.0);
+        }
+        error.map_or(Ok(()), Err)
+    }
+
+    fn fill_inner(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        plans: &mut plan_bridge::CallbackBudget,
+        actions: &mut action_lane::Budget,
     ) -> Result<(), timeline_map::MapError> {
         out.fill(0.0);
         if self.faulted {
@@ -271,6 +322,9 @@ impl Audio {
         }
         let channels = channels.max(1);
         self.service_actions(actions);
+        if self.faulted {
+            return Ok(());
+        }
         self.plans.service(plans, self.pending == 0);
         self.service_actions(actions);
         if self.faulted {

@@ -539,7 +539,7 @@ impl<T: Copy, R: Copy> Audio<T, R> {
         bridge: &mut plan_bridge::Audio,
         apply: &mut impl FnMut(Event<T>, &mut plan_bridge::Processing<'_>) -> R,
     ) -> Service {
-        if !bridge.matches_runtime(&self.runtime) || bridge.engine().faulted() {
+        if !bridge.matches_runtime(&self.runtime) || bridge.faulted() {
             self.state.faulted = true;
         }
         let active = bridge.engine().active().generation;
@@ -547,7 +547,7 @@ impl<T: Copy, R: Copy> Audio<T, R> {
         let mut dispatch = |event| {
             // The restricted view cannot change these. Recheck at each dispatch so
             // future view extensions cannot silently invalidate prerequisite checks.
-            if !bridge.matches_runtime(runtime) || bridge.engine().faulted() || bridge.engine().active().generation != active {
+            if !bridge.matches_runtime(runtime) || bridge.faulted() || bridge.engine().active().generation != active {
                 return None;
             }
             Some(apply(event, &mut bridge.processing()))

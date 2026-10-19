@@ -126,7 +126,10 @@ fn timeline_exhaustion_still_executes_stop_and_faults_the_runtime() {
     fill(&mut audio, &mut [0.0; 128]);
     audio.transport.epoch = u64::MAX;
     let stop = control.stop().unwrap();
-    fill(&mut audio, &mut [0.0; 128]);
+    assert_eq!(
+        audio.fill(&mut [0.0; 128], 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()),
+        Err(RenderError::Timeline(timeline_map::MapError::Arithmetic))
+    );
     assert!(audio.faulted);
     assert!(!audio.transport.playing);
     assert!(!shared.playing.load(Ordering::Relaxed));
@@ -233,5 +236,306 @@ fn a_seek_discards_real_pending_audio_and_session_retirement_runs_off_callback()
     assert!(weak.upgrade().is_some(), "retired session still belongs to the return envelope");
     control.service(&mut make);
     assert!(weak.upgrade().is_none(), "control reclaims its final owner");
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_fault_returns_pending_plans_and_actions_and_closes_control_admission() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    fill(&mut audio, &mut [0.0; 128]);
+    control.service(&mut make);
+    let mut replacement = Session::default();
+    replacement.outputs[0].format = soundcraft_model::ChannelFormat::Surround51;
+    let replacement = Arc::new(replacement);
+    let weak = Arc::downgrade(&replacement);
+    let request = control.request(replacement, None).unwrap();
+    control.service(&mut make);
+    let stop = control.stop().unwrap();
+    let later = control.send_action(Command::Recording(true), false).unwrap();
+    audio.transport.epoch = u64::MAX;
+    let mut out = [1.0; 128];
+    let (result, heap) = measure(|| audio.fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()));
+    assert_eq!(result, Err(RenderError::Timeline(timeline_map::MapError::Arithmetic)));
+    assert!(heap.is_zero(), "{heap:?}");
+    assert_eq!(out, [0.0; 128]);
+    assert!(!shared.playing.load(Ordering::Relaxed));
+    assert!(control.sessions.faulted(), "control observes failure before polling a return");
+    assert!(weak.upgrade().is_some(), "the returned owner is still anchored until main polls");
+    assert_eq!(control.request(Arc::new(Session::default()), None), Err(crate::player::PlayerError::Faulted));
+    assert_eq!(control.send_action(Command::Recording(false), false), Err(crate::player::PlayerError::Faulted));
+    assert_eq!(control.stop(), Err(crate::player::PlayerError::Faulted));
+    assert_eq!(control.all_notes_off(), Err(crate::player::PlayerError::Faulted));
+    for _ in 0..10 {
+        fill(&mut audio, &mut out);
+        control.service(&mut make);
+    }
+    assert!(weak.upgrade().is_none());
+    assert_eq!(control.recovery_progress().0, stop, "only the Stop whose handler ran is acknowledged");
+    let mut notices = [None; 16];
+    control.poll_notices(&mut notices);
+    assert!(notices.iter().flatten().any(|n| matches!(n, crate::player::Notice::Session(crate::player::SessionNotice { request: id, outcome: crate::player::SessionOutcome::Rejected(crate::player::SessionFailure::Faulted) }) if *id == request)));
+    assert!(notices.iter().flatten().any(|n| matches!(n, crate::player::Notice::Action(r) if r.sequence == later && r.outcome == action_lane::Outcome::Faulted && r.handler_result.is_none())));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_fault_drains_saturated_action_and_note_lanes_over_successive_callbacks() {
+    let (mut control, mut audio, _) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 128]);
+    control.service(&mut make);
+    control.poll_notices(&mut [None; 8]);
+    control.stop().unwrap();
+    let mut admitted = Vec::new();
+    for _ in 0..action_lane::CAPACITY {
+        admitted.push(control.send_action(Command::Recording(true), false).unwrap());
+    }
+    for _ in 0..action_lane::NOTE_CAPACITY {
+        admitted.push(control.send_note(Command::Recording(true), action_lane::NoteKind::On).unwrap());
+    }
+    admitted.sort_unstable();
+    audio.transport.epoch = u64::MAX;
+    let mut collected = Vec::new();
+    for callback in 0..8 {
+        let mut out = [1.0; 128];
+        let (result, heap) = measure(|| audio.fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()));
+        assert!(heap.is_zero(), "{heap:?}");
+        assert_eq!(result, if callback == 0 { Err(RenderError::Timeline(timeline_map::MapError::Arithmetic)) } else { Ok(()) });
+        assert_eq!(out, [0.0; 128]);
+        assert!(!audio.transport.recording, "no faulted action may reach the handler");
+        let mut notices = [None; action_lane::CALLBACK_ACTIONS + action_lane::CALLBACK_NOTES + 1];
+        let count = control.poll_notices(&mut notices);
+        assert_eq!(count, action_lane::CALLBACK_ACTIONS + action_lane::CALLBACK_NOTES);
+        for notice in notices.into_iter().flatten() {
+            let crate::player::Notice::Action(receipt) = notice else { panic!("unexpected session result") };
+            assert_eq!(receipt.outcome, action_lane::Outcome::Faulted);
+            assert_eq!(receipt.handler_result, None);
+            collected.push(receipt.sequence);
+        }
+    }
+    collected.sort_unstable();
+    assert_eq!(collected, admitted, "every accepted action returns exactly once");
+    assert!(control.retire(audio.plans, audio.actions).0.is_empty());
+}
+
+#[test]
+fn all_propagated_timeline_errors_permanently_fault_and_silence() {
+    for speed_exhaustion in [false, true] {
+        let (mut control, mut audio, shared) = fixture(48_000);
+        let from = if speed_exhaustion { 0 } else { MAX_POSITION - 10 };
+        control.send_action(Command::Play { from, end: None, looped: None }, true).unwrap();
+        if speed_exhaustion {
+            fill(&mut audio, &mut [0.0; 128]);
+            audio.transport.epoch = u64::MAX;
+            shared.speed.store(500, Ordering::Relaxed);
+        }
+        let mut out = [1.0; 128];
+        let (result, heap) = measure(|| audio.fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()));
+        assert_eq!(result, Err(RenderError::Timeline(timeline_map::MapError::Arithmetic)));
+        assert!(heap.is_zero());
+        assert_eq!(out, [0.0; 128]);
+        assert!(audio.faulted && control.sessions.faulted());
+        assert!(!shared.playing.load(Ordering::Relaxed));
+        let position = shared.position.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            fill(&mut audio, &mut out);
+        }
+        assert_eq!(shared.position.load(Ordering::Relaxed), position);
+        control.retire(audio.plans, audio.actions);
+    }
+}
+
+#[test]
+fn a_publication_finishing_after_a_concurrent_fault_is_returned_without_adoption() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 128]);
+    control.service(&mut make);
+    let holder = Arc::new(Mutex::new(Some(audio)));
+    let held = Arc::clone(&holder);
+    let (go, start) = std::sync::mpsc::channel();
+    let (done, faulted) = std::sync::mpsc::channel();
+    let (drain, finish) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        start.recv().unwrap();
+        {
+            let mut guard = held.try_lock().unwrap();
+            let audio = guard.as_mut().unwrap();
+            audio.transport.epoch = u64::MAX;
+            shared.speed.store(500, Ordering::Relaxed);
+            assert_eq!(
+                audio.fill(&mut [1.0; 128], 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()),
+                Err(RenderError::Timeline(timeline_map::MapError::Arithmetic))
+            );
+        }
+        done.send(()).unwrap();
+        finish.recv().unwrap();
+        let mut guard = held.try_lock().unwrap();
+        let audio = guard.as_mut().unwrap();
+        let ((), heap) = measure(|| fill(audio, &mut [1.0; 128]));
+        assert!(heap.is_zero());
+    });
+    let late = signal();
+    let weak = Arc::downgrade(&late);
+    let request = control.request(late, None).unwrap();
+    let main = std::thread::current().id();
+    control.service(&mut |spec, generation| {
+        assert_eq!(std::thread::current().id(), main);
+        go.send(()).unwrap();
+        faulted.recv().unwrap();
+        make(spec, generation)
+    });
+    assert!(control.sessions.faulted());
+    assert!(weak.upgrade().is_some());
+    drain.send(()).unwrap();
+    worker.join().unwrap();
+    control.service(&mut make);
+    assert!(weak.upgrade().is_none());
+    let audio = holder.lock().unwrap().take().unwrap();
+    let notices = control.retire(audio.plans, audio.actions).0;
+    assert!(notices.iter().any(|notice| matches!(notice, crate::player::Notice::Session(crate::player::SessionNotice { request: id, outcome: crate::player::SessionOutcome::Rejected(crate::player::SessionFailure::Faulted) }) if *id == request)));
+}
+
+struct CountedInstrument {
+    inner: Box<dyn soundcraft_dsp::Plugin>,
+    resets: Arc<std::sync::atomic::AtomicUsize>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    panic: Option<(std::thread::ThreadId, Arc<std::sync::atomic::AtomicUsize>, Arc<AtomicBool>)>,
+}
+impl soundcraft_dsp::Plugin for CountedInstrument {
+    fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+        self.inner.info()
+    }
+    fn prepare(&mut self, rate: f32, frames: usize, channels: usize) {
+        self.inner.prepare(rate, frames, channels);
+    }
+    fn reset(&mut self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
+        self.inner.reset();
+    }
+    fn set_param(&mut self, id: &str, value: f32) -> bool {
+        self.inner.set_param(id, value)
+    }
+    fn param(&self, id: &str) -> Option<f32> {
+        self.inner.param(id)
+    }
+    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        if let Some((main, drops, on_main)) = &self.panic {
+            std::panic::panic_any(PanicOwner { main: *main, drops: Arc::clone(drops), on_main: Arc::clone(on_main) });
+        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.process(io, frames);
+    }
+    fn all_notes_off(&mut self) {
+        self.inner.all_notes_off();
+    }
+}
+
+#[test]
+fn stop_and_end_reset_the_instrument_and_deliver_its_release_pass_while_unmonitored() {
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+    use std::sync::atomic::AtomicUsize;
+    for end in [false, true] {
+        let (mut control, mut audio, _) = fixture(48_000);
+        fill(&mut audio, &mut [0.0; 128]);
+        control.service(&mut make);
+        let mut s = Session::default();
+        let track = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+        control.request(Arc::new(s), None).unwrap();
+        let resets = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        control.service(&mut |spec, generation| {
+            let made = make(spec, generation).unwrap();
+            Some(NewInstance {
+                plugin: Box::new(CountedInstrument { inner: made.plugin, resets: Arc::clone(&resets), calls: Arc::clone(&calls), panic: None }),
+                refused_state: false,
+            })
+        });
+        fill(&mut audio, &mut [0.0; 128]);
+        control.service(&mut make);
+        let before_resets = resets.load(Ordering::Relaxed);
+        let before_calls = calls.load(Ordering::Relaxed);
+        if end {
+            control.send_action(Command::Play { from: 0, end: Some(64), looped: None }, true).unwrap();
+        } else {
+            control.stop().unwrap();
+        }
+        let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 128]));
+        assert!(heap.is_zero());
+        assert_eq!(resets.load(Ordering::Relaxed) - before_resets, if end { 2 } else { 1 });
+        assert_eq!(calls.load(Ordering::Relaxed) - before_calls, if end { 2 } else { 1 });
+        control.retire(audio.plans, audio.actions);
+    }
+}
+
+#[test]
+fn the_linear_converter_never_interpolates_from_unrendered_storage_after_a_short_loop_block() {
+    let (mut control, mut audio, _) = fixture_session(44_100, signal());
+    control.send_action(Command::Play { from: 17, end: None, looped: Some(Range::new(17, 20)) }, true).unwrap();
+    let mut out = [0.0; 6];
+    fill(&mut audio, &mut out);
+    // The third output sample is fractional but sits at the last valid frame of
+    // this 3-frame render. Capacity beyond that frame is NOT a valid neighbor.
+    assert!((out[4] - 20.0 / 128.0).abs() < 0.00001);
+    assert!((out[5] - 40.0 / 128.0).abs() < 0.00001);
+    control.retire(audio.plans, audio.actions);
+}
+
+struct PanicOwner {
+    main: std::thread::ThreadId,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+    on_main: Arc<AtomicBool>,
+}
+impl Drop for PanicOwner {
+    fn drop(&mut self) {
+        self.on_main.store(std::thread::current().id() == self.main, Ordering::Relaxed);
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+#[test]
+fn escaped_processing_panic_stays_owned_until_main_reclaims_the_callback_holder() {
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+    use std::sync::atomic::AtomicUsize;
+    let (mut control, mut audio, _) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 128]);
+    control.service(&mut make);
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    control.request(Arc::new(session), None).unwrap();
+    let main = std::thread::current().id();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let on_main = Arc::new(AtomicBool::new(false));
+    control.service(&mut |spec, generation| {
+        let made = make(spec, generation).unwrap();
+        Some(NewInstance {
+            plugin: Box::new(CountedInstrument {
+                inner: made.plugin,
+                resets: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                panic: Some((main, Arc::clone(&drops), Arc::clone(&on_main))),
+            }),
+            refused_state: false,
+        })
+    });
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    let holder = Arc::new(Mutex::new(Some(audio)));
+    let held = Arc::clone(&holder);
+    std::thread::spawn(move || {
+        let mut guard = held.try_lock().unwrap();
+        let audio = guard.as_mut().unwrap();
+        let mut out = [1.0; 128];
+        assert_eq!(audio.fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()), Err(RenderError::Panicked));
+        assert_eq!(out, [0.0; 128]);
+        assert!(audio.panic_payload.is_some());
+    })
+    .join()
+    .unwrap();
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    assert!(control.sessions.faulted());
+    let mut audio = holder.lock().unwrap().take().unwrap();
+    drop(audio.panic_payload.take());
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert!(on_main.load(Ordering::Relaxed));
     control.retire(audio.plans, audio.actions);
 }
