@@ -127,5 +127,16 @@ fn host_event_queues_and_the_vst3_point_slab_allocate_nothing_at_saturation() {
         assert_eq!(stats, AllocStats::default(), "{name}: on the audio thread");
         assert!(refused.0 > 0, "{name}: saturated");
         assert_eq!(refused.1, 0, "{name}: every release fits the reserve");
+        // Stop with pedals down and notes held: the reset keeps every release (review F10-1).
+        saturate_and_process(&mut *p, &mut io);
+        let ((), stats) = measure(|| {
+            for channel in 0..16u8 {
+                p.event(0, &PluginEvent { channel, note_id: -1, message: Message::Control { cc: 64, value: 0 } });
+            }
+            p.all_notes_off();
+            p.reset();
+            p.process(&mut io, BLOCK);
+        });
+        assert_eq!(stats, AllocStats::default(), "{name}: a reset keeping releases, on the audio thread");
     }
 }

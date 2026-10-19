@@ -90,6 +90,40 @@ fn admission_delivery_revocation_and_panic_allocate_nothing() {
         }
         mix.all_notes_off();
         mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        // Half-pedal values, re-strikes, and releases carrying the old transport (review fixes).
+        for p in 20..40u16 {
+            let src = Source { port: p, channel: (p % 16) as u8, generation: 1 };
+            let now = mix.next_frame().0;
+            for (k, v) in [90u8, 70, 30].into_iter().enumerate() {
+                mix.queue_event(&ev(src, now + k as u64, Message::Control { cc: 64, value: v }, None));
+            }
+            let id = NoteId(u32::from(p) * 100);
+            mix.queue_event(&ev(src, now + 3, Message::NoteOn { key: 0, velocity: 90, id }, Some(TransportEpoch(2))));
+            mix.queue_event(&ev(src, now + 4, Message::NoteOn { key: 0, velocity: 90, id }, Some(TransportEpoch(2))));
+        }
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        mix.set_transport_epoch(TransportEpoch(3));
+        for p in 20..40u16 {
+            let src = Source { port: p, channel: (p % 16) as u8, generation: 1 };
+            let id = NoteId(u32::from(p) * 100);
+            let now = mix.next_frame().0;
+            mix.queue_event(&ev(src, now, Message::NoteOff { key: 0, velocity: 0, id }, Some(TransportEpoch(2))));
+            mix.queue_event(&ev(src, now, Message::Control { cc: 121, value: 0 }, Some(TransportEpoch(2))));
+        }
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        // Stop: release everything, then reset the plug-ins.
+        let now = mix.next_frame().0;
+        let src = Source { port: 50, channel: 0, generation: 1 };
+        mix.queue_event(&ev(src, now, Message::NoteOn { key: 60, velocity: 90, id: NoteId::NONE }, None));
+        mix.queue_event(&ev(src, now, Message::Control { cc: 64, value: 127 }, None));
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
+        mix.reset();
+        mix.render_active(pos, BLOCK, &mut out);
+        pos += BLOCK as i64;
         let _ = mix.event_status();
     });
     let st = mix.event_status();
@@ -99,4 +133,24 @@ fn admission_delivery_revocation_and_panic_allocate_nothing() {
     assert_eq!(st.dropped_releases, 0);
     assert!(st.shed.note_on > 0 && st.shed.pedal_down > 0);
     assert!(st.revoked > 0);
+    assert!(st.restrikes > 0);
+
+    // A track made inactive: adoption voids its instrument's queue (prepared off the measure).
+    let src = Source { port: 51, channel: 0, generation: 1 };
+    let now = mix.next_frame().0;
+    mix.queue_event(&ev(src, now + 5000, Message::NoteOn { key: 61, velocity: 90, id: NoteId::NONE }, None));
+    let mut s = (**mix.session()).clone();
+    s.track_mut(t).unwrap().inactive = true;
+    let mut make = |spec: &InstanceSpec, _: SlotGen| soundcraft_mix::create_instance(&spec.id, None, SR as f32, BLOCK, spec.ch);
+    let mut env = comp.compile(Arc::new(s), comp.active(), PlanGeneration::EMPTY.checked_next().unwrap().checked_next().unwrap(), &mut make).unwrap();
+    let (adopted, stats) = measure(|| {
+        let a = mix.adopt_plan(&mut env);
+        mix.render_active(pos, BLOCK, &mut out);
+        a
+    });
+    assert_eq!(adopted, Adoption::Adopted);
+    assert_eq!(stats, AllocStats::default(), "adoption voiding a queue, on the audio thread");
+    assert!(!mix.has_pending_events());
+    assert_eq!(mix.event_status().voided[0], 1);
+    comp.reclaim(env);
 }
