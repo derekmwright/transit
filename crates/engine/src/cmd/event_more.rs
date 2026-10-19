@@ -206,16 +206,10 @@ fn move_song_start(e: &mut Engine, p: &Value) -> Result<Value> {
         map.set_meter((m.tick + dticks).max(1), m.numerator, m.denominator).map_err(|err| bad(id, err.to_string()))?;
     }
     s.tempo = map;
-    let mut moved = 0;
-    for tr in s.tracks.iter_mut().filter(|t| t.ticks_timebase && t.kind.has_playlist()) {
-        if let Some(pl) = tr.playlist_mut() {
-            for c in &mut pl.clips {
-                c.start = c.start.saturating_add(delta).max(0);
-                moved += 1;
-            }
-            pl.sort();
-        }
-    }
+    // Musical material moves with the song: the same set a tempo change re-places (every playlist
+    // of ticks-timebase tracks, their automation, markers, key changes and the selections).
+    let moved: usize = s.tracks.iter().filter(|t| t.ticks_timebase).flat_map(|t| &t.playlists).map(|pl| pl.clips.len()).sum();
+    crate::retime::move_material(s, &|x| x.saturating_add(delta).max(0)).map_err(|m| bad(id, m))?;
     s.edit.values.insert("song.start".into(), to as f64);
     Ok(json!({"song_start": to, "moved": moved}))
 }
@@ -267,7 +261,7 @@ fn tempo_curve(e: &mut Engine, p: &Value, curve: Curve, id: &str) -> Result<Valu
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
-    crate::edit::retime_to_tempo(s, &old);
+    e.retime_after_tempo(id, &old)?;
     Ok(json!({"events": n, "start_tick": t0, "end_tick": t1}))
 }
 
@@ -293,7 +287,7 @@ fn tempo_stretch(e: &mut Engine, p: &Value) -> Result<Value> {
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
-    crate::edit::retime_to_tempo(s, &old);
+    e.retime_after_tempo(id, &old)?;
     Ok(json!({"factor": factor, "events": events.len()}))
 }
 
@@ -701,9 +695,8 @@ fn beat_detective(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     if set_tempo && let Some(b) = bpm {
         let tick = s.tempo.samples_to_ticks(r.start, sr);
-        let old = s.tempo.clone();
+        // Beat mapping: the tempo is measured from audio at fixed samples, so nothing moves.
         s.tempo.set_tempo(tick, b).map_err(|err| bad(id, err.to_string()))?;
-        crate::edit::retime_to_tempo(s, &old);
     }
     let shown: Vec<Samples> = beats.iter().take(2000).copied().collect();
     Ok(json!({"beats": shown, "count": beats.len(), "bpm": bpm, "separated": separated}))
@@ -724,9 +717,9 @@ fn identify_beat(e: &mut Engine, p: &Value) -> Result<Value> {
     let secs = s.sample_rate.seconds(r.len());
     let bpm = quarters * 60.0 / secs;
     let s = e.session_mut();
-    let old = s.tempo.clone();
+    // Beat mapping: the tempo is fitted to audio at fixed samples, so nothing moves (as Logic's
+    // beat mapping keeps regions and markers where they are).
     s.tempo.set_tempo(t0, bpm).map_err(|err| bad(id, err.to_string()))?;
-    crate::edit::retime_to_tempo(s, &old);
     Ok(json!({"bpm": bpm, "tick": t0}))
 }
 

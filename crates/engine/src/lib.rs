@@ -16,6 +16,7 @@ pub mod file_access;
 pub mod import;
 pub mod inspect;
 pub mod io;
+pub mod retime;
 pub mod score;
 
 use serde_json::{Value, json};
@@ -105,6 +106,15 @@ impl Clipboard {
     }
 }
 
+/// A tempo change being dragged (see `execute_merged`): the document the gesture started from,
+/// the document its last step left, and the journal length after that step.
+struct TempoGesture {
+    key: String,
+    source: Arc<Session>,
+    result: Arc<Session>,
+    journal_len: usize,
+}
+
 #[derive(Debug, Clone)]
 struct HistoryEntry {
     label: String,
@@ -137,6 +147,12 @@ pub struct Engine {
     merge_key: Option<String>,
     /// The key every merged gesture takes while held (see `hold_merge`).
     merge_hold: Option<String>,
+    /// The tempo gesture in progress, so each step retimes from the gesture's start.
+    tempo_gesture: Option<TempoGesture>,
+    /// While a gesture step runs: the document its retime converts from.
+    retime_base: Option<Arc<Session>>,
+    /// Set by a command that retimed material for a tempo change.
+    retimed: bool,
     /// Messages for the UI status line / agents.
     pub messages: Vec<String>,
     /// The edit selection (range, tracks) before the last change, for Restore Last Selection.
@@ -173,6 +189,9 @@ impl Engine {
             dirty_at: Cell::new((0, false)),
             merge_key: None,
             merge_hold: None,
+            tempo_gesture: None,
+            retime_base: None,
+            retimed: false,
             messages: Vec::new(),
             last_selection: None,
             imports: import::Imports::default(),
@@ -379,6 +398,7 @@ impl Engine {
         if !Arc::ptr_eq(&before, &self.doc) {
             // Only a change to the document ends a gesture, so Stop doesn't split the pass it ends.
             self.merge_key = None;
+            self.tempo_gesture = None;
         }
         match result {
             Ok(v) => {
@@ -426,9 +446,35 @@ impl Engine {
         if continuing {
             self.history_limit = limit.saturating_add(1);
         }
+        // A tempo step converts from the gesture's start while nothing else has moved the material
+        // since the last step, so dragging never trims audio for good and rounding never compounds.
+        let gesture = self
+            .tempo_gesture
+            .take()
+            .filter(|g| continuing && g.key == key && (Arc::ptr_eq(&g.result, &self.doc) || retime::same_material(&g.result, &self.doc)));
+        let before = Arc::clone(&self.doc);
+        self.retime_base = gesture.as_ref().map(|g| Arc::clone(&g.source));
+        self.retimed = false;
         let r = self.execute(id, params);
+        self.retime_base = None;
         self.history_limit = limit;
-        let r = r?;
+        let Ok(r) = r else {
+            self.tempo_gesture = gesture;
+            return r;
+        };
+        if std::mem::take(&mut self.retimed) {
+            let journal_len = self.journal.len();
+            // The journal keeps one step per gesture, which replays from the gesture's start.
+            if let Some(g) = &gesture
+                && journal_len == g.journal_len + 1
+                && g.journal_len > 0
+                && self.journal.get(g.journal_len - 1).is_some_and(|j| j.0 == id)
+            {
+                self.journal.remove(g.journal_len - 1);
+            }
+            let source = gesture.map_or(before, |g| g.source);
+            self.tempo_gesture = Some(TempoGesture { key: key.clone(), source, result: Arc::clone(&self.doc), journal_len: self.journal.len() });
+        }
         // Whether a step was pushed comes from the push counter, which still moves at the cap
         // where the stack length stays put.
         if continuing && self.undo_pushes == pushes + 1 && before_len > 0 {
@@ -454,6 +500,23 @@ impl Engine {
     /// End a gesture started with `execute_merged`.
     pub fn end_merge(&mut self) {
         self.merge_key = None;
+        self.tempo_gesture = None;
+    }
+
+    /// For commands that changed the tempo map from `old`: keep musical material on its bars
+    /// (see [`retime`]). Within a merged gesture it converts from the gesture's start.
+    pub(crate) fn retime_after_tempo(&mut self, id: &str, old: &soundcraft_time::TempoMap) -> Result<()> {
+        self.retimed = true;
+        let base = self.retime_base.clone();
+        let s = self.session_mut();
+        let r = match &base {
+            Some(b) => {
+                retime::restore_material(s, b);
+                retime::retime_to_tempo(s, &b.tempo)
+            }
+            None => retime::retime_to_tempo(s, old),
+        };
+        r.map_err(|m| EngineError::BadParams(id.to_string(), m))
     }
 
     /// Convenience: execute with `{}` params.

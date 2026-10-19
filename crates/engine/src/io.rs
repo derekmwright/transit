@@ -418,7 +418,7 @@ pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: b
             let _ = s.tempo.set_meter(*tick, u32::from(*n), u32::from(*d));
         }
         // The file's tempo map replaces the session's: material already on ticks tracks keeps its bars.
-        crate::edit::retime_to_tempo(s, &old);
+        crate::retime::retime_to_tempo(s, &old).map_err(|m| EngineError::Io(format!("MIDI file tempo map: {m}")))?;
     }
     let base_tick = s.tempo.samples_to_ticks(at, s.sample_rate);
     let mut out = Vec::new();

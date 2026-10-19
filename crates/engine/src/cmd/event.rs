@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let tick = s.tempo.samples_to_ticks(at, s.sample_rate);
             let old = s.tempo.clone();
             let removed = s.tempo.remove_tempo(tick);
-            crate::edit::retime_to_tempo(s, &old);
+            e.retime_after_tempo("event.tempo_remove", &old)?;
             Ok(json!({"removed": removed}))
         }),
         cmd!("event.meter", "Change Meter...", ["Event", "Time Operations"], None, "{numerator, denominator, at?: position}", always, meter),
@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let s = e.session_mut();
             let old = s.tempo.clone();
             s.tempo.scale_tempos(f).map_err(|err| bad("event.tempo_scale", err.to_string()))?;
-            crate::edit::retime_to_tempo(s, &old);
+            e.retime_after_tempo("event.tempo_scale", &old)?;
             Ok(json!({}))
         }),
         cmd!("event.tempo_constant", "Constant...", ["Event", "Tempo Operations"], None, "{bpm, start?, end?}", always, tempo_constant),
@@ -114,7 +114,7 @@ fn tempo(e: &mut Engine, p: &Value) -> Result<Value> {
     let tick = s.tempo.samples_to_ticks(at, s.sample_rate);
     let old = s.tempo.clone();
     s.tempo.set_tempo(tick, bpm).map_err(|err| bad("event.tempo", err.to_string()))?;
-    crate::edit::retime_to_tempo(s, &old);
+    e.retime_after_tempo("event.tempo", &old)?;
     Ok(json!({"tick": tick, "bpm": bpm}))
 }
 
@@ -140,7 +140,7 @@ fn tempo_constant(e: &mut Engine, p: &Value) -> Result<Value> {
     if !had_end {
         s.tempo.set_tempo(t1, after).map_err(|err| bad(id, err.to_string()))?;
     }
-    crate::edit::retime_to_tempo(s, &old);
+    e.retime_after_tempo(id, &old)?;
     Ok(json!({"tick": t0, "end_tick": t1, "bpm": bpm}))
 }
 

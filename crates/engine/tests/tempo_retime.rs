@@ -176,7 +176,6 @@ fn tempo_curves_and_stretch_keep_midi_clips_on_their_bars() {
         ("event.tempo_parabolic", json!({"start": bar(2), "end": bar(4), "end_bpm": 80})),
         ("event.tempo_s_curve", json!({"start": bar(2), "end": bar(4), "end_bpm": 80})),
         ("event.tempo_stretch", json!({"start": bar(2), "end": bar(4), "factor": 1.5})),
-        ("event.identify_beat", json!({"start": bar(2), "end": bar(2) + 100_000, "bars": 1})),
     ] {
         let (mut e, _, c) = midi_at_bar_5();
         run(&mut e, id, p);
@@ -383,4 +382,225 @@ fn every_playlist_on_a_ticks_track_follows_and_midi_fades_keep_their_length_in_b
     on_bar(s, tr.playlists[1].clips[0].start, 6);
     let k = clip(&e, c);
     assert_eq!((k.fade_in.len, k.fade_out.len), (BAR / 2, BAR), "a beat and two beats at 60 BPM");
+}
+
+/// The playlist rule on every track: sorted, every clip at least a sample long, no overlaps
+/// (these fixtures have no crossfades).
+fn assert_playlists_valid(s: &Session) {
+    for t in &s.tracks {
+        for pl in &t.playlists {
+            for c in &pl.clips {
+                assert!(c.length >= 1, "{} is empty", c.name);
+            }
+            for w in pl.clips.windows(2) {
+                assert!(w[0].start <= w[1].start, "unsorted: {:?} {:?}", w[0].range(), w[1].range());
+                assert!(w[0].end() <= w[1].start, "{:?} overlaps {:?}", w[0].range(), w[1].range());
+            }
+        }
+    }
+}
+
+fn drag(e: &mut Engine, bpms: impl IntoIterator<Item = f64>) {
+    for bpm in bpms {
+        e.execute_merged("event.tempo", &json!({"bpm": bpm, "at": 0}), "tempo_drag").unwrap();
+    }
+    e.end_merge();
+}
+
+/// Audio A spanning bars 2 and 3, B right after it at bar 4, on a ticks-timebase track.
+fn adjacent_audio() -> (Engine, [ClipId; 2]) {
+    let mut e = Engine::default();
+    let (_, ids) = audio_track(&mut e, true, &[(bar(2), 2 * BAR), (bar(4), BAR)]);
+    (e, [ids[0], ids[1]])
+}
+
+#[test]
+fn a_dragged_tempo_change_that_returns_leaves_audio_exactly_as_it_was() {
+    let (mut e, ids) = adjacent_audio();
+    let before = positions(e.session());
+    drag(&mut e, [240.0, 120.0]);
+    assert_eq!(clip(&e, ids[0]).length, 2 * BAR, "the drag must not trim A for good");
+    assert_eq!(positions(e.session()), before);
+}
+
+#[test]
+fn four_hundred_drag_steps_leave_material_exact_in_one_undo_step_and_one_journal_line() {
+    let (mut e, _) = adjacent_audio();
+    let t = new_track(&mut e, "midi");
+    let c = midi_clip(&mut e, t, bar(5) + 13, BAR + 7);
+    run(&mut e, "automation.set_point", json!({"track": t.0, "param": "volume", "at": bar(6) + 11, "value": -3.0}));
+    let start = e.session().clone();
+    let before = positions(&start);
+    let journal = e.journal.len();
+    let steps: Vec<f64> = (0..400).map(|i| 120.0 + 180.0 * (std::f64::consts::PI * i as f64 / 399.0).sin() + (i % 7) as f64 * 0.37).collect();
+    drag(&mut e, steps.iter().copied().chain([120.0]));
+    assert_eq!(positions(e.session()), before);
+    assert_playlists_valid(e.session());
+    run(&mut e, "edit.undo", json!({}));
+    assert_eq!(positions(e.session()), before);
+    run(&mut e, "edit.redo", json!({}));
+
+    // A second gesture ends somewhere else; the material follows the bars of its last step.
+    drag(&mut e, steps.iter().copied().chain([97.0]));
+    let s = e.session();
+    assert!((bb(s, clip(&e, c).start).bar, bb(s, clip(&e, c).start).beat) == (5, 1));
+    assert_playlists_valid(s);
+    run(&mut e, "edit.undo", json!({}));
+    run(&mut e, "edit.undo", json!({}));
+    assert_eq!(positions(e.session()), before, "each gesture is one undo step");
+    run(&mut e, "edit.redo", json!({}));
+    run(&mut e, "edit.redo", json!({}));
+
+    // The journal keeps one line per gesture, and replaying it gives the same document.
+    let tempo_lines = e.journal[journal..].iter().filter(|j| j.0 == "event.tempo").count();
+    assert_eq!(tempo_lines, 2, "{:?}", &e.journal[journal..]);
+    let mut replayed = Engine::new(start);
+    for (id, p) in &e.journal[journal..] {
+        replayed.execute(id, p).unwrap();
+    }
+    assert_eq!(positions(replayed.session()), positions(e.session()));
+    assert_eq!(replayed.session().tempo, e.session().tempo);
+}
+
+#[test]
+fn a_tempo_that_would_squeeze_a_clip_to_nothing_is_refused() {
+    let mut e = Engine::default();
+    run(&mut e, "event.tempo", json!({"bpm": 20, "at": 0}));
+    let t = new_track(&mut e, "audio");
+    run(&mut e, "track.timebase", json!({"tracks": [t.0], "ticks": true}));
+    let s = e.session_mut();
+    s.sources.push(source(7));
+    // The later clip has the lower id, so a (start, id) sort would put it first on a tie.
+    let (late, early) = (s.new_clip_id(), s.new_clip_id());
+    s.track_mut(t).and_then(|t| t.playlist_mut()).unwrap().clips =
+        vec![Clip::audio(early, "early", SourceId(7), 0, 100_000, 10), Clip::audio(late, "late", SourceId(7), 0, 100_010, 50_000)];
+    let before = positions(e.session());
+    let err = e.execute("event.tempo", &json!({"bpm": 999, "at": 0})).unwrap_err().to_string();
+    assert!(err.contains("early"), "{err}");
+    assert_eq!(positions(e.session()), before, "a refused change leaves everything in place");
+    assert_eq!(e.session().tempo.tempo_at_tick(0), 20.0);
+    assert_playlists_valid(e.session());
+}
+
+#[test]
+fn the_playlist_rule_holds_at_20_and_999_bpm() {
+    let mut e = Engine::default();
+    // Clips of many sizes, back to back and with gaps, on ticks audio and MIDI tracks.
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for i in 0..40 {
+        let len = BAR / 2 + (i % 5) * 9_973;
+        spans.push((at, len));
+        at += len + if i % 3 == 0 { 0 } else { 517 * (i % 4) };
+    }
+    audio_track(&mut e, true, &spans);
+    let m = new_track(&mut e, "midi");
+    for (start, len) in &spans {
+        midi_clip(&mut e, m, *start, *len);
+    }
+    assert_playlists_valid(e.session());
+    for bpm in [20.0, 999.0, 61.0, 999.0, 20.0, 120.0] {
+        run(&mut e, "event.tempo", json!({"bpm": bpm, "at": 0}));
+        assert_playlists_valid(e.session());
+    }
+}
+
+#[test]
+fn a_time_locked_clip_keeps_its_samples_and_neighbors_trim_against_it() {
+    let mut e = Engine::default();
+    // Moving clip M at bar 3 runs onto locked L when the tempo slows.
+    let (_, ids) = audio_track(&mut e, true, &[(bar(3), 150_000), (bar(5), BAR)]);
+    e.session_mut().find_clip_mut(ids[1]).unwrap().time_locked = true;
+    run(&mut e, "event.tempo", json!({"bpm": 80, "at": 0}));
+    let (m, l) = (clip(&e, ids[0]), clip(&e, ids[1]));
+    on_bar(e.session(), m.start, 3);
+    assert_eq!((l.start, l.length), (bar(5), BAR), "the locked clip stays at its samples");
+    assert_eq!(m.end(), l.start, "M's tail is trimmed at the locked clip");
+    assert_playlists_valid(e.session());
+
+    // A clip that lands on a locked clip's tail loses its head instead.
+    let mut e = Engine::default();
+    let (_, ids) = audio_track(&mut e, true, &[(0, 180_000), (bar(3), 50_000)]);
+    e.session_mut().find_clip_mut(ids[0]).unwrap().time_locked = true;
+    run(&mut e, "event.tempo", json!({"bpm": 160, "at": 0}));
+    let (l, m) = (clip(&e, ids[0]), clip(&e, ids[1]));
+    assert_eq!((l.start, l.length), (0, 180_000));
+    assert_eq!((m.start, m.end()), (180_000, 144_000 + 50_000));
+    assert_eq!(m.source_offset(), 1_000 + 36_000, "the head is trimmed; the audio stays where it plays");
+    assert_playlists_valid(e.session());
+}
+
+#[test]
+fn beat_mapping_moves_nothing() {
+    let (mut e, _, c) = midi_at_bar_5();
+    run(&mut e, "markers.add", json!({"at": 480_000}));
+    run(&mut e, "event.identify_beat", json!({"start": 0, "end": 480_000, "bars": 4}));
+    assert!((e.session().tempo.tempo_at_tick(0) - 96.0).abs() < 1e-9);
+    assert_eq!(e.session().markers[0].start, 480_000);
+    assert_eq!(clip(&e, c).start, bar(5));
+}
+
+#[test]
+fn track_lane_markers_follow_their_own_tracks_timebase() {
+    let (mut e, midi, _) = midi_at_bar_5();
+    let audio = new_track(&mut e, "audio");
+    for t in [midi, audio] {
+        run(&mut e, "markers.add", json!({"at": bar(9)}));
+        e.session_mut().markers.last_mut().unwrap().track = Some(t);
+    }
+    run(&mut e, "event.tempo", json!({"bpm": 60, "at": 0}));
+    let s = e.session();
+    on_bar(s, s.markers[0].start, 9);
+    assert_eq!(s.markers[1].start, bar(9), "a marker on a samples-timebase track stays");
+}
+
+#[test]
+fn moving_the_song_start_moves_all_musical_material() {
+    let (mut e, t, c) = midi_at_bar_5();
+    {
+        let s = e.session_mut();
+        let mut alt = s.track(t).unwrap().playlists[0].clone();
+        alt.name = "alt".into();
+        s.track_mut(t).unwrap().playlists.push(alt);
+    }
+    run(&mut e, "automation.set_point", json!({"track": t.0, "param": "volume", "at": bar(6), "value": -3.0}));
+    run(&mut e, "markers.add", json!({"at": bar(7)}));
+    let a = new_track(&mut e, "audio");
+    run(&mut e, "automation.set_point", json!({"track": a.0, "param": "volume", "at": bar(6), "value": -3.0}));
+    run(&mut e, "event.move_song_start", json!({"to": BAR}));
+    let s = e.session();
+    let tr = s.track(t).unwrap();
+    assert_eq!(clip(&e, c).start, bar(6));
+    assert_eq!(tr.playlists[1].clips[0].start, bar(6), "the alternate playlist moves too");
+    assert_eq!(tr.automation[0].points[0].at, bar(7));
+    assert_eq!(s.markers[0].start, bar(8));
+    assert_eq!(s.track(a).unwrap().automation[0].points[0].at, bar(6), "samples-timebase automation stays");
+}
+
+/// 10,000 clips and 100,000 automation points under 2,001 tempo events: one retime must fit in a
+/// drag step. Run with `cargo test --release -p soundcraft-engine --test tempo_retime -- --ignored`.
+#[test]
+#[ignore]
+fn retiming_a_large_session_is_fast() {
+    let mut s = Session::default();
+    for i in 0..2_000i64 {
+        s.tempo.set_tempo(i * 960, 100.0 + (i % 40) as f64).unwrap();
+    }
+    let t = s.add_track(soundcraft_model::TrackKind::Midi, soundcraft_model::ChannelFormat::Mono, Some("big"));
+    let end = s.tempo.tick_to_samples(2_000 * 960, s.sample_rate);
+    let step = end / 10_000;
+    let clips: Vec<Clip> =
+        (0..10_000).map(|i| Clip::midi(ClipId(1_000_000 + i as u64), "c", i * step, step - 10, soundcraft_midi::Sequence::default())).collect();
+    let tr = s.track_mut(t).unwrap();
+    tr.playlist_mut().unwrap().clips = clips;
+    let lane = tr.lane_mut(&soundcraft_model::AutoParam::Volume);
+    lane.points = (0..100_000).map(|i| soundcraft_model::AutomationPoint { at: i * (end / 100_000), value: 0.0 }).collect();
+    let old = s.tempo.clone();
+    s.tempo.scale_tempos(1.1).unwrap();
+    let t0 = std::time::Instant::now();
+    soundcraft_engine::retime::retime_to_tempo(&mut s, &old).unwrap();
+    let took = t0.elapsed();
+    eprintln!("retime of 10k clips and 100k points under 2,001 tempo events: {took:?}");
+    assert_playlists_valid(&s);
+    assert!(took.as_millis() < 20, "took {took:?}");
 }
