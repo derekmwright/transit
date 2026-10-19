@@ -848,7 +848,7 @@ dependencies = [
 [[package]]
 name = "cpal"
 version = "0.16.0"
-source = "git+https://github.com/derekmwright/cpal?rev=873c2526000b37756949a3a0ef93b84c6d768950#873c2526000b37756949a3a0ef93b84c6d768950"
+source = "git+https://github.com/derekmwright/cpal?rev=31b5dd4d0bcd4b38924cea42e991dbae87f84479#31b5dd4d0bcd4b38924cea42e991dbae87f84479"
 dependencies = [
  "alsa",
  "asio-sys",
