@@ -25,6 +25,7 @@ use super::plan::SlotGen;
 use super::{INSTRUMENT_SLOT, MixEngine, Plugin, PluginSlot, SlotBinding, Strip};
 use soundcraft_dsp::event::{CC_ALL_NOTES_OFF, CC_ALL_SOUND_OFF, CC_RESET_CONTROLLERS, CC_SOSTENUTO, CC_SUSTAIN, is_pedal};
 pub use soundcraft_dsp::event::{Message, NoteId, PluginEvent};
+use soundcraft_model::Session;
 
 /// A position on the engine's render clock (annex R): the frame count rendered since the engine
 /// started, monotonic through same-rate plans and seeks.
@@ -149,7 +150,8 @@ pub enum EventOutcome {
     StaleBinding,
     /// `transport` is `Some` and not current.
     StaleTransport,
-    /// No strip, no instrument, a failed instance, or a slot that is not the instrument.
+    /// No adopted plan, no strip, no instrument, a failed instance, an inactive track, or a slot
+    /// that is not the instrument.
     NoInstrument,
     /// A non-release due beyond the horizon: playback retains it and submits it later.
     TooEarly,
@@ -243,6 +245,10 @@ pub struct EventStatus {
     pub revoked: u64,
     /// Queued events that retired with their instance: [non-release, release].
     pub retired_with_instance: [u64; 2],
+    /// Queued events of an instrument that failed or whose track is inactive: [non-release,
+    /// release]. Its notes and pedals were released at the plug-in instead (see
+    /// [`MixEngine::has_pending_events`]).
+    pub voided: [u64; 2],
     /// The instrument of the last refusal or shed.
     pub affected: Option<SlotBinding>,
 }
@@ -284,6 +290,9 @@ impl EventStatus {
         add(&mut self.cancelled_transport, o.cancelled_transport);
         add(&mut self.revoked, o.revoked);
         for (a, b) in self.retired_with_instance.iter_mut().zip(o.retired_with_instance) {
+            add(a, b);
+        }
+        for (a, b) in self.voided.iter_mut().zip(o.voided) {
             add(a, b);
         }
         if o.affected.is_some() {
@@ -933,6 +942,19 @@ impl InstrumentEvents {
         self.writers = [[None; 2]; 16];
     }
 
+    /// The instrument failed, or its track is inactive: it will not process this queue. Its
+    /// queued events are dropped (counted `voided`) and its notes and pedals are released at the
+    /// plug-in at once, so nothing stays pending.
+    pub(crate) fn void(&mut self, plugin: &mut dyn Plugin) {
+        if !self.busy() {
+            return;
+        }
+        let [n, r] = self.queued_counts();
+        self.status.voided[0] = self.status.voided[0].saturating_add(n);
+        self.status.voided[1] = self.status.voided[1].saturating_add(r);
+        self.release_all(plugin);
+    }
+
     /// The sounding notes: source, key, voice id.
     #[cfg(test)]
     pub(crate) fn sounding(&self) -> impl Iterator<Item = (Source, u8, i32)> + '_ {
@@ -1079,21 +1101,29 @@ impl EngineEvents {
 
 /// The instrument slot an event names, when it is a live, event-taking instrument.
 fn instrument_of<'a>(
+    session: &Session,
     strips: &'a mut [Strip],
     tracks: &[(soundcraft_model::TrackId, u16)],
     target: &SlotBinding,
 ) -> Result<&'a mut PluginSlot, EventOutcome> {
     let (track, slot, generation) = *target;
     let i = tracks.binary_search_by_key(&track, |(t, _)| *t).ok().and_then(|i| tracks.get(i)).map(|(_, s)| usize::from(*s));
-    let inst = i.and_then(|i| strips.get_mut(i)).and_then(|st| st.instrument.as_mut()).filter(|_| slot == INSTRUMENT_SLOT);
+    let strip = i.and_then(|i| strips.get_mut(i));
+    let inactive = strip.as_deref().is_some_and(|st| !plays(session, st));
+    let inst = strip.and_then(|st| st.instrument.as_mut()).filter(|_| slot == INSTRUMENT_SLOT);
     let Some(inst) = inst else { return Err(EventOutcome::NoInstrument) };
     if generation == SlotGen::VACANT || inst.generation != generation {
         return Err(EventOutcome::StaleBinding);
     }
-    if inst.failed || inst.events.is_none() {
+    if inst.failed || inst.events.is_none() || inactive {
         return Err(EventOutcome::NoInstrument);
     }
     Ok(inst)
+}
+
+/// The strip's track is rendered (it is not inactive): its instrument processes its queue.
+fn plays(session: &Session, strip: &Strip) -> bool {
+    session.tracks.get(usize::from(strip.track)).is_some_and(|t| !t.inactive)
 }
 
 impl MixEngine {
@@ -1101,6 +1131,11 @@ impl MixEngine {
     /// `epoch` ([`MixEngine::queue_event`]). Playback creates the epoch before construction and
     /// gives every engine (device or rate) incarnation a new one. Engines made any other way
     /// refuse every event with [`EventOutcome::StaleEngine`].
+    ///
+    /// Events reach instruments only through the plan path: adopt a plan and render with
+    /// [`MixEngine::render_active`], which delivers them and advances [`MixEngine::next_frame`].
+    /// The legacy [`MixEngine::render`] does neither; before the first adoption every event is
+    /// refused ([`EventOutcome::NoInstrument`]).
     #[must_use]
     pub fn realtime_with_events(target: super::RenderTarget, epoch: EngineEpoch, limits: EventLimits) -> Self {
         let mut eng = MixEngine::realtime(target);
@@ -1162,11 +1197,12 @@ impl MixEngine {
         if self.events.revoked.get(port).copied().flatten().is_some_and(|r| ev.source.generation <= r) {
             return (EventOutcome::RevokedSource, None);
         }
-        let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::StaleEngine, None) };
+        // No adopted plan (or a legacy `render` engine): there is no instrument to take it.
+        let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::NoInstrument, None) };
         if plan.faulted {
             return (EventOutcome::Faulted, None);
         }
-        let inst = match instrument_of(&mut plan.tables.strips, &plan.tables.tracks, &ev.target) {
+        let inst = match instrument_of(&plan.session, &mut plan.tables.strips, &plan.tables.tracks, &ev.target) {
             Ok(i) => i,
             Err(o) => return (o, None),
         };
@@ -1300,6 +1336,21 @@ impl MixEngine {
     /// Every instrument's event state in the active plan.
     fn instrument_events(&mut self) -> impl Iterator<Item = &mut InstrumentEvents> {
         self.plan.iter_mut().flat_map(|p| p.tables.strips.iter_mut()).filter_map(|st| st.instrument.as_mut()).filter_map(|i| i.events.as_deref_mut())
+    }
+
+    /// After an adoption: an instrument whose track is now inactive will not process its queue,
+    /// so the queue is voided (counted) and what it holds is released at the plug-in.
+    pub(crate) fn void_silent_instruments(plan: &mut super::plan::ActivePlan) {
+        let session: &Session = &plan.session;
+        for st in plan.tables.strips.iter_mut() {
+            let playing = plays(session, st);
+            if let Some(inst) = st.instrument.as_mut()
+                && let Some(e) = inst.events.as_deref_mut()
+                && (!playing || inst.failed)
+            {
+                e.void(&mut *inst.plugin);
+            }
+        }
     }
 
     /// After an adoption: the displaced instruments' queues retire with them (counted) and their

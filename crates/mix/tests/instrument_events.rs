@@ -10,6 +10,7 @@ use soundcraft_mix::{
     Shed, SlotBinding, SlotGen, Source, TransportEpoch,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SR: u32 = 48_000;
@@ -30,6 +31,8 @@ struct Recorder {
     instance: usize,
     pending: Vec<(u32, Option<PluginEvent>)>,
     rendered: u64,
+    /// While set, the instrument renders NaN (the mix takes it out as failed).
+    fail: Arc<AtomicBool>,
 }
 
 impl Plugin for Recorder {
@@ -58,8 +61,9 @@ impl Plugin for Recorder {
             heard.push((self.instance, self.rendered + u64::from(o), e));
         }
         self.rendered += frames as u64;
+        let y = if self.fail.load(Ordering::Relaxed) { f32::NAN } else { 0.0 };
         for c in io.iter_mut() {
-            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+            c.iter_mut().take(frames).for_each(|x| *x = y);
         }
     }
     fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
@@ -82,6 +86,7 @@ struct Rig {
     epoch: EngineEpoch,
     track: TrackId,
     session: Session,
+    fail: Arc<AtomicBool>,
 }
 
 fn instrument_session(id: &str) -> (Session, TrackId) {
@@ -109,6 +114,7 @@ impl Rig {
             epoch,
             track,
             session,
+            fail: Arc::default(),
         };
         let s = rig.session.clone();
         rig.publish(&s);
@@ -120,13 +126,20 @@ impl Rig {
 
     fn publish(&mut self, s: &Session) {
         self.generation = self.generation.checked_next().unwrap();
-        let (heard, made) = (Arc::clone(&self.heard), Arc::clone(&self.made));
+        let (heard, made, fail) = (Arc::clone(&self.heard), Arc::clone(&self.made), Arc::clone(&self.fail));
         let mut make = move |spec: &InstanceSpec, _: SlotGen| -> Option<NewInstance> {
             let mut inner = soundcraft_dsp::create("gain")?;
             inner.prepare(SR as f32, BLOCK, spec.ch);
             let mut n = made.lock().unwrap();
             *n += 1;
-            let plugin = Box::new(Recorder { inner, heard: Arc::clone(&heard), instance: *n, pending: Vec::with_capacity(4096), rendered: 0 });
+            let plugin = Box::new(Recorder {
+                inner,
+                heard: Arc::clone(&heard),
+                instance: *n,
+                pending: Vec::with_capacity(4096),
+                rendered: 0,
+                fail: Arc::clone(&fail),
+            });
             Some(NewInstance { plugin, refused_state: false })
         };
         let mut env = self.comp.compile(Arc::new(s.clone()), self.comp.active(), self.generation, &mut make).unwrap();
@@ -759,5 +772,59 @@ fn revoking_the_last_generation_refuses_it() {
     rig.mix.revoke_source(3, 5);
     assert_eq!(rig.send(Source { port: 3, generation: 5, ..last }, now, on(60)), EventOutcome::RevokedSource);
     assert_eq!(rig.send(Source { port: 3, generation: 6, ..last }, now, on(60)), EventOutcome::Queued);
+}
+
+/// Review F10-4b: an events engine with no adopted plan has no instrument to take an event.
+#[test]
+fn an_events_engine_without_a_plan_refuses_events() {
+    let rig = Rig::new();
+    let ev = rig.event(port(1, 0), Due::Next, on(60));
+    let mut eng = MixEngine::realtime_with_events(target(), rig.epoch, EventLimits::default());
+    assert_eq!(eng.queue_event(&ev), EventOutcome::NoInstrument);
+    assert!(!eng.has_pending_events());
+}
+
+/// Review F10-4c: an instrument that fails keeps nothing pending; its queue is voided (counted)
+/// and its sounding note and pedal released.
+#[test]
+fn a_failed_instrument_keeps_nothing_pending() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    let now = rig.mix.next_frame().0;
+    rig.send(src, now, on(60));
+    rig.send(src, now, cc(64, 127));
+    rig.send(src, now + 3000, on(62));
+    rig.send(src, now + 4000, off(62));
+    rig.render(1);
+    rig.fail.store(true, Ordering::Relaxed);
+    rig.render(1);
+    assert!(!rig.mix.has_pending_events(), "the failed instrument's queue is void");
+    assert_eq!(rig.mix.event_status().voided, [1, 1], "the future on and its off");
+    assert_eq!(rig.send(src, rig.mix.next_frame().0, on(64)), EventOutcome::NoInstrument);
+    rig.fail.store(false, Ordering::Relaxed);
+    rig.mix.reset();
+    rig.render(1);
+    let heard = rig.heard_by(1);
+    assert_eq!(every_on_has_its_off(&heard), 1);
+    assert_eq!(pedal_values(&heard, 64).last().map(|x| x.1), Some(0));
+}
+
+/// Review F10-4c: an instrument whose track becomes inactive keeps nothing pending either, and
+/// takes no new events.
+#[test]
+fn an_inactive_instrument_keeps_nothing_pending() {
+    let mut rig = Rig::new();
+    let src = port(1, 0);
+    let now = rig.mix.next_frame().0;
+    rig.send(src, now, on(60));
+    rig.send(src, now + 3000, on(62));
+    rig.render(1);
+    let mut s = rig.session.clone();
+    s.track_mut(rig.track).unwrap().inactive = true;
+    rig.publish(&s);
+    assert!(!rig.mix.has_pending_events());
+    assert_eq!(rig.mix.event_status().voided, [1, 0]);
+    assert_eq!(rig.send(src, rig.mix.next_frame().0, on(64)), EventOutcome::NoInstrument);
+    rig.render(1);
 }
 

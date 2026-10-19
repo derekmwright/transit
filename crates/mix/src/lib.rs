@@ -1925,6 +1925,10 @@ fn process_strip<B: Busses + ?Sized>(
                 }
                 if contain_failure(inst, &mut strip.buf, frames) {
                     strip.failures.record(INSTRUMENT_SLOT);
+                    // Out until the next reset: its queue is voided and what it held released (F10).
+                    if let Some(e) = inst.events.as_deref_mut() {
+                        e.void(&mut *inst.plugin);
+                    }
                 }
             }
         }

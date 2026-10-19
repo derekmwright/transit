@@ -271,6 +271,8 @@ impl MixEngine {
         }
         std::mem::swap(&mut active.session, &mut plan.session);
         fault_point(4);
+        // An instrument on a track that became inactive keeps no pending events (F10).
+        MixEngine::void_silent_instruments(active);
         // Last: the native Sampler takes its new sample. The old (audio, wrapper) pair is already
         // in the envelope, so the wrapper the Sampler drops here is never the last owner.
         for a in plan.attach.iter() {
