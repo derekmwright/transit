@@ -6,7 +6,7 @@ use std::sync::mpsc;
 
 fn fixture() -> (Observer, Pump, SnapshotReader, SnapshotReader) {
     let (observer, reader) = raw_fixture();
-    let (pump, ui, audio) = prepare(reader);
+    let (pump, ui, audio, _) = prepare(reader);
     (observer, pump, ui, audio)
 }
 
@@ -30,6 +30,75 @@ fn offer(observer: &mut Observer) -> u64 {
         },
     ));
     host
+}
+
+#[test]
+fn input_placement_is_latched_independently_of_ui_and_disk_progress() {
+    let key = ClockKey { generation: 71, domain: 90, direction: Direction::Input };
+    let (mut observer, observations) = observation_lane(key, 48_000);
+    let reader = ClockReader { inner: Box::new(Reader { observations, fitter: ClockFitter::new(key), origin: HostOrigin::default() }) };
+    let (mut pump, ui, _, mut placements) = prepare(reader);
+    let ui = Mutex::new(ui);
+    let _held_ui = ui.lock().unwrap();
+    let mut now = 0;
+    for _ in 0..32 {
+        now = offer(&mut observer);
+        assert!(pump.step(|| Some(now)));
+    }
+    let (mut control, mut publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    let start = control.prepare().unwrap();
+    let (placement, input) = mapping::pair(start.clone(), key);
+    let input = input.with_lifetime(Arc::clone(&pump.state.finished));
+    placements.push(placement).ok().unwrap();
+    pump.step(|| Some(now));
+    assert_eq!(input.frame(), Ok(None));
+    let point = start::Point {
+        host_ns: 1_100_000_000,
+        output_frame: 22,
+        position: crate::timeline_map::Position { sample: 100, fraction: 0, denominator: 1 },
+    };
+    assert!(publisher.start(start.ticket(), point));
+    control.cancel(); // Stop before the mapping acknowledgment must preserve it.
+    pump.step(|| Some(now)); // No new input callback is needed.
+    assert_eq!(input.frame(), Ok(Some(4800)));
+    pump.step(|| Some(now + 10_000_000_000)); // All current clock maps have expired.
+    drop(pump);
+    assert_eq!(input.frame(), Ok(Some(4800)), "a disk stall cannot erase the latched input origin");
+}
+
+#[test]
+fn clock_worker_shutdown_rejects_both_queued_and_active_record_placements() {
+    for queued in [false, true] {
+        let (_, reader) = raw_fixture();
+        let key = reader.key();
+        let (mut pump, _, _, mut placements) = prepare(reader);
+        let (mut control, _) = start::pair(soundcraft_mix::EngineEpoch(1));
+        let (placement, input) = mapping::pair(control.prepare().unwrap(), key);
+        placements.push(placement).ok().unwrap();
+        if !queued {
+            pump.step(|| Some(0));
+        }
+        assert_eq!(input.frame(), Ok(None));
+        drop(pump);
+        assert!(input.frame().is_err(), "teardown must not strand a finalizing writer");
+    }
+}
+
+#[test]
+fn a_submission_racing_past_the_final_worker_drain_cannot_strand_its_reader() {
+    let (_, reader) = raw_fixture();
+    let key = reader.key();
+    let (pump, _, _, mut placements) = prepare(reader);
+    let finished = Arc::clone(&pump.state.finished);
+    let (mut control, _) = start::pair(soundcraft_mix::EngineEpoch(1));
+    let (placement, input) = mapping::pair(control.prepare().unwrap(), key);
+    let input = input.with_lifetime(finished);
+    drop(pump);
+    // Model Main being preempted after its preflight, then publishing after
+    // the consumer's last drain. rtrb keeps this unread owner until Main drops.
+    placements.push(placement).ok().unwrap();
+    assert!(input.frame().is_err());
+    assert!(!placements.is_full());
 }
 
 #[test]
@@ -168,7 +237,15 @@ fn dropping_service_does_not_join_a_worker_paused_by_the_scheduler() {
         held.recv().unwrap();
         drop(pump);
     });
-    let service = ClockService { ui: Mutex::new(ui), audio: Some(audio), state: Arc::clone(&state), worker };
+    let (placements, _) = rtrb::RingBuffer::new(8);
+    let service = ClockService {
+        ui: Mutex::new(ui),
+        audio: Some(audio),
+        state: Arc::clone(&state),
+        worker,
+        placements,
+        key: ClockKey { generation: 7, domain: 9, direction: Direction::Output },
+    };
     let (done, returned) = mpsc::sync_channel(1);
     let owner = std::thread::spawn(move || {
         drop(service);

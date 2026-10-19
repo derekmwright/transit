@@ -5,6 +5,8 @@
 //! streams the ring into one WAV file per take, rewriting the header every second so a crash leaves
 //! a playable file.
 
+pub mod start;
+
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -91,6 +93,7 @@ struct Shared {
     /// Generation in the high bits; admission and in-flight producer in the low bits.
     capture_state: AtomicU64,
     ring: CaptureRing,
+    first_frame: AtomicU64,
     /// Producer-owned while admitted; reset only when quiescent, drained by the writer at stop.
     pending_silence: AtomicUsize,
     /// Samples lost while the ring was full.
@@ -106,7 +109,16 @@ struct Shared {
 impl Shared {
     fn new(ring: CaptureRing) -> Shared {
         let (beats, fault, failed) = (AtomicU64::new(0), AtomicU8::new(0), Mutex::new(None));
-        Shared { capture_state: AtomicU64::new(0), ring, pending_silence: AtomicUsize::new(0), dropped: AtomicUsize::new(0), beats, fault, failed }
+        Shared {
+            capture_state: AtomicU64::new(0),
+            ring,
+            first_frame: AtomicU64::new(u64::MAX),
+            pending_silence: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            beats,
+            fault,
+            failed,
+        }
     }
 
     /// Control thread, after the preceding writer has joined (or failed startup quiesced).
@@ -172,6 +184,11 @@ impl Shared {
 
     /// The input callback's work under a CaptureLease. Samples that don't fit are owed and queued
     /// as silence before the next block, so the take keeps its timing.
+    fn capture_at(&self, first_frame: u64, data: &[f32]) {
+        let _ = self.first_frame.compare_exchange(u64::MAX, first_frame, Ordering::Release, Ordering::Relaxed);
+        self.capture(data);
+    }
+
     fn capture(&self, data: &[f32]) {
         let owed = self.pending_silence.load(Ordering::Relaxed);
         let owed = owed - self.ring.push(owed, |_| 0.0);
@@ -197,6 +214,7 @@ pub struct Recorder {
     #[cfg(not(target_os = "freebsd"))]
     _stream: Option<cpal::Stream>,
     clock: Option<crate::device_clock::MaintainedClock>,
+    record_start: Option<start::Reader>,
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
@@ -232,18 +250,21 @@ where
         config,
         move |data: &[T], info: &cpal::InputCallbackInfo| {
             crate::mark_audio_thread();
+            let first_frame = clock.cpal.next_frame();
             clock.cpal.input(data.len() / channels, info, clock.origin.now_ns());
             sh.guarded(|| {
                 // One admission covers the entire device callback, including scratch chunks.
                 let capture = sh.begin_capture();
-                for part in data.chunks(chunk) {
+                for (index, part) in data.chunks(chunk).enumerate() {
                     let Some(s) = scratch.get_mut(..part.len()) else { return };
                     for (o, x) in s.iter_mut().zip(part) {
                         *o = f32::from_sample(*x);
                     }
                     mon.push(s);
-                    if capture.is_some() {
-                        sh.capture(s);
+                    if capture.is_some()
+                        && let Some(frame) = first_frame.checked_add((index * (chunk / channels)) as u64)
+                    {
+                        sh.capture_at(frame, s);
                     }
                 }
             });
@@ -392,6 +413,7 @@ impl Recorder {
             shared,
             _stream: Some(stream),
             clock,
+            record_start: None,
             device_name: name,
             sample_rate: config.sample_rate.0,
             channels,
@@ -419,6 +441,7 @@ impl Recorder {
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
             clock: None,
+            record_start: None,
             device_name: name.into(),
             sample_rate: 48_000,
             channels: 1,
@@ -430,6 +453,53 @@ impl Recorder {
     /// Create each take's file and start recording into them: a track's take records the given
     /// input channels into a new file.
     pub fn arm(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>) -> Result<(), String> {
+        self.arm_with(takes, None)
+    }
+
+    /// Prepare files and bounded input history. Only the applied audio transaction
+    /// supplies the timestamp at which samples start belonging to the take.
+    pub fn prepare(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>, start: start::Reader) -> Result<(), String> {
+        if self.has_pending_take() {
+            return Err("already recording".into());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let clock = self.clock.as_mut().ok_or("input clock is unavailable for recording")?;
+            let input = clock.report().map.ok_or("input clock is not ready for recording")?.key;
+            if input.direction != crate::device_clock::Direction::Input {
+                return Err("recording requires this input device's clock".into());
+            }
+            let input_start = clock.prepare_recording(start.clone())?;
+            let gate = WriterStart {
+                reader: start,
+                history: start::History::new(self.channels, (self.sample_rate as usize).saturating_mul(RING_SECONDS)),
+                input_start,
+                placed: false,
+                next: None,
+            };
+            self.arm_with(takes, Some(gate))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (takes, start);
+            Err("timestamped audio recording is unavailable on this platform".into())
+        }
+    }
+
+    /// The applied origin survives Stop until the caller has collected the take.
+    pub(crate) fn prepared_start(&self) -> Option<start::Ticket> {
+        self.record_start.as_ref().map(start::Reader::ticket)
+    }
+
+    /// The applied origin survives Stop until the caller has collected the take.
+    pub fn applied_start(&self) -> Option<start::Point> {
+        match self.record_start.as_ref()?.status() {
+            start::Status::Started(point) => Some(point),
+            _ => None,
+        }
+    }
+
+    fn arm_with(&mut self, takes: Vec<(TrackId, Vec<usize>, PathBuf)>, gate: Option<WriterStart>) -> Result<(), String> {
         if self.writer.is_some() {
             return Err("already recording".into());
         }
@@ -439,9 +509,11 @@ impl Recorder {
         let ring = &self.shared.ring;
         ring.tail.store(ring.head.load(Ordering::Acquire), Ordering::Release);
         *self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.shared.first_frame.store(u64::MAX, Ordering::Relaxed);
+        self.record_start = gate.as_ref().map(|gate| gate.reader.clone());
         self.shared.start_capture();
         let (shared, channels) = (Arc::clone(&self.shared), self.channels);
-        match std::thread::Builder::new().name("take writer".into()).spawn(move || write_takes(&shared, takes, channels)) {
+        match std::thread::Builder::new().name("take writer".into()).spawn(move || write_takes_started(&shared, takes, channels, gate)) {
             Ok(w) => self.writer = Some((w, live)),
             Err(e) => {
                 self.shared.stop_capture();
@@ -497,6 +569,9 @@ impl Recorder {
     }
 
     pub fn finish(&mut self) -> Takes {
+        if let Some(start) = &self.record_start {
+            start.cancel();
+        }
         self.shared.stop_capture();
         self.shared.wait_for_capture();
         let (takes, problem) = self.writer.take().map_or_else(Takes::default, |(w, _)| {
@@ -515,14 +590,73 @@ impl Drop for Recorder {
     }
 }
 
-fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> Takes {
+#[cfg(test)]
+fn write_takes(shared: &Shared, takes: Vec<TakeWriter>, channels: usize) -> Takes {
+    write_takes_started(shared, takes, channels, None)
+}
+
+struct WriterStart {
+    reader: start::Reader,
+    history: start::History,
+    input_start: start::mapping::InputStart,
+    placed: bool,
+    next: Option<u64>,
+}
+
+impl WriterStart {
+    fn finished(&self) -> bool {
+        self.placed || self.reader.status() == start::Status::Cancelled || self.input_start.frame().is_err()
+    }
+
+    fn write(&mut self, shared: &Shared, takes: &mut [TakeWriter], block: &[f32], channels: usize) -> Result<(), String> {
+        if !self.placed {
+            match self.reader.status() {
+                start::Status::Pending => {}
+                start::Status::Started(_) => {
+                    if let Some(frame) = self.input_start.frame()? {
+                        self.history.set_start(frame);
+                        self.placed = true;
+                    }
+                }
+                start::Status::Cancelled => {
+                    shared.stop_capture();
+                    return Ok(());
+                }
+            }
+        }
+        let first = *self.next.get_or_insert_with(|| shared.first_frame.load(Ordering::Acquire));
+        if first == u64::MAX {
+            if block.is_empty() {
+                self.next = None;
+                return Ok(());
+            }
+            return Err("recording input arrived without a device position".into());
+        }
+        self.history.push(first, block, |data| takes.iter_mut().for_each(|take| take.write(data, channels)))?;
+        self.next = Some(first.checked_add((block.len() / channels.max(1)) as u64).ok_or("recording input position exhausted")?);
+        Ok(())
+    }
+}
+
+fn write_block(shared: &Shared, gate: &mut Option<WriterStart>, takes: &mut [TakeWriter], block: &[f32], channels: usize) {
+    if let Some(gate) = gate {
+        if let Err(error) = gate.write(shared, takes, block, channels) {
+            shared.stop_capture();
+            takes.iter_mut().for_each(|take| take.fail(&error));
+        }
+    } else {
+        takes.iter_mut().for_each(|take| take.write(block, channels));
+    }
+}
+
+fn write_takes_started(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize, mut gate: Option<WriterStart>) -> Takes {
     let (mut block, mut header_written, mut reported) = (Vec::new(), Instant::now(), false);
     loop {
         let stopping = shared.drain_capture(&mut block);
         // The ring holds interleaved samples and a pop can end mid-frame: write whole frames and
         // keep the remainder for the next pop, so channels never shift.
         let whole = block.len() - block.len() % channels.max(1);
-        takes.iter_mut().for_each(|t| t.write(&block[..whole], channels));
+        write_block(shared, &mut gate, &mut takes, &block[..whole], channels);
         block.drain(..whole);
         if !reported && let Some(e) = takes.iter().find_map(|t| t.error.clone()) {
             *shared.failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
@@ -537,11 +671,19 @@ fn write_takes(shared: &Shared, mut takes: Vec<TakeWriter>, channels: usize) -> 
                 let n = owed.min(chunk);
                 block.resize(block.len() + n, 0.0);
                 let whole = block.len() - block.len() % channels.max(1);
-                takes.iter_mut().for_each(|t| t.write(&block[..whole], channels));
+                write_block(shared, &mut gate, &mut takes, &block[..whole], channels);
                 block.drain(..whole);
                 owed -= n;
             }
-            break;
+            // An applied start may still be in the independent clock worker.
+            // Preserve the final input history until that worker acknowledges;
+            // no further audio callback is required. Worker teardown fails the
+            // pending mapping explicitly instead of leaving this join stranded.
+            if gate.as_ref().is_none_or(WriterStart::finished) || takes.iter().all(|take| take.error.is_some()) {
+                break;
+            }
+            #[cfg(test)]
+            tests::on_placement_wait();
         }
         if header_written.elapsed() >= Duration::from_secs(1) {
             header_written = Instant::now();
@@ -643,6 +785,7 @@ mod tests {
         // Deterministic control-thread scheduling point. Never runs in the input callback;
         // absent from production builds and private to each test's control thread.
         static CAPTURE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+        static PLACEMENT_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     }
 
     pub(super) fn on_capture_wait() {
@@ -652,8 +795,156 @@ mod tests {
         }
     }
 
+    pub(super) fn on_placement_wait() {
+        if let Some(hook) = PLACEMENT_WAIT_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
     fn decode(path: &PathBuf) -> Vec<Vec<f32>> {
         soundcraft_audio_io::decode(&std::fs::read(path).unwrap(), None).unwrap().1.channels
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn recording_map() -> (crate::device_clock::ClockKey, crate::device_clock::ClockMap, u64) {
+        use crate::device_clock::{self, ClockFitter, Direction, Observation, Quality, Stamp};
+        let (_, reader) = device_clock::stream_clock(Direction::Input, 48_000).unwrap();
+        let key = reader.key();
+        drop(reader);
+        let mut fitter = ClockFitter::new(key);
+        for i in 0..=30u64 {
+            let ns = i * 4_000_000;
+            let _ = fitter.observe(Observation {
+                key,
+                first_frame: i * 192,
+                frames: 192,
+                nominal_rate: 48_000,
+                stamp: Stamp {
+                    host_callback_ns: 1_000_000_000 + ns,
+                    backend_callback_ns: ns as i64,
+                    backend_frame_ns: ns as i64,
+                    quality: Quality::BackendEstimate,
+                    offset_uncertainty_ns: None,
+                },
+            });
+        }
+        let map = fitter.map().unwrap();
+        let now = 1_120_000_000;
+        (key, map, now)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn applied_record_boundary_trims_real_wav_channels_across_input_order_and_partitions() {
+        let (key, map, now) = recording_map();
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let data: Vec<f32> = (0..12).flat_map(|frame| [frame as f32 / 20.0, -(frame as f32) / 20.0]).collect();
+        for (case, parts) in [vec![12], vec![4, 4, 4], vec![1, 2, 5, 1, 3]].iter().enumerate() {
+            for published_after in 0..=parts.len() {
+                let path = std::env::temp_dir().join(format!("soundcraft-record-start-{}-{unique}-{case}-{published_after}.wav", std::process::id()));
+                let mut takes = [TakeWriter::create(TrackId(1), vec![1, 0], path.clone(), 48_000).unwrap()];
+                let shared = Shared::new(CaptureRing::new(64));
+                shared.first_frame.store(100, Ordering::Release);
+                let (mut control, mut publisher) = start::pair(soundcraft_mix::EngineEpoch(5));
+                let reader = control.prepare().unwrap();
+                let ticket = reader.ticket();
+                let (mut mapping, input_start) = start::mapping::pair(reader.clone(), key);
+                let mut gate = WriterStart { reader, history: start::History::new(2, 24), input_start, placed: false, next: None };
+                let point = start::Point {
+                    host_ns: map.frame_to_host(key, 104, now).unwrap(),
+                    output_frame: 900,
+                    position: crate::timeline_map::Position { sample: 500, fraction: 0, denominator: 1 },
+                };
+                let mut offset = 0;
+                for (index, &frames) in parts.iter().enumerate() {
+                    if index == published_after {
+                        assert!(publisher.start(ticket, point));
+                        // Supply the deterministic device-clock snapshot at the
+                        // exact placement seam; all WAV/history work stays real.
+                        assert!(mapping.service(Some(map), Some(now)));
+                    }
+                    gate.write(&shared, &mut takes, &data[offset * 2..(offset + frames) * 2], 2).unwrap();
+                    if index < published_after {
+                        assert_eq!(takes[0].frames, 0);
+                    }
+                    offset += frames;
+                }
+                if published_after == parts.len() {
+                    assert!(publisher.start(ticket, point));
+                    assert!(mapping.service(Some(map), Some(now)));
+                }
+                control.cancel(); // Stop retains the applied boundary for final drain.
+                gate.write(&shared, &mut takes, &[], 2).unwrap();
+                takes[0].write_header();
+                assert_eq!(takes[0].frames, 8);
+                assert!(takes[0].error.is_none());
+                drop(takes);
+                let channels = decode(&path);
+                assert_eq!(channels[0], (4..12).map(|frame| -(frame as f32) / 20.0).collect::<Vec<_>>());
+                assert_eq!(channels[1], (4..12).map(|frame| frame as f32 / 20.0).collect::<Vec<_>>());
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stopped_writer_waits_for_clock_ack_without_another_input_callback() {
+        use std::sync::mpsc;
+        let (key, map, now) = recording_map();
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        for success in [false, true] {
+            let path = std::env::temp_dir().join(format!("soundcraft-final-start-{}-{unique}-{success}.wav", std::process::id()));
+            let takes = vec![TakeWriter::create(TrackId(1), vec![0], path.clone(), 48_000).unwrap()];
+            let shared = Arc::new(Shared::new(CaptureRing::new(32)));
+            shared.start_capture();
+            {
+                let _lease = shared.begin_capture().unwrap();
+                shared.capture_at(100, &(0..12).map(|i| i as f32 / 20.0).collect::<Vec<_>>());
+            }
+            shared.stop_capture();
+            assert!(shared.quiescent());
+            let (mut control, mut publisher) = start::pair(soundcraft_mix::EngineEpoch(5));
+            let reader = control.prepare().unwrap();
+            let (mut mapping, input_start) = start::mapping::pair(reader.clone(), key);
+            let gate = WriterStart { reader: reader.clone(), history: start::History::new(1, 24), input_start, placed: false, next: None };
+            let point = start::Point {
+                host_ns: map.frame_to_host(key, 104, now).unwrap(),
+                output_frame: 900,
+                position: crate::timeline_map::Position { sample: 500, fraction: 0, denominator: 1 },
+            };
+            assert!(publisher.start(reader.ticket(), point));
+            control.cancel();
+            let (entered, waiting) = mpsc::sync_channel(0);
+            let (release, resume) = mpsc::sync_channel(0);
+            let writer = std::thread::spawn(move || {
+                PLACEMENT_WAIT_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        entered.send(()).unwrap();
+                        resume.recv().unwrap();
+                    }))
+                });
+                write_takes_started(&shared, takes, 1, Some(gate))
+            });
+            let reached = waiting.recv_timeout(Duration::from_secs(30));
+            if success {
+                assert!(mapping.service(Some(map), Some(now)));
+            }
+            drop(mapping); // Failure/shutdown must also end finalization.
+            let _ = release.send(());
+            let (takes, error) = writer.join().unwrap();
+            assert!(reached.is_ok(), "writer returned before acknowledging its applied start");
+            if success {
+                assert!(error.is_none(), "{error:?}");
+                assert_eq!(takes.len(), 1);
+                assert_eq!(decode(&path)[0], (4..12).map(|i| i as f32 / 20.0).collect::<Vec<_>>());
+                std::fs::remove_file(path).unwrap();
+            } else {
+                assert!(takes.is_empty());
+                assert!(error.is_some());
+                assert!(!path.exists());
+            }
+        }
     }
 
     #[test]
@@ -685,6 +976,7 @@ mod tests {
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
             clock: None,
+            record_start: None,
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,

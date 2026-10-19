@@ -3981,6 +3981,7 @@ dependencies = [
  "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",
+ "soundcraft-midi-io",
  "soundcraft-mix",
  "soundcraft-model",
  "soundcraft-rt",

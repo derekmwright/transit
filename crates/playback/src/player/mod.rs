@@ -17,6 +17,8 @@ mod handles;
 pub use handles::Handles;
 mod runtime;
 pub use runtime::{AudioPorts, Retirement, RuntimeControl, ServiceReport};
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ingress;
 pub mod sources;
 
 mod audio;
@@ -38,6 +40,7 @@ impl SessionRequestId {
 pub enum PlayerError {
     Busy,
     RecordingActive,
+    NoPreparedRecording,
     InvalidNote,
     NoInstrument,
     SessionBackpressure,
@@ -53,6 +56,7 @@ impl std::fmt::Display for PlayerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RecordingActive => f.write_str("finish and collect the recording before returning its input device"),
+            Self::NoPreparedRecording => f.write_str("prepare a recording before requesting its start"),
             Self::Busy => f.write_str("audio control is busy servicing a reentrant request"),
             Self::InvalidNote => f.write_str("MIDI pitch and velocity must be below 128"),
             Self::NoInstrument => f.write_str("the requested instrument has no active binding"),

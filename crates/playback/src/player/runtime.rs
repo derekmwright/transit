@@ -218,6 +218,15 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         self.control.all_notes_off()
     }
+    /// Build the independent native MIDI producer on Main. Its audio endpoint
+    /// must join this runtime's anchored bundle and share its callback budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn midi_lane(&self) -> Result<super::ingress::Lane, PlayerError> {
+        if self.faulted() {
+            return Err(PlayerError::Faulted);
+        }
+        Ok(action_lane::pair_with_result(&self.control.sessions.bridge))
+    }
     pub fn register_source(&mut self, port: u16) -> Result<sources::Token, PlayerError> {
         if self.faulted() {
             return Err(PlayerError::Faulted);

@@ -1,6 +1,7 @@
 //! Native clock fitting independent of UI/editor/factory progress. Only Copy
 //! snapshots cross to audio; a stalled reader cannot stall fitting or its peer.
 use super::{ClockReader, ClockReport, HostOrigin};
+use crate::record::start::{self, mapping};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -16,7 +17,7 @@ const _: () = {
 
 struct State {
     stop: AtomicBool,
-    finished: AtomicBool,
+    finished: Arc<AtomicBool>,
 }
 
 /// Sole consumer. Keep it on its owner, or in the main-anchored audio bundle.
@@ -53,6 +54,8 @@ struct Pump {
     ui: triple_buffer::Input<ClockReport>,
     audio: triple_buffer::Input<ClockReport>,
     state: Arc<State>,
+    placements: rtrb::Consumer<mapping::Mapping>,
+    placement: Option<mapping::Mapping>,
 }
 
 impl Pump {
@@ -60,7 +63,16 @@ impl Pump {
         if self.state.stop.load(Ordering::Acquire) {
             return false;
         }
-        let report = self.reader.poll_with(now);
+        let now = now();
+        let report = self.reader.poll_with(|| now);
+        // Main can replace a cancelled take; this fixed queue bounds all work.
+        for _ in 0..8 {
+            let Ok(placement) = self.placements.pop() else { break };
+            self.placement = Some(placement);
+        }
+        if self.placement.as_mut().is_some_and(|placement| placement.service(report.map, now)) {
+            self.placement = None;
+        }
         self.ui.write(report);
         self.audio.write(report);
         true
@@ -70,19 +82,28 @@ impl Pump {
 impl Drop for Pump {
     fn drop(&mut self) {
         self.state.finished.store(true, Ordering::Release);
+        // rtrb retains unread entries until BOTH endpoints die. Return already
+        // queued mappings now; InputStart's lifetime token covers a Main push
+        // racing this final drain while the producer remains owned on Main.
+        for _ in 0..8 {
+            let Ok(placement) = self.placements.pop() else { break };
+            drop(placement);
+        }
     }
 }
 
-fn prepare(reader: ClockReader) -> (Pump, SnapshotReader, SnapshotReader) {
+fn prepare(reader: ClockReader) -> (Pump, SnapshotReader, SnapshotReader, rtrb::Producer<mapping::Mapping>) {
     let origin = reader.inner.origin;
     let empty = ClockReport { map: None, publication: Default::default(), fitting: Default::default() };
-    let state = Arc::new(State { stop: AtomicBool::new(false), finished: AtomicBool::new(false) });
+    let state = Arc::new(State { stop: AtomicBool::new(false), finished: Arc::new(AtomicBool::new(false)) });
     let (ui_send, ui_receive) = triple_buffer::triple_buffer(&empty);
     let (audio_send, audio_receive) = triple_buffer::triple_buffer(&empty);
+    let (placements, receive_placements) = rtrb::RingBuffer::new(8);
     (
-        Pump { reader, ui: ui_send, audio: audio_send, state: Arc::clone(&state) },
+        Pump { reader, ui: ui_send, audio: audio_send, state: Arc::clone(&state), placements: receive_placements, placement: None },
         SnapshotReader { receive: ui_receive, state: Arc::clone(&state), origin },
         SnapshotReader { receive: audio_receive, state, origin },
+        placements,
     )
 }
 
@@ -94,6 +115,8 @@ pub struct ClockService {
     audio: Option<SnapshotReader>,
     state: Arc<State>,
     worker: std::thread::JoinHandle<()>,
+    placements: rtrb::Producer<mapping::Mapping>,
+    key: super::ClockKey,
 }
 
 impl ClockService {
@@ -105,19 +128,30 @@ impl ClockService {
     }
 
     fn start_with(reader: ClockReader, mut now: impl FnMut() -> Option<u64> + Send + 'static, period: Duration) -> std::io::Result<Self> {
-        let (mut pump, ui, audio) = prepare(reader);
+        let key = reader.key();
+        let (mut pump, ui, audio, placements) = prepare(reader);
         let state = Arc::clone(&pump.state);
         let worker = std::thread::Builder::new().name("soundcraft-device-clock".into()).spawn(move || {
             while pump.step(&mut now) {
                 std::thread::park_timeout(period);
             }
         })?;
-        Ok(Self { ui: Mutex::new(ui), audio: Some(audio), state, worker })
+        Ok(Self { ui: Mutex::new(ui), audio: Some(audio), state, worker, placements, key })
     }
 
     /// UI/control snapshot only; this lock is never touched by the worker or audio.
     pub fn report(&self) -> ClockReport {
         self.ui.lock().unwrap_or_else(PoisonError::into_inner).poll()
+    }
+
+    pub(crate) fn prepare_recording(&mut self, start: start::Reader) -> Result<mapping::InputStart, &'static str> {
+        if self.is_finished() || self.key.direction != super::Direction::Input {
+            return Err("recording input clock is unavailable");
+        }
+        let (placement, reader) = mapping::pair(start, self.key);
+        self.placements.push(placement).map_err(|_| "input clock preparation queue is full")?;
+        self.worker.thread().unpark();
+        Ok(reader.with_lifetime(Arc::clone(&self.state.finished)))
     }
 
     /// Transfer the separate bounded consumer to the main-anchored audio state.

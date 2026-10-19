@@ -147,3 +147,40 @@ fn failed_state_capture_aborts_save_and_preserves_document() {
     assert_eq!(serde_json::to_value(app.engine.session()).unwrap(), before);
     assert!(app.engine.is_dirty());
 }
+
+#[test]
+fn atomic_record_start_receipt_updates_transport_and_clock_refusal_collects_the_take() {
+    use soundcraft_playback::{record::start, timeline_map::Position};
+    for success in [false, true] {
+        let mut control = control();
+        let (mut starts, _) = start::pair(soundcraft_mix::EngineEpoch(1));
+        let reader = starts.prepare().unwrap();
+        let command = PlayerCommand::Record { ticket: reader.ticket(), from: Some(500), end: None, looped: None };
+        let sequence = control.send_action(command, false).unwrap();
+        let mut requests = PlayerRequests { play: Some(sequence), recording: Some(sequence), ..Default::default() };
+        let mut status = "Record pending".to_owned();
+        let mut recording = false;
+        let result = if success {
+            ActionResult::RecordingStarted(start::Point {
+                host_ns: 100,
+                output_frame: 30,
+                position: Position { sample: 500, fraction: 0, denominator: 1 },
+            })
+        } else {
+            ActionResult::RecordingClock(soundcraft_playback::device_clock::Unavailable::Stale)
+        };
+        let collect = requests.notice(
+            PlayerNotice::Action(Receipt { sequence, payload: command, outcome: Outcome::Applied, handler_result: Some(result) }),
+            &mut status,
+            &mut recording,
+        );
+        assert_eq!(collect, !success);
+        assert_eq!(recording, success);
+        assert!(!requests.pending());
+        if success {
+            assert_eq!(status, "Recording");
+        } else {
+            assert!(status.contains("RecordingClock"));
+        }
+    }
+}

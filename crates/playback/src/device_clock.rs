@@ -452,6 +452,10 @@ fn relative_ns(instant: cpal::StreamInstant, origin: cpal::StreamInstant) -> Opt
 }
 
 impl CpalObserver {
+    pub fn next_frame(&self) -> u64 {
+        self.observer.next_frame()
+    }
+
     pub fn new(observer: Observer) -> Self {
         Self { observer, backend_origin: None }
     }
@@ -610,6 +614,18 @@ pub(crate) struct MaintainedClock {
     reader: ClockReader,
 }
 impl MaintainedClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn prepare_recording(
+        &mut self,
+        start: crate::record::start::Reader,
+    ) -> Result<crate::record::start::mapping::InputStart, &'static str> {
+        self.service.prepare_recording(start)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn take_audio_reader(&mut self) -> Option<service::SnapshotReader> {
+        self.service.take_audio_reader()
+    }
+
     pub(crate) fn start(reader: ClockReader) -> std::io::Result<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {

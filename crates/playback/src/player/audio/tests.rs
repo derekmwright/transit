@@ -38,6 +38,128 @@ fn fill(audio: &mut Audio, out: &mut [f32]) {
     audio.fill(out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()).unwrap();
 }
 
+fn recording_clock(audio: &mut Audio, rate: u32) {
+    use crate::device_clock::{ClockFitter, Observation, Quality, Stamp};
+    let key = audio.transport.clock_key;
+    let mut fitter = ClockFitter::new(key);
+    for i in 0..=30u64 {
+        let ns = i * 4_000_000;
+        let _ = fitter.observe(Observation {
+            key,
+            first_frame: i * u64::from(rate) / 250,
+            frames: rate / 250,
+            nominal_rate: rate,
+            stamp: Stamp {
+                host_callback_ns: 1_000_000_000 + ns,
+                backend_callback_ns: ns as i64,
+                backend_frame_ns: ns as i64,
+                quality: Quality::BackendEstimate,
+                offset_uncertainty_ns: None,
+            },
+        });
+    }
+    audio.transport.clock_map = Some(fitter.map().unwrap());
+    audio.transport.clock_now = Some(1_120_000_000);
+}
+
+#[test]
+fn recording_waits_for_its_plan_and_publishes_the_actual_consumed_output_boundary() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 8]);
+    control.service(&mut make);
+    let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    audio.transport.record_start = publisher;
+    recording_clock(&mut audio, 48_000);
+    let reader = start.prepare().unwrap();
+    control.request(Arc::new(Session::default()), None).unwrap();
+    let sequence = control.send_action(Command::Record { ticket: reader.ticket(), from: Some(700), end: None, looped: None }, true).unwrap();
+    for _ in 0..3 {
+        fill(&mut audio, &mut [0.0; 8]);
+        assert_eq!(reader.status(), start::Status::Pending);
+        assert!(!audio.transport.playing);
+    }
+    let first = audio.transport.timeline.next_output();
+    control.service(&mut make);
+    let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 8]));
+    assert!(heap.is_zero(), "{heap:?}");
+    let start::Status::Started(point) = reader.status() else { panic!("Record did not apply") };
+    assert_eq!(point.output_frame, first);
+    assert_eq!(point.host_ns, 1_000_000_000 + (first as f64 * 1e9 / 48_000.0).round() as u64);
+    assert_eq!(point.position, timeline_map::Position { sample: 700, fraction: 0, denominator: 1 });
+    assert_eq!(shared.position.load(Ordering::Relaxed), 704);
+    let mut notices = [None; 16];
+    let n = control.poll_notices(&mut notices);
+    assert!(notices[..n].iter().flatten().any(
+        |n| matches!(n, super::super::Notice::Action(r) if r.sequence == sequence && r.handler_result == Some(ActionResult::RecordingStarted(point)))
+    ));
+    start.cancel();
+    control.stop().unwrap();
+    fill(&mut audio, &mut [0.0; 8]);
+    assert_eq!(reader.status(), start::Status::Started(point), "Stop must retain the applied take origin");
+    assert!(!audio.transport.recording);
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn cancelled_or_unclocked_recording_cannot_apply_play_or_start_a_newer_take() {
+    for unavailable in [false, true] {
+        let (mut control, mut audio, _) = fixture(48_000);
+        let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+        audio.transport.record_start = publisher;
+        let reader = start.prepare().unwrap();
+        let newer = if unavailable {
+            None
+        } else {
+            recording_clock(&mut audio, 48_000);
+            start.cancel();
+            Some(start.prepare().unwrap())
+        };
+        let sequence = control.send_action(Command::Record { ticket: reader.ticket(), from: Some(800), end: None, looped: None }, true).unwrap();
+        let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 8]));
+        assert!(heap.is_zero());
+        assert!(!audio.transport.playing && !audio.transport.recording);
+        assert_eq!(reader.status(), start::Status::Cancelled);
+        if let Some(newer) = newer {
+            assert_eq!(newer.status(), start::Status::Pending);
+        }
+        let mut notices = [None; 16];
+        let n = control.poll_notices(&mut notices);
+        let expected =
+            if unavailable { ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp) } else { ActionResult::RecordingCancelled };
+        assert!(
+            notices[..n]
+                .iter()
+                .flatten()
+                .any(|n| matches!(n, super::super::Notice::Action(r) if r.sequence == sequence && r.handler_result == Some(expected)))
+        );
+        control.retire(audio.plans, audio.actions);
+    }
+}
+
+#[test]
+fn punch_in_retains_fractional_playhead_and_pending_dsp_output() {
+    let (mut control, mut audio, _) = fixture(44_100);
+    control.send_action(Command::Play { from: 100, end: None, looped: None }, true).unwrap();
+    fill(&mut audio, &mut [0.0; 2]);
+    let position = audio.transport.timeline.position().unwrap();
+    assert_ne!(position.fraction, 0);
+    let pending = audio.pending;
+    let read = audio.read;
+    let render_position = audio.transport.render_position;
+    let epoch = audio.transport.epoch;
+    recording_clock(&mut audio, 44_100);
+    let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    audio.transport.record_start = publisher;
+    let reader = start.prepare().unwrap();
+    control.send_action(Command::Record { ticket: reader.ticket(), from: None, end: None, looped: None }, true).unwrap();
+    let ((), heap) = measure(|| fill(&mut audio, &mut []));
+    assert!(heap.is_zero());
+    let start::Status::Started(point) = reader.status() else { panic!("punch did not apply") };
+    assert_eq!(point.position, position);
+    assert_eq!((audio.pending, audio.read, audio.transport.render_position, audio.transport.epoch), (pending, read, render_position, epoch));
+    control.retire(audio.plans, audio.actions);
+}
+
 fn owner_fixture() -> (crate::player::RuntimeControl<Command, ActionResult>, Audio, soundcraft_model::TrackId) {
     use soundcraft_model::{ChannelFormat, Insert, TrackKind};
     let mut session = Session::default();
@@ -54,7 +176,7 @@ fn owner_fixture() -> (crate::player::RuntimeControl<Command, ActionResult>, Aud
     });
     let (mut owner, ports) = crate::player::RuntimeControl::new(Arc::new(session), None, target, PlanLimits::default()).unwrap();
     owner.service();
-    let mut audio = Audio::from_ports(ports, key, 48_000, shared).unwrap();
+    let (mut audio, _) = Audio::from_ports(ports, key, 48_000, shared).unwrap();
     fill(&mut audio, &mut [0.0; 128]);
     owner.service();
     (owner, audio, track)
@@ -810,7 +932,7 @@ fn retained_payload_cleanup_cannot_escape_quiescent_endpoint_return() {
     .unwrap();
     owner.service();
     let (_, _, shared) = fixture(48_000);
-    let mut audio = Audio::from_ports(ports, ClockKey { generation: 1, domain: 1, direction: Direction::Output }, 48_000, shared).unwrap();
+    let (mut audio, _) = Audio::from_ports(ports, ClockKey { generation: 1, domain: 1, direction: Direction::Output }, 48_000, shared).unwrap();
     audio.panic_payload = RetainedPanic(Some(Box::new(Payload)));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.retire(audio.into_ports())));
     assert!(result.is_ok());

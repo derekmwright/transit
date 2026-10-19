@@ -592,7 +592,7 @@ impl SoundApp {
             // Punch in on the fly at the current playhead.
             self.record_start = self.position();
             self.punch = None;
-            self.plan_recording(takes, None);
+            self.plan_recording(takes, None, None);
             return;
         }
         let e = self.engine.session().edit.clone();
@@ -600,8 +600,7 @@ impl SoundApp {
         if e.loop_record && !sel.is_empty() {
             self.record_start = sel.start;
             self.punch = None;
-            self.start_play(sel.start, None, Some(sel));
-            self.plan_recording(takes, Some(sel.len()));
+            self.plan_recording(takes, Some(sel.len()), Some((sel.start, None, Some(sel))));
         } else {
             // Record into the selection when there is one (punch), with pre/post-roll if enabled;
             // the take is trimmed back to the punch range afterwards.
@@ -610,26 +609,42 @@ impl SoundApp {
             self.record_start = from;
             self.punch = (!sel.is_empty()).then_some(sel);
             let end = (!sel.is_empty()).then_some(sel.end + post);
-            self.start_play(from, end, None);
-            self.plan_recording(takes, None);
+            self.plan_recording(takes, None, Some((from, end, None)));
         }
     }
 
     /// Remember where the armed `takes` go (split into passes of `pass` when loop recording) and
     /// autosave that plan with the session.
-    fn plan_recording(&mut self, takes: Vec<soundcraft_engine::io::Take>, pass: Option<Samples>) {
+    fn plan_recording(
+        &mut self,
+        takes: Vec<soundcraft_engine::io::Take>,
+        pass: Option<Samples>,
+        play: Option<(Samples, Option<Samples>, Option<Range>)>,
+    ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
         if let Some(p) = &self.player {
-            if !p.is_playing() && self.player_requests.play.is_none() {
+            if self.player_requests.result(&mut self.ui.status, p.update_session(self.engine.session_arc())).is_none() {
                 self.finish_recording();
                 return;
             }
-            let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.set_recording(true)) else {
+            self.last_rev = self.engine.revision;
+            let Some(recorder) = self.recorder.as_ref() else {
+                self.finish_recording();
+                return;
+            };
+            let (from, end, looped) = play.map_or((None, None, None), |(from, end, looped)| (Some(from), end, looped));
+            let Some(sequence) = self.player_requests.result(&mut self.ui.status, p.record(recorder, from, end, looped)) else {
                 self.finish_recording();
                 return;
             };
             self.player_requests.recording = Some(sequence);
+            if play.is_some() {
+                self.player_requests.play = Some(sequence);
+            }
+            self.ui.status = "Record pending".into();
+        } else if let Some((from, end, looped)) = play {
+            self.start_play(from, end, looped);
         }
         if let Some(root) = self.autosave_dir.clone() {
             self.queue_autosave(root);
@@ -653,7 +668,11 @@ impl SoundApp {
             .iter()
             .map(|(track, inputs, path)| soundcraft_engine::io::Take { track: *track, path: path.clone(), channels: inputs.len() })
             .collect();
-        r.arm(plan)?;
+        if let Some(player) = &self.player {
+            player.prepare_recording(r, plan)?;
+        } else {
+            r.arm(plan)?;
+        }
         Ok(takes)
     }
 
@@ -724,6 +743,12 @@ impl SoundApp {
 
     /// Hand the session to the autosaver for its folder under `root`.
     fn queue_autosave(&mut self, root: std::path::PathBuf) {
+        if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start)
+            && let Some(plan) = &mut self.take_plan
+        {
+            plan.start = point.position.sample;
+            self.record_start = plan.start;
+        }
         self.autosaved_rev = self.engine.revision;
         let w = self.autosaver.get_or_insert_with(|| soundcraft_engine::autosave::Autosaver::new(root));
         w.write(self.engine.session_arc(), self.engine.path.clone(), self.take_plan.clone());
@@ -911,6 +936,17 @@ impl SoundApp {
         if collect && self.recording_active() {
             self.finish_recording();
         }
+        if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start)
+            && self.take_plan.as_ref().is_some_and(|plan| plan.start != point.position.sample)
+        {
+            self.record_start = point.position.sample;
+            if let Some(plan) = &mut self.take_plan {
+                plan.start = self.record_start;
+            }
+            if let Some(root) = self.autosave_dir.clone() {
+                self.queue_autosave(root);
+            }
+        }
     }
 
     /// Take the input once (for recording and input monitoring) from the player and feed the
@@ -1029,13 +1065,17 @@ impl SoundApp {
         }
         let (takes, problem) = r.finish();
         let tracks = takes.len().max(1);
-        let plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
+        let mut plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
             pass: None,
             punch: self.punch,
             rate: 0,
             takes: Vec::new(),
         });
+        if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start) {
+            plan.start = point.position.sample;
+            self.record_start = plan.start;
+        }
         self.punch = None;
         self.autosaved_rev = 0;
         let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
@@ -1543,6 +1583,7 @@ impl PlayerRequests {
                         r.handler_result,
                         Some(
                             ActionResult::Applied
+                                | ActionResult::RecordingStarted(_)
                                 | ActionResult::Event(
                                     soundcraft_mix::EventOutcome::Queued
                                         | soundcraft_mix::EventOutcome::QueuedLate { .. }
@@ -1564,8 +1605,17 @@ impl PlayerRequests {
                 }
                 if record {
                     self.recording = None;
-                    if applied && let PlayerCommand::Recording(on) = r.payload {
-                        *recording = on;
+                    if applied {
+                        match r.payload {
+                            PlayerCommand::Recording(on) => *recording = on,
+                            PlayerCommand::Record { .. } => {
+                                *recording = true;
+                                if status == "Record pending" {
+                                    *status = "Recording".into();
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 if !applied && !matches!(r.outcome, Outcome::Stopped | Outcome::NotesReleased) {

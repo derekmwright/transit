@@ -23,6 +23,7 @@ pub struct Player {
     fault: Arc<Fault>,
     failure_signal: Option<plan_bridge::RuntimeIdentity>,
     owner: RefCell<Option<Owner>>,
+    record_start: RefCell<Option<record::start::Control>>,
     state: Holder,
     stream: Option<cpal::Stream>,
     input: RefCell<HeldInput>,
@@ -78,6 +79,7 @@ impl Player {
             fault: Arc::default(),
             failure_signal: None,
             owner: RefCell::new(None),
+            record_start: RefCell::new(None),
             state: Arc::new(Mutex::new(None)),
             stream: None,
             input: RefCell::new(HeldInput::No),
@@ -123,19 +125,23 @@ impl Player {
             owner.retire(ports);
             return Err("initial audio plan preparation faulted".into());
         }
-        let audio = match Audio::from_ports(ports, key, device_rate, Arc::clone(&player.shared)) {
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let (mut audio, record_start) = match Audio::from_ports(ports, key, device_rate, Arc::clone(&player.shared)) {
             Ok(audio) => audio,
             Err(failure) => {
                 owner.retire(*failure.ports);
                 return Err(format!("invalid output timeline: {:?}", failure.error));
             }
         };
+        *player.clock.get_mut() =
+            device_clock::MaintainedClock::start(reader).map_err(|error| log::warn!("output clock maintenance unavailable: {error}")).ok();
+        #[cfg(not(target_arch = "wasm32"))]
+        audio.set_clock(player.clock.get_mut().as_mut().and_then(device_clock::MaintainedClock::take_audio_reader), player.origin);
+        *player.record_start.get_mut() = Some(record_start);
         *player.state.lock().unwrap_or_else(PoisonError::into_inner) = Some(audio);
         player.failure_signal = Some(owner.failure_signal());
         *player.owner.get_mut() = Some(owner);
         player.audition = Some(audition);
-        *player.clock.get_mut() =
-            device_clock::MaintainedClock::start(reader).map_err(|error| log::warn!("output clock maintenance unavailable: {error}")).ok();
         Ok((player, callback_clock))
     }
 
@@ -293,12 +299,54 @@ impl Player {
         self.owner()?.send_action(Command::Play { from, end, looped }, true)
     }
     pub fn locate(&self, at: Samples) -> Result<action_lane::Sequence, PlayerError> {
+        self.cancel_record_start()?;
         self.owner()?.send_action(Command::Locate(at), true)
     }
+    /// Prepare input history and files on Main. The device applies the start in
+    /// the same ordered transaction as Play, without waiting for a UI receipt.
+    pub fn prepare_recording(&self, recorder: &mut record::Recorder, takes: Vec<(TrackId, Vec<usize>, std::path::PathBuf)>) -> Result<(), String> {
+        self.owner().map_err(|error| error.to_string())?;
+        if recorder.has_pending_take() {
+            return Err("already recording".into());
+        }
+        let mut control = self.record_start.try_borrow_mut().map_err(|_| PlayerError::Busy.to_string())?;
+        let control = control.as_mut().ok_or_else(|| PlayerError::Faulted.to_string())?;
+        let reader = control.prepare().ok_or_else(|| PlayerError::SequenceExhausted.to_string())?;
+        if let Err(error) = recorder.prepare(takes, reader) {
+            control.cancel();
+            return Err(error);
+        }
+        Ok(())
+    }
+    /// `from=None` punches in at the consumed playhead without flushing DSP.
+    pub fn record(
+        &self,
+        recorder: &record::Recorder,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+    ) -> Result<action_lane::Sequence, PlayerError> {
+        let ticket = recorder.prepared_start().ok_or(PlayerError::NoPreparedRecording)?;
+        let result = self.owner()?.send_action(Command::Record { ticket, from, end, looped }, true);
+        if result.is_err() {
+            self.cancel_record_start()?;
+        }
+        result
+    }
+    fn cancel_record_start(&self) -> Result<(), PlayerError> {
+        if let Some(control) = self.record_start.try_borrow().map_err(|_| PlayerError::Busy)?.as_ref() {
+            control.cancel();
+        }
+        Ok(())
+    }
     pub fn set_recording(&self, on: bool) -> Result<action_lane::Sequence, PlayerError> {
+        if !on {
+            self.cancel_record_start()?;
+        }
         self.owner()?.send_action(Command::Recording(on), false)
     }
     pub fn stop(&self) -> Result<action_lane::Sequence, PlayerError> {
+        self.cancel_record_start()?;
         self.owner()?.stop()
     }
     pub fn all_notes_off(&self) -> Result<action_lane::Sequence, PlayerError> {

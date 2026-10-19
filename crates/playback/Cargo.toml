@@ -23,6 +23,7 @@ rtrb.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true
 triple_buffer.workspace = true
+soundcraft-midi-io.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Backend startup owns registration and release; never promote from the data callback.
@@ -40,6 +41,9 @@ asio = ["cpal/asio", "soundcraft-asio-panel/asio"]
 soundcraft-rt = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
 soundcraft-midi.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+soundcraft-midi-io = { workspace = true, features = ["fake"] }
 
 [lints]
 workspace = true

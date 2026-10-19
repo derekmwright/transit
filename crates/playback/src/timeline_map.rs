@@ -103,6 +103,7 @@ impl Segment {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Timeline {
     key: ClockKey,
     transport: u64,

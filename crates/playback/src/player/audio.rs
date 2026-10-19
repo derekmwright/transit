@@ -4,6 +4,7 @@ use super::{AudioPorts, sources};
 #[cfg(test)]
 use super::{Control, endpoints};
 use crate::{Shared, action_lane, device_clock::ClockKey, plan_bridge, timeline_map};
+use crate::{device_clock, record::start};
 #[cfg(test)]
 use soundcraft_mix::{PlanLimits, RenderTarget};
 use soundcraft_time::{MAX_POSITION, Range, Samples};
@@ -13,6 +14,7 @@ use std::sync::atomic::Ordering;
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
     Play { from: Samples, end: Option<Samples>, looped: Option<Range> },
+    Record { ticket: start::Ticket, from: Option<Samples>, end: Option<Samples>, looped: Option<Range> },
     Locate(Samples),
     Recording(bool),
     Note(soundcraft_mix::InstrumentEvent),
@@ -21,6 +23,10 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionResult {
     Applied,
+    RecordingStarted(start::Point),
+    RecordingClock(device_clock::Unavailable),
+    RecordingNotPlaying,
+    RecordingCancelled,
     InvalidPosition,
     Timeline(timeline_map::MapError),
     Event(soundcraft_mix::EventOutcome),
@@ -46,9 +52,72 @@ struct Transport {
     loop_engaged: bool,
     discard_pending: bool,
     timeline_fault: Option<timeline_map::MapError>,
+    record_start: start::Publisher,
+    clock_key: ClockKey,
+    clock_map: Option<device_clock::ClockMap>,
+    clock_now: Option<u64>,
 }
 
 impl Transport {
+    fn record(
+        &mut self,
+        ticket: start::Ticket,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        live: &mut plan_bridge::Processing<'_>,
+    ) -> ActionResult {
+        let prepared = (|| {
+            let mut timeline = self.timeline;
+            let mut epoch = self.epoch;
+            if let Some(from) = from {
+                if !(-MAX_POSITION..=MAX_POSITION).contains(&from)
+                    || end.is_some_and(|end| !(-MAX_POSITION..=MAX_POSITION).contains(&end) || end < from)
+                {
+                    return Err(ActionResult::InvalidPosition);
+                }
+                epoch = epoch.checked_add(1).ok_or(ActionResult::Timeline(timeline_map::MapError::Arithmetic))?;
+                timeline.change(epoch, Some(from), self.rate, true, looped.map(|r| (r.start, r.end))).map_err(ActionResult::Timeline)?;
+            } else if !self.playing {
+                return Err(ActionResult::RecordingNotPlaying);
+            }
+            let map = self.clock_map.ok_or(ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp))?;
+            let now = self.clock_now.ok_or(ActionResult::RecordingClock(device_clock::Unavailable::Stale))?;
+            let output_frame = timeline.next_output();
+            let host_ns = map.frame_to_host(self.clock_key, output_frame, now).map_err(ActionResult::RecordingClock)?;
+            let position = timeline.position().map_err(ActionResult::Timeline)?;
+            Ok((timeline, epoch, start::Point { host_ns, output_frame, position }))
+        })();
+        let (timeline, epoch, point) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.record_start.cancel(ticket);
+                return error;
+            }
+        };
+        // All fallible preparation precedes publication. If Main cancelled or
+        // rearmed, neither Play nor recording changes. After success the local
+        // assignments are infallible and precede rendering this output frame.
+        if !self.record_start.start(ticket, point) {
+            return ActionResult::RecordingCancelled;
+        }
+        if let Some(from) = from {
+            self.timeline = timeline;
+            self.epoch = epoch;
+            self.playing = true;
+            self.render_position = from;
+            self.end = end;
+            self.looped = looped;
+            self.loop_engaged = looped.is_some_and(|r| from < r.end);
+            self.discard_pending = true;
+            live.set_transport_epoch(soundcraft_mix::TransportEpoch(epoch));
+        }
+        // Punching in preserves already-rendered audio and DSP state. Monitoring
+        // changes at its next render boundary, while capture uses this consumed D.
+        self.recording = true;
+        ActionResult::RecordingStarted(point)
+    }
+
     fn change(&mut self, seek: Option<Samples>, playing: bool, looped: Option<Range>) -> Result<(), timeline_map::MapError> {
         let epoch = self.epoch.checked_add(1).ok_or(timeline_map::MapError::Arithmetic)?;
         self.timeline.change(epoch, seek, self.rate, playing, looped.map(|r| (r.start, r.end)))?;
@@ -60,6 +129,9 @@ impl Transport {
 
     fn command(&mut self, event: action_lane::Event<Command>, live: &mut plan_bridge::Processing<'_>) -> ActionResult {
         let result = match event {
+            action_lane::Event::Action { payload: Command::Record { ticket, from, end, looped }, .. } => {
+                return self.record(ticket, from, end, looped, live);
+            }
             action_lane::Event::Action { payload: Command::Play { from, end, looped }, .. } => {
                 if !(-MAX_POSITION..=MAX_POSITION).contains(&from)
                     || end.is_some_and(|e| !(-MAX_POSITION..=MAX_POSITION).contains(&e) || e < from)
@@ -96,6 +168,7 @@ impl Transport {
             action_lane::Event::Stop { .. } => {
                 let result = self.change(None, false, None);
                 self.playing = false;
+                self.recording = false;
                 self.end = None;
                 self.loop_engaged = false;
                 self.discard_pending = true;
@@ -150,6 +223,10 @@ pub(super) struct Audio {
     /// An escaped panic may own a heap payload. Retain it with the audio holder
     /// until main reclaims that holder; do not destroy it during error handling.
     panic_payload: RetainedPanic,
+    #[cfg(not(target_arch = "wasm32"))]
+    clock_reader: Option<device_clock::service::SnapshotReader>,
+    #[cfg(not(target_arch = "wasm32"))]
+    clock_origin: device_clock::HostOrigin,
 }
 
 /// Payload ownership follows Audio back to Main. This separate field wrapper
@@ -187,7 +264,9 @@ pub(super) fn pair(
 ) -> Result<(Control<Command, ActionResult>, Audio), timeline_map::MapError> {
     let (control, plans, actions) = endpoints(target, limits);
     let (_, sources) = sources::pair(&control.sessions.bridge).map_err(|_| timeline_map::MapError::Arithmetic)?;
-    Audio::from_ports(AudioPorts { plans, actions, sources }, key, device_rate, shared).map(|audio| (control, audio)).map_err(|failure| failure.error)
+    Audio::from_ports(AudioPorts { plans, actions, sources }, key, device_rate, shared)
+        .map(|(audio, _)| (control, audio))
+        .map_err(|failure| failure.error)
 }
 
 impl Audio {
@@ -205,7 +284,7 @@ impl Audio {
         key: ClockKey,
         device_rate: u32,
         shared: Arc<Shared>,
-    ) -> Result<Self, InitError> {
+    ) -> Result<(Self, start::Control), InitError> {
         let target = ports.plans.engine().active().target;
         let init = || {
             if target.device.0 != key.generation {
@@ -219,33 +298,51 @@ impl Audio {
             Ok(value) => value,
             Err(error) => return Err(InitError { error, ports: Box::new(ports) }),
         };
-        Ok(Self {
-            plans: ports.plans,
-            actions: ports.actions,
-            sources: ports.sources,
-            shared,
-            pending: 0,
-            read: 0.0,
-            sample_rate: target.sample_rate,
-            device_rate,
-            speed: 1000,
-            faulted: false,
-            panic_payload: RetainedPanic(None),
-            transport: Transport {
-                timeline,
-                history: timeline_map::History::default(),
-                epoch: 0,
-                rate,
-                render_position: 0,
-                playing: false,
-                recording: false,
-                end: None,
-                looped: None,
-                loop_engaged: false,
-                discard_pending: false,
-                timeline_fault: None,
+        let (record_control, record_start) = start::pair(soundcraft_mix::EngineEpoch(key.generation));
+        Ok((
+            Self {
+                plans: ports.plans,
+                actions: ports.actions,
+                sources: ports.sources,
+                shared,
+                pending: 0,
+                read: 0.0,
+                sample_rate: target.sample_rate,
+                device_rate,
+                speed: 1000,
+                faulted: false,
+                panic_payload: RetainedPanic(None),
+                #[cfg(not(target_arch = "wasm32"))]
+                clock_reader: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                clock_origin: device_clock::HostOrigin::default(),
+                transport: Transport {
+                    timeline,
+                    history: timeline_map::History::default(),
+                    epoch: 0,
+                    rate,
+                    render_position: 0,
+                    playing: false,
+                    recording: false,
+                    end: None,
+                    looped: None,
+                    loop_engaged: false,
+                    discard_pending: false,
+                    timeline_fault: None,
+                    record_start,
+                    clock_key: key,
+                    clock_map: None,
+                    clock_now: None,
+                },
             },
-        })
+            record_control,
+        ))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn set_clock(&mut self, reader: Option<device_clock::service::SnapshotReader>, origin: device_clock::HostOrigin) {
+        self.clock_reader = reader;
+        self.clock_origin = origin;
     }
 
     /// Main only, after callback quiescence. Retained panic payloads are dropped
@@ -396,6 +493,11 @@ impl Audio {
     ) -> Result<(), timeline_map::MapError> {
         // fill() excludes an already-faulted local state before entering here.
         out.fill(0.0);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(reader) = &mut self.clock_reader {
+            self.transport.clock_map = reader.poll().map;
+            self.transport.clock_now = self.clock_origin.now_ns();
+        }
         let channels = channels.max(1);
         self.service_actions(actions);
         if self.faulted {
