@@ -419,10 +419,25 @@ impl Engine {
         let key = self.merge_hold.clone().unwrap_or_else(|| key.to_string());
         let continuing = self.merge_key.as_ref() == Some(&key);
         let before_len = self.undo.len();
-        let r = self.execute(id, params)?;
-        if continuing && self.undo.len() == before_len + 1 && before_len > 0 {
+        let pushes = self.undo_pushes;
+        // A continuing command pushes a step only to have it popped below, so keep room for it:
+        // at `history_limit` the push would otherwise drop the oldest step for nothing.
+        let limit = self.history_limit;
+        if continuing {
+            self.history_limit = limit.saturating_add(1);
+        }
+        let r = self.execute(id, params);
+        self.history_limit = limit;
+        let r = r?;
+        // Whether a step was pushed comes from the push counter, which still moves at the cap
+        // where the stack length stays put.
+        if continuing && self.undo_pushes == pushes + 1 && before_len > 0 {
             // Drop the step just pushed; the earlier one still holds the pre-gesture document.
             self.undo.pop();
+        }
+        if self.undo.len() > limit {
+            let excess = self.undo.len() - limit;
+            self.undo.drain(..excess);
         }
         self.merge_key = Some(key);
         Ok(r)
