@@ -250,6 +250,11 @@ impl IAudioProcessorTrait for GainProcessor {
 struct GainController {
     gain: AtomicU64,
     freq: AtomicU64,
+    /// A gain (normalized, f64 bits) to switch to at the next `getState`, as a preset change in
+    /// the plug-in's own window would, telling the host with
+    /// `restartComponent(kParamValuesChanged)`; `u64::MAX`: none. Set by a controller state that
+    /// carries a second f64 after the Freq value.
+    preset: AtomicU64,
     _live: Live,
 }
 
@@ -419,10 +424,20 @@ impl IEditControllerTrait for GainController {
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
             self.freq.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
+            self.preset.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
         kResultOk
     }
     unsafe fn getState(&self, state: *mut IBStream) -> tresult {
         ctrl_call("getState");
+        let preset = self.preset.swap(u64::MAX, Ordering::Relaxed);
+        if preset != u64::MAX {
+            self.gain.store(preset, Ordering::Relaxed);
+            if let Some(h) = unsafe { ComRef::from_raw(HANDLER.load(Ordering::SeqCst)) } {
+                unsafe { h.restartComponent(RestartFlags_::kParamValuesChanged as i32) };
+            }
+        }
         let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
         let mut bytes = f64::from_bits(self.freq.load(Ordering::Relaxed)).to_le_bytes();
         let mut n = 0;
@@ -875,6 +890,7 @@ impl IPluginFactoryTrait for Factory {
             ComWrapper::new(GainController {
                 gain: AtomicU64::new(0.5f64.to_bits()),
                 freq: AtomicU64::new(0.5f64.to_bits()),
+                preset: AtomicU64::new(u64::MAX),
                 _live: Live::new(&OBJECTS),
             })
             .to_com_ptr::<FUnknown>()
