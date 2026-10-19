@@ -84,6 +84,12 @@ pub struct PlanIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SlotGen(pub(crate) u64);
 
+/// One plug-in instance: its track, its slot ([`INSTRUMENT_SLOT`](crate::INSTRUMENT_SLOT), an
+/// insert index or a [`clip_fx_slot`](crate::clip_fx_slot)), and its [`SlotGen`]. The compiler
+/// gives each instance its generation before the factory makes it, so playback can bind handles
+/// (editors, state readers) to exactly that instance.
+pub type SlotBinding = (TrackId, usize, SlotGen);
+
 impl SlotGen {
     /// Not a cell: a strip shell waiting for its state, or legacy (non-plan) storage.
     pub const VACANT: Self = SlotGen(0);
@@ -132,12 +138,13 @@ pub(crate) struct CellMove {
     pub(crate) expect: SlotGen,
 }
 
-/// Storage swapped into a cell of the new tables that is live after the moves.
+/// Storage swapped into a cell of the new tables that is live after the moves. `from_move` is the index
+/// of the move that fills the cell (`None` for a fresh instance), so validation is O(1) per attachment.
 pub(crate) enum Attach {
     /// NaN-filled parameter storage of the slot's new (long) map length.
-    Applied { cell: u16, storage: Vec<f32> },
+    Applied { cell: u16, from_move: Option<u16>, storage: Vec<f32> },
     /// The native Sampler's new sample: both owners. `set_sample` runs after the swap.
-    Sample { cell: u16, audio: Option<Arc<SourceAudio>>, wrapper: Option<Arc<dyn SampleSource>> },
+    Sample { cell: u16, from_move: Option<u16>, audio: Option<Arc<SourceAudio>>, wrapper: Option<Arc<dyn SampleSource>> },
 }
 
 /// Every table a realtime engine renders from, sized off the audio thread.
@@ -197,6 +204,29 @@ impl PlanTables {
         self.strips.iter().flat_map(|st| {
             st.plugins.iter().flatten().chain(st.instrument.iter()).chain(st.clip_fx.0.iter().flat_map(|(_, fx)| fx.eq.iter().chain(fx.comp.iter())))
         })
+    }
+
+    /// The binding (track, slot, generation) of every instance in the tables.
+    pub(crate) fn bindings(&self) -> Vec<SlotBinding> {
+        let mut out = Vec::new();
+        for st in &self.strips {
+            for (i, p) in st.plugins.iter().enumerate() {
+                if let Some(p) = p {
+                    out.push((st.id, i, p.generation));
+                }
+            }
+            if let Some(p) = &st.instrument {
+                out.push((st.id, crate::INSTRUMENT_SLOT, p.generation));
+            }
+            for (clip, fx) in &st.clip_fx.0 {
+                for (m, comp) in [(&fx.eq, false), (&fx.comp, true)] {
+                    if let (Some(p), Some(k)) = (m, crate::clip_fx_slot(*clip, comp)) {
+                        out.push((st.id, k, p.generation));
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -289,6 +319,9 @@ pub enum Adoption {
 pub struct PlanEnvelope {
     pub(crate) plan: PreparedPlan,
     pub(crate) state: EnvelopeState,
+    /// Set when a commit starts. Still `Pending` with this set means the commit unwound: the
+    /// envelope is torn (it may hold old and new cells alike) and nothing in it is reused.
+    pub(crate) committing: bool,
 }
 
 impl std::fmt::Debug for PlanEnvelope {
@@ -303,7 +336,7 @@ impl std::fmt::Debug for PlanEnvelope {
 
 impl PlanEnvelope {
     pub(crate) fn new(plan: PreparedPlan) -> Self {
-        PlanEnvelope { plan, state: EnvelopeState::Pending }
+        PlanEnvelope { plan, state: EnvelopeState::Pending, committing: false }
     }
 
     /// The envelope's state.
@@ -316,6 +349,13 @@ impl PlanEnvelope {
     #[must_use]
     pub fn plan(&self) -> &PreparedPlan {
         &self.plan
+    }
+
+    /// True when an adoption of this envelope unwound mid-commit: it is still `Pending`, the
+    /// engine is faulted, and the envelope may hold cells of both plans. Tear down both.
+    #[must_use]
+    pub fn torn(&self) -> bool {
+        self.committing && self.state == EnvelopeState::Pending
     }
 
     /// Control thread only: what came back. `Ok` holds everything the adopted plan displaced;
@@ -367,6 +407,13 @@ impl Retired {
     #[must_use]
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.session.as_ref()
+    }
+
+    /// The binding of every plan-mode instance inside: dropping `self` destroys them, so
+    /// playback releases their handles (legacy instances have none).
+    #[must_use]
+    pub fn instances(&self) -> Vec<SlotBinding> {
+        self.tables.as_ref().map(PlanTables::bindings).unwrap_or_default()
     }
 }
 

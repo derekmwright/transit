@@ -140,7 +140,7 @@ impl Rig {
     fn compile(&mut self, s: &Session) -> PlanEnvelope {
         self.generation = self.generation.checked_next().unwrap();
         let shared = Arc::clone(&self.shared);
-        let mut f = move |spec: &InstanceSpec| make(&shared, spec);
+        let mut f = move |spec: &InstanceSpec, _: soundcraft_mix::SlotGen| make(&shared, spec);
         self.compiler.compile(Arc::new(s.clone()), self.compiler.active(), self.generation, &mut f).unwrap()
     }
 

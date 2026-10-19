@@ -49,8 +49,9 @@ fn slot_shape(kind: CellKind, s: &PluginSlot) -> Shape {
 }
 
 /// Moves a strip's running state into a new strip shell: held notes, note chasing, mute, gain
-/// reduction, latency, failures, meter, and delay lines of the same capacity. Only swaps and
-/// copies; what the shell had goes back with the old strip.
+/// reduction, latency, failures, meter, and its delay lines whole (with their contents and
+/// capacity) where the shell holds placeholders for them. A shell with real (larger) lines keeps
+/// them. Only swaps and copies; what the shell had goes back with the old strip.
 fn move_strip(old: &mut Strip, new: &mut Strip) {
     std::mem::swap(&mut old.held, &mut new.held);
     new.chase = old.chase;
@@ -59,7 +60,7 @@ fn move_strip(old: &mut Strip, new: &mut Strip) {
     new.latency = old.latency;
     new.failures = old.failures;
     for (a, b) in [(&mut old.align, &mut new.align), (&mut old.align_pre, &mut new.align_pre), (&mut old.out_extra, &mut new.out_extra)] {
-        if a.cap == b.cap && a.bufs.len() == b.bufs.len() {
+        if b.is_placeholder() {
             std::mem::swap(a, b);
         }
     }
@@ -136,31 +137,33 @@ fn validate(active: &ActivePlan, plan: &mut PreparedPlan) -> Result<(), RejectRe
         }
     }
     for a in &plan.attach {
-        let (cell, sample) = match a {
-            Attach::Applied { cell, storage } => {
+        let (cell, from_move, sample) = match a {
+            Attach::Applied { cell, from_move, storage } => {
                 if !plan::needs_storage(storage.len()) {
                     return Err(RejectReason::AttachInvalid);
                 }
-                (*cell, false)
+                (*cell, *from_move, false)
             }
-            Attach::Sample { cell, .. } => (*cell, true),
+            Attach::Sample { cell, from_move, .. } => (*cell, *from_move, true),
         };
         let Some(loc) = new.cells.get(usize::from(cell)) else { return Err(RejectReason::AttachInvalid) };
         let kind_ok = if sample { loc.shape.kind == CellKind::Instrument } else { matches!(loc.shape.kind, CellKind::Insert | CellKind::Instrument) };
         if !kind_ok {
             return Err(RejectReason::AttachInvalid);
         }
-        // The slot that will be live there after the moves.
+        // The slot that will be live there after the moves: the one its move brings (named by
+        // index, O(1)), or the fresh one already in the new tables.
         let moved = plan.dst_claimed.get(usize::from(cell)).copied().unwrap_or(false);
-        let slot = if moved {
-            plan.moves
-                .iter()
-                .find(|m| m.to == cell)
+        let slot = match (moved, from_move) {
+            (true, Some(i)) => plan
+                .moves
+                .get(usize::from(i))
+                .filter(|m| m.to == cell)
                 .and_then(|m| old.cells.get(usize::from(m.from)))
                 .and_then(|l| old.slot(l))
-                .and_then(Option::as_ref)
-        } else {
-            new.slot(loc).and_then(Option::as_ref)
+                .and_then(Option::as_ref),
+            (false, None) => new.slot(loc).and_then(Option::as_ref),
+            _ => None,
         };
         let Some(slot) = slot else { return Err(RejectReason::AttachInvalid) };
         if slot_shape(loc.shape.kind, slot) != loc.shape || (sample && slot.id != SAMPLER) {
@@ -226,6 +229,7 @@ impl MixEngine {
         // Commit. Every step is a complete swap; the plan never leaves its envelope, so an unwind
         // at any point leaves each owner either here or there. `faulted` stays set if one does.
         active.faulted = true;
+        env.committing = true;
         let replaced = active.id.generation;
         let plan = &mut env.plan;
         if let Some(new) = plan.tables.as_mut() {

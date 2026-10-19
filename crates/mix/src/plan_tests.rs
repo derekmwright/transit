@@ -39,6 +39,8 @@ struct Log {
     latency: AtomicUsize,
     /// `set_sample` unwinds (armed after the instances are made).
     panic_on_sample: AtomicBool,
+    panic_on_drop: AtomicBool,
+    panic_on_process: AtomicBool,
 }
 
 type SharedLog = Arc<Log>;
@@ -67,6 +69,9 @@ impl Plugin for Probe {
         self.inner.param(id)
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        if self.log.panic_on_process.load(Ordering::Relaxed) {
+            panic!("plug-in panics in process");
+        }
         self.inner.process(io, frames);
     }
     fn latency(&self) -> usize {
@@ -107,12 +112,15 @@ impl Plugin for Probe {
 impl Drop for Probe {
     fn drop(&mut self) {
         self.log.drops.lock().unwrap().push(std::thread::current().id());
+        if self.log.panic_on_drop.swap(false, Ordering::Relaxed) {
+            panic!("plug-in panics in drop");
+        }
     }
 }
 
-fn factory(log: &SharedLog) -> impl FnMut(&InstanceSpec) -> Option<NewInstance> + use<> {
+fn factory(log: &SharedLog) -> impl FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance> + use<> {
     let log = Arc::clone(log);
-    move |spec: &InstanceSpec| {
+    move |spec: &InstanceSpec, _generation: SlotGen| {
         let base = if spec.id.starts_with("clap:test.") { "gain" } else { spec.id.as_str() };
         if spec.id == "clap:test.missing" {
             return None;
@@ -439,9 +447,9 @@ fn rejects_invalid_attachments() {
         let to = env.plan.moves[slot_moves(&env)[0]].to;
         let strip_cell = env.plan.moves.iter().find(|m| m.kind == CellKind::Strip).unwrap().to;
         let a = match f {
-            0 => Attach::Applied { cell: to, storage: vec![f32::NAN; 8] },
-            1 => Attach::Applied { cell: strip_cell, storage: vec![f32::NAN; 80] },
-            _ => Attach::Sample { cell: to, audio: None, wrapper: None },
+            0 => Attach::Applied { cell: to, from_move: None, storage: vec![f32::NAN; 8] },
+            1 => Attach::Applied { cell: strip_cell, from_move: None, storage: vec![f32::NAN; 80] },
+            _ => Attach::Sample { cell: to, from_move: None, audio: None, wrapper: None },
         };
         env.plan.attach = vec![a].into_boxed_slice();
         assert_rejected(rig, env, RejectReason::AttachInvalid);
@@ -567,7 +575,7 @@ fn limits_are_checked_before_anything_is_allocated() {
     }
     // Multiplication overflow is a limit, not a wrap.
     assert_eq!(
-        compile::strip_bytes(16, 16_384, usize::MAX / 8, 4),
+        compile::strip_bytes(16, 16_384, usize::MAX / 8, 4, 0),
         Err(CompileError::ResourceLimit { what: "prepared_bytes", need: usize::MAX, limit: usize::MAX })
     );
 }
@@ -768,4 +776,391 @@ fn moves_name_cells_of_the_active_plan() {
         assert_eq!(old.cells[usize::from(*from)].shape.kind, *kind);
     }
     assert_eq!(env.plan.src_claimed.len(), old.cells.len());
+}
+
+// Review repros (ADR 0009 refutation review of feat/prepared-plan).
+
+/// Track `a` plays through PDC delay lines; plan 2 lowers the session's max latency, plan 3 is an
+/// unrelated insert add. Returns the left channel.
+fn shrink_with_edit(edit: bool) -> Vec<f32> {
+    let (mut s, _, b) = audio_session();
+    s.edit.delay_compensation = true;
+    let mut rig = Rig::new();
+    rig.log.latency.store(10_000, Ordering::Relaxed);
+    s.track_mut(b).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
+    rig.publish(&s);
+    let mut out = rig.render(2);
+    rig.log.latency.store(480, Ordering::Relaxed);
+    s.track_mut(b).unwrap().mixer.inserts[0] = None;
+    s.track_mut(b).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.latent"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    out.extend(rig.render(4));
+    if edit {
+        s.track_mut(b).unwrap().mixer.inserts[2] = Some(builtin("gain"));
+        assert_eq!(rig.publish(&s), Adoption::Adopted);
+    }
+    out.extend(rig.render(8));
+    out
+}
+
+#[test]
+fn a_delay_tail_survives_a_capacity_shrink() {
+    let r = shrink_with_edit(false);
+    let e = shrink_with_edit(true);
+    let first = r.iter().zip(&e).position(|(x, y)| x.to_bits() != y.to_bits());
+    assert_eq!(first, None, "an unrelated insert add changed the output (cap shrink drops the delay lines)");
+}
+
+#[test]
+fn one_large_status_does_not_wedge_later_compiles() {
+    let (s, _, _) = audio_session();
+    let mut rig = Rig::new();
+    rig.comp = PlanCompiler::new(target(), PlanLimits { prepared_bytes: 32 << 20, ..PlanLimits::default() });
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    rig.comp.observe(&PlanStatus { required_latency: 1 << 20, capacity_exceeded: 1, ..PlanStatus::default() });
+    let mut make = factory(&rig.log);
+    let mut s2 = s.clone();
+    s2.tracks[0].mixer.inserts[0] = Some(builtin("gain"));
+    let r = rig.comp.compile(Arc::new(s2), rig.comp.active(), PlanGeneration::from_raw(50), &mut make);
+    assert!(r.is_ok(), "one transient status wedges every structural compile: {:?}", r.err());
+}
+
+#[test]
+fn a_panicking_drop_in_the_pool_does_not_wedge_the_compiler() {
+    let (mut rig, _, mut env) = rig_with_pending();
+    env.plan.moves[0].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    assert_eq!(rig.comp.pooled(), 1);
+    rig.log.panic_on_drop.store(true, Ordering::Relaxed);
+    let (s, _, _) = audio_session();
+    let mut make = factory(&rig.log);
+    let active = rig.comp.active();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rig.comp.compile(Arc::new(s.clone()), active, PlanGeneration::from_raw(40), &mut make).map(|_| ())
+    }));
+    assert!(r.is_err(), "the pooled instance's drop panicked inside compile");
+    let again = rig.comp.compile(Arc::new(s), active, PlanGeneration::from_raw(41), &mut make);
+    assert!(again.is_ok(), "compiler wedged after a panicking drop: {:?}", again.err());
+}
+
+#[test]
+fn reclaiming_a_torn_envelope_pools_nothing_under_the_wrong_spec() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("room_reverb"));
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    rig.render(2);
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("chorus"));
+    let mut env = rig.compile(&s);
+    FAULT_AT.set(4);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.eng.adopt_plan(&mut env)));
+    FAULT_AT.set(0);
+    assert!(r.is_err());
+    assert_eq!(env.state(), EnvelopeState::Pending);
+    rig.comp.reclaim(env);
+    let pooled = rig.comp.pooled();
+    // Same compiler: a compile that wants chorus at (a, 0).
+    let mut make = factory(&rig.log);
+    let env = rig.comp.compile(Arc::new(s.clone()), rig.comp.active(), PlanGeneration::from_raw(30), &mut make).unwrap();
+    let t = env.plan.tables.as_ref().unwrap();
+    let si = t.strip_of(a).unwrap();
+    let got = t.strips[si].plugins[0].as_ref().map(|p| p.plugin.info().id);
+    assert_eq!(got, Some("chorus"), "pooled after unwind: {pooled}; the chorus cell holds {got:?}");
+}
+
+#[test]
+fn a_plugin_panic_in_render_drops_nothing_and_the_engine_continues() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.fx"));
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    rig.render(1);
+    rig.log.panic_on_process.store(true, Ordering::Relaxed);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.render(1)));
+    assert!(r.is_err());
+    rig.log.panic_on_process.store(false, Ordering::Relaxed);
+    assert_eq!(rig.drops(), 0);
+    rig.render(2);
+    s.track_mut(a).unwrap().mixer.inserts[1] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!(rig.drops(), 0);
+}
+
+#[test]
+fn empty_and_shrinking_sessions_and_the_track_limit() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&Session::default()), Adoption::Adopted);
+    assert_eq!(rig.render(2), vec![0.0; 2 * BLOCK]);
+    let (s, _, _) = audio_session();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    let mut one = s.clone();
+    one.tracks.truncate(1);
+    assert_eq!(rig.publish(&one), Adoption::Adopted);
+    rig.render(2);
+    for n in [2u16, 1] {
+        let mut comp = PlanCompiler::new(target(), PlanLimits { tracks: n, ..PlanLimits::default() });
+        let mut make = factory(&rig.log);
+        let r = comp.compile(Arc::new(s.clone()), PlanGeneration::EMPTY, PlanGeneration::from_raw(1), &mut make);
+        if n == 2 { assert!(r.is_ok()) } else { assert!(matches!(r, Err(CompileError::ResourceLimit { what: "tracks", .. }))) }
+    }
+}
+
+#[test]
+fn a_refused_replacement_dropped_from_the_pool_is_released_at_an_occupied_key() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    let _ = rig.comp.take_released();
+    let mut s2 = s.clone();
+    s2.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.b"));
+    let mut env = rig.compile(&s2);
+    let i = env.plan.moves.iter().position(|m| m.kind == CellKind::Strip).unwrap();
+    env.plan.moves[i].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    assert_eq!(rig.comp.pooled(), 1, "B waits in the pool");
+    let drops = rig.drops();
+    let env = rig.compile(&s);
+    assert_eq!(rig.drops(), drops + 1, "B was destroyed by drop_pool");
+    let released = rig.comp.take_released();
+    drop(env);
+    assert!(!released.is_empty(), "B's destruction is reported: released = {released:?}");
+}
+
+// Coverage for the review's mutants.
+
+fn synth_track(s: &mut Session) -> TrackId {
+    use soundcraft_midi::{Note, Sequence};
+    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    let mut seq = Sequence::default();
+    for (i, p) in [60u8, 64, 67].into_iter().enumerate() {
+        seq.notes.push(Note { pitch: p, velocity: 100, release_velocity: 64, channel: 0, start: i as i64 * 10, length: 40_000 });
+    }
+    let cid = s.new_clip_id();
+    let tr = s.track_mut(t).unwrap();
+    tr.playlist_mut().unwrap().clips.push(Clip::midi(cid, "n", 0, 96_000, seq));
+    tr.instrument = Some(builtin("subtractive_synth"));
+    t
+}
+
+#[test]
+fn a_sample_attachment_on_an_instrument_that_is_not_the_sampler_is_rejected() {
+    let mut s = Session::default();
+    let t = synth_track(&mut s);
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    let mut env = rig.compile(&s);
+    let (i, m) = env.plan.moves.iter().enumerate().find(|(_, m)| m.kind == CellKind::Instrument).unwrap();
+    let (to, from_move) = (m.to, Some(i as u16));
+    env.plan.attach = vec![Attach::Sample { cell: to, from_move, audio: None, wrapper: None }].into_boxed_slice();
+    assert_rejected(rig, env, RejectReason::AttachInvalid);
+}
+
+#[test]
+fn held_notes_and_note_chasing_move_with_the_strip() {
+    let mut s = Session::default();
+    let t = synth_track(&mut s);
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    rig.render(4);
+    let strip = |rig: &Rig| {
+        let p = rig.eng.plan.as_deref().unwrap();
+        let st = &p.tables.strips[p.tables.strip_of(t).unwrap()];
+        (st.held.clone(), st.chase)
+    };
+    let before = strip(&rig);
+    assert_eq!(before, (vec![60, 64, 67], false), "three notes sound; the controllers were chased");
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!(strip(&rig), before, "a structural plan keeps the held notes and the chase state");
+}
+
+#[test]
+fn a_format_change_of_the_same_width_makes_a_fresh_instance() {
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Audio, ChannelFormat::Quad, None);
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    let made = rig.log.made.load(Ordering::Relaxed);
+    s.track_mut(t).unwrap().format = ChannelFormat::Ambisonics(1);
+    assert_eq!(rig.publish(&s), Adoption::Adopted, "a new layout is a new cell, not a move");
+    assert_eq!(rig.log.made.load(Ordering::Relaxed), made + 1);
+}
+
+#[test]
+fn reset_zeroes_the_plan_meters() {
+    let (s, _, _) = audio_session();
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    rig.render(2);
+    assert!(rig.eng.meters().any(|(_, m)| m.peaks.iter().any(|x| *x > 0.0)));
+    rig.eng.reset();
+    assert!(rig.eng.meters().all(|(_, m)| m.peaks.iter().all(|x| *x == 0.0) && m.peak == [0.0; 2]));
+    assert!(rig.eng.active_main_meter().peaks.iter().all(|x| *x == 0.0));
+}
+
+// Instance identity (F5): the factory gets each instance's generation, and every instance the
+// compiler destroys comes back once from `take_released` with that generation.
+
+fn compile_recording(rig: &mut Rig, s: &Session, made: &Arc<Mutex<Vec<SlotBinding>>>) -> PlanEnvelope {
+    rig.issued += 1;
+    let mut inner = factory(&rig.log);
+    let made = Arc::clone(made);
+    let mut make = move |spec: &InstanceSpec, generation: SlotGen| {
+        made.lock().unwrap().push((spec.track, spec.slot, generation));
+        inner(spec, generation)
+    };
+    rig.comp.compile(Arc::new(s.clone()), rig.comp.active(), PlanGeneration::from_raw(rig.issued), &mut make).unwrap()
+}
+
+fn publish_recording(rig: &mut Rig, s: &Session, made: &Arc<Mutex<Vec<SlotBinding>>>) -> Adoption {
+    let mut env = compile_recording(rig, s, made);
+    let a = rig.eng.adopt_plan(&mut env);
+    rig.comp.reclaim(env);
+    a
+}
+
+fn sorted(mut v: Vec<SlotBinding>) -> Vec<SlotBinding> {
+    v.sort_unstable();
+    v
+}
+
+#[test]
+fn the_factory_gets_the_generation_each_instance_carries() {
+    let (mut s, a, b) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("room_reverb"));
+    s.track_mut(b).unwrap().mixer.inserts[3] = Some(Insert::new("clap:test.fx"));
+    let (mut rig, made) = (Rig::new(), Arc::default());
+    let mut env = compile_recording(&mut rig, &s, &made);
+    assert_eq!(rig.comp.pending_bindings(), Some(sorted(made.lock().unwrap().clone())), "bound before publication");
+    assert_eq!(rig.eng.adopt_plan(&mut env), Adoption::Adopted);
+    rig.comp.reclaim(env);
+    assert_eq!(rig.comp.active_bindings(), sorted(made.lock().unwrap().clone()));
+    assert!(rig.comp.take_released().is_empty());
+}
+
+#[test]
+fn a_displaced_instance_is_released_with_its_generation() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let (mut rig, made) = (Rig::new(), Arc::default());
+    publish_recording(&mut rig, &s, &made);
+    let old = made.lock().unwrap()[0];
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.b"));
+    assert_eq!(publish_recording(&mut rig, &s, &made), Adoption::Adopted);
+    let new = made.lock().unwrap()[1];
+    assert_eq!((new.0, new.1), (old.0, old.1), "the same slot");
+    assert_eq!(rig.comp.take_released(), vec![old], "the displaced instance, by its generation");
+    assert_eq!(rig.comp.active_bindings(), vec![new], "the new one lives at that slot");
+}
+
+#[test]
+fn a_rejected_instance_is_released_when_the_pool_drops_it_and_not_when_it_is_reused() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let (mut rig, made) = (Rig::new(), Arc::default());
+    publish_recording(&mut rig, &s, &made);
+    let mut s2 = s.clone();
+    s2.track_mut(a).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.b"));
+    let mut env = compile_recording(&mut rig, &s2, &made);
+    let b = *made.lock().unwrap().last().unwrap();
+    env.plan.moves[0].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    assert!(rig.comp.take_released().is_empty(), "rejected: B waits in the pool, alive");
+    // Reused: same binding, nothing released.
+    let mut env = compile_recording(&mut rig, &s2, &made);
+    assert!(rig.comp.pending_bindings().unwrap().contains(&b), "the pooled instance keeps its generation");
+    assert!(rig.comp.take_released().is_empty());
+    env.plan.moves[0].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    // Not wanted by the next compile: dropped from the pool, released.
+    let env = compile_recording(&mut rig, &s, &made);
+    assert_eq!(rig.comp.take_released(), vec![b]);
+    drop(env);
+}
+
+#[test]
+fn a_pool_drop_at_an_occupied_slot_is_released_by_generation() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let (mut rig, made) = (Rig::new(), Arc::default());
+    publish_recording(&mut rig, &s, &made);
+    let a_bound = made.lock().unwrap()[0];
+    let mut s2 = s.clone();
+    s2.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.b"));
+    let mut env = compile_recording(&mut rig, &s2, &made);
+    let b_bound = made.lock().unwrap()[1];
+    env.plan.moves[0].expect = SlotGen(9_999);
+    assert!(matches!(rig.eng.adopt_plan(&mut env), Adoption::Rejected(_)));
+    rig.comp.reclaim(env);
+    let env = compile_recording(&mut rig, &s, &made);
+    assert_eq!(rig.comp.take_released(), vec![b_bound], "B is gone although A lives at the same slot");
+    assert_eq!(rig.comp.pending_bindings(), Some(vec![a_bound]));
+    drop(env);
+}
+
+#[test]
+fn teardown_reports_every_instance_by_generation() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let (mut rig, made) = (Rig::new(), Arc::default());
+    publish_recording(&mut rig, &s, &made);
+    s.track_mut(a).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.b"));
+    // A plan that never reaches the audio thread, then teardown.
+    let env = compile_recording(&mut rig, &s, &made);
+    rig.comp.reclaim(env);
+    rig.comp.clear_pool();
+    let b = made.lock().unwrap()[1];
+    assert_eq!(rig.comp.take_released(), vec![b], "the unsent plan's instance");
+    let active = rig.comp.active_bindings();
+    let retired = std::mem::replace(&mut rig.eng, MixEngine::realtime(target())).into_retired();
+    assert_eq!(sorted(retired.instances()), active, "the engine's instances, for playback to release at teardown");
+    drop(retired);
+    assert_eq!(rig.drops(), 2);
+}
+
+#[test]
+fn slot_generations_never_wrap() {
+    let (mut s, a, _) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    let mut rig = Rig::new();
+    rig.comp.set_slot_generation_for_tests(u64::MAX - 1);
+    let mut make = factory(&rig.log);
+    let r = rig.comp.compile(Arc::new(s), PlanGeneration::EMPTY, PlanGeneration::from_raw(1), &mut make);
+    assert_eq!(r.unwrap_err(), CompileError::GenerationExhausted);
+    assert_eq!(rig.comp.pending(), None, "nothing in flight");
+    assert_eq!(rig.log.made.load(Ordering::Relaxed), rig.drops(), "whatever was made was dropped");
+    assert_eq!(rig.comp.take_released().len(), rig.drops(), "and reported");
+}
+
+#[test]
+fn a_hint_sizes_only_the_strip_that_asked_and_is_dropped_when_it_does_not_fit() {
+    let (mut s, a, b) = audio_session();
+    s.edit.delay_compensation = true;
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    let cap = |rig: &Rig, t: TrackId| {
+        let p = rig.eng.plan.as_deref().unwrap();
+        p.tables.strips[p.tables.strip_of(t).unwrap()].align.cap
+    };
+    rig.comp.observe(&PlanStatus { required_latency: 40_000, capacity_exceeded: 1, affected: Some((b, SlotGen(1))), ..PlanStatus::default() });
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!(cap(&rig, b), Some(65_536), "the strip that asked");
+    assert_eq!(cap(&rig, a), Some(MIN_DELAY_CAPACITY), "only that strip");
+    // A hint beyond the byte limit is dropped instead of failing every later compile.
+    rig.comp = PlanCompiler::new(target(), PlanLimits { prepared_bytes: 8 << 20, ..PlanLimits::default() });
+    rig.eng = MixEngine::realtime(target());
+    rig.issued = 0;
+    rig.publish(&s);
+    rig.comp.observe(&PlanStatus { required_latency: 1 << 20, capacity_exceeded: 1, affected: Some((b, SlotGen(1))), ..PlanStatus::default() });
+    s.track_mut(a).unwrap().mixer.inserts[1] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!(cap(&rig, b), Some(MIN_DELAY_CAPACITY));
 }

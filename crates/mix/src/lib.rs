@@ -84,7 +84,7 @@ mod plan_tests;
 pub use compile::{CompileError, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
 pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
-    RenderTarget, Retired, SlotGen,
+    RenderTarget, Retired, SlotBinding, SlotGen,
 };
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
@@ -471,6 +471,15 @@ struct DelayLine {
 }
 
 impl DelayLine {
+    /// A plan-mode stand-in in a strip shell whose live lines move in with the strip state.
+    fn placeholder() -> Self {
+        DelayLine { bufs: Vec::new(), idx: 0, len: 0, cap: Some(0) }
+    }
+
+    fn is_placeholder(&self) -> bool {
+        self.cap == Some(0) && self.bufs.is_empty()
+    }
+
     /// A plan-mode delay line with `cap` samples of storage per channel.
     fn with_capacity(ch: usize, cap: usize) -> Self {
         DelayLine { bufs: vec![vec![0.0; cap]; ch], idx: 0, len: 0, cap: Some(cap) }
