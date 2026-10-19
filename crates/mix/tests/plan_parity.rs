@@ -326,3 +326,22 @@ fn reordered_tracks_match_todays_path() {
     steps.push(s.clone());
     assert_parity("aux and audio trade places", &steps, 12);
 }
+
+#[test]
+fn an_inactive_aux_keeps_its_latency_across_a_structural_plan() {
+    let mut s = Session::default();
+    s.edit.delay_compensation = true;
+    let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);
+    s.busses.push(Bus { id: BusId(900), name: "V".into(), format: ChannelFormat::Stereo });
+    let aux = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, None);
+    s.track_mut(aux).unwrap().mixer.input = Route::Bus(BusId(900));
+    let mut la = builtin("compressor");
+    la.params.insert("lookahead".into(), 5.0);
+    s.track_mut(aux).unwrap().mixer.inserts[0] = Some(la);
+    s.track_mut(a).unwrap().mixer.sends[0] = send(BusId(900), false);
+    let mut steps = vec![s.clone()];
+    s.track_mut(aux).unwrap().inactive = true;
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("gain"));
+    steps.push(s.clone());
+    assert_parity("inactive aux latency", &steps, 6);
+}
