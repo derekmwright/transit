@@ -180,6 +180,8 @@ pub struct PlanCompiler {
     /// next plans size that strip's lines for it. Cleared once a confirmed plan holds it, and
     /// dropped when it does not fit the limits.
     hints: HashMap<TrackId, usize>,
+    /// Teardown began ([`PlanCompiler::clear_pool`]): reclaimed instances are released, not pooled.
+    closing: bool,
 }
 
 /// The planned content of one slot cell.
@@ -198,6 +200,8 @@ struct PlannedSlot {
     params: usize,
     sample: Option<Arc<SourceAudio>>,
     plan: SlotPlan,
+    /// A fresh instance's latency, read once when it is made.
+    latency: usize,
 }
 
 /// The planned slots of one strip: its track index, layout, slots and clip entries.
@@ -311,6 +315,7 @@ impl PlanCompiler {
             pool: Vec::new(),
             released: Vec::new(),
             hints: HashMap::new(),
+            closing: false,
         }
     }
 
@@ -345,15 +350,20 @@ impl PlanCompiler {
         self.pool.len()
     }
 
-    /// Takes a status the engine reported: a strip that asked for a delay beyond its capacity
-    /// gets lines for it in the next structural plan (only that strip). A status that names no
-    /// strip changes nothing.
+    /// Takes a status the engine reported: when a delay line had to clamp, every confirmed strip
+    /// whose lines hold less than the delay asked for gets lines for it in the next structural
+    /// plan, so one plan restores alignment for all of them (delay compensation can ask any strip
+    /// for up to that much). Strips that already hold enough are left as they are.
     pub fn observe(&mut self, status: &PlanStatus) {
-        if let Some((track, _)) = status.affected
-            && status.required_latency > 0
-        {
-            let h = self.hints.entry(track).or_default();
-            *h = (*h).max(status.required_latency as usize);
+        let need = status.required_latency as usize;
+        if status.capacity_exceeded == 0 || need == 0 {
+            return;
+        }
+        for st in &self.active.strips {
+            if st.generation != SlotGen::VACANT && st.cap < need {
+                let h = self.hints.entry(st.track).or_default();
+                *h = (*h).max(need);
+            }
         }
     }
 
@@ -388,8 +398,16 @@ impl PlanCompiler {
         per.and_then(|p| p.checked_mul(usize::from(self.limits.tracks))).unwrap_or(usize::MAX)
     }
 
-    /// Reports and drops (on this thread) what the pool still holds.
+    /// Teardown: reports and drops (on this thread) what the pool holds, and stops pooling. Every
+    /// envelope reclaimed afterwards has its instances dropped and reported instead of kept, so
+    /// none dies unreported with the compiler.
     pub fn clear_pool(&mut self) {
+        self.closing = true;
+        self.drop_pool();
+    }
+
+    /// Reports and drops (on this thread) what the pool still holds.
+    fn drop_pool(&mut self) {
         let leftovers = std::mem::take(&mut self.pool);
         self.released.extend(leftovers.iter().map(|p| (p.key.0, p.key.1, p.slot.generation)));
         drop(leftovers);
@@ -470,7 +488,7 @@ impl PlanCompiler {
                 dst_claimed: Box::new([]),
                 tracks: self.active.tracks.clone(),
             };
-            self.clear_pool();
+            self.drop_pool();
             self.last = next;
             self.pending = Some(Pending { generation: next, shadow: None });
             return Ok(PlanEnvelope::new(plan));
@@ -479,7 +497,7 @@ impl PlanCompiler {
         let (tables, moves, attach, shadow) = match built {
             Ok(b) => b,
             Err(e) => {
-                self.clear_pool();
+                self.drop_pool();
                 return Err(e);
             }
         };
@@ -592,10 +610,14 @@ impl PlanCompiler {
                 })
             }
         };
-        let Some(mut slot) = slot else {
+        let Some(slot) = slot else {
             p.plan = SlotPlan::Absent;
             return Ok(());
         };
+        // The instance is in the planned list before any of its own code runs: an unwind from here
+        // on finds it there and reports it.
+        p.plan = SlotPlan::Fresh(Box::new(slot));
+        let SlotPlan::Fresh(slot) = &mut p.plan else { return Ok(()) };
         slot.layout = layout;
         if slot.applied.heap.len() != long || !slot.applied.fixed {
             slot.applied = Applied::prepared(if long > 0 { vec![f32::NAN; long] } else { Vec::new() });
@@ -606,7 +628,7 @@ impl PlanCompiler {
             slot.sample_audio = p.sample.clone();
             slot.sample_wrapper = wrapper;
         }
-        p.plan = SlotPlan::Fresh(Box::new(slot));
+        p.latency = slot.plugin.latency();
         Ok(())
     }
 
@@ -636,7 +658,7 @@ impl PlanCompiler {
                     _ => 0,
                 };
                 let sample = if kind == CellKind::Instrument { instrument_sample(s, t) } else { None };
-                let mut p = PlannedSlot {
+                let p = PlannedSlot {
                     key,
                     kind,
                     index: u16::try_from(index).unwrap_or(u16::MAX),
@@ -644,12 +666,14 @@ impl PlanCompiler {
                     params: ins.map_or(0, |i| i.params.len()),
                     sample,
                     plan: SlotPlan::Absent,
+                    latency: 0,
                 };
-                let r = self.plan_slot(&mut p, layout, make);
-                if let Some((_, _, planned, _)) = out.last_mut() {
-                    planned.push(p);
+                // Planned in place, so whatever it makes is in `out` the moment it exists.
+                let Some((_, _, planned, _)) = out.last_mut() else { continue };
+                planned.push(p);
+                if let Some(p) = planned.last_mut() {
+                    self.plan_slot(p, layout, make)?;
                 }
-                r?;
             }
             if let Some((_, _, _, c)) = out.last_mut() {
                 *c = clips;
@@ -675,13 +699,23 @@ impl PlanCompiler {
         let sr = self.target.sample_rate as f32;
         // Slots first: their instances tell the delay the strips need.
         let mut per_strip: Vec<PlannedStrip> = Vec::new();
-        if let Err(e) = self.plan_slots(s, rows, &specs, make, &mut per_strip) {
-            self.release_planned(per_strip);
-            return Err(e);
+        // The factory and the instances run plug-in code that may unwind: report what was made (or
+        // taken from the pool) before the unwind drops it, then let it continue.
+        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_slots(s, rows, &specs, make, &mut per_strip)));
+        match planned {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.release_planned(per_strip);
+                return Err(e);
+            }
+            Err(panic) => {
+                self.release_planned(per_strip);
+                std::panic::resume_unwind(panic);
+            }
         }
         let latency_of = |p: &PlannedSlot, me: &Self| match &p.plan {
             SlotPlan::Move { .. } => me.active.slots.get(&p.key).map_or(0, |o| o.latency),
-            SlotPlan::Fresh(slot) => slot.plugin.latency(),
+            SlotPlan::Fresh(_) => p.latency,
             SlotPlan::Absent => 0,
         };
         let need1 = per_strip
@@ -815,7 +849,7 @@ impl PlanCompiler {
                     }
                     SlotPlan::Fresh(slot) => {
                         sh.generation = slot.generation;
-                        sh.latency = slot.plugin.latency();
+                        sh.latency = p.latency;
                         sh.heap = slot.applied.heap.len();
                         if let Some(c) = tables.slot_mut(&loc) {
                             *c = Some(*slot);
@@ -868,7 +902,7 @@ impl PlanCompiler {
                     self.hints.retain(|t, h| active.strips.iter().any(|s| s.track == *t && s.cap < capacity_for(*h, limit)));
                 }
                 EnvelopeState::Rejected { .. } | EnvelopeState::Pending => {
-                    if let (Some(sh), Some(tables)) = (p.shadow, env.plan.tables.as_mut()) {
+                    if let (false, Some(sh), Some(tables)) = (self.closing, p.shadow, env.plan.tables.as_mut()) {
                         self.harvest(tables, &sh);
                     }
                 }

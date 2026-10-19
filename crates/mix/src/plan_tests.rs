@@ -1140,7 +1140,7 @@ fn slot_generations_never_wrap() {
 }
 
 #[test]
-fn a_hint_sizes_only_the_strip_that_asked_and_is_dropped_when_it_does_not_fit() {
+fn a_hint_sizes_every_strip_below_it_once_and_is_dropped_when_it_does_not_fit() {
     let (mut s, a, b) = audio_session();
     s.edit.delay_compensation = true;
     let mut rig = Rig::new();
@@ -1149,11 +1149,20 @@ fn a_hint_sizes_only_the_strip_that_asked_and_is_dropped_when_it_does_not_fit() 
         let p = rig.eng.plan.as_deref().unwrap();
         p.tables.strips[p.tables.strip_of(t).unwrap()].align.cap
     };
-    rig.comp.observe(&PlanStatus { required_latency: 40_000, capacity_exceeded: 1, affected: Some((b, SlotGen(1))), ..PlanStatus::default() });
+    // Status without a clamp changes nothing.
+    rig.comp.observe(&PlanStatus { required_latency: 40_000, ..PlanStatus::default() });
     s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("gain"));
     assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!((cap(&rig, a), cap(&rig, b)), (Some(MIN_DELAY_CAPACITY), Some(MIN_DELAY_CAPACITY)));
+    rig.comp.observe(&PlanStatus { required_latency: 40_000, capacity_exceeded: 1, affected: Some((b, SlotGen(1))), ..PlanStatus::default() });
+    s.track_mut(a).unwrap().mixer.inserts[2] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
     assert_eq!(cap(&rig, b), Some(65_536), "the strip that asked");
-    assert_eq!(cap(&rig, a), Some(MIN_DELAY_CAPACITY), "only that strip");
+    assert_eq!(cap(&rig, a), Some(65_536), "and every other strip below it, in the same plan");
+    // Satisfied hints are gone: the next structural plan keeps those lines and asks for no more.
+    s.track_mut(a).unwrap().mixer.inserts[3] = Some(builtin("gain"));
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!((cap(&rig, a), cap(&rig, b)), (Some(65_536), Some(65_536)));
     // A hint beyond the byte limit is dropped instead of failing every later compile.
     rig.comp = PlanCompiler::new(target(), PlanLimits { prepared_bytes: 8 << 20, ..PlanLimits::default() });
     rig.eng = MixEngine::realtime(target());
@@ -1163,4 +1172,127 @@ fn a_hint_sizes_only_the_strip_that_asked_and_is_dropped_when_it_does_not_fit() 
     s.track_mut(a).unwrap().mixer.inserts[1] = Some(builtin("gain"));
     assert_eq!(rig.publish(&s), Adoption::Adopted);
     assert_eq!(cap(&rig, b), Some(MIN_DELAY_CAPACITY));
+}
+
+// Second review repros.
+#[test]
+fn a_factory_panic_mid_compile_reports_the_instances_already_made() {
+    let (mut s, a, _) = audio_session();
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    let _ = rig.comp.take_released();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    s.track_mut(a).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.boom"));
+    let handed = Arc::new(Mutex::new(Vec::new()));
+    let mut inner = factory(&rig.log);
+    let h2 = Arc::clone(&handed);
+    let mut make = move |spec: &InstanceSpec, g: SlotGen| {
+        if spec.id == "clap:test.boom" {
+            panic!("factory unwinds");
+        }
+        let n = inner(spec, g);
+        if n.is_some() {
+            h2.lock().unwrap().push(g);
+        }
+        n
+    };
+    let active = rig.comp.active();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rig.comp.compile(Arc::new(s.clone()), active, PlanGeneration::from_raw(50), &mut make).map(|_| ())
+    }));
+    assert!(r.is_err());
+    let made = handed.lock().unwrap().clone();
+    assert_eq!(made.len(), 1);
+    assert_eq!(rig.drops(), 1, "the made instance was destroyed by the unwind");
+    let rel: Vec<SlotGen> = rig.comp.take_released().iter().map(|b| b.2).collect();
+    assert!(rel.contains(&made[0]), "destroyed generation {:?} not reported; released {rel:?}", made[0]);
+}
+
+#[test]
+fn runtime_latency_growth_is_absorbed_by_one_plan_for_every_strip() {
+    let (mut s, a, b) = audio_session();
+    s.edit.delay_compensation = true;
+    let c = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    let d = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    let _ = (a, c, d);
+    s.track_mut(b).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
+    let mut rig = Rig::new();
+    rig.publish(&s);
+    rig.render(2);
+    rig.log.latency.store(20_000, Ordering::Relaxed);
+    let mut rounds = 0;
+    for i in 0..6 {
+        rig.render(2);
+        let st = rig.eng.status();
+        if st.capacity_exceeded == 0 {
+            break;
+        }
+        rounds += 1;
+        rig.comp.observe(&st);
+        s.tracks[0].mixer.volume_db = -(i as f32) - 1.0;
+        assert_eq!(rig.publish(&s), Adoption::Adopted);
+    }
+    assert!(rounds <= 1, "needed {rounds} plans before no strip clamped");
+}
+
+#[test]
+fn reclaim_after_clear_pool_releases_instead_of_pooling() {
+    let (mut rig, s2, env) = rig_with_pending();
+    let _ = s2;
+    rig.comp.clear_pool();
+    rig.comp.reclaim(env); // never serviced (teardown)
+    assert_eq!(rig.comp.pooled(), 0, "teardown: reclaim after clear_pool pools instances that die unreported with the compiler");
+}
+
+#[test]
+fn every_instance_is_released_exactly_once_across_pool_reuse_and_teardown() {
+    use std::collections::BTreeSet;
+    let (mut s1, a, _) = audio_session();
+    s1.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.a"));
+    let mut s2 = s1.clone();
+    s2.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.b"));
+    s2.track_mut(a).unwrap().mixer.inserts[1] = Some(Insert::new("clap:test.c"));
+    let mut rig = Rig::new();
+    let mut released: Vec<SlotGen> = Vec::new();
+    let mut seen: BTreeSet<SlotGen> = BTreeSet::new();
+    let reject = |env: &mut PlanEnvelope| {
+        if let Some(i) = env.plan.moves.iter().position(|m| m.kind == CellKind::Strip) {
+            env.plan.moves[i].expect = SlotGen(9_999);
+        }
+    };
+    let steps: [(u8, bool); 7] = [(1, true), (2, false), (2, false), (1, true), (2, false), (2, true), (1, true)];
+    for (k, (which, ok)) in steps.into_iter().enumerate() {
+        let s = if which == 1 { &s1 } else { &s2 };
+        let mut env = rig.compile(s);
+        for b in env.plan.tables.as_ref().map(|t| t.bindings()).unwrap_or_default() {
+            seen.insert(b.2);
+        }
+        if !ok {
+            reject(&mut env);
+        }
+        let r = rig.eng.adopt_plan(&mut env);
+        assert_eq!(matches!(r, Adoption::Adopted), ok, "step {k}");
+        rig.comp.reclaim(env);
+        released.extend(rig.comp.take_released().iter().map(|b| b.2));
+        rig.render(1);
+        let live: Vec<SlotGen> = rig.comp.active_bindings().iter().map(|b| b.2).collect();
+        let mut sorted = released.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), released.len(), "step {k}: double release {released:?}");
+        assert!(live.iter().all(|g| !released.contains(g)), "step {k}: live {live:?} released {released:?}");
+        let mut lv = live.clone();
+        lv.sort();
+        lv.dedup();
+        assert_eq!(lv.len(), live.len(), "step {k}: aliased live generations");
+    }
+    rig.comp.clear_pool();
+    released.extend(rig.comp.take_released().iter().map(|b| b.2));
+    let retired = std::mem::replace(&mut rig.eng, MixEngine::realtime(target())).into_retired();
+    released.extend(retired.instances().iter().map(|b| b.2));
+    drop(retired);
+    let all: BTreeSet<SlotGen> = released.iter().copied().collect();
+    assert_eq!(all.len(), released.len(), "double release at teardown");
+    assert_eq!(all, seen, "every instance ever made is released exactly once");
+    assert_eq!(rig.drops(), seen.len());
 }
