@@ -1340,7 +1340,8 @@ fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
         let _ = app.engine.squash_undo(added + 1, "Write Automation");
         app.status = format!("Thinned the write pass: {removed} point{plural} removed");
     } else if added > 0 {
-        app.status = format!("Thinned the write pass as its own step (Thin), because an edit came after it: {removed} point{plural} removed");
+        app.status =
+            format!("Thinned the write pass as its own step (Thin), since the pass is no longer the newest step: {removed} point{plural} removed");
     } else {
         app.status = format!("Thinned the write pass: {removed} point{plural} removed");
     }
@@ -1377,6 +1378,14 @@ impl StudioApp {
         let n = r["removed"].as_u64().unwrap_or(0) as usize;
         self.status = format!("Thinned the automation: {n} point{} removed", if n == 1 { "" } else { "s" });
         Ok(n)
+    }
+}
+
+/// A control the user is moving ran a command under the pass's merge key: it is part of the pass,
+/// so the pass is still the newest step.
+pub(crate) fn note_pass_edit(app: &mut StudioApp) {
+    if app.auto.writing {
+        app.auto.pass_mark = app.engine.revision;
     }
 }
 

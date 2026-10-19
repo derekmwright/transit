@@ -1100,3 +1100,73 @@ fn latch_keeps_writing_after_release_by_design() {
     assert_eq!(t.app.pass_spans(a).len(), 1, "one continuous span");
     t.key("Space");
 }
+
+/// Drag the strip fader up or down by `dy` points for `n` steps, then let the release arrive.
+fn fader_drag(t: &mut T, a: TrackId, dy: f32, n: usize) {
+    let f = strip_of(t, a).fader;
+    let (x, y) = ((f[0] + f[2]) / 2.0, (f[1] + f[3]) / 2.0);
+    t.input("ui.drag", json!({"x": x, "y": y, "to_x": x, "to_y": y + dy, "steps": n}));
+    t.frames(n + 5);
+}
+
+fn assert_one_pass_step(t: &mut T, a: TrackId, before: usize, thinned_ok: bool) {
+    let h = t.app.engine.undo_history();
+    assert_eq!(h.len(), before + 1, "a multi-touch pass is one undo step: {h:?}");
+    assert_eq!(h.last().unwrap(), "Write Automation", "{h:?}");
+    assert!(!t.app.status.contains("because an edit"), "the status text must not blame an edit: {}", t.app.status);
+    let thin = t.points(a, &AutoParam::Volume);
+    assert!(thinned_ok);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.undo_len(), before, "one Undo removes the whole pass");
+    t.app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume), thin, "Redo restores the thinned curves");
+}
+
+#[test]
+fn a_two_touch_pass_on_the_header_volume_is_one_step_after_stop() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    let before = t.undo_len();
+    t.key("Space");
+    touch_drag(&mut t, a, 100.0, 100);
+    t.frames(30);
+    touch_drag(&mut t, a, -100.0, 100);
+    assert_eq!(t.app.pass_spans(a).len(), 2);
+    t.key("Space");
+    t.frames(3);
+    assert_one_pass_step(&mut t, a, before, true);
+}
+
+#[test]
+fn a_two_touch_pass_on_the_strip_fader_is_one_step_after_stop() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    t.app.ui.show_mixer = true;
+    t.frames(3);
+    let before = t.undo_len();
+    t.key("Space");
+    fader_drag(&mut t, a, -60.0, 100);
+    t.frames(30);
+    fader_drag(&mut t, a, 40.0, 100);
+    assert_eq!(t.app.pass_spans(a).len(), 2, "{:?}", t.app.pass_spans(a));
+    t.key("Space");
+    t.frames(3);
+    assert_one_pass_step(&mut t, a, before, true);
+}
+
+#[test]
+fn a_latch_pass_with_a_regrab_is_one_step_after_stop() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    t.app.set_automation_mode(a, AutomationMode::Latch).unwrap();
+    t.app.ui.show_mixer = true;
+    t.frames(3);
+    let before = t.undo_len();
+    t.key("Space");
+    fader_drag(&mut t, a, -60.0, 100);
+    t.frames(30);
+    fader_drag(&mut t, a, 40.0, 100);
+    t.key("Space");
+    t.frames(3);
+    assert_one_pass_step(&mut t, a, before, true);
+}

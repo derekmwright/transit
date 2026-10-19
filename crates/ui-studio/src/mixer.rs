@@ -540,6 +540,13 @@ impl StudioApp {
     /// Set a control (dB, or balance for a knob) as part of a merged gesture: `key` is the
     /// gesture's merge key, by default the control's own drag key.
     pub fn set_value_merged(&mut self, t: Target, v: f32, key: Option<&str>) -> Result<Value, String> {
+        let r = self.set_value_keyed(t, v, key);
+        // The touched control's own commands belong to a running pass.
+        crate::automation::note_pass_edit(self);
+        r
+    }
+
+    fn set_value_keyed(&mut self, t: Target, v: f32, key: Option<&str>) -> Result<Value, String> {
         match t {
             Target::Fader(id) => {
                 let key = key.map_or_else(|| format!("fader:{}", id.0), str::to_string);
