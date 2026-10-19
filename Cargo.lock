@@ -3912,6 +3912,7 @@ dependencies = [
  "soundcraft-rt",
  "soundcraft-time",
  "soundcraft-video",
+ "soundcraft-vst3-host",
  "thiserror 2.0.21",
  "zip",
 ]
@@ -3950,6 +3951,7 @@ dependencies = [
  "soundcraft-model",
  "soundcraft-rt",
  "soundcraft-time",
+ "soundcraft-vst3-host",
 ]
 
 [[package]]
@@ -4025,6 +4027,7 @@ dependencies = [
  "soundcraft-playback",
  "soundcraft-time",
  "soundcraft-video",
+ "soundcraft-vst3-host",
  "toml",
 ]
 
@@ -4047,6 +4050,7 @@ dependencies = [
  "soundcraft-model",
  "soundcraft-playback",
  "soundcraft-time",
+ "soundcraft-vst3-host",
 ]
 
 [[package]]
@@ -4072,6 +4076,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soundcraft-dsp",
+ "soundcraft-vst3-host",
  "thiserror 2.0.21",
  "vst3",
  "windows-sys 0.61.2",

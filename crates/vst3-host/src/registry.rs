@@ -108,16 +108,17 @@ fn merge(files: Vec<scan_cache::Entry<Vst3Descriptor>>) -> Vec<Vst3Descriptor> {
 /// Scans the search folders and keeps the result. With `reuse`, files the cache file knows are
 /// not loaded again unless they changed; either way the cache file is rewritten.
 fn scan_now(reuse: bool) -> Vec<Vst3Descriptor> {
-    let (dirs, cache_file, scanner) = {
+    let (dirs, mut taken, cache_file, scanner) = {
         let r = lock();
         // Unit tests never scan the machine's plug-in folders: that loads every installed plug-in
         // in-process, and some never unload, which hangs the test binary at exit (CI has none).
-        #[cfg(test)]
+        // Nor do the integration tests with the scan hook (the registry race test calls `scan`).
+        #[cfg(any(test, feature = "test-hooks"))]
         let mut dirs = Vec::new();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-hooks")))]
         let mut dirs = paths::default_search_paths();
         dirs.extend(r.extra_dirs.iter().cloned());
-        (dirs, r.cache_file.clone(), r.scanner.clone())
+        (dirs, r.extra_dirs.clone(), r.cache_file.clone(), r.scanner.clone())
     };
     let load = |p: &Path| match &scanner {
         // Skip kills a child that is loading; a file loading here has to finish.
@@ -142,11 +143,45 @@ fn scan_now(reuse: bool) -> Vec<Vst3Descriptor> {
         scan_cache::write(f, &files);
     }
     let problems = files.iter().filter_map(|f| Some((f.path.clone(), f.error.clone()?))).collect();
-    let list = merge(files);
-    let mut r = lock();
-    r.scanned = Some(list.clone());
-    r.problems = problems;
-    list
+    let mut list = merge(files);
+    #[cfg(feature = "test-hooks")]
+    run_after_load_hook();
+    // Folders added while this scan loaded are not in `list` (and `add_search_dir` leaves it to
+    // the scan to publish them): scan them here, until none is new at the moment of publishing.
+    loop {
+        let mut r = lock();
+        let late: Vec<PathBuf> = r.extra_dirs.iter().filter(|d| !taken.contains(d)).cloned().collect();
+        if late.is_empty() {
+            r.scanned = Some(list.clone());
+            r.problems = problems;
+            return list;
+        }
+        drop(r);
+        for d in scan_paths(&late) {
+            if !list.iter().any(|o| o.id == d.id) {
+                list.push(d);
+            }
+        }
+        list.sort_by_key(|d| d.name.to_lowercase());
+        taken.extend(late);
+    }
+}
+
+/// Test hook: runs after a scan loaded its files and before it publishes them.
+#[cfg(feature = "test-hooks")]
+static AFTER_LOAD: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+
+#[cfg(feature = "test-hooks")]
+pub fn set_after_load_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    *AFTER_LOAD.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+}
+
+#[cfg(feature = "test-hooks")]
+fn run_after_load_hook() {
+    let hook = AFTER_LOAD.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if let Some(h) = hook {
+        h();
+    }
 }
 
 pub fn scan() -> Vec<Vst3Descriptor> {

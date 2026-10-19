@@ -67,3 +67,11 @@ type_complexity = "allow"
 [[test]]
 name = "real_plugin_repro"
 harness = false
+
+# Test-only hook in the scan (see tests/registry_race.rs); off in every normal build.
+[features]
+test-hooks = []
+
+# Turns the hook on for this crate's own tests.
+[dev-dependencies]
+soundcraft-vst3-host = { path = ".", features = ["test-hooks"] }

@@ -350,6 +350,14 @@ pub fn add_search_dir(dir: &Path) -> usize {
     api::add_search_dir(dir)
 }
 
+/// Runs `hook` in every scan after its files loaded and before it publishes them. Only for the
+/// registry race test.
+#[cfg(all(feature = "test-hooks", not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub fn set_scan_hook(hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    registry::set_after_load_hook(hook)
+}
+
 /// Scans the given folders without touching the cache.
 pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
     api::scan_paths(dirs)
