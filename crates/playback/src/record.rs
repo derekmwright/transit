@@ -604,8 +604,14 @@ struct WriterStart {
 }
 
 impl WriterStart {
-    fn finished(&self) -> bool {
-        self.placed || self.reader.status() == start::Status::Cancelled || self.input_start.frame().is_err()
+    fn finished(&self) -> Result<bool, &'static str> {
+        if self.placed || self.reader.status() == start::Status::Cancelled {
+            return Ok(true);
+        }
+        // Mapping can fail after the last write. Propagate that failure before
+        // finalizing; a terminal mapping state is not evidence of a saved take.
+        self.input_start.frame()?;
+        Ok(false)
     }
 
     fn write(&mut self, shared: &Shared, takes: &mut [TakeWriter], block: &[f32], channels: usize) -> Result<(), String> {
@@ -679,7 +685,16 @@ fn write_takes_started(shared: &Shared, mut takes: Vec<TakeWriter>, channels: us
             // Preserve the final input history until that worker acknowledges;
             // no further audio callback is required. Worker teardown fails the
             // pending mapping explicitly instead of leaving this join stranded.
-            if gate.as_ref().is_none_or(WriterStart::finished) || takes.iter().all(|take| take.error.is_some()) {
+            #[cfg(test)]
+            tests::on_finalize_gate();
+            let finished = match gate.as_ref().map_or(Ok(true), WriterStart::finished) {
+                Ok(finished) => finished,
+                Err(error) => {
+                    takes.iter_mut().for_each(|take| take.fail(error));
+                    true
+                }
+            };
+            if finished || takes.iter().all(|take| take.error.is_some()) {
                 break;
             }
             #[cfg(test)]
@@ -798,6 +813,92 @@ mod tests {
     pub(super) fn on_placement_wait() {
         if let Some(hook) = PLACEMENT_WAIT_HOOK.with(|hook| hook.borrow_mut().take()) {
             hook();
+        }
+    }
+
+    thread_local! {
+        static FINALIZE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn on_finalize_gate() {
+        if let Some(hook) = FINALIZE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn mapping_failure_between_write_and_stop_check_reports_failure() {
+        let (key, map, now) = recording_map();
+        let path = std::env::temp_dir().join(format!("clock-failure-{}.wav", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let takes = vec![TakeWriter::create(TrackId(1), vec![0], path.clone(), 48_000).unwrap()];
+        let shared = Shared::new(CaptureRing::new(32));
+        shared.start_capture();
+        {
+            let _lease = shared.begin_capture().unwrap();
+            shared.capture_at(100, &[0.5; 12]);
+        }
+        shared.stop_capture();
+        let (mut control, mut publisher) = start::pair(soundcraft_mix::EngineEpoch(5));
+        let reader = control.prepare().unwrap();
+        let (mut mapping, input_start) = start::mapping::pair(reader.clone(), key);
+        let point = start::Point {
+            host_ns: map.frame_to_host(key, 104, now).unwrap(),
+            output_frame: 900,
+            position: crate::timeline_map::Position { sample: 500, fraction: 0, denominator: 1 },
+        };
+        assert!(publisher.start(reader.ticket(), point));
+        let gate = WriterStart { reader, history: start::History::new(1, 24), input_start, placed: false, next: None };
+        FINALIZE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(mapping.service(None, Some(now)));
+            }))
+        });
+        let (takes, error) = write_takes_started(&shared, takes, 1, Some(gate));
+        assert!(takes.is_empty());
+        assert!(!path.exists());
+        assert!(error.is_some(), "input mapping failed during Stop, but the take was deleted and success returned");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn writer_delay_overflow_and_input_partitions_preserve_boundary() {
+        let (key, map, now) = recording_map();
+        for (case, parts) in [vec![12], vec![4, 4, 4], vec![1, 3, 5, 3]].into_iter().enumerate() {
+            let path = std::env::temp_dir().join(format!("boundary-overflow-{}-{case}.wav", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let takes = vec![TakeWriter::create(TrackId(1), vec![0], path.clone(), 48_000).unwrap()];
+            let shared = Shared::new(CaptureRing::new(8));
+            shared.start_capture();
+            let (mut control, mut publisher) = start::pair(soundcraft_mix::EngineEpoch(5));
+            let reader = control.prepare().unwrap();
+            let (mut mapping, input_start) = start::mapping::pair(reader.clone(), key);
+            let gate = WriterStart { reader: reader.clone(), history: start::History::new(1, 24), input_start, placed: false, next: None };
+            let data: Vec<f32> = (0..12).map(|n| n as f32 / 20.0).collect();
+            let mut offset = 0;
+            for frames in parts {
+                let (_, heap) = soundcraft_rt::testing::measure(|| {
+                    let _lease = shared.begin_capture().unwrap();
+                    shared.capture_at(100 + offset as u64, &data[offset..offset + frames]);
+                });
+                assert!(heap.is_zero(), "{heap:?}");
+                offset += frames;
+            }
+            let point = start::Point {
+                host_ns: map.frame_to_host(key, 104, now).unwrap(),
+                output_frame: 900,
+                position: crate::timeline_map::Position { sample: 500, fraction: 0, denominator: 1 },
+            };
+            assert!(publisher.start(reader.ticket(), point));
+            assert!(mapping.service(Some(map), Some(now)));
+            shared.stop_capture();
+            let (takes, error) = write_takes_started(&shared, takes, 1, Some(gate));
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(takes.len(), 1);
+            assert_eq!(decode(&path)[0], [0.2, 0.25, 0.3, 0.35, 0.0, 0.0, 0.0, 0.0]);
+            assert_eq!(shared.dropped.load(Ordering::Relaxed), 4);
+            std::fs::remove_file(path).unwrap();
         }
     }
 
