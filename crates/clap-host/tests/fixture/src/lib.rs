@@ -17,8 +17,9 @@
 //!   Commands arrive as a "state" to load, `CMD:<command>` (see `requests_command`); its saved
 //!   "state" is that log as text, with the token of the thread saving it (`me=`), so a test can
 //!   compare each call's thread with its own.
-//! - `org.soundcraft.test.events` (only in the build with the `events` feature, which lists
-//!   nothing else; F10): the synth with param 5 "Probe" (0..1) that writes every input event into
+//! - `org.soundcraft.test.events` and `org.soundcraft.test.events-midi` (only in the build with
+//!   the `events` feature; F10): native-note and MIDI-only variants of the synth with param 5
+//!   "Probe" (0..1) that write every input event into
 //!   its output instead of a level, one record of four samples each, in the order it reads them:
 //!   `[code, time, a, b]` with code 1 note on, 2 note off (a = channel * 1000 + key, b = note id),
 //!   3 pressure expression (a as for notes, b = value * 1e6), 4 parameter (a = id,
@@ -56,6 +57,19 @@ static EVENTS_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
     id: c"org.soundcraft.test.events".as_ptr(),
     name: c"Fixture Events".as_ptr(),
+    vendor: c"SoundCraft tests".as_ptr(),
+    url: std::ptr::null(),
+    manual_url: std::ptr::null(),
+    support_url: std::ptr::null(),
+    version: c"1.0.0".as_ptr(),
+    description: std::ptr::null(),
+    features: SYNTH_FEATURES.0.as_ptr(),
+};
+
+static EVENTS_MIDI_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
+    clap_version: CLAP_VERSION,
+    id: c"org.soundcraft.test.events-midi".as_ptr(),
+    name: c"Fixture Events MIDI".as_ptr(),
     vendor: c"SoundCraft tests".as_ptr(),
     url: std::ptr::null(),
     manual_url: std::ptr::null(),
@@ -132,6 +146,7 @@ struct Fx {
     requests: bool,
     /// The events plugin (see the crate docs).
     events: bool,
+    events_midi: bool,
     latency: u32,
     /// Latency to take at the next `activate` (requests plugin).
     next_latency: Option<u32>,
@@ -421,13 +436,16 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         unsafe { (host.request_restart.unwrap())(f.host) };
         note(f, "request_restart");
     }
+    #[deny(clippy::undocumented_unsafe_blocks)]
     if f.events {
         // Allocation-free, so hosts can measure their own audio path around it.
+        // SAFETY: CLAP process supplies a writable first output channel of n f32 samples.
         let first = unsafe { std::slice::from_raw_parts_mut(*out.data32, n) };
         first.fill(0.0);
         let mut w = 0;
         let mut last_time = 0u32;
         for k in 0..count {
+            // SAFETY: k is below size(); SDK input_events.get returns a live header for this process call.
             let h = unsafe { &*(ev.get.unwrap())(pr.in_events, k) };
             assert!(h.time >= last_time, "events not sorted");
             assert!((h.time as usize) < n, "event time outside the block");
@@ -437,19 +455,23 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             }
             let (code, a, b) = match h.type_ {
                 CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF => {
+                    // SAFETY: The CLAP core NOTE_ON/OFF tag selects this aligned event payload.
                     let e = unsafe { &*(h as *const clap_event_header as *const clap_event_note) };
                     (if h.type_ == CLAP_EVENT_NOTE_ON { 1.0 } else { 2.0 }, f32::from(e.channel) * 1000.0 + f32::from(e.key), e.note_id as f32)
                 }
                 CLAP_EVENT_NOTE_EXPRESSION => {
+                    // SAFETY: The CLAP core NOTE_EXPRESSION tag selects this aligned event payload.
                     let e = unsafe { &*(h as *const clap_event_header as *const clap_event_note_expression) };
                     assert_eq!(e.expression_id, CLAP_NOTE_EXPRESSION_PRESSURE);
                     (3.0, f32::from(e.channel) * 1000.0 + f32::from(e.key), (e.value * 1e6).round() as f32)
                 }
                 CLAP_EVENT_PARAM_VALUE => {
+                    // SAFETY: The CLAP core PARAM_VALUE tag selects this aligned event payload.
                     let e = unsafe { &*(h as *const clap_event_header as *const clap_event_param_value) };
                     (4.0, e.param_id as f32, (e.value * 1e6).round() as f32)
                 }
                 CLAP_EVENT_MIDI => {
+                    // SAFETY: The CLAP core MIDI tag selects this aligned three-byte event payload.
                     let e = unsafe { &*(h as *const clap_event_header as *const clap_event_midi) };
                     (5.0, (u32::from(e.data[0]) << 16 | u32::from(e.data[1]) << 8 | u32::from(e.data[2])) as f32, 0.0)
                 }
@@ -463,6 +485,7 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             }
         }
         for c in 1..out.channel_count as usize {
+            // SAFETY: c is within the SDK output table; its n writable samples are distinct from first (no input buses).
             let o = unsafe { std::slice::from_raw_parts_mut(*out.data32.add(c), n) };
             o.copy_from_slice(first);
         }
@@ -518,6 +541,7 @@ fn write_name(dst: &mut [c_char], s: &CStr) {
 
 unsafe extern "C" fn params_get_info(p: *const clap_plugin, index: u32, info: *mut clap_param_info) -> bool {
     let events = unsafe { fx(p) }.events;
+    // SAFETY: The CLAP extension caller supplies writable parameter-info storage.
     let info = unsafe { &mut *info };
     let (id, name, flags, min, max, def): (clap_id, &CStr, u32, f64, f64, f64) = match index {
         0 if events => (5, c"Probe", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1.0, 0.0),
@@ -610,14 +634,17 @@ unsafe extern "C" fn notes_count(p: *const clap_plugin, is_input: bool) -> u32 {
     if is_input && unsafe { fx(p) }.synth { 1 } else { 0 }
 }
 
-unsafe extern "C" fn notes_get(_p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_note_port_info) -> bool {
+unsafe extern "C" fn notes_get(p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_note_port_info) -> bool {
     if index != 0 || !is_input {
         return false;
     }
+    // SAFETY: The CLAP note-ports caller supplies writable port-info storage.
     let info = unsafe { &mut *info };
     info.id = 0;
-    info.supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
-    info.preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
+    // SAFETY: CLAP supplies this live fixture instance to its note-ports callback.
+    let midi = unsafe { fx(p) }.events_midi;
+    info.supported_dialects = if midi { CLAP_NOTE_DIALECT_MIDI } else { CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI };
+    info.preferred_dialect = if midi { CLAP_NOTE_DIALECT_MIDI } else { CLAP_NOTE_DIALECT_CLAP };
     write_name(&mut info.name, c"notes");
     true
 }
@@ -802,7 +829,7 @@ static DESCS: [&clap_plugin_descriptor; 2] = [&GAIN_DESC, &SYNTH_DESC];
 #[cfg(feature = "requests")]
 static DESCS: [&clap_plugin_descriptor; 1] = [&REQUESTS_DESC];
 #[cfg(all(feature = "events", not(feature = "requests")))]
-static DESCS: [&clap_plugin_descriptor; 1] = [&EVENTS_DESC];
+static DESCS: [&clap_plugin_descriptor; 2] = [&EVENTS_DESC, &EVENTS_MIDI_DESC];
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
     DESCS.len() as u32
@@ -820,6 +847,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         (&SYNTH_DESC as *const _, true, false, false)
     } else if id == c"org.soundcraft.test.requests" {
         (&REQUESTS_DESC as *const _, false, true, false)
+    } else if id == c"org.soundcraft.test.events-midi" {
+        (&EVENTS_MIDI_DESC as *const _, true, false, true)
     } else if id == c"org.soundcraft.test.events" {
         (&EVENTS_DESC as *const _, true, false, true)
     } else {
@@ -844,6 +873,7 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         synth,
         requests,
         events,
+        events_midi: id == c"org.soundcraft.test.events-midi",
         latency: if requests { 5 } else { 3 },
         next_latency: None,
         restart_at: None,

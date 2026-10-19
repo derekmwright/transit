@@ -64,25 +64,28 @@ fn vst3_events() -> Box<dyn Plugin> {
     soundcraft_vst3_host::create(&id).unwrap()
 }
 
-fn clap_events() -> Box<dyn Plugin> {
-    let built = build(
-        "clap-host/tests/fixture",
-        &["--features", "events"],
-        "mix-clap-events-target",
-        ["libclap_fixture.dylib", "clap_fixture.dll", "libclap_fixture.so"],
-    );
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mix-clap-events-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    if cfg!(target_os = "macos") {
-        let exe = dir.join("Events.clap/Contents/MacOS");
-        std::fs::create_dir_all(&exe).unwrap();
-        std::fs::copy(&built, exe.join("Events")).unwrap();
-    } else {
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(&built, dir.join("Events.clap")).unwrap();
-    }
-    assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 1);
-    soundcraft_clap_host::create("clap:org.soundcraft.test.events").unwrap()
+fn clap_events(midi: bool) -> Box<dyn Plugin> {
+    static INSTALL: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALL.get_or_init(|| {
+        let built = build(
+            "clap-host/tests/fixture",
+            &["--features", "events"],
+            "mix-clap-events-target",
+            ["libclap_fixture.dylib", "clap_fixture.dll", "libclap_fixture.so"],
+        );
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("mix-clap-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        if cfg!(target_os = "macos") {
+            let exe = dir.join("Events.clap/Contents/MacOS");
+            std::fs::create_dir_all(&exe).unwrap();
+            std::fs::copy(&built, exe.join("Events")).unwrap();
+        } else {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(&built, dir.join("Events.clap")).unwrap();
+        }
+        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 2);
+    });
+    soundcraft_clap_host::create(if midi { "clap:org.soundcraft.test.events-midi" } else { "clap:org.soundcraft.test.events" }).unwrap()
 }
 
 /// Saturates every queue of `p`, then processes one block; returns what was refused.
@@ -114,8 +117,8 @@ fn saturate_and_process(p: &mut dyn Plugin, io: &mut [Vec<f32>]) -> (usize, usiz
 
 #[test]
 fn host_event_queues_and_the_vst3_point_slab_allocate_nothing_at_saturation() {
-    for name in ["vst3", "clap"] {
-        let mut p = if name == "vst3" { vst3_events() } else { clap_events() };
+    for name in ["vst3", "clap", "clap-midi"] {
+        let mut p = if name == "vst3" { vst3_events() } else { clap_events(name == "clap-midi") };
         p.prepare(48_000.0, BLOCK, 2);
         let mut io = vec![vec![0.0f32; BLOCK]; 2];
         // Warm up (not measured): the first blocks.
@@ -139,4 +142,96 @@ fn host_event_queues_and_the_vst3_point_slab_allocate_nothing_at_saturation() {
         });
         assert_eq!(stats, AllocStats::default(), "{name}: a reset keeping releases, on the audio thread");
     }
+}
+
+/// Observe the fixture before the mixer applies gain/pan; the SDK records are exact integers.
+struct OffObserver {
+    inner: Box<dyn Plugin>,
+    offs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Plugin for OffObserver {
+    fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+        self.inner.info()
+    }
+    fn prepare(&mut self, sr: f32, block: usize, channels: usize) {
+        self.inner.prepare(sr, block, channels);
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn set_param(&mut self, id: &str, value: f32) -> bool {
+        self.inner.set_param(id, value)
+    }
+    fn param(&self, id: &str) -> Option<f32> {
+        self.inner.param(id)
+    }
+    fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        self.inner.event(offset, ev)
+    }
+    fn all_notes_off(&mut self) {
+        self.inner.all_notes_off();
+    }
+    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        self.inner.process(io, frames);
+        for r in io[0].as_chunks::<4>().0.iter().take_while(|r| r[0] != 0.0) {
+            if r[0] == 5.0 && r[2] == 0x83_3C_00 as f32 {
+                self.offs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[test]
+fn midi_dialect_source_revocation_keeps_the_other_source_sounding_without_allocating() {
+    use soundcraft_mix::*;
+    use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    MixEngine::force_serial(true);
+    let offs = Arc::new(AtomicUsize::new(0));
+    let mut plugin = clap_events(true);
+    plugin.prepare(48_000.0, BLOCK, 2);
+    let mut plugin: Option<Box<dyn Plugin>> = Some(Box::new(OffObserver { inner: plugin, offs: Arc::clone(&offs) }));
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32 };
+    let mut mix = MixEngine::realtime_with_events(target, EngineEpoch::FIRST, EventLimits::default());
+    let mut comp = PlanCompiler::new(target, PlanLimits::default());
+    let mut s = Session::default();
+    let track = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    s.track_mut(track).unwrap().instrument = Some(Insert::new("clap:org.soundcraft.test.events-midi"));
+    let mut make = |_: &InstanceSpec, _: SlotGen| plugin.take().map(|plugin| NewInstance { plugin, refused_state: false });
+    let mut env = comp.compile(Arc::new(s), PlanGeneration::EMPTY, PlanGeneration::EMPTY.checked_next().unwrap(), &mut make).unwrap();
+    assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+    comp.reclaim(env);
+    let binding = comp.active_bindings().into_iter().find(|b| b.1 == INSTRUMENT_SLOT).unwrap();
+    let mut io = vec![vec![0.0; BLOCK]; 2];
+    mix.render_active(0, BLOCK, &mut io);
+    let ((), stats) = measure(|| {
+        for port in [1, 2] {
+            assert_eq!(
+                mix.queue_event(&InstrumentEvent {
+                    engine: EngineEpoch::FIRST,
+                    target: binding,
+                    due: Due::Next,
+                    transport: None,
+                    source: Source { port, channel: 3, generation: 1 },
+                    message: Message::NoteOn { key: 60, velocity: 100, id: NoteId::NONE },
+                    arrival: Arrival { host_ns: 0, sequence: 0 },
+                }),
+                EventOutcome::Queued
+            );
+        }
+        mix.render_active(BLOCK as i64, BLOCK, &mut io);
+        assert_eq!(offs.load(Ordering::Relaxed), 0);
+        mix.revoke_source(1, 1);
+        mix.render_active(2 * BLOCK as i64, BLOCK, &mut io);
+        assert_eq!(offs.load(Ordering::Relaxed), 0, "unplugging one source must not emit an off");
+        mix.revoke_source(2, 1);
+        mix.render_active(3 * BLOCK as i64, BLOCK, &mut io);
+        assert_eq!(offs.load(Ordering::Relaxed), 1, "the final unplug must emit exactly one off");
+        assert!(!mix.has_pending_events());
+    });
+    assert_eq!(stats, AllocStats::default());
 }

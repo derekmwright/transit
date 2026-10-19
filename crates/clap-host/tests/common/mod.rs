@@ -21,11 +21,11 @@ pub fn requests_fixture_dir() -> &'static Path {
 }
 
 /// Builds the fixture with its `events` feature once and returns a folder containing
-/// `Events.clap` (only the events plug-in, F10).
+/// `Events.clap` (the native-note and MIDI-only events plug-ins, F10).
 #[allow(dead_code)]
 pub fn events_fixture_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| install(&["--features", "events"], "clap-events-fixture-target", "clap-events-install", "Events", 1))
+    DIR.get_or_init(|| install(&["--features", "events"], "clap-events-fixture-target", "clap-events-install", "Events", 2))
 }
 
 fn install(features: &[&str], target_dir: &str, install_dir: &str, name: &str, plugins: usize) -> PathBuf {

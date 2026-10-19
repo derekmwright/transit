@@ -395,6 +395,9 @@ pub struct ClapPlugin {
     midi_in: bool,
     /// Keys held per MIDI channel, for `all_notes_off` and `reset`.
     held: [[bool; 128]; 16],
+    /// MIDI has no voice ids on the wire. Keep them until sample-ordered delivery.
+    midi_voices: [Option<MidiVoice>; EVENT_CAP],
+    deferred_midi_offs: u64,
     channels: usize,
     steady: i64,
     transport: Option<Transport>,
@@ -410,7 +413,83 @@ pub struct ClapPlugin {
     gate: Gate,
 }
 
+#[derive(Clone, Copy)]
+struct MidiVoice {
+    channel: u8,
+    key: u8,
+    id: i32,
+    sounding: bool,
+}
+
+impl MidiVoice {
+    fn matches(&self, channel: u8, key: u8, id: i32) -> bool {
+        self.channel == channel && self.key == key && self.id == id
+    }
+}
+
+/// Convert in stable sample order, absorbing an off while another identity holds the key.
+/// Entries are reserved at admission, including future ons, and reclaimed after this pass.
+/// EVENT_CAP bounds storage; F10 has at most 224 sounding notes + 767 queued non-releases.
+fn midi_events(queue: &mut Vec<Event>, voices: &mut [Option<MidiVoice>; EVENT_CAP], held: &mut [[bool; 128]; 16], deferred: &mut u64) {
+    queue.retain_mut(|event| {
+        match *event {
+            Event::NoteOn { time, key, velocity, channel, id } => {
+                if let Some(v) = voices.iter_mut().flatten().find(|v| v.matches(channel, key, id)) {
+                    v.sounding = true;
+                }
+                *event = Event::Midi { time, data: [0x90 | channel, key, (velocity * 127.0).round().clamp(1.0, 127.0) as u8] };
+            }
+            Event::NoteOff { time, key, velocity, channel, id } => {
+                if let Some(v) = voices.iter_mut().flatten().find(|v| v.matches(channel, key, id)) {
+                    v.sounding = false;
+                }
+                if voices.iter().flatten().any(|v| v.sounding && v.channel == channel && v.key == key) {
+                    *deferred = deferred.saturating_add(1);
+                    return false;
+                }
+                *event = Event::Midi { time, data: [0x80 | channel, key, (velocity * 127.0).round().clamp(0.0, 127.0) as u8] };
+            }
+            Event::Midi { data: [status, key, value], .. } => {
+                // Global/raw releases, including all_notes_off and reset, retire their keys.
+                let off = status & 0xF0 == 0x80 || (status & 0xF0 == 0x90 && value == 0);
+                let all = status & 0xF0 == 0xB0 && matches!(key, 120 | 123);
+                if off || all {
+                    for v in voices.iter_mut().flatten().filter(|v| v.channel == status & 0x0F && (all || v.key == key)) {
+                        v.sounding = false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    });
+    *held = [[false; 128]; 16];
+    for entry in voices {
+        if let Some(v) = entry {
+            if v.sounding {
+                if let Some(h) = held.get_mut(usize::from(v.channel)).and_then(|h| h.get_mut(usize::from(v.key))) {
+                    *h = true;
+                }
+            } else {
+                *entry = None;
+            }
+        }
+    }
+}
+
 impl ClapPlugin {
+    /// Note-offs absorbed because another host identity still held the MIDI channel/key.
+    #[must_use]
+    pub fn deferred_midi_offs(&self) -> u64 {
+        self.deferred_midi_offs
+    }
+
+    fn prepare_midi_events(&mut self) {
+        if self.notes == NoteMode::Midi {
+            midi_events(&mut self.queue, &mut self.midi_voices, &mut self.held, &mut self.deferred_midi_offs);
+        }
+    }
+
     pub(crate) fn new(inst: Instance, info: &'static PluginInfo) -> ClapPlugin {
         let ids: Vec<u32> = info.params.iter().map(|p| p.id.parse::<u32>().unwrap_or(u32::MAX)).collect();
         let values = info.params.iter().zip(&ids).map(|(p, id)| inst.param_value(*id).map_or(p.default, |v| p.clamp(v as f32))).collect();
@@ -453,6 +532,8 @@ impl ClapPlugin {
             notes: NoteMode::None,
             midi_in: false,
             held: [[false; 128]; 16],
+            midi_voices: [None; EVENT_CAP],
+            deferred_midi_offs: 0,
             channels: 2,
             steady: 0,
             transport: None,
@@ -617,7 +698,9 @@ impl Plugin for ClapPlugin {
         // plug-in is called for, under the same lock as that block, so a main thread holding the
         // instance meanwhile can never make it miss one (review R6).
         self.reset_pending = true;
+        self.prepare_midi_events();
         keep_releases_on_reset(&mut self.queue, &mut self.held, self.notes);
+        self.midi_voices.fill(None);
     }
 
     fn set_param(&mut self, id: &str, value: f32) -> bool {
@@ -692,6 +775,9 @@ impl Plugin for ClapPlugin {
             if e.time() > last {
                 e.set_time(last);
             }
+        }
+        if self.notes == NoteMode::Midi {
+            midi_events(&mut self.queue, &mut self.midi_voices, &mut self.held, &mut self.deferred_midi_offs);
         }
         let mut start = 0usize;
         while start < frames {
@@ -799,6 +885,9 @@ impl Plugin for ClapPlugin {
         };
         match (ev.message, self.notes) {
             (Message::NoteOn { key, .. } | Message::NoteOff { key, .. } | Message::PolyPressure { key, .. }, _) if key > 127 => true,
+            (Message::NoteOn { key, velocity: 0, id }, NoteMode::Midi) => {
+                self.event(offset, &PluginEvent { message: Message::NoteOff { key, velocity: 0, id }, ..*ev })
+            }
             (_, NoteMode::None) if !self.midi_in => true,
             (Message::NoteOn { key, velocity, .. }, NoteMode::Clap) => {
                 let ok = self.push(Event::NoteOn { time: offset, key, velocity: unit(velocity), channel: ch, id: ev.note_id }, release);
@@ -814,16 +903,24 @@ impl Plugin for ClapPlugin {
             (Message::PolyPressure { key, value, .. }, NoteMode::Clap) => {
                 self.push(Event::Pressure { time: offset, key, value: unit(value), channel: ch, id: ev.note_id }, release)
             }
-            (Message::NoteOn { key, .. }, NoteMode::Midi) => {
-                let ok = self.push_midi(offset, ch, ev, release);
-                if ok {
-                    held(self, key, true);
+            (Message::NoteOn { key, velocity, .. }, NoteMode::Midi) => {
+                let slot = self
+                    .midi_voices
+                    .iter()
+                    .position(|v| v.is_some_and(|v| v.matches(ch, key, ev.note_id)))
+                    .or_else(|| self.midi_voices.iter().position(Option::is_none));
+                let Some(slot) = slot else { return false };
+                let ok = self.push(Event::NoteOn { time: offset, key, velocity: unit(velocity), channel: ch, id: ev.note_id }, release);
+                if ok
+                    && let Some(v) = self.midi_voices.get_mut(slot)
+                    && v.is_none()
+                {
+                    *v = Some(MidiVoice { channel: ch, key, id: ev.note_id, sounding: false });
                 }
                 ok
             }
-            (Message::NoteOff { key, .. }, NoteMode::Midi) => {
-                held(self, key, false);
-                self.push_midi(offset, ch, ev, release)
+            (Message::NoteOff { key, velocity, .. }, NoteMode::Midi) => {
+                self.push(Event::NoteOff { time: offset, key, velocity: unit(velocity), channel: ch, id: ev.note_id }, release)
             }
             (Message::NoteOn { .. } | Message::NoteOff { .. }, NoteMode::None) => true,
             _ if self.midi_in => self.push_midi(offset, ch, ev, release),
@@ -832,6 +929,14 @@ impl Plugin for ClapPlugin {
     }
 
     fn all_notes_off(&mut self) {
+        self.prepare_midi_events();
+        if self.notes == NoteMode::Midi {
+            // Retire the identities and pending ons together, so a future on cannot follow
+            // the global off and leave an untracked key sounding.
+            keep_releases_on_reset(&mut self.queue, &mut self.held, self.notes);
+            self.midi_voices.fill(None);
+            return;
+        }
         for ch in 0..16u8 {
             for key in 0..128u8 {
                 if self.held.get(usize::from(ch)).and_then(|h| h.get(usize::from(key))).copied().unwrap_or(false) {

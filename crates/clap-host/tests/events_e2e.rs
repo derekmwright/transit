@@ -99,3 +99,109 @@ fn a_reset_keeps_the_pedal_up_and_the_note_offs() {
     assert!(r.contains(&(2, 0, 60, 5)), "the note-off survives the reset: {r:?}");
     assert!(!r.iter().any(|x| x.0 == 5 && x.2 == 0xB0_01_09), "non-releases do not: {r:?}");
 }
+
+fn midi_plugin(block: usize) -> Box<dyn Plugin> {
+    events_fixture_dir();
+    let mut p = soundcraft_clap_host::create("clap:org.soundcraft.test.events-midi").unwrap();
+    p.prepare(48_000.0, block, 2);
+    p
+}
+
+fn note_on(channel: u8, id: i32) -> PluginEvent {
+    ev(channel, id, Message::NoteOn { key: 60, velocity: 100, id: NoteId::NONE })
+}
+
+fn note_off(channel: u8, id: i32) -> PluginEvent {
+    ev(channel, id, Message::NoteOff { key: 60, velocity: 0, id: NoteId::NONE })
+}
+
+#[test]
+fn midi_dialect_defers_off_until_the_last_identity_releases() {
+    let mut p = midi_plugin(256);
+    for first in [101, 102] {
+        assert!(p.event(0, &note_on(3, 101)));
+        assert!(p.event(1, &note_on(3, 102)));
+        assert_eq!(records(&mut p, 256), vec![(5, 0, 0x933C64, 0), (5, 1, 0x933C64, 0)]);
+        assert!(p.event(10, &note_off(3, first)));
+        assert!(records(&mut p, 256).is_empty(), "the other source must keep sounding");
+        assert!(p.event(20, &note_off(3, 203 - first)));
+        assert_eq!(records(&mut p, 256), vec![(5, 20, 0x83_3C_00, 0)]);
+    }
+}
+
+#[test]
+fn midi_dialect_uses_delivery_order_and_keeps_channels_separate() {
+    let mut p = midi_plugin(256);
+    // Reverse arrival order; a future holder cannot suppress an earlier last-holder off.
+    assert!(p.event(50, &note_on(3, 102)));
+    assert!(p.event(10, &note_on(3, 101)));
+    assert!(p.event(30, &note_off(3, 101)));
+    assert!(p.event(0, &note_on(4, 101)));
+    assert_eq!(records(&mut p, 256), vec![(5, 0, 0x943C64, 0), (5, 10, 0x933C64, 0), (5, 30, 0x83_3C_00, 0), (5, 50, 0x933C64, 0)]);
+    assert!(p.event(15, &note_on(3, 103)));
+    assert!(p.event(15, &note_off(3, 102)));
+    assert!(p.event(25, &note_off(3, 103)));
+    assert!(p.event(30, &note_off(4, 101)));
+    assert_eq!(records(&mut p, 256), vec![(5, 15, 0x933C64, 0), (5, 25, 0x83_3C_00, 0), (5, 30, 0x84_3C_00, 0)]);
+}
+
+#[test]
+fn midi_dialect_preserves_last_release_at_saturation_and_reclaims_identities() {
+    let mut p = midi_plugin(4096);
+    // More lifetimes than the bounded table can hold at once: slots must be reclaimed.
+    for _ in 0..8 {
+        for id in 0..224 {
+            assert!(p.event(0, &note_on(3, id)));
+        }
+        records(&mut p, 4096);
+        for i in 0..767 {
+            assert!(p.event(i, &ev(3, -1, Message::Control { cc: 1, value: 1 })));
+        }
+        assert!(!p.event(0, &note_on(3, 9999)), "ordinary queue is saturated");
+        for id in 0..224 {
+            assert!(p.event(800, &note_off(3, id)));
+        }
+        let r = records(&mut p, 4096);
+        assert_eq!(r.iter().filter(|r| r.2 == 0x83_3C_00).count(), 1);
+        assert_eq!(r.last(), Some(&(5, 800, 0x83_3C_00, 0)));
+    }
+}
+
+#[test]
+fn midi_dialect_reset_and_all_notes_off_retire_remaining_holders() {
+    for reset in [false, true] {
+        let mut p = midi_plugin(256);
+        p.event(0, &note_on(3, 101));
+        p.event(0, &note_on(3, 102));
+        records(&mut p, 256);
+        p.event(0, &note_off(3, 101));
+        assert!(records(&mut p, 256).is_empty());
+        p.event(100, &note_on(3, 103));
+        p.event(0, &ev(3, -1, Message::Control { cc: 64, value: 63 }));
+        if reset {
+            p.reset();
+        } else {
+            p.all_notes_off();
+        }
+        let r = records(&mut p, 256);
+        assert_eq!(r.iter().filter(|r| r.2 == 0x83_3C_00).count(), 1);
+        assert!(r.contains(&(5, 0, 0xB3_40_3F, 0)));
+        assert!(!r.iter().any(|r| r.2 == 0x933C64));
+        p.event(0, &note_on(3, 104));
+        p.event(10, &note_off(3, 104));
+        assert_eq!(records(&mut p, 256), vec![(5, 0, 0x933C64, 0), (5, 10, 0x83_3C_00, 0)]);
+    }
+}
+
+#[test]
+fn midi_dialect_velocity_zero_releases_its_identity() {
+    let mut p = midi_plugin(256);
+    p.event(0, &note_on(3, 101));
+    p.event(0, &note_on(3, 102));
+    records(&mut p, 256);
+    for (id, last) in [(101, false), (102, true)] {
+        assert!(p.event(10, &ev(3, id, Message::NoteOn { key: 60, velocity: 0, id: NoteId::NONE })));
+        let r = records(&mut p, 256);
+        assert_eq!(r, if last { vec![(5, 10, 0x83_3C_00, 0)] } else { vec![] });
+    }
+}
