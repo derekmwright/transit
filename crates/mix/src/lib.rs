@@ -1133,7 +1133,11 @@ impl MixEngine {
         if velocity > 0 { inst.plugin.note_on(0, pitch.min(127), velocity.min(127)) } else { inst.plugin.note_off(0, pitch.min(127)) }
     }
 
-    /// Reset all plugin state (on stop / seek).
+    /// Stop or panic: releases every instrument event source, live and clip (every open note's
+    /// off and held pedal's up go to the plug-in), then resets all plugin state. Plug-in hosts
+    /// keep those releases through their reset. For a locate or loop wrap during playback use
+    /// [`MixEngine::set_transport_epoch`] and the position jump in [`MixEngine::render_active`]
+    /// instead, which release only what the clips play (see the `events` module).
     pub fn reset(&mut self) {
         for s in self.all_strips() {
             for p in s.plugins.iter_mut().flatten() {
@@ -1410,6 +1414,10 @@ impl MixEngine {
     }
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
+    ///
+    /// This legacy path does not deliver instrument events ([`MixEngine::queue_event`]) and does
+    /// not advance [`MixEngine::next_frame`]: events need an adopted plan and
+    /// [`MixEngine::render_active`].
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
         // Stopped, the position stands still: not a seek (it would cut auditioned notes).

@@ -17,9 +17,33 @@
 //!
 //! **Delivery**, before the instrument's `process`: controller chase, then the clips (as
 //! [`Source::CLIP`], through the same note and pedal table), then the queue entries due in the
-//! block at `due − block start`. Pedals are tracked per source; the plug-in sees the OR across
-//! sources, evaluated in due order. The mix assigns every note a voice id of its own
-//! ([`PluginEvent::note_id`]), so two sources' notes on one key stay apart.
+//! block at `due − block start`. Pedals are tracked per source: any value above 0 holds, 0
+//! releases. The plug-in gets the maximum of the holders' current values, evaluated in due order:
+//! down when the first holder appears, 0 when the last one leaves, and every change of the
+//! maximum in between (one holder's half-pedal values pass through exactly). The mix assigns
+//! every note a voice id of its own ([`PluginEvent::note_id`]), so two sources' notes on one key
+//! stay apart.
+//!
+//! **Releases are never refused for transport staleness.** A note-off or pedal-up carrying an
+//! older [`TransportEpoch`] may end a note that sounds, so it is admitted (matched by source and
+//! identity as always); it is still refused for a stale engine epoch or binding.
+//!
+//! # Seek and reset contract
+//!
+//! - [`MixEngine::reset`] is Stop or panic: it releases every source, live and clip (each open
+//!   note's off and each held pedal's up go to the plug-in), and then resets the plug-ins. Plug-in
+//!   hosts keep every pending release through their own reset and deliver it on the next
+//!   `process` ([`Message::survives_reset`]).
+//! - Locate or loop wrap during playback is [`MixEngine::set_transport_epoch`] plus the position
+//!   jump in [`MixEngine::render_active`]: only the clips' notes and pedals are released and
+//!   queued clip-derived events cancelled. Live notes and pedals keep sounding; a clip's CC 121
+//!   (the controller chase) is followed by the pedals other sources hold, sent down again.
+//! - The legacy [`MixEngine::render`] does not deliver queued events (it renders the legacy
+//!   strips, not the plan's instruments): events need [`MixEngine::render_active`]. An engine
+//!   without an adopted plan refuses every event ([`EventOutcome::NoInstrument`]).
+//! - An instrument that fails, or whose track is inactive, does not process its queue: the queue
+//!   is voided (counted `voided`), its notes and pedals are released at the plug-in, and it takes
+//!   no events until it plays again.
 //!
 //! Nothing here allocates, locks or logs on the audio thread; counters are fixed storage read
 //! with [`MixEngine::event_status`].
