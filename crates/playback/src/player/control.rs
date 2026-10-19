@@ -131,7 +131,7 @@ impl<T: Copy, R: Copy> Control<T, R> {
             // Preserve ownership and order under defensive saturation.
             Err(SendError::Full { .. } | SendError::EarlierReservation) => false,
             Err(_) => {
-                self.sessions.faulted = true;
+                self.sessions.fault();
                 false
             }
         }

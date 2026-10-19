@@ -113,11 +113,21 @@ pub struct Budget {
     notes_remaining: usize,
     stop_serviced: bool,
     release_serviced: bool,
+    source_scan_serviced: bool,
 }
 pub(super) fn callback_scope() -> Budget {
-    Budget { remaining: CALLBACK_ACTIONS, notes_remaining: CALLBACK_NOTES, stop_serviced: false, release_serviced: false }
+    Budget {
+        remaining: CALLBACK_ACTIONS,
+        notes_remaining: CALLBACK_NOTES,
+        stop_serviced: false,
+        release_serviced: false,
+        source_scan_serviced: false,
+    }
 }
 impl Budget {
+    pub(super) fn claim_source_scan(&mut self) -> bool {
+        !std::mem::replace(&mut self.source_scan_serviced, true)
+    }
     pub fn remaining(&self) -> usize {
         self.remaining
     }

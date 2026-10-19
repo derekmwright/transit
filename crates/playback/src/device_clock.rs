@@ -508,6 +508,13 @@ impl Default for HostOrigin {
 }
 
 impl HostOrigin {
+    /// The exact origin used by native audio observations. Pass this to other
+    /// device adapters rather than comparing nanoseconds from separate origins.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn instant(self) -> std::time::Instant {
+        self.instant
+    }
+
     pub fn now_ns(self) -> Option<u64> {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -558,6 +565,16 @@ pub fn stream_clock(direction: Direction, nominal_rate: u32) -> Result<(Callback
 }
 
 impl ClockReader {
+    /// Identity of this stream, available before its first callback or clock fit.
+    /// The prepared transport must use this key, including on failed/retried opens.
+    pub fn key(&self) -> ClockKey {
+        self.inner.fitter.key
+    }
+
+    pub fn host_origin(&self) -> HostOrigin {
+        self.inner.origin
+    }
+
     /// Control/UI only. Bounded even when the producer continues publishing concurrently.
     pub fn poll(&mut self) -> ClockReport {
         let reader = &mut self.inner;

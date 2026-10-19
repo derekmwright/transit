@@ -215,6 +215,11 @@ struct Counters {
 
 /// Identity of this actual pair, independent of numeric device/plan generations.
 pub(super) struct RuntimeIdentity(Arc<Counters>);
+impl RuntimeIdentity {
+    pub(super) fn faulted(&self) -> bool {
+        self.0.faulted.load(Ordering::Acquire)
+    }
+}
 
 /// Independent diagnostic fields can straddle a callback. Age counts callbacks in
 /// which a pending publication could not be admitted; it is not physical latency.
@@ -379,6 +384,11 @@ impl Control {
     /// control after quiescence; ordinary admission must stop even before a return arrives.
     pub fn faulted(&self) -> bool {
         self.compiler.faulted() || self.counters.faulted.load(Ordering::Acquire)
+    }
+    /// Permanently close admission after a control/device failure. The current
+    /// audio borrower observes this flag; main never borrows processing state.
+    pub fn fault(&mut self) {
+        self.counters.faulted.store(true, Ordering::Release);
     }
     pub fn active_bindings(&self) -> Vec<SlotBinding> {
         self.compiler.active_bindings()

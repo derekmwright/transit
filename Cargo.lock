@@ -3978,12 +3978,14 @@ dependencies = [
  "serde_json",
  "soundcraft-asio-panel",
  "soundcraft-audio-io",
+ "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",
  "soundcraft-mix",
  "soundcraft-model",
  "soundcraft-rt",
  "soundcraft-time",
+ "soundcraft-vst3-host",
 ]
 
 [[package]]

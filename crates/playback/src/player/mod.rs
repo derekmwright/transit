@@ -15,6 +15,9 @@ mod control;
 pub use control::{Control, Notice, endpoints};
 mod handles;
 pub use handles::Handles;
+mod runtime;
+pub use runtime::{AudioPorts, Retirement, RuntimeControl, ServiceReport};
+pub mod sources;
 
 // Integration fixture first; the device adapter switches to this implementation
 // once its event and shutdown plumbing is complete.
@@ -35,6 +38,7 @@ impl SessionRequestId {
 pub enum PlayerError {
     SessionBackpressure,
     Action(action_lane::SendError),
+    Source(sources::Error),
     NoSession,
     SequenceExhausted,
     NeedsReopen { current_rate: u32, requested_rate: u32 },
@@ -45,6 +49,7 @@ impl std::fmt::Display for PlayerError {
         match self {
             Self::SessionBackpressure => f.write_str("session request results must be collected before another update"),
             Self::Action(error) => write!(f, "audio action was not admitted: {error:?}"),
+            Self::Source(error) => write!(f, "MIDI source was not admitted: {error}"),
             Self::NoSession => f.write_str("audio runtime has no requested session"),
             Self::SequenceExhausted => f.write_str("audio request identities are exhausted; reopen the runtime"),
             Self::NeedsReopen { current_rate, requested_rate } => {
@@ -174,13 +179,20 @@ impl SessionControl {
         match result {
             Ok(Ok(true)) => self.published = Some(Published { id: request.id, generation: self.bridge.issued() }),
             Ok(Ok(false)) => {
-                self.faulted = true; // Credit/publication invariant failed; do not pretend this is queued.
+                self.fault(); // Credit/publication invariant failed; do not pretend this is queued.
                 self.finish(request.id, SessionOutcome::Rejected(SessionFailure::Faulted));
             }
             Ok(Err(error)) => self.finish(request.id, SessionOutcome::Rejected(SessionFailure::Compile(error))),
-            Err(_) => {
-                self.faulted = true;
+            Err(payload) => {
+                // Publish before any payload destructor can block, reenter or
+                // panic. Source admission observes the same shared fault.
+                self.fault();
                 self.finish(request.id, SessionOutcome::Rejected(SessionFailure::FactoryPanicked));
+                if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+                    // A destructor of a panic payload may itself panic. Trying
+                    // to destroy that new payload can recurse without a bound.
+                    std::mem::forget(secondary);
+                }
             }
         }
     }
@@ -188,7 +200,7 @@ impl SessionControl {
         if let Some(report) = self.bridge.poll() {
             if let Some(published) = self.published.take() {
                 let outcome = if report.torn || report.requested != published.generation {
-                    self.faulted = true;
+                    self.fault();
                     SessionOutcome::Rejected(SessionFailure::Faulted)
                 } else {
                     match report.state {
@@ -208,7 +220,7 @@ impl SessionControl {
                 };
                 self.finish(published.id, outcome);
             } else {
-                self.faulted = true;
+                self.fault();
             }
         }
     }
@@ -244,6 +256,10 @@ impl SessionControl {
             count += 1;
         }
         count
+    }
+    fn fault(&mut self) {
+        self.bridge.fault();
+        self.faulted = true;
     }
     pub fn faulted(&self) -> bool {
         self.faulted || self.bridge.faulted()

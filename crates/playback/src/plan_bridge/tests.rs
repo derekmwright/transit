@@ -656,3 +656,44 @@ fn public_stop_handler_reaches_the_plugin_before_ack_and_faults_both_classes_on_
         assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
     }
 }
+
+#[test]
+fn a_control_fault_returns_a_publication_without_adopting_it_even_at_a_drained_boundary() {
+    for ready in [false, true] {
+        let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+        control.request(Arc::new(session(ChannelFormat::Stereo)), None);
+        control.prepare(&mut make).unwrap();
+        adopt(&mut audio);
+        control.poll();
+        let generation = audio.engine().active().generation;
+        control.request(Arc::new(session(ChannelFormat::Surround51)), None);
+        control.prepare(&mut make).unwrap();
+        control.fault();
+        let (result, heap) = measure(|| audio.service(&mut super::callback_scope(), ready));
+        assert_eq!(result, Service::Returned);
+        assert!(heap.is_zero());
+        assert_eq!(audio.engine().active().generation, generation);
+        assert_eq!(audio.output().len(), 2);
+        assert!(matches!(control.poll().unwrap().state, EnvelopeState::Pending));
+        control.retire(audio);
+    }
+}
+
+#[test]
+fn direct_render_after_a_control_fault_zeroes_the_requested_output_and_meters() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    control.request(Arc::new(session(ChannelFormat::Stereo)), None);
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    control.poll();
+    audio.render(0, 64);
+    assert!(audio.output().iter().any(|c| c[..64].iter().any(|&v| v != 0.0)));
+    control.fault();
+    let ((), heap) = measure(|| audio.render(64, 64));
+    assert!(heap.is_zero());
+    assert!(audio.output().iter().all(|c| c[..64].iter().all(|&v| v == 0.0)));
+    let mut meters = MeterSnapshot::default();
+    control.copy_meters(&mut meters);
+    assert!(meters.main.peak.iter().all(|&v| v == 0.0));
+    control.retire(audio);
+}

@@ -316,10 +316,8 @@ impl Audio {
         plans: &mut plan_bridge::CallbackBudget,
         actions: &mut action_lane::Budget,
     ) -> Result<(), timeline_map::MapError> {
+        // fill() excludes an already-faulted local state before entering here.
         out.fill(0.0);
-        if self.faulted {
-            return Ok(());
-        }
         let channels = channels.max(1);
         self.service_actions(actions);
         if self.faulted {

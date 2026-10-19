@@ -400,6 +400,7 @@ struct CountedInstrument {
     resets: Arc<std::sync::atomic::AtomicUsize>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     panic: Option<(std::thread::ThreadId, Arc<std::sync::atomic::AtomicUsize>, Arc<AtomicBool>)>,
+    gate: Option<(std::sync::mpsc::SyncSender<()>, Arc<std::sync::Barrier>)>,
 }
 impl soundcraft_dsp::Plugin for CountedInstrument {
     fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
@@ -419,6 +420,10 @@ impl soundcraft_dsp::Plugin for CountedInstrument {
         self.inner.param(id)
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        if let Some((entered, resume)) = &self.gate {
+            entered.send(()).unwrap();
+            resume.wait();
+        }
         if let Some((main, drops, on_main)) = &self.panic {
             std::panic::panic_any(PanicOwner { main: *main, drops: Arc::clone(drops), on_main: Arc::clone(on_main) });
         }
@@ -447,7 +452,13 @@ fn stop_and_end_reset_the_instrument_and_deliver_its_release_pass_while_unmonito
         control.service(&mut |spec, generation| {
             let made = make(spec, generation).unwrap();
             Some(NewInstance {
-                plugin: Box::new(CountedInstrument { inner: made.plugin, resets: Arc::clone(&resets), calls: Arc::clone(&calls), panic: None }),
+                plugin: Box::new(CountedInstrument {
+                    inner: made.plugin,
+                    resets: Arc::clone(&resets),
+                    calls: Arc::clone(&calls),
+                    panic: None,
+                    gate: None,
+                }),
                 refused_state: false,
             })
         });
@@ -514,6 +525,7 @@ fn escaped_processing_panic_stays_owned_until_main_reclaims_the_callback_holder(
                 resets: Arc::new(AtomicUsize::new(0)),
                 calls: Arc::new(AtomicUsize::new(0)),
                 panic: Some((main, Arc::clone(&drops), Arc::clone(&on_main))),
+                gate: None,
             }),
             refused_state: false,
         })
@@ -537,5 +549,69 @@ fn escaped_processing_panic_stays_owned_until_main_reclaims_the_callback_holder(
     drop(audio.panic_payload.take());
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     assert!(on_main.load(Ordering::Relaxed));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn an_already_published_control_fault_is_drained_as_known_failure() {
+    let (mut control, mut audio, _) = fixture(48_000);
+    let action = control.send_action(Command::Recording(true), true).unwrap();
+    control.sessions.bridge.fault();
+    let mut out = [1.0; 128];
+    let (result, heap) = measure(|| audio.fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()));
+    assert_eq!(result, Ok(()));
+    assert!(heap.is_zero());
+    assert_eq!(out, [0.0; 128]);
+    assert!(!audio.transport.recording);
+    let notices = control.retire(audio.plans, audio.actions).0;
+    assert!(
+        notices.iter().any(|n| matches!(n, crate::player::Notice::Action(r) if r.sequence == action && r.outcome == action_lane::Outcome::Faulted))
+    );
+}
+
+#[test]
+fn a_control_failure_during_processing_silences_that_callback_before_it_returns() {
+    use soundcraft_model::{ChannelFormat, Insert, TrackKind};
+    use std::sync::atomic::AtomicUsize;
+    let (mut control, mut audio, shared) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 128]);
+    control.service(&mut make);
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    let (entered, in_process) = std::sync::mpsc::sync_channel(1);
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    control.request(Arc::new(session), None).unwrap();
+    control.service(&mut |spec, generation| {
+        let made = make(spec, generation).unwrap();
+        Some(NewInstance {
+            plugin: Box::new(CountedInstrument {
+                inner: made.plugin,
+                resets: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                panic: None,
+                gate: Some((entered.clone(), Arc::clone(&resume))),
+            }),
+            refused_state: false,
+        })
+    });
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    let holder = Arc::new(Mutex::new(Some(audio)));
+    let worker_holder = Arc::clone(&holder);
+    let worker = std::thread::spawn(move || {
+        let mut guard = worker_holder.lock().unwrap();
+        let mut out = [1.0; 128];
+        let result = guard.as_mut().unwrap().fill(&mut out, 2, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope());
+        assert_eq!(result, Err(RenderError::HandlerFault));
+        assert_eq!(out, [0.0; 128]);
+    });
+    // A deliberately paused test processor establishes this interleaving. Neither
+    // the production flag store nor the callback's fault check needs this barrier.
+    in_process.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    control.sessions.bridge.fault();
+    resume.wait();
+    worker.join().unwrap();
+    assert!(!shared.playing.load(Ordering::Relaxed));
+    let audio = holder.lock().unwrap().take().unwrap();
     control.retire(audio.plans, audio.actions);
 }

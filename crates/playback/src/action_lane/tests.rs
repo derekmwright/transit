@@ -739,3 +739,23 @@ fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
     );
     assert_eq!(control.retire(audio).len(), 101);
 }
+
+#[test]
+fn a_faulted_bridge_returns_an_action_waiting_for_an_unavailable_plan_without_dispatch() {
+    let (mut plans, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, u8>(&plans);
+    let sequence = control.send_action(7, Some(generation(5))).unwrap();
+    plans.fault();
+    let mut called = false;
+    let report = audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |_, _| {
+        called = true;
+        1
+    });
+    assert!(report.faulted);
+    assert!(!report.waiting_for_plan);
+    assert!(!called);
+    let receipt = control.reclaim().unwrap();
+    assert_eq!((receipt.sequence, receipt.outcome, receipt.handler_result), (sequence, Outcome::Faulted, None));
+    control.retire(audio);
+    plans.retire(plan_audio);
+}
