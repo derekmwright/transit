@@ -921,93 +921,230 @@ mod tests {
 
 /// Ring state behind the lock: interleaved input frames at the input device's rate, plus the
 /// fractional read position (in input frames) of the next output sample.
-struct RingState {
-    data: std::collections::VecDeque<f32>,
+/// Lifetime monitor diagnostics. Independent fields may straddle a callback.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorTelemetry {
+    pub overflow_frames: u64,
+    pub underrun_frames: u64,
+    pub input_contention_frames: u64,
+    pub output_contention_frames: u64,
+    pub input_fault_frames: u64,
+    pub output_fault_frames: u64,
+    /// Frames deliberately discarded at clear or after a real overflow.
+    pub discarded_frames: u64,
+    pub overflow_recoveries: u64,
+    pub incomplete_input_samples: u64,
+}
+
+#[derive(Default)]
+struct MonitorCounters {
+    overflow: AtomicU64,
+    underrun: AtomicU64,
+    input_contention: AtomicU64,
+    output_contention: AtomicU64,
+    input_fault: AtomicU64,
+    output_fault: AtomicU64,
+    discarded: AtomicU64,
+    recoveries: AtomicU64,
+    incomplete: AtomicU64,
+}
+
+struct MonitorReader {
+    queue: rtrb::Consumer<f32>,
+    left: Vec<f32>,
+    right: Vec<f32>,
+    left_valid: bool,
+    right_valid: bool,
     phase: f64,
 }
 
-/// A small interleaved FIFO from the input callback to the output callback, for input
-/// monitoring. Both sides only `try_lock`; it holds at most ~0.5 s and drops the oldest frames.
-/// The input device may run at a different rate than the session, so the reader converts
-/// rates with linear interpolation (cheap, allocation-free, fine for monitoring).
+impl MonitorReader {
+    fn frame(queue: &mut rtrb::Consumer<f32>, frame: &mut [f32]) -> bool {
+        if queue.slots() < frame.len() {
+            return false;
+        }
+        for sample in frame {
+            // Only this serialized consumer pops; a producer cannot remove available samples.
+            *sample = queue.pop().unwrap_or(0.0);
+        }
+        true
+    }
+
+    /// Discard only the frames present at entry, never chase a running producer.
+    fn clear(&mut self) -> usize {
+        let ch = self.left.len();
+        let queued = self.queue.slots() / ch;
+        if let Ok(chunk) = self.queue.read_chunk(queued * ch) {
+            // Commit the discard in one queue operation; f32 carries no destructor.
+            chunk.commit_all();
+        }
+        // `left` is already consumed when phase >= 1; a prefetched right is still pending.
+        let held = usize::from(self.left_valid && self.phase < 1.0) + usize::from(self.right_valid);
+        self.left_valid = false;
+        self.right_valid = false;
+        self.phase = 0.0;
+        queued + held
+    }
+
+    fn render(&mut self, out: &mut [Vec<f32>], frames: usize, step: f64) -> usize {
+        let mut written = 0;
+        for f in 0..frames {
+            if !self.left_valid {
+                self.left_valid = Self::frame(&mut self.queue, &mut self.left);
+                if !self.left_valid {
+                    break;
+                }
+            }
+            while self.phase >= 1.0 {
+                if self.right_valid {
+                    std::mem::swap(&mut self.left, &mut self.right);
+                    self.right_valid = false;
+                } else if !Self::frame(&mut self.queue, &mut self.left) {
+                    return written;
+                }
+                self.phase -= 1.0;
+            }
+            // An exact sample needs no lookahead. Equal rates therefore add no interpolation
+            // frame of latency and consume the final available frame, even for a one-frame call.
+            if self.phase > 0.0 && !self.right_valid {
+                self.right_valid = Self::frame(&mut self.queue, &mut self.right);
+                if !self.right_valid {
+                    break;
+                }
+            }
+            let fraction = self.phase as f32;
+            for ((channel, &a), &b) in out.iter_mut().zip(&self.left).zip(&self.right) {
+                if let Some(x) = channel.get_mut(f) {
+                    *x = if fraction == 0.0 { a } else { finite(a * (1.0 - fraction) + b * fraction) };
+                }
+            }
+            self.phase += step;
+            written += 1;
+        }
+        written
+    }
+}
+
+/// A bounded interleaved FIFO for input monitoring. The input and output roles have
+/// separate locks, so they never exclude one another. Each callback only tries its own
+/// role lock; contention from a second caller or a control-side clear is counted.
+///
+/// Normal callback partitioning never discards audio. Full storage rejects whole new
+/// frames and requests a counted flush on the next read, so a stall does not leave the
+/// monitor permanently late. Rate conversion is currently linear interpolation: it is
+/// not bandlimited SRC or compensation for independent device-clock drift.
 pub struct InputRing {
-    state: Mutex<RingState>,
+    producer: Mutex<rtrb::Producer<f32>>,
+    reader: Mutex<MonitorReader>,
+    /// Device channel count, for consumers to size their prepared storage. Read-only by contract.
     pub channels: std::sync::atomic::AtomicUsize,
+    ch: usize,
     /// Input device sample rate in Hz (0 when unknown, which reads as "same as the session").
     rate: u32,
-    /// Most samples kept: half a second of input, or 24 000 frames when the rate is unknown.
-    cap: usize,
+    overrun_pending: std::sync::atomic::AtomicBool,
+    clear_pending: std::sync::atomic::AtomicBool,
+    counters: MonitorCounters,
 }
 
 impl InputRing {
+    /// Prepare up to half a second of storage, capped at 16 MiB of sample data. Channels
+    /// follow CPAL's u16 domain (zero normalizes to one); an extreme format gets a shorter
+    /// FIFO, not an unbounded allocation. Interpolation history adds two device frames.
     pub fn new(channels: usize, rate: u32) -> Arc<InputRing> {
-        let ch = channels.max(1);
-        let frames = if rate == 0 { 24_000 } else { rate as usize / 2 };
+        let ch = channels.clamp(1, usize::from(u16::MAX));
+        let wanted = if rate == 0 { 24_000 } else { (rate as usize / 2).max(1) };
+        let frames = wanted.min((1 << 22) / ch);
+        let (producer, queue) = rtrb::RingBuffer::new(frames * ch);
         Arc::new(InputRing {
-            state: Mutex::new(RingState { data: std::collections::VecDeque::with_capacity(rate.max(48_000) as usize * ch), phase: 0.0 }),
+            producer: Mutex::new(producer),
+            reader: Mutex::new(MonitorReader { queue, left: vec![0.0; ch], right: vec![0.0; ch], left_valid: false, right_valid: false, phase: 0.0 }),
             channels: std::sync::atomic::AtomicUsize::new(ch),
+            ch,
             rate,
-            cap: frames * ch,
+            overrun_pending: std::sync::atomic::AtomicBool::new(false),
+            clear_pending: std::sync::atomic::AtomicBool::new(false),
+            counters: MonitorCounters::default(),
         })
     }
 
     pub fn push(&self, samples: &[f32]) {
-        if let Ok(mut s) = self.state.try_lock() {
-            s.data.extend(samples.iter().copied().map(finite));
-            while s.data.len() > self.cap {
-                s.data.pop_front();
+        let frames = samples.len() / self.ch;
+        self.counters.incomplete.fetch_add((samples.len() % self.ch) as u64, Ordering::Relaxed);
+        let mut producer = match self.producer.try_lock() {
+            Ok(p) => p,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.counters.input_contention.fetch_add(frames as u64, Ordering::Relaxed);
+                return;
             }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.counters.input_fault.fetch_add(frames as u64, Ordering::Relaxed);
+                return;
+            }
+        };
+        let accepted = frames.min(producer.slots() / self.ch);
+        for &sample in samples.iter().take(accepted * self.ch) {
+            // Capacity was reserved by this sole serialized producer; the consumer only frees it.
+            let _ = producer.push(finite(sample));
+        }
+        let lost = frames - accepted;
+        if lost > 0 {
+            self.counters.overflow.fetch_add(lost as u64, Ordering::Relaxed);
+            self.overrun_pending.store(true, Ordering::Release);
         }
     }
 
-    /// Empty the ring: the monitor starts from the next input block. Called from the UI thread
-    /// (the input held since startup on ASIO has filled the ring to its cap before anything
-    /// reads it). It waits for the lock, which the audio callbacks only ever `try_lock` and hold
-    /// for one block, so it cannot block them.
+    /// Control thread: discard queued/history frames if the reader is idle, otherwise
+    /// request a flush at the next output call (including input arriving before that flush).
+    /// Never waits for the reader: its callback unlock must not wake a blocked control waiter.
     pub fn clear_monitor(&self) {
-        let mut s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        s.data.clear();
-        s.phase = 0.0;
+        if let Ok(mut reader) = self.reader.try_lock() {
+            self.clear_pending.swap(false, Ordering::AcqRel);
+            self.overrun_pending.swap(false, Ordering::AcqRel);
+            self.counters.discarded.fetch_add(reader.clear() as u64, Ordering::Relaxed);
+        } else {
+            self.clear_pending.store(true, Ordering::Release);
+        }
     }
 
     /// Fill `out` (planar, at `session_rate`) with up to `frames` frames, converting from the
-    /// input rate. Missing frames are silence.
-    ///
-    /// The backlog is bounded: when more than two blocks of input are queued (the reader stalled,
-    /// or never ran), the oldest are dropped down to one block before reading, so a stall can
-    /// never leave the monitor permanently late.
+    /// input rate. Missing frames are counted silence. No allocation or wait occurs here.
     pub fn pop_into(&self, out: &mut [Vec<f32>], frames: usize, session_rate: u32) {
-        let ch = self.channels.load(Ordering::Relaxed).max(1);
         for c in out.iter_mut() {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
         }
-        let Ok(mut s) = self.state.try_lock() else { return };
-        // Input frames consumed per output frame.
-        let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
-        // One block of input (plus the interpolation frame), in input frames.
-        let block = (frames as f64 * step).ceil() as usize + 1;
-        let queued = s.data.len() / ch;
-        if queued > block.saturating_mul(2) {
-            s.data.drain(..(queued - block) * ch);
+        let mut reader = match self.reader.try_lock() {
+            Ok(r) => r,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.counters.output_contention.fetch_add(frames as u64, Ordering::Relaxed);
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.counters.output_fault.fetch_add(frames as u64, Ordering::Relaxed);
+                return;
+            }
+        };
+        let overrun = self.overrun_pending.swap(false, Ordering::AcqRel);
+        let clear = self.clear_pending.swap(false, Ordering::AcqRel);
+        if overrun || clear {
+            self.counters.discarded.fetch_add(reader.clear() as u64, Ordering::Relaxed);
+            self.counters.recoveries.fetch_add(u64::from(overrun), Ordering::Relaxed);
         }
-        for f in 0..frames {
-            // Drop input frames we have moved past; keep the one at `phase` and the next one.
-            while s.phase >= 1.0 && s.data.len() >= 2 * ch {
-                s.data.drain(..ch);
-                s.phase -= 1.0;
-            }
-            if s.phase >= 1.0 || s.data.len() < 2 * ch {
-                break;
-            }
-            let fr = s.phase as f32;
-            for c in 0..ch {
-                let a = s.data.get(c).copied().unwrap_or(0.0);
-                let b = s.data.get(ch + c).copied().unwrap_or(a);
-                if let Some(x) = out.get_mut(c).and_then(|o| o.get_mut(f)) {
-                    *x = a + (b - a) * fr;
-                }
-            }
-            s.phase += step;
+        let step = if self.rate == 0 || session_rate == 0 { 1.0 } else { f64::from(self.rate) / f64::from(session_rate) };
+        let written = reader.render(out, frames, step);
+        self.counters.underrun.fetch_add((frames - written) as u64, Ordering::Relaxed);
+    }
+
+    pub fn telemetry(&self) -> MonitorTelemetry {
+        MonitorTelemetry {
+            overflow_frames: self.counters.overflow.load(Ordering::Relaxed),
+            underrun_frames: self.counters.underrun.load(Ordering::Relaxed),
+            input_contention_frames: self.counters.input_contention.load(Ordering::Relaxed),
+            output_contention_frames: self.counters.output_contention.load(Ordering::Relaxed),
+            input_fault_frames: self.counters.input_fault.load(Ordering::Relaxed),
+            output_fault_frames: self.counters.output_fault.load(Ordering::Relaxed),
+            discarded_frames: self.counters.discarded.load(Ordering::Relaxed),
+            overflow_recoveries: self.counters.recoveries.load(Ordering::Relaxed),
+            incomplete_input_samples: self.counters.incomplete.load(Ordering::Relaxed),
         }
     }
 }
@@ -1015,6 +1152,71 @@ impl InputRing {
 #[cfg(test)]
 mod ring_tests {
     use super::InputRing;
+
+    #[test]
+    fn input_and_output_roles_do_not_exclude_each_other() {
+        let ring = InputRing::new(1, 48_000);
+        let read_guard = ring.reader.lock().unwrap();
+        ring.push(&[1.0, 2.0]);
+        drop(read_guard);
+        let write_guard = ring.producer.lock().unwrap();
+        let mut output = vec![vec![0.0; 2]];
+        ring.pop_into(&mut output, 2, 48_000);
+        drop(write_guard);
+        assert_eq!(output[0], [1.0, 2.0]);
+        assert_eq!(ring.telemetry(), super::MonitorTelemetry::default());
+    }
+
+    #[test]
+    fn same_role_contention_is_counted_and_never_waits() {
+        let ring = InputRing::new(2, 48_000);
+        let write_guard = ring.producer.lock().unwrap();
+        ring.push(&[1.0; 6]);
+        drop(write_guard);
+        let read_guard = ring.reader.lock().unwrap();
+        let mut output = vec![vec![1.0; 4]; 2];
+        ring.pop_into(&mut output, 4, 48_000);
+        drop(read_guard);
+        assert!(output.iter().flatten().all(|&x| x == 0.0));
+        assert_eq!(ring.telemetry().input_contention_frames, 3);
+        assert_eq!(ring.telemetry().output_contention_frames, 4);
+        assert_eq!(ring.telemetry().underrun_frames, 0);
+    }
+
+    #[test]
+    fn clear_while_reading_defers_without_a_waiter_on_the_audio_lock() {
+        let ring = InputRing::new(1, 48_000);
+        ring.push(&[1.0, 2.0]);
+        let read_guard = ring.reader.lock().unwrap();
+        ring.clear_monitor();
+        ring.push(&[3.0]);
+        drop(read_guard);
+        let mut output = vec![vec![9.0; 2]];
+        ring.pop_into(&mut output, 2, 48_000);
+        assert_eq!(output[0], [0.0, 0.0]);
+        assert_eq!(ring.telemetry().discarded_frames, 3);
+        assert_eq!(ring.telemetry().overflow_recoveries, 0);
+    }
+
+    #[test]
+    fn poisoned_roles_fail_closed_and_are_distinct_from_contention() {
+        let ring = InputRing::new(1, 48_000);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ring.producer.lock().unwrap();
+            panic!("injected producer fault");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ring.reader.lock().unwrap();
+            panic!("injected reader fault");
+        }));
+        ring.push(&[1.0; 3]);
+        let mut output = vec![vec![1.0; 4]];
+        ring.pop_into(&mut output, 4, 48_000);
+        assert_eq!(output[0], [0.0; 4]);
+        let t = ring.telemetry();
+        assert_eq!((t.input_fault_frames, t.output_fault_frames), (3, 4));
+        assert_eq!((t.input_contention_frames, t.output_contention_frames), (0, 0));
+    }
 
     /// A 1 kHz sine recorded at 16 kHz must come out as a 1 kHz sine at 48 kHz, across calls.
     #[test]
@@ -1072,25 +1274,21 @@ mod ring_tests {
         let mut out = vec![vec![1.0f32; 64]];
         ring.pop_into(&mut out, 64, 48_000);
         assert!(out[0].iter().all(|v| *v == 0.0), "nothing left to hear");
-        assert_eq!(ring.state.lock().unwrap().data.len(), 0);
+        assert_eq!(ring.reader.lock().unwrap().queue.slots(), 0);
     }
 
-    /// A stalled reader leaves no permanent latency: more than two blocks queued is trimmed to one.
+    /// Callback size is not a latency policy: a larger input block must survive smaller reads.
     #[test]
-    fn pop_trims_a_backlog_to_one_block() {
+    fn pop_preserves_a_larger_input_block() {
         let ring = InputRing::new(1, 48_000);
         let input: Vec<f32> = (0..4 * 256).map(|i| i as f32).collect();
         ring.push(&input);
         let mut out = vec![vec![0.0f32; 256]];
         ring.pop_into(&mut out, 256, 48_000);
-        let left = ring.state.lock().unwrap().data.len();
-        assert!(left <= 257, "at most one block (plus the interpolation frame) left, got {left}");
-        assert!(out[0][0] >= 3.0 * 256.0 - 2.0, "the oldest blocks were dropped, not played: {}", out[0][0]);
-        // Within two blocks nothing is dropped.
-        let ring = InputRing::new(1, 48_000);
-        ring.push(&input[..2 * 256]);
+        assert_eq!(out[0], input[..256]);
         ring.pop_into(&mut out, 256, 48_000);
-        assert_eq!(out[0][0], 0.0);
+        assert_eq!(out[0], input[256..512]);
+        assert_eq!(ring.telemetry(), super::MonitorTelemetry::default());
     }
 
     /// A device whose input reports no channels is not an input (asio-sys would hit `unreachable!`).
