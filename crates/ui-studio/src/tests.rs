@@ -285,6 +285,25 @@ fn strip(app: &StudioApp, t: TrackId) -> crate::mixer::StripLayout {
 }
 
 #[test]
+fn the_fader_cap_has_a_line_at_the_value() {
+    use crate::{fine::Target, mixer::db_to_k};
+    let (mut app, ctx, mut time, t) = mixer_app();
+    let want = |s: &crate::mixer::StripLayout, db: f32| s.fader[3] - db_to_k(db) * (s.fader[3] - s.fader[1]);
+    // At 0 dB the cap's line is the 0 dB tick.
+    let s = strip(&app, t);
+    let (cap, zero) = (s.cap_line_y.expect("the cap line was painted"), s.zero_tick_y.expect("the 0 dB tick was painted"));
+    assert_eq!(cap, zero, "at 0 dB the cap line sits on the 0 dB line");
+    assert!((cap - want(&s, 0.0)).abs() <= 0.5, "and on the value position: {cap} vs {}", want(&s, 0.0));
+    // At -12 dB it follows the value, away from the 0 dB line.
+    app.set_value(Target::Fader(t), -12.0).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let s = strip(&app, t);
+    let cap = s.cap_line_y.unwrap();
+    assert!((cap - want(&s, -12.0)).abs() <= 0.5, "-12 dB: {cap} vs {}", want(&s, -12.0));
+    assert!(cap > s.zero_tick_y.unwrap() + 10.0, "well below the 0 dB line");
+}
+
+#[test]
 fn fader_and_balance_laws_round_trip() {
     use crate::mixer::{balance_of, db_to_k, k_to_db, pans_for};
     for db in [-60.0f32, -24.0, -6.0, 0.0, 6.0, 12.0] {

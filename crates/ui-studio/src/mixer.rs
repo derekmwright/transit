@@ -115,6 +115,10 @@ pub struct StripLayout {
     pub arm: R4,
     pub monitor: R4,
     pub fader: R4,
+    /// The y of the line through the fader cap, and of the 0 dB tick, as painted last frame.
+    /// Both are on physical pixel centers, so at 0 dB they are one y.
+    pub cap_line_y: Option<f32>,
+    pub zero_tick_y: Option<f32>,
     pub meter: R4,
     /// The dB readout under the fader (double-click types a level) and its text.
     pub readout_rect: R4,
@@ -1710,7 +1714,7 @@ fn strip(
         let all = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
         app.reset_meters(if all { None } else { Some(id) });
     }
-    fader_widget(app, ui, &p, clip, id, vol_db, fader);
+    (sl.cap_line_y, sl.zero_tick_y) = fader_widget(app, ui, &p, clip, id, vol_db, fader);
     let db = vol_db;
     let text = fine::db_text(db);
     let ro = Rect::from_min_max(pos2(x0, bottom), pos2(r.max.x - 4.0, r.max.y - 4.0));
@@ -1776,7 +1780,16 @@ fn draw_knob(p: &egui::Painter, r: Rect, b: f32, hot: bool) {
     p.circle_filled(c + vec2(ang(b).cos(), ang(b).sin()) * rad, 2.5, TOKENS.text);
 }
 
-fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect, id: TrackId, db: f32, r: Rect) {
+/// `y` moved to the center of the physical pixel row it falls in, so a 1 px line there is crisp.
+fn snap_y(y: f32, ppp: f32) -> f32 {
+    ((y * ppp).floor() + 0.5) / ppp
+}
+
+/// Draws the fader; returns the y of the cap's center line and of the 0 dB tick.
+fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect, id: TrackId, db: f32, r: Rect) -> (Option<f32>, Option<f32>) {
+    let ppp = ui.ctx().pixels_per_point();
+    let hair = 1.0 / ppp;
+    let mut zero_y = None;
     let me = Target::Fader(id);
     let resp = ui.interact(r.expand2(vec2(4.0, 6.0)).intersect(clip), ui.id().with(("fader", id.0)), Sense::click_and_drag());
     // Track and marks: a line across the track at 0 dB, fainter ticks at -6, -12 and -24.
@@ -1784,21 +1797,26 @@ fn fader_widget(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect,
     p.rect_filled(groove, crate::theme::RADIUS_SM, TOKENS.bg);
     let y_of = |k: f32| r.max.y - k * r.height();
     for mark in fine::DB_MARKS {
-        let yy = y_of(db_to_k(mark));
+        let yy = snap_y(y_of(db_to_k(mark)), ppp);
         if mark == 0.0 {
+            zero_y = Some(yy);
             p.line_segment([pos2(r.min.x, yy), pos2(r.max.x, yy)], Stroke::new(1.0, TOKENS.text_dim));
         } else {
             p.line_segment([pos2(r.center().x - 8.0, yy), pos2(r.center().x + 8.0, yy)], Stroke::new(1.0, TOKENS.text_dim.gamma_multiply(0.5)));
         }
     }
     let k = db_to_k(db);
-    let cap = Rect::from_center_size(pos2(r.center().x, y_of(k)), vec2(r.width().min(26.0), 12.0));
+    let cap_y = snap_y(y_of(k), ppp);
+    let cap = Rect::from_center_size(pos2(r.center().x, cap_y), vec2(r.width().min(26.0), 12.0));
     let hot = resp.hovered() || app.mixer.gesture.is_some_and(|g| g.target == me);
     p.rect_filled(cap, crate::theme::RADIUS_SM, if hot { TOKENS.accent } else { TOKENS.text_dim });
+    // The line through the cap marks the exact point the value sits at, to line up with the 0 dB line.
+    p.line_segment([pos2(cap.min.x, cap_y), pos2(cap.max.x, cap_y)], Stroke::new(hair, TOKENS.bg));
     if resp.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
     control(app, ui, &resp, me, r.height().max(1.0), true, true);
+    (Some(cap_y), zero_y)
 }
 
 /// A number under a control that is also a way in: double-click types a value in its place,
