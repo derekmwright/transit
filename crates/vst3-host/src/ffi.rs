@@ -44,6 +44,13 @@ const MAX_BUS_CHANNELS: u32 = 64;
 pub(crate) const EVENT_CAP: usize = 1024;
 /// Most parameter queues per block (preallocated).
 pub(crate) const PARAM_QUEUE_CAP: usize = 1024;
+/// Parameter points one block carries across all its queues (a preallocated slab).
+pub(crate) const PARAM_POINTS: usize = 4096;
+/// Event entries kept for releases (F10): one per note and pedal the mix holds open (224 + 32),
+/// plus one reset. Other events are refused once only these remain.
+pub(crate) const RELEASE_RESERVE: usize = 257;
+/// MIDI channels the controller mapping covers.
+pub(crate) const MIDI_CHANNELS: usize = 16;
 /// Largest plugin state we buffer (component or controller state).
 const MAX_STATE_BYTES: usize = 64 << 20;
 /// Most editor parameter edits buffered between two UI frames.
@@ -527,8 +534,8 @@ impl Bundle {
             active: false,
             processing: false,
             max_frames: 0,
-            in_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
-            out_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP)),
+            in_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP, PARAM_POINTS)),
+            out_params: ComWrapper::new(ParamChanges::new(PARAM_QUEUE_CAP, 0)),
             in_events: ComWrapper::new(EventList::new(EVENT_CAP)),
             out_events: ComWrapper::new(EventList::new(EVENT_CAP)),
             // SAFETY: `ProcessContext` is plain data (numbers and small structs); all-zero is valid.
@@ -1176,11 +1183,62 @@ impl IMessageTrait for HostMessage {
 /// One parameter's points for one block. SoundCraft sends at most one point per block; a
 /// plugin writing output changes may add more, of which only the last is kept.
 #[derive(Default)]
+
+/// One parameter point the host sends: its time in the block, the parameter, its class
+/// (0: automation and host values, 1: a mapped MIDI controller, which follows automation at the
+/// same offset), the order it was set in, and the normalized value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ParamPoint {
+    pub time: u32,
+    pub id: u32,
+    pub class: u8,
+    pub seq: u32,
+    pub value: f64,
+}
+
+/// A queue's points live inline (one point a plug-in wrote), not in the slab.
+const INLINE: u32 = u32::MAX;
+
+/// The points one block carries: (offset, value bits).
+type Slab = Arc<[(AtomicI32, AtomicU64)]>;
+
+/// One parameter's points for one block: a contiguous range of its [`ParamChanges`]'s slab,
+/// ascending by offset (host → plug-in), or one inline point (a plug-in's output changes; only the
+/// last one it adds is kept).
 pub(crate) struct ParamQueue {
     id: AtomicU32,
+    /// First slab point, or [`INLINE`].
+    start: AtomicU32,
+    points: AtomicI32,
     offset: AtomicI32,
     value: AtomicU64,
-    points: AtomicI32,
+    slab: Slab,
+}
+
+impl ParamQueue {
+    fn new(slab: Slab) -> ParamQueue {
+        ParamQueue {
+            id: AtomicU32::new(0),
+            start: AtomicU32::new(INLINE),
+            points: AtomicI32::new(0),
+            offset: AtomicI32::new(0),
+            value: AtomicU64::new(0),
+            slab,
+        }
+    }
+
+    /// Point `index`: (offset, value).
+    fn point(&self, index: i32) -> Option<(i32, f64)> {
+        if index < 0 || index >= self.points.load(Ordering::Relaxed) {
+            return None;
+        }
+        let start = self.start.load(Ordering::Relaxed);
+        if start == INLINE {
+            return (index == 0).then(|| (self.offset.load(Ordering::Relaxed), f64::from_bits(self.value.load(Ordering::Relaxed))));
+        }
+        let (o, v) = self.slab.get((start as usize).checked_add(index as usize)?)?;
+        Some((o.load(Ordering::Relaxed), f64::from_bits(v.load(Ordering::Relaxed))))
+    }
 }
 
 impl Class for ParamQueue {
@@ -1195,13 +1253,11 @@ impl IParamValueQueueTrait for ParamQueue {
         self.points.load(Ordering::Relaxed)
     }
     unsafe fn getPoint(&self, index: sb::int32, offset: *mut sb::int32, value: *mut sv::ParamValue) -> sb::tresult {
-        if index != 0 || self.points.load(Ordering::Relaxed) < 1 {
-            return sb::kInvalidArgument;
-        }
+        let Some((at, v)) = self.point(index) else { return sb::kInvalidArgument };
         // SAFETY: out-pointers from the plugin (or null, handled).
-        if let (Some(o), Some(v)) = (unsafe { offset.as_mut() }, unsafe { value.as_mut() }) {
-            *o = self.offset.load(Ordering::Relaxed);
-            *v = f64::from_bits(self.value.load(Ordering::Relaxed));
+        if let (Some(o), Some(out)) = (unsafe { offset.as_mut() }, unsafe { value.as_mut() }) {
+            *o = at;
+            *out = v;
             sb::kResultOk
         } else {
             sb::kInvalidArgument
@@ -1210,6 +1266,7 @@ impl IParamValueQueueTrait for ParamQueue {
     unsafe fn addPoint(&self, offset: sb::int32, value: sv::ParamValue, index: *mut sb::int32) -> sb::tresult {
         self.offset.store(offset, Ordering::Relaxed);
         self.value.store(value.to_bits(), Ordering::Relaxed);
+        self.start.store(INLINE, Ordering::Relaxed);
         self.points.store(1, Ordering::Relaxed);
         // SAFETY: out-pointer from the plugin (or null, handled).
         if let Some(i) = unsafe { index.as_mut() } {
@@ -1219,10 +1276,14 @@ impl IParamValueQueueTrait for ParamQueue {
     }
 }
 
-/// A fixed pool of parameter queues (`IParameterChanges`), reused every block.
+/// A fixed pool of parameter queues (`IParameterChanges`) and the slab of their points, reused
+/// every block. Nothing here allocates after `new`.
 pub(crate) struct ParamChanges {
     queues: Vec<ComWrapper<ParamQueue>>,
     count: AtomicI32,
+    slab: Slab,
+    /// Slab points handed out this block.
+    used: AtomicUsize,
 }
 
 impl Class for ParamChanges {
@@ -1230,12 +1291,21 @@ impl Class for ParamChanges {
 }
 
 impl ParamChanges {
-    fn new(cap: usize) -> ParamChanges {
-        ParamChanges { queues: (0..cap).map(|_| ComWrapper::new(ParamQueue::default())).collect(), count: AtomicI32::new(0) }
+    /// `cap` queues sharing a slab of `points` points (0 for output changes, which keep one
+    /// inline point per queue).
+    fn new(cap: usize, points: usize) -> ParamChanges {
+        let slab: Slab = (0..points).map(|_| (AtomicI32::new(0), AtomicU64::new(0))).collect::<Vec<_>>().into();
+        ParamChanges {
+            queues: (0..cap).map(|_| ComWrapper::new(ParamQueue::new(Arc::clone(&slab)))).collect(),
+            count: AtomicI32::new(0),
+            slab,
+            used: AtomicUsize::new(0),
+        }
     }
 
     fn clear(&self) {
         self.count.store(0, Ordering::Relaxed);
+        self.used.store(0, Ordering::Relaxed);
     }
 
     /// Finds or adds the queue for `id`; `None` when the pool is full.
@@ -1248,18 +1318,52 @@ impl ParamChanges {
         }
         let q = self.queues.get(n as usize)?;
         q.id.store(id, Ordering::Relaxed);
+        q.start.store(INLINE, Ordering::Relaxed);
         q.points.store(0, Ordering::Relaxed);
         self.count.store(n + 1, Ordering::Relaxed);
         Some((n, q))
     }
 
-    /// Host side: one point for `id` at `offset` (replacing an earlier one this block).
-    fn set(&self, id: u32, offset: i32, value: f64) {
-        if let Some((_, q)) = self.queue_for(id) {
-            q.offset.store(offset, Ordering::Relaxed);
-            q.value.store(value.to_bits(), Ordering::Relaxed);
-            q.points.store(1, Ordering::Relaxed);
+    /// Host side: this block's points (times relative to `offset`, all inside the block) become
+    /// one queue per parameter with its points ascending by offset. At one offset the last point
+    /// wins (a controller after automation). When the slab runs out, a parameter keeps only its
+    /// last point. Sorts `points` in place (`sort_unstable_by_key`: no allocation). Returns the
+    /// points dropped (slab or queue pool exhausted).
+    pub(crate) fn fill(&self, points: &mut [ParamPoint], offset: u32) -> u32 {
+        self.clear();
+        points.sort_unstable_by_key(|p| (p.id, p.time, p.class, p.seq));
+        let mut groups = points.chunk_by(|a, b| a.id == b.id).count();
+        let mut dropped = 0u32;
+        for group in points.chunk_by(|a, b| a.id == b.id) {
+            groups -= 1;
+            let Some(first) = group.first() else { continue };
+            // The last point at each offset.
+            let last_at = |k: usize| group.get(k + 1).is_none_or(|n| n.time != group.get(k).map_or(0, |p| p.time));
+            let distinct = (0..group.len()).filter(|&k| last_at(k)).count();
+            let Some((_, q)) = self.queue_for(first.id) else {
+                dropped = dropped.saturating_add(distinct as u32);
+                continue;
+            };
+            let start = self.used.load(Ordering::Relaxed);
+            // Keep one slab point for each parameter still to come.
+            let room = self.slab.len().saturating_sub(start).saturating_sub(groups);
+            let all = distinct <= room;
+            let mut w = 0usize;
+            for (k, p) in group.iter().enumerate() {
+                if !last_at(k) || (!all && k + 1 != group.len()) {
+                    continue;
+                }
+                let Some((o, v)) = self.slab.get(start + w) else { break };
+                o.store(i32::try_from(p.time.saturating_sub(offset)).unwrap_or(i32::MAX), Ordering::Relaxed);
+                v.store(p.value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+                w += 1;
+            }
+            dropped = dropped.saturating_add((distinct - w) as u32);
+            q.start.store(u32::try_from(start).unwrap_or(INLINE), Ordering::Relaxed);
+            q.points.store(i32::try_from(w).unwrap_or(0), Ordering::Relaxed);
+            self.used.store(start + w, Ordering::Relaxed);
         }
+        dropped
     }
 
     fn queue_ptr(&self, index: usize) -> *mut sv::IParamValueQueue {
@@ -1449,12 +1553,13 @@ impl IBStreamTrait for MemoryStream {
 
 // ---- events and buffers --------------------------------------------------------------------
 
-/// A host → plugin note event, safe to build anywhere; converted inside `process`.
+/// A host → plugin note event, safe to build anywhere; converted inside `process`. `channel` is
+/// the MIDI channel (0..=15) and `id` the host's voice id (`-1`: none), as VST3's `noteId`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum NoteEvent {
-    On { time: u32, key: u8, velocity: f32 },
-    Off { time: u32, key: u8 },
-    Pressure { time: u32, key: u8, pressure: f32 },
+    On { time: u32, key: u8, velocity: f32, channel: u8, id: i32 },
+    Off { time: u32, key: u8, velocity: f32, channel: u8, id: i32 },
+    Pressure { time: u32, key: u8, pressure: f32, channel: u8, id: i32 },
 }
 
 impl NoteEvent {
@@ -1476,17 +1581,19 @@ impl NoteEvent {
         e.sampleOffset = i32::try_from(self.time().saturating_sub(offset)).unwrap_or(0);
         e.flags = sv::Event_::EventFlags_::kIsLive as u16;
         match self {
-            NoteEvent::On { key, velocity, .. } => {
+            NoteEvent::On { key, velocity, channel, id, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kNoteOnEvent as u16;
-                e.__field0.noteOn = sv::NoteOnEvent { channel: 0, pitch: i16::from(key), tuning: 0.0, velocity, length: 0, noteId: -1 };
+                e.__field0.noteOn =
+                    sv::NoteOnEvent { channel: i16::from(channel & 0x0F), pitch: i16::from(key), tuning: 0.0, velocity, length: 0, noteId: id };
             }
-            NoteEvent::Off { key, .. } => {
+            NoteEvent::Off { key, velocity, channel, id, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kNoteOffEvent as u16;
-                e.__field0.noteOff = sv::NoteOffEvent { channel: 0, pitch: i16::from(key), velocity: 0.0, noteId: -1, tuning: 0.0 };
+                e.__field0.noteOff =
+                    sv::NoteOffEvent { channel: i16::from(channel & 0x0F), pitch: i16::from(key), velocity, noteId: id, tuning: 0.0 };
             }
-            NoteEvent::Pressure { key, pressure, .. } => {
+            NoteEvent::Pressure { key, pressure, channel, id, .. } => {
                 e.r#type = sv::Event_::EventTypes_::kPolyPressureEvent as u16;
-                e.__field0.polyPressure = sv::PolyPressureEvent { channel: 0, pitch: i16::from(key), pressure, noteId: -1 };
+                e.__field0.polyPressure = sv::PolyPressureEvent { channel: i16::from(channel & 0x0F), pitch: i16::from(key), pressure, noteId: id };
             }
         }
         e
@@ -1748,16 +1855,18 @@ impl Instance {
         v.is_finite().then(|| v.clamp(0.0, 1.0))
     }
 
-    /// The parameter each MIDI controller drives on channel 1 (`IMidiMapping`), indexed by VST3's
-    /// controller numbers: CCs 0–127, then [`AFTERTOUCH`] and [`PITCH_BEND`]. Main thread only.
+    /// The parameter each MIDI controller drives on each of the 16 channels (`IMidiMapping`):
+    /// channel-major, each channel indexed by VST3's controller numbers (CCs 0–127, then
+    /// [`AFTERTOUCH`] and [`PITCH_BEND`]). Main thread only.
     pub fn midi_mapping(&self) -> Vec<Option<u32>> {
         let Some(m) = self.controller.as_ref().and_then(|c| c.cast::<sv::IMidiMapping>()) else { return Vec::new() };
-        (0..=PITCH_BEND)
-            .map(|n| {
+        (0..MIDI_CHANNELS)
+            .flat_map(|ch| (0..=PITCH_BEND).map(move |n| (ch, n)))
+            .map(|(ch, n)| {
                 let mut id: sv::ParamID = 0;
-                let n = i16::try_from(n).unwrap_or(0);
+                let (ch, n) = (i16::try_from(ch).unwrap_or(0), i16::try_from(n).unwrap_or(0));
                 // SAFETY: valid mapping interface on the main thread; `id` is a local.
-                ok(unsafe { m.getMidiControllerAssignment(0, 0, n, &mut id) }).then_some(id)
+                ok(unsafe { m.getMidiControllerAssignment(0, ch, n, &mut id) }).then_some(id)
             })
             .collect()
     }
@@ -1914,22 +2023,22 @@ impl Instance {
         }
     }
 
-    /// Runs one `process` call over `frames` frames: `params` become one point each at offset 0,
-    /// `controls` (time, id, value) one point at their time when it falls in this call (the last
-    /// one wins per parameter), and `notes` (sorted by time) have their times made relative to
-    /// `offset`.
+    /// Runs one `process` call over `frames` frames starting at block time `offset`: `points`
+    /// (all inside this call) become one parameter queue each, ascending (see
+    /// [`ParamChanges::fill`]; `points` is sorted in place), and `notes` (sorted by time) have
+    /// their times made relative to `offset`. Returns the parameter points dropped because the
+    /// slab ran out.
     pub fn process(
         &mut self,
         frames: usize,
         inputs: &mut BusBuffers,
         outputs: &mut BusBuffers,
-        params: &[(u32, f64)],
-        controls: &[(u32, u32, f64)],
+        points: &mut [ParamPoint],
         notes: &[NoteEvent],
         offset: u32,
         project_time: i64,
         transport: Option<&Transport>,
-    ) -> Result<(), Vst3Error> {
+    ) -> Result<u32, Vst3Error> {
         if !self.active {
             return Err(Vst3Error::Process("not active".into()));
         }
@@ -1943,15 +2052,7 @@ impl Instance {
             unsafe { p.setProcessing(1) };
             self.processing = true;
         }
-        self.in_params.clear();
-        for &(id, v) in params.iter().take(PARAM_QUEUE_CAP) {
-            self.in_params.set(id, 0, v.clamp(0.0, 1.0));
-        }
-        for &(time, id, v) in controls {
-            if let Some(at) = time.checked_sub(offset).filter(|&t| (t as usize) < frames) {
-                self.in_params.set(id, i32::try_from(at).unwrap_or(0), v.clamp(0.0, 1.0));
-            }
-        }
+        let dropped = self.in_params.fill(points, offset);
         self.out_params.clear();
         let event_in = self.event_in;
         self.in_events.with(|v| {
@@ -1989,7 +2090,7 @@ impl Instance {
         // parameter/event objects and the context are owned by `self` and untouched until the
         // call returns.
         let r = unsafe { p.process(&mut data) };
-        if ok(r) { Ok(()) } else { Err(Vst3Error::Process(format!("process returned {r}"))) }
+        if ok(r) { Ok(dropped) } else { Err(Vst3Error::Process(format!("process returned {r}"))) }
     }
 }
 
@@ -2760,12 +2861,34 @@ mod tests {
     }
 
     #[test]
+    fn parameter_points_keep_every_offset_in_order() {
+        let pc = ParamChanges::new(8, 6);
+        let pt = |time, id, class, seq, value| ParamPoint { time, id, class, seq, value };
+        // Two parameters, several offsets; at offset 32 of parameter 1 a controller follows automation.
+        let mut points =
+            [pt(40, 1, 0, 4, 0.8), pt(0, 1, 1, 0, 1.0), pt(32, 1, 1, 3, 0.0), pt(5, 1, 0, 1, 0.2), pt(32, 1, 0, 2, 0.6), pt(9, 2, 0, 5, 0.3)];
+        assert_eq!(pc.fill(&mut points, 0), 0);
+        let read = |i: usize| {
+            let q = &pc.queues[i];
+            (q.id.load(Ordering::Relaxed), (0..q.points.load(Ordering::Relaxed)).map(|k| q.point(k).unwrap()).collect::<Vec<_>>())
+        };
+        assert_eq!(read(0), (1, vec![(0, 1.0), (5, 0.2), (32, 0.0), (40, 0.8)]));
+        assert_eq!(read(1), (2, vec![(9, 0.3)]));
+        // Exhaustion: four points for parameter 1 and one for 2 in a slab of 3 keep the last of 1.
+        let small = ParamChanges::new(8, 3);
+        let mut points = [pt(0, 1, 0, 0, 0.1), pt(1, 1, 0, 1, 0.2), pt(2, 1, 0, 2, 0.3), pt(3, 1, 0, 3, 0.4), pt(0, 2, 0, 4, 0.5)];
+        assert_eq!(small.fill(&mut points, 0), 3);
+        let q = &small.queues[0];
+        assert_eq!((q.points.load(Ordering::Relaxed), q.point(0)), (1, Some((3, 0.4))));
+        assert_eq!(small.queues[1].point(0), Some((0, 0.5)), "every parameter keeps a point");
+    }
+
+    #[test]
     fn host_objects_behave() {
-        let pc = ParamChanges::new(2);
-        pc.set(5, 0, 0.25);
-        pc.set(5, 0, 0.5);
-        pc.set(6, 0, 1.0);
-        pc.set(7, 0, 1.0);
+        let pc = ParamChanges::new(2, 16);
+        let pt = |time, id, seq, value| ParamPoint { time, id, class: 0, seq, value };
+        let mut points = [pt(2, 5, 0, 0.25), pt(2, 5, 1, 0.5), pt(2, 6, 2, 1.0), pt(2, 7, 3, 1.0)];
+        assert_eq!(pc.fill(&mut points, 2), 1, "the third parameter finds no queue");
         // SAFETY: test calls through our own implementation.
         unsafe {
             assert_eq!(pc.getParameterCount(), 2, "full pool drops extra params");
@@ -2773,13 +2896,15 @@ mod tests {
             assert!(pc.getParameterData(-1).is_null());
             let q = pc.queues[0].as_com_ref::<sv::IParamValueQueue>().unwrap();
             let (mut o, mut v) = (9, 0.0);
+            assert_eq!(q.getPointCount(), 1, "one offset, the last value");
             assert_eq!(q.getPoint(0, &mut o, &mut v), sb::kResultOk);
             assert_eq!((o, v), (0, 0.5));
             assert_ne!(q.getPoint(1, &mut o, &mut v), sb::kResultOk);
+            assert_ne!(q.getPoint(-1, &mut o, &mut v), sb::kResultOk);
             assert_ne!(q.getPoint(0, std::ptr::null_mut(), &mut v), sb::kResultOk);
         }
         let el = EventList::new(1);
-        let mut e = NoteEvent::On { time: 5, key: 60, velocity: 1.0 }.to_raw(2);
+        let mut e = NoteEvent::On { time: 5, key: 60, velocity: 1.0, channel: 3, id: 9 }.to_raw(2);
         // SAFETY: as above.
         unsafe {
             assert_eq!(el.addEvent(&mut e), sb::kResultOk);
@@ -2789,6 +2914,7 @@ mod tests {
             assert_eq!(el.getEvent(0, &mut out), sb::kResultOk);
             assert_eq!(out.sampleOffset, 3);
             assert_eq!(out.__field0.noteOn.pitch, 60);
+            assert_eq!((out.__field0.noteOn.channel, out.__field0.noteOn.noteId), (3, 9));
             assert_ne!(el.getEvent(1, &mut out), sb::kResultOk);
         }
         let s = MemoryStream { inner: Mutex::new((Vec::new(), 0)) };
