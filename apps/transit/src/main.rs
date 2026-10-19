@@ -212,7 +212,13 @@ fn services() -> Services {
             d.pick_file().map(|p| p.to_string_lossy().into_owned())
         })),
         pick_save: Some(Box::new(|default: &str| {
-            rfd::FileDialog::new().add_filter("Session", &["scraft"]).set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
+            // A bounce (slice 6) asks with its audio file name; everything else is a session.
+            let ext = std::path::Path::new(default).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+            let d = match ext.as_str() {
+                "wav" | "aif" | "aiff" | "flac" => rfd::FileDialog::new().add_filter("Audio", &[ext.as_str()]),
+                _ => rfd::FileDialog::new().add_filter("Session", &["scraft"]),
+            };
+            d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
         })),
     }
 }
