@@ -91,10 +91,12 @@ const HELLO_BLOB: [u8; 5] = [0, 1, 2, 0xfe, 0xff];
 fn host_create<I: vst3::Interface>(host: &ComRef<'_, IHostApplication>) -> Option<vst3::ComPtr<I>> {
     let mut iid = I::IID.map(|b| b as c_char);
     let mut obj: *mut c_void = std::ptr::null_mut();
+    // SAFETY: the host is live, both IDs are readable TUIDs, and obj is a distinct writable output.
     let r = unsafe { host.createInstance(&mut iid, &mut iid, &mut obj) };
     if r != kResultOk && r != kResultTrue {
         return None;
     }
+    // SAFETY: successful SDK creation returns the requested interface with one owned reference.
     unsafe { vst3::ComPtr::from_raw(obj.cast::<I>()) }
 }
 
@@ -102,6 +104,7 @@ fn host_create<I: vst3::Interface>(host: &ComRef<'_, IHostApplication>) -> Optio
 fn say_hello(host: &vst3::ComPtr<IHostApplication>, peer: &ComRef<'_, IConnectionPoint>) {
     let host = host.as_com_ref();
     let Some(list) = host_create::<IAttributeList>(&host) else { violation("host createInstance made no IAttributeList") };
+    // SAFETY: list is owned here; IDs are terminated literals and n is a writable scalar.
     unsafe {
         assert_eq!(list.setInt(c"n".as_ptr(), -7), kResultOk);
         let mut n = 0i64;
@@ -110,6 +113,8 @@ fn say_hello(host: &vst3::ComPtr<IHostApplication>, peer: &ComRef<'_, IConnectio
         assert_ne!(list.getInt(c"missing".as_ptr(), &mut n), kResultOk, "host attribute list: no such int");
     }
     let Some(msg) = host_create::<IMessage>(&host) else { violation("host createInstance made no IMessage for IConnectionPoint::notify") };
+    // SAFETY: msg owns the borrowed attributes; all setter inputs remain live through their
+    // copying calls. The live peer borrows msg only during synchronous notify (retention needs AddRef).
     unsafe {
         msg.setMessageID(HELLO_ID.as_ptr());
         let Some(attrs) = ComRef::from_raw(msg.getAttributes()) else { violation("host IMessage without attributes") };
@@ -123,8 +128,14 @@ fn say_hello(host: &vst3::ComPtr<IHostApplication>, peer: &ComRef<'_, IConnectio
 }
 
 /// Checks the component's greeting (see the module docs).
-fn hello_ok(message: *mut IMessage) -> bool {
+///
+/// # Safety
+/// message must be null or a live IMessage borrowed for this call, with no concurrent mutation.
+unsafe fn hello_ok(message: *mut IMessage) -> bool {
+    // SAFETY: notify forwards its live borrowed message; ComRef rejects null and does not release it.
     let Some(msg) = (unsafe { ComRef::from_raw(message) }) else { return false };
+    // SAFETY: msg and its ID/attributes remain live and unmodified during notify. The output
+    // buffers have the reported byte sizes; successful getBinary supplies size readable bytes.
     unsafe {
         let id = msg.getMessageID();
         if id.is_null() || std::ffi::CStr::from_ptr(id) != HELLO_ID {
@@ -173,8 +184,13 @@ impl IPluginBaseTrait for GainProcessor {
 }
 
 impl IConnectionPointTrait for GainProcessor {
+    /// # Safety
+    /// other must be null or a live connection point; this component must be initialized.
     unsafe fn connect(&self, other: *mut IConnectionPoint) -> tresult {
+        // SAFETY: the SDK passes a live peer (or null, rejected); this call only borrows it.
         let Some(peer) = (unsafe { ComRef::from_raw(other) }) else { return kInvalidArgument };
+        // SAFETY: initialize stored a host context that lives until terminate; cast owns an
+        // additional reference, released after say_hello returns.
         let host = unsafe { ComRef::from_raw(self.host.load(Ordering::SeqCst)) }.and_then(|h| h.cast::<IHostApplication>());
         let Some(host) = host else { violation("the host context has no IHostApplication") };
         say_hello(&host, &peer);
@@ -422,8 +438,11 @@ impl IConnectionPointTrait for GainController {
     unsafe fn disconnect(&self, _other: *mut IConnectionPoint) -> tresult {
         kResultOk
     }
+    /// # Safety
+    /// message must be null or a live IMessage borrowed for this call, with no concurrent mutation.
     unsafe fn notify(&self, message: *mut IMessage) -> tresult {
-        if !hello_ok(message) {
+        // SAFETY: forwards the SDK notify borrow; hello_ok does not retain the message or its data.
+        if !unsafe { hello_ok(message) } {
             violation("the component's IMessage reached the controller garbled");
         }
         self.hello.store(true, Ordering::SeqCst);

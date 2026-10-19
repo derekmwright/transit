@@ -29,6 +29,7 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::{self as sb};
 use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
+use vst3::com_scrape_types::{Construct, Header, MakeHeader, Wrapper};
 use vst3::{Class, ComPtr, ComWrapper, Interface};
 
 /// Most classes one factory may report (hostile-input cap).
@@ -674,26 +675,30 @@ impl IHostApplicationTrait for HostContext {
     /// Host-side `IMessage` and `IAttributeList` objects, which plug-ins whose component and
     /// controller talk through `IConnectionPoint` allocate here (the SDK's `allocateMessage`).
     /// A host must provide them; some plug-ins (iZotope Ozone 11) use the result unchecked.
+    ///
+    /// # Safety
+    /// Non-null IDs must point to readable TUIDs; `obj` must be null or a distinct writable pointer.
     unsafe fn createInstance(&self, cid: *mut sb::TUID, iid: *mut sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
         // SAFETY: `obj` is the plugin's out-pointer (or null, handled).
         let Some(out) = (unsafe { obj.as_mut() }) else { return sb::kInvalidArgument };
         *out = std::ptr::null_mut();
         // SAFETY: the plugin passes two readable 16-byte TUIDs (or null, handled).
-        let (Some(cid), Some(iid)) = (unsafe { cid.as_ref() }, unsafe { iid.as_ref() }) else { return sb::kInvalidArgument };
+        let (Some(cid), Some(iid)) = (unsafe { (cid.as_ref(), iid.as_ref()) }) else { return sb::kInvalidArgument };
         let (cid, iid) = (tuid_bytes(cid), tuid_bytes(iid));
-        let raw = if cid == sv::IMessage::IID {
-            query::<sv::IMessage, _>(&ComWrapper::new(HostMessage::default()), &iid)
-        } else if cid == sv::IAttributeList::IID {
-            query::<sv::IAttributeList, _>(&ComWrapper::new(HostAttributeList::default()), &iid)
+        // Refuse unsupported pairs before allocating, including under memory pressure.
+        let raw = if cid == sv::IMessage::IID && (iid == cid || iid == FUnknown::IID) {
+            HostMessage::try_new().map(|p| p.into_raw().cast())
+        } else if cid == sv::IAttributeList::IID && (iid == cid || iid == FUnknown::IID) {
+            HostAttributeList::try_new().map(|p| p.into_raw().cast())
         } else {
-            None
+            return sb::kResultFalse;
         };
         match raw {
-            Some(p) => {
+            Ok(p) => {
                 *out = p;
                 sb::kResultOk
             }
-            None => sb::kResultFalse,
+            Err(e) => e,
         }
     }
 }
@@ -748,17 +753,151 @@ impl IComponentHandlerTrait for HostContext {
     }
 }
 
-/// `obj` as its interface `I` (requested as `I` or `FUnknown`), with one reference owned by the
-/// caller; `None` for any other interface id.
-fn query<I: Interface, C: Class>(obj: &ComWrapper<C>, iid: &[u8; 16]) -> Option<*mut c_void> {
-    if *iid == I::IID {
-        Some(obj.to_com_ptr::<I>()?.into_raw().cast())
-    } else if *iid == FUnknown::IID {
-        Some(obj.to_com_ptr::<FUnknown>()?.into_raw().cast())
-    } else {
-        None
+// ComWrapper uses infallible Arc allocation. These two SDK objects instead allocate one
+// header/data block fallibly, retaining the dependency's generated ABI thunks.
+#[repr(C)]
+struct HostObject<C: Class> {
+    header: Header<C>,
+    refs: AtomicUsize,
+    data: C,
+}
+
+// fetch_update keeps this wrapper compatible with the crate's Rust 1.90 MSRV.
+#[allow(deprecated)]
+impl<C: Class> Wrapper<C> for HostObject<C> {
+    /// # Safety
+    /// `ptr` must be the header of a live allocation made by `try_host_object`.
+    unsafe fn data_from_header(ptr: *mut Header<C>) -> *mut C {
+        // SAFETY: repr(C) puts the header first; the allocation contains an initialized C.
+        unsafe { std::ptr::addr_of_mut!((*ptr.cast::<Self>()).data) }
+    }
+
+    /// # Safety
+    /// `ptr` must be the data member of a live allocation made by `try_host_object`.
+    unsafe fn header_from_data(ptr: *mut C) -> *mut Header<C> {
+        // SAFETY: subtracting the repr(C) member offset recovers the original allocation/header.
+        unsafe { ptr.cast::<u8>().sub(std::mem::offset_of!(Self, data)).cast() }
+    }
+
+    /// # Safety
+    /// `ptr` must name live data and the caller must hold a reference throughout the call.
+    unsafe fn add_ref(ptr: *mut C) -> usize {
+        // SAFETY: the caller's live reference keeps this header and atomic counter alive.
+        let object = unsafe { &*Self::header_from_data(ptr).cast::<Self>() };
+        // Saturate instead of wrapping. A saturated object is intentionally never freed.
+        object.refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1))).unwrap_or(usize::MAX).saturating_add(1)
+    }
+
+    /// # Safety
+    /// `ptr` must name live data and the caller must surrender exactly one owned reference.
+    unsafe fn release(ptr: *mut C) -> usize {
+        // SAFETY: the surrendered reference keeps the allocation alive through the decrement.
+        let allocation = unsafe { Self::header_from_data(ptr).cast::<Self>() };
+        // SAFETY: allocation is live; only the atomic counter is accessed before the last release.
+        let previous = unsafe { &(*allocation).refs }
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |n| if n == usize::MAX { None } else { n.checked_sub(1) });
+        match previous {
+            Ok(1) => {
+                std::sync::atomic::fence(Ordering::Acquire);
+                // SAFETY: this was the last reference. Drop once, then free with the allocation's
+                // original layout; no references to the header or data are used afterward.
+                unsafe {
+                    std::ptr::drop_in_place(allocation);
+                    std::alloc::dealloc(allocation.cast(), std::alloc::Layout::new::<Self>());
+                }
+                0
+            }
+            Ok(n) => n.saturating_sub(1),
+            Err(n) => n,
+        }
     }
 }
+
+// Test-only, thread-local failure countdown: no global allocator changes or real OOM.
+#[cfg(test)]
+thread_local! {
+    static HOST_ALLOC_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn host_allocation() -> Result<(), sb::tresult> {
+    #[cfg(test)]
+    HOST_ALLOC_FAIL_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => Err(sb::kOutOfMemory),
+        Some(n) => {
+            remaining.set(Some(n - 1));
+            Ok(())
+        }
+        None => Ok(()),
+    })?;
+    Ok(())
+}
+
+fn try_host_copy<T: Copy>(source: &[T]) -> Result<Vec<T>, sb::tresult> {
+    let mut copy = Vec::new();
+    if !source.is_empty() {
+        host_allocation()?;
+        copy.try_reserve_exact(source.len()).map_err(|_| sb::kOutOfMemory)?;
+        copy.extend_from_slice(source);
+    }
+    Ok(copy)
+}
+
+/// Allocate a single-interface SDK object with one reference. Only the two matching static
+/// vtables below are supplied here; each uses HostObject<C> and offset zero.
+fn try_host_object<C, I>(data: C, vtbl: &'static I::Vtbl) -> Result<ComPtr<I>, sb::tresult>
+where
+    C: Class<Interfaces = (I,)> + 'static,
+    I: Construct<C, HostObject<C>, 0>,
+{
+    host_allocation()?;
+    let layout = std::alloc::Layout::new::<HostObject<C>>();
+    // SAFETY: the header/counter make layout nonzero; null is handled before any write.
+    let allocation = unsafe { std::alloc::alloc(layout) }.cast::<HostObject<C>>();
+    if allocation.is_null() {
+        return Err(sb::kOutOfMemory);
+    }
+    // SAFETY: allocation has the exact size/alignment of HostObject<C>. Its single-interface
+    // header starts at offset zero, with a vtable pointer as required by Interface/MakeHeader.
+    // The supplied static vtable retains the generated thunks for C and this wrapper, replacing
+    // only QI. ComPtr takes the sole initial reference and release frees this exact allocation.
+    unsafe {
+        allocation.write(HostObject { header: <(I,) as MakeHeader<C, HostObject<C>>>::HEADER, refs: AtomicUsize::new(1), data });
+        allocation.cast::<*const I::Vtbl>().write(vtbl);
+        Ok(ComPtr::from_raw_unchecked(allocation.cast::<I>()))
+    }
+}
+
+/// vst3 0.3.0's FUnknown QI neither clears failed outputs nor checks null arguments. Wrap that
+/// third-party helper for the new objects; successful QI retains its ABI, identity and AddRef.
+///
+/// # Safety
+/// `this` must be the live single-interface HostObject<C> header. Non-null `iid` must be
+/// readable, and non-null `obj` must be a distinct writable pointer.
+unsafe extern "system" fn host_query_interface<C: Class>(this: *mut FUnknown, iid: *const sb::TUID, obj: *mut *mut c_void) -> sb::tresult {
+    if obj.is_null() {
+        return sb::kInvalidArgument;
+    }
+    // SAFETY: the caller supplies a writable pointer, and null was rejected.
+    unsafe { obj.write(std::ptr::null_mut()) };
+    if iid.is_null() {
+        return sb::kInvalidArgument;
+    }
+    // SAFETY: inputs are validated; the generated helper knows C's header and reference counter.
+    unsafe { (FUnknown::make_vtbl::<C, HostObject<C>, 0>().queryInterface)(this, iid, obj) }
+}
+
+const ATTRIBUTE_VTBL: sv::IAttributeListVtbl = {
+    // SAFETY: Construct supplies a static vtable with the SDK ABI for this C/wrapper/offset.
+    let mut vtbl = unsafe { *<sv::IAttributeList as Construct<HostAttributeList, HostObject<HostAttributeList>, 0>>::OBJ.vtbl };
+    vtbl.base.queryInterface = host_query_interface::<HostAttributeList>;
+    vtbl
+};
+const MESSAGE_VTBL: sv::IMessageVtbl = {
+    // SAFETY: Construct supplies a static vtable with the SDK ABI for this C/wrapper/offset.
+    let mut vtbl = unsafe { *<sv::IMessage as Construct<HostMessage, HostObject<HostMessage>, 0>>::OBJ.vtbl };
+    vtbl.base.queryInterface = host_query_interface::<HostMessage>;
+    vtbl
+};
 
 /// One `IAttributeList` value.
 enum Attr {
@@ -781,36 +920,85 @@ impl Class for HostAttributeList {
     type Interfaces = (sv::IAttributeList,);
 }
 
-/// An attribute id's bytes (a NUL-terminated C string; null is refused).
-fn attr_key(id: sv::IAttributeList_::AttrID) -> Option<Vec<u8>> {
-    // SAFETY: the plugin passes a NUL-terminated string (or null, handled).
-    (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes().to_vec())
+/// Borrow a terminated SDK string without allocation, rejecting oversized input.
+///
+/// # Safety
+/// Non-null `ptr` must be readable through its first NUL (including that terminator) and
+/// remain valid for the returned borrow. `max` must be less than isize::MAX / size_of::<T>().
+unsafe fn host_string<'a, T: Copy + Default + PartialEq>(ptr: *const T, max: usize) -> Result<&'a [T], sb::tresult> {
+    if ptr.is_null() {
+        return Err(sb::kInvalidArgument);
+    }
+    for len in 0..=max {
+        // SAFETY: the SDK supplies terminated input; we stop at its first terminator or cap.
+        if unsafe { *ptr.add(len) } == T::default() {
+            // SAFETY: these len elements precede the terminator and fit within isize::MAX.
+            return Ok(unsafe { std::slice::from_raw_parts(ptr, len) });
+        }
+    }
+    Err(sb::kResultFalse)
 }
 
 impl HostAttributeList {
-    fn set(&self, id: sv::IAttributeList_::AttrID, v: Attr) -> sb::tresult {
-        let Some(k) = attr_key(id) else { return sb::kInvalidArgument };
-        self.attrs.lock().unwrap_or_else(PoisonError::into_inner).insert(k, v);
+    fn try_new() -> Result<ComPtr<sv::IAttributeList>, sb::tresult> {
+        try_host_object(Self::default(), &ATTRIBUTE_VTBL)
+    }
+
+    /// # Safety
+    /// `id` must be null or a readable NUL-terminated SDK attribute ID for this call.
+    unsafe fn set(&self, id: sv::IAttributeList_::AttrID, v: Attr) -> sb::tresult {
+        // SAFETY: forwarded SDK string contract; keys are only borrowed during this call.
+        let key = match unsafe { host_string(id.cast::<u8>(), ATTR_STRING_MAX) } {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        let mut attrs = self.attrs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(old) = attrs.get_mut(key) {
+            *old = v;
+            return sb::kResultOk;
+        }
+        if attrs.len() >= ATTR_COUNT_MAX {
+            return sb::kOutOfMemory;
+        }
+        let key = match try_host_copy(key) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        if attrs.len() == attrs.capacity() && (host_allocation().is_err() || attrs.try_reserve(1).is_err()) {
+            return sb::kOutOfMemory;
+        }
+        attrs.insert(key, v);
         sb::kResultOk
     }
 
-    fn get<T>(&self, id: sv::IAttributeList_::AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Option<T> {
-        let k = attr_key(id)?;
-        f(self.attrs.lock().unwrap_or_else(PoisonError::into_inner).get(&k)?)
+    /// # Safety
+    /// `id` must be null or a readable NUL-terminated SDK attribute ID for this call.
+    unsafe fn get<T>(&self, id: sv::IAttributeList_::AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Option<T> {
+        // SAFETY: forwarded SDK string contract; the closure cannot retain the key or value borrow.
+        let key = unsafe { host_string(id.cast::<u8>(), ATTR_STRING_MAX) }.ok()?;
+        f(self.attrs.lock().unwrap_or_else(PoisonError::into_inner).get(key)?)
     }
 }
 
-/// Longest string attribute read, in UTF-16 units (a guard against unterminated input).
+/// Maximum accepted text length (excluding NUL), binary size, and distinct attribute count.
 const ATTR_STRING_MAX: usize = 1 << 20;
+const ATTR_BINARY_MAX: usize = 64 << 20;
+const ATTR_COUNT_MAX: usize = 1 << 16;
 
 impl IAttributeListTrait for HostAttributeList {
+    /// # Safety
+    /// `id` must be null or a readable NUL-terminated SDK attribute ID.
     unsafe fn setInt(&self, id: sv::IAttributeList_::AttrID, value: i64) -> sb::tresult {
-        self.set(id, Attr::Int(value))
+        // SAFETY: forwards the SDK attribute ID contract.
+        unsafe { self.set(id, Attr::Int(value)) }
     }
+    /// # Safety
+    /// `id` must be null or terminated; `value` must be null or a distinct writable i64.
     unsafe fn getInt(&self, id: sv::IAttributeList_::AttrID, value: *mut i64) -> sb::tresult {
         // SAFETY: the plugin's out-pointer (or null, handled).
         let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
-        match self.get(id, |a| if let Attr::Int(v) = a { Some(*v) } else { None }) {
+        // SAFETY: forwards the SDK attribute ID contract; only the scalar is copied.
+        match unsafe { self.get(id, |a| if let Attr::Int(v) = a { Some(*v) } else { None }) } {
             Some(v) => {
                 *out = v;
                 sb::kResultOk
@@ -818,13 +1006,19 @@ impl IAttributeListTrait for HostAttributeList {
             None => sb::kResultFalse,
         }
     }
+    /// # Safety
+    /// `id` must be null or a readable NUL-terminated SDK attribute ID.
     unsafe fn setFloat(&self, id: sv::IAttributeList_::AttrID, value: f64) -> sb::tresult {
-        self.set(id, Attr::Float(value))
+        // SAFETY: forwards the SDK attribute ID contract.
+        unsafe { self.set(id, Attr::Float(value)) }
     }
+    /// # Safety
+    /// `id` must be null or terminated; `value` must be null or a distinct writable f64.
     unsafe fn getFloat(&self, id: sv::IAttributeList_::AttrID, value: *mut f64) -> sb::tresult {
         // SAFETY: the plugin's out-pointer (or null, handled).
         let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
-        match self.get(id, |a| if let Attr::Float(v) = a { Some(*v) } else { None }) {
+        // SAFETY: forwards the SDK attribute ID contract; only the scalar is copied.
+        match unsafe { self.get(id, |a| if let Attr::Float(v) = a { Some(*v) } else { None }) } {
             Some(v) => {
                 *out = v;
                 sb::kResultOk
@@ -832,50 +1026,77 @@ impl IAttributeListTrait for HostAttributeList {
             None => sb::kResultFalse,
         }
     }
+    /// # Safety
+    /// `id` and `string` must be null or readable NUL-terminated SDK strings.
     unsafe fn setString(&self, id: sv::IAttributeList_::AttrID, string: *const sv::TChar) -> sb::tresult {
-        if string.is_null() {
-            return sb::kInvalidArgument;
-        }
-        let mut v = Vec::new();
-        while v.len() < ATTR_STRING_MAX {
-            // SAFETY: the plugin passes a NUL-terminated UTF-16 string; reading stops at the
-            // terminator.
-            let c = unsafe { *string.add(v.len()) };
-            if c == 0 {
-                break;
-            }
-            v.push(c);
-        }
-        self.set(id, Attr::String(v))
+        // SAFETY: the SDK supplies a terminated UTF-16 string; the helper rejects null/oversize.
+        let source = match unsafe { host_string(string, ATTR_STRING_MAX) } {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let copy = match try_host_copy(source) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        // SAFETY: forwards the SDK attribute ID contract after successfully copying the value.
+        unsafe { self.set(id, Attr::String(copy)) }
     }
+    /// # Safety
+    /// `id` must be null or terminated; `string` must be null or an aligned, distinct writable
+    /// buffer of size_in_bytes bytes. It must not alias this list's stored values.
     unsafe fn getString(&self, id: sv::IAttributeList_::AttrID, string: *mut sv::TChar, size_in_bytes: u32) -> sb::tresult {
         let units = size_in_bytes as usize / 2;
-        if string.is_null() || units == 0 {
+        if string.is_null() || units == 0 || units > isize::MAX as usize / 2 {
             return sb::kInvalidArgument;
         }
-        let Some(s) = self.get(id, |a| if let Attr::String(s) = a { Some(s.clone()) } else { None }) else { return sb::kResultFalse };
-        // SAFETY: the plugin's buffer of `size_in_bytes` writable bytes.
+        // SAFETY: the plugin supplies the writable UTF-16 buffer; its length fits isize::MAX.
         let dst = unsafe { std::slice::from_raw_parts_mut(string, units) };
-        write_c16_units(&s, dst);
-        sb::kResultOk
+        // SAFETY: forwards the SDK ID contract; copies while the lock keeps storage stable.
+        unsafe {
+            self.get(id, |a| {
+                if let Attr::String(s) = a {
+                    write_c16_units(s, dst);
+                    Some(())
+                } else {
+                    None
+                }
+            })
+        }
+        .map_or(sb::kResultFalse, |()| sb::kResultOk)
     }
+    /// # Safety
+    /// `id` must be null or terminated. Nonempty `data` must have size_in_bytes readable bytes;
+    /// rejected oversized buffers are never read.
     unsafe fn setBinary(&self, id: sv::IAttributeList_::AttrID, data: *const c_void, size_in_bytes: u32) -> sb::tresult {
-        let bytes = if size_in_bytes == 0 {
-            Vec::new()
+        let len = size_in_bytes as usize;
+        if len > ATTR_BINARY_MAX {
+            return sb::kOutOfMemory;
+        }
+        let source = if len == 0 {
+            &[]
         } else if data.is_null() {
             return sb::kInvalidArgument;
         } else {
-            // SAFETY: the plugin passes `size_in_bytes` readable bytes.
-            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size_in_bytes as usize) }.to_vec()
+            // SAFETY: the SDK supplies len readable bytes; the cap also fits isize::MAX on 32-bit.
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) }
         };
-        self.set(id, Attr::Binary(bytes))
+        let bytes = match try_host_copy(source) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        // SAFETY: forwards the SDK attribute ID contract after successfully copying the bytes.
+        unsafe { self.set(id, Attr::Binary(bytes)) }
     }
+    /// # Safety
+    /// `id` must be null or terminated; non-null output pointers must be aligned, writable and
+    /// distinct. Borrowed data must not be used concurrently with replacement/final release.
     unsafe fn getBinary(&self, id: sv::IAttributeList_::AttrID, data: *mut *const c_void, size_in_bytes: *mut u32) -> sb::tresult {
         // SAFETY: the plugin's out-pointers (or null, handled).
-        let (Some(d), Some(n)) = (unsafe { data.as_mut() }, unsafe { size_in_bytes.as_mut() }) else { return sb::kInvalidArgument };
+        let (Some(d), Some(n)) = (unsafe { (data.as_mut(), size_in_bytes.as_mut()) }) else { return sb::kInvalidArgument };
         // The pointer stays valid after the lock is released: the vector is untouched until the
         // attribute is replaced or the list is released (the SDK's contract).
-        match self.get(id, |a| if let Attr::Binary(b) = a { Some((b.as_ptr().cast::<c_void>(), b.len())) } else { None }) {
+        // SAFETY: forwards the SDK ID contract; the caller synchronizes borrowed pointer use.
+        match unsafe { self.get(id, |a| if let Attr::Binary(b) = a { Some((b.as_ptr().cast::<c_void>(), b.len())) } else { None }) } {
             Some((p, len)) => {
                 *d = p;
                 *n = u32::try_from(len).unwrap_or(u32::MAX);
@@ -896,14 +1117,15 @@ fn write_c16_units(src: &[u16], dst: &mut [u16]) {
 
 /// A host `IMessage`: an id plus its own attribute list.
 pub(crate) struct HostMessage {
-    /// Valid until the next `setMessageID` (when the SDK's own host message frees it too).
-    id: Mutex<Option<std::ffi::CString>>,
-    attrs: ComWrapper<HostAttributeList>,
+    /// NUL-terminated bytes, valid until the next successful setMessageID or final release.
+    id: Mutex<Option<Vec<u8>>>,
+    attrs: ComPtr<sv::IAttributeList>,
 }
 
-impl Default for HostMessage {
-    fn default() -> Self {
-        HostMessage { id: Mutex::new(None), attrs: ComWrapper::new(HostAttributeList::default()) }
+impl HostMessage {
+    fn try_new() -> Result<ComPtr<sv::IMessage>, sb::tresult> {
+        let attrs = HostAttributeList::try_new()?;
+        try_host_object(HostMessage { id: Mutex::new(None), attrs }, &MESSAGE_VTBL)
     }
 }
 
@@ -912,17 +1134,32 @@ impl Class for HostMessage {
 }
 
 impl IMessageTrait for HostMessage {
+    /// # Safety
+    /// The returned borrowed ID must not be used concurrently with replacement/final release.
     unsafe fn getMessageID(&self) -> sb::FIDString {
-        self.id.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+        self.id.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map_or(std::ptr::null(), |s| s.as_ptr().cast())
     }
+    /// # Safety
+    /// `id` must be null or a readable NUL-terminated SDK string for this call.
     unsafe fn setMessageID(&self, id: sb::FIDString) {
-        // SAFETY: the plugin passes a NUL-terminated string (or null, which clears the id).
-        let new = (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_owned());
+        let new = if id.is_null() {
+            None
+        } else {
+            // SAFETY: the SDK supplies a terminated ID; the helper checks null and the length cap.
+            let Ok(source) = (unsafe { host_string(id.cast::<u8>(), ATTR_STRING_MAX) }) else { return };
+            // SAFETY: source excludes the terminator, which the helper read; include it in the copy.
+            let source = unsafe { std::slice::from_raw_parts(id.cast::<u8>(), source.len() + 1) };
+            // The SDK method returns void: preserve the prior ID on failure. Copy first so
+            // assigning our own borrowed ID is also valid.
+            let Ok(copy) = try_host_copy(source) else { return };
+            Some(copy)
+        };
         *self.id.lock().unwrap_or_else(PoisonError::into_inner) = new;
     }
+    /// # Safety
+    /// The returned pointer is borrowed for the message lifetime; callers must AddRef to retain it.
     unsafe fn getAttributes(&self) -> *mut sv::IAttributeList {
-        // Not add-ref'd: the list lives as long as the message (the SDK's contract).
-        self.attrs.as_com_ref::<sv::IAttributeList>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+        self.attrs.as_ptr()
     }
 }
 
@@ -2376,6 +2613,10 @@ mod window {
 
     pub fn resize(_window: *mut c_void, _w: f64, _h: f64) {}
 }
+
+#[cfg(test)]
+#[path = "host_object_tests.rs"]
+mod host_object_tests;
 
 #[cfg(test)]
 mod tests {

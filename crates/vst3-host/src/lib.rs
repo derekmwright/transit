@@ -35,9 +35,8 @@
 //! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
 //! "unsupported".
 //!
-//! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
-//! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
-//! inactive) and 64-bit processing.
+//! The host supplies `IMessage` and `IAttributeList` for processor ↔ controller messaging.
+//! Sidechain (aux buses are kept inactive) and 64-bit processing are not hosted yet.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
