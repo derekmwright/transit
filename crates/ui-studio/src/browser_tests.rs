@@ -1038,9 +1038,11 @@ fn pinned_keeps_the_label_and_x_on_the_visible_part() {
         egui::Rect::from_min_max(egui::pos2(300.0, 60.0), egui::pos2(53_707.0, 100.0)),
         egui::Rect::from_min_max(egui::pos2(-5_000.0, 60.0), egui::pos2(53_707.0, 100.0)),
         egui::Rect::from_min_max(egui::pos2(300.0, 60.0), egui::pos2(324.0, 100.0)),
+        egui::Rect::from_min_max(egui::pos2(-5_000.0, 60.0), egui::pos2(104.0, 100.0)),
+        egui::Rect::from_min_max(egui::pos2(895.0, 40.0), egui::pos2(53_707.0, 100.0)),
     ] {
         let (text, x) = crate::import::pinned(r, tl);
-        assert!(x.max.x <= tl.max.x && x.min.x >= tl.min.x - 1.0 || r.width() < 30.0, "{x:?} in {tl:?}");
+        assert!(tl.contains_rect(x), "{x:?} in {tl:?}");
         assert!(text.x >= tl.min.x, "{text:?}");
     }
 }
@@ -1056,11 +1058,33 @@ fn files_the_engine_would_not_prepare_are_named_in_the_status() {
     let files = vec![ok, outside];
     let app = &mut t.app;
     soundcraft_engine::file_access::confine(roots.as_ref(), || app.queue_imports(&files, Some(audio), 0, 0)).unwrap();
-    assert!(t.app.status.starts_with("1 of 2 could not be prepared: elsewhere.wav"), "{}", t.app.status);
+    assert!(t.app.status.starts_with("1 of 2 could not be prepared: elsewhere.wav ("), "{}", t.app.status);
     t.settle_imports();
     assert!(
-        t.app.status.starts_with("Imported loop 90.wav to") && t.app.status.ends_with("1 of 2 could not be prepared: elsewhere.wav"),
+        t.app.status.starts_with("Imported loop 90.wav to") && t.app.status.contains("; 1 of 2 could not be prepared: elsewhere.wav ("),
         "{}",
         t.app.status
     );
+}
+
+#[test]
+fn many_refused_files_show_three_names_the_first_reason_and_a_count() {
+    let refused: Vec<(String, String)> = (1..=7).map(|i| (format!("f{i}.wav"), format!("why {i}"))).collect();
+    assert_eq!(crate::import::not_prepared(&refused, 9), "7 of 9 could not be prepared: f1.wav (why 1), f2.wav, f3.wav and 4 more");
+    assert_eq!(crate::import::not_prepared(&refused[..2], 2), "2 of 2 could not be prepared: f1.wav (why 1), f2.wav");
+}
+
+#[test]
+fn imports_pace_is_bounded_and_a_rejected_ui_set_leaves_it_alone() {
+    let mut t = T::new();
+    assert!(t.app.set_ui(&json!({"imports_pace": 90})).is_ok());
+    assert_eq!(t.app.imports.pace, Some(90));
+    assert!(t.app.set_ui(&json!({"imports_pace": 601})).is_err());
+    assert!(t.app.set_ui(&json!({"imports_pace": u32::MAX})).is_err());
+    assert!(t.app.set_ui(&json!({"imports_pace": -1})).is_err());
+    assert_eq!(t.app.imports.pace, Some(90), "a rejected value changes nothing");
+    assert!(t.app.set_ui(&json!({"imports_pace": 5, "plugin_dirs": ["Z:/elsewhere"]})).is_err());
+    assert_eq!(t.app.imports.pace, Some(90), "a rejected ui.set changes nothing");
+    assert!(t.app.set_ui(&json!({"imports_pace": null})).is_ok());
+    assert_eq!(t.app.imports.pace, None);
 }

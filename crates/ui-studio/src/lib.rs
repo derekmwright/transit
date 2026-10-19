@@ -40,6 +40,9 @@ pub use control::ControlRequest;
 
 /// Our own UI state (serde, so agents can read and set it; saved as `ui.json` in the transit
 /// settings folder). Not `soundcraft-ui-egui`'s `UiState` (plan 06, L13).
+/// The most frames `ui.set imports_pace` may stretch a fake prepare over.
+const MAX_IMPORTS_PACE: u32 = 600;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UiState {
@@ -416,13 +419,22 @@ impl StudioApp {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        // A test seam, not state: `imports_pace` fakes a slow prepare (frames per file; null off).
-        if let Some(v) = p.get("imports_pace") {
-            self.imports.pace = v.as_u64().and_then(|n| u32::try_from(n).ok());
-        }
+        // A test seam, not state: `imports_pace` fakes a slow prepare (frames per file, at most
+        // 600; null off). Applied only once the rest of the request is accepted.
+        let pace = match p.get("imports_pace") {
+            None => None,
+            Some(v) if v.is_null() => Some(None),
+            Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n <= MAX_IMPORTS_PACE) {
+                Some(n) => Some(Some(n)),
+                None => return Err(format!("imports_pace must be null or 0-{MAX_IMPORTS_PACE} frames")),
+            },
+        };
         let ns: UiState = serde_json::from_value(cur).map_err(|e| format!("bad ui state: {e}"))?;
         if ns.plugin_dirs != self.ui.plugin_dirs {
             return Err("plugin folders can't be changed over the control channel".into());
+        }
+        if let Some(pace) = pace {
+            self.imports.pace = pace;
         }
         let mut ns = ns;
         (ns.cursor, ns.cursor_track, ns.focus_track) = (self.ui.cursor, self.ui.cursor_track, self.ui.focus_track);

@@ -48,7 +48,7 @@ struct Batch {
     committed: usize,
     closed: usize,
     /// Files the engine refused to prepare, and how many were asked for.
-    refused: Vec<String>,
+    refused: Vec<(String, String)>,
     asked: usize,
 }
 
@@ -116,7 +116,7 @@ impl StudioApp {
                 }
                 Err(e) => {
                     last_err = Some(format!("Couldn't import {name}: {e}"));
-                    refused.push(name);
+                    refused.push((name, e.to_string()));
                 }
             }
         }
@@ -236,9 +236,16 @@ impl StudioApp {
     }
 }
 
-/// "2 of 18 could not be prepared: a.wav, b.wav".
-fn not_prepared(names: &[String], asked: usize) -> String {
-    format!("{} of {asked} could not be prepared: {}", names.len(), names.join(", "))
+/// "2 of 18 could not be prepared: a.wav (why), b.wav": the first reason, up to three names, then
+/// "and N more".
+pub(crate) fn not_prepared(refused: &[(String, String)], asked: usize) -> String {
+    let mut names: Vec<String> = refused.iter().take(3).map(|(n, _)| n.clone()).collect();
+    if let (Some(first), Some((_, why))) = (names.first_mut(), refused.first()) {
+        first.push_str(&format!(" ({why})"));
+    }
+    let more = refused.len().saturating_sub(3);
+    let tail = if more > 0 { format!(" and {more} more") } else { String::new() };
+    format!("{} of {asked} could not be prepared: {}{tail}", refused.len(), names.join(", "))
 }
 
 /// Once a frame (from `logic`): poll progress (at most ten times a second), commit what is ready
@@ -325,7 +332,23 @@ fn poll(app: &mut StudioApp) {
 /// than the view still shows both. Returns the label's top-left and the × rect.
 pub(crate) fn pinned(r: Rect, tl: Rect) -> (egui::Pos2, Rect) {
     let vis = r.intersect(tl);
-    let x = Rect::from_center_size(pos2((vis.max.x - 10.0).max(vis.min.x + 10.0), r.min.y + 10.0), vec2(16.0, 16.0));
+    let mut x = Rect::from_center_size(pos2((vis.max.x - 10.0).max(vis.min.x + 10.0), r.min.y + 10.0), vec2(16.0, 16.0));
+    // Never let the hit area leave the timeline, whatever sliver of the outline shows.
+    let dx = if x.min.x < tl.min.x {
+        tl.min.x - x.min.x
+    } else if x.max.x > tl.max.x {
+        tl.max.x - x.max.x
+    } else {
+        0.0
+    };
+    let dy = if x.min.y < tl.min.y {
+        tl.min.y - x.min.y
+    } else if x.max.y > tl.max.y {
+        tl.max.y - x.max.y
+    } else {
+        0.0
+    };
+    x = x.translate(vec2(dx, dy));
     (pos2(vis.min.x + 6.0, r.min.y + 4.0), x)
 }
 
