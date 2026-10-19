@@ -22,6 +22,7 @@ rtrb.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true
+triple_buffer.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Backend startup owns registration and release; never promote from the data callback.

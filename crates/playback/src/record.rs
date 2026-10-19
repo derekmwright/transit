@@ -196,7 +196,7 @@ pub struct Recorder {
     pub monitor: Arc<InputRing>,
     #[cfg(not(target_os = "freebsd"))]
     _stream: Option<cpal::Stream>,
-    clock: Option<crate::device_clock::ClockReader>,
+    clock: Option<crate::device_clock::MaintainedClock>,
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
@@ -381,12 +381,17 @@ impl Recorder {
             cpal::SampleFormat::I16 => build_input::<i16>(device, &config, &shared, &monitor),
             _ => build_input::<f32>(device, &config, &shared, &monitor),
         }?;
+        let clock = crate::device_clock::MaintainedClock::start(clock)
+            .map_err(|error| {
+                log::warn!("input clock maintenance unavailable: {error}");
+            })
+            .ok();
         let seen = (0, Instant::now());
         Ok(Recorder {
             monitor,
             shared,
             _stream: Some(stream),
-            clock: Some(clock),
+            clock,
             device_name: name,
             sample_rate: config.sample_rate.0,
             channels,
@@ -458,7 +463,6 @@ impl Recorder {
     /// Why the input can't go on, if it can't: the device went away or, while recording, stopped
     /// sending audio; its callback hit a bug; or writing a take failed (reported once).
     pub fn trouble(&mut self) -> Option<Trouble> {
-        let _ = self.clock_report();
         if let Some(e) = self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
             return Some(Trouble::Disk(e));
         }
@@ -481,9 +485,9 @@ impl Recorder {
         (frames as u64).saturating_mul(1000) / u64::from(self.sample_rate.max(1))
     }
 
-    /// Control-side input clock fit; separate from the output even at the same nominal rate.
+    /// Independently maintained input clock snapshot; separate from output at every rate.
     pub fn clock_report(&mut self) -> Option<crate::device_clock::ClockReport> {
-        self.clock.as_mut().map(crate::device_clock::ClockReader::poll)
+        self.clock.as_mut().map(crate::device_clock::MaintainedClock::report)
     }
 
     pub fn finish(&mut self) -> Takes {

@@ -47,6 +47,8 @@ zip = { version = "9", default-features = false }
 cpal = "=0.16.0"
 # Publication protocol depends on bounded single-element push/pop; review every version bump.
 rtrb = "=0.4.0"
+# Latest clock-state publication uses a bounded swap, never a retry loop; review every bump.
+triple_buffer = "=9.0.0"
 # MIDI device transport (soundcraft-midi-io). Pinned: the input callback contract is reviewed per bump.
 midir = "=0.10.4"
 

@@ -668,8 +668,8 @@ pub struct Player {
     pub silent: bool,
     /// The input opened with the output, on ASIO ([`Player::open_input`]).
     input: Mutex<HeldInput>,
-    /// Control owns the observation consumer until after the stream is closed.
-    clock: Mutex<Option<device_clock::ClockReader>>,
+    /// Native fitting is independent of the UI; control owns service cancellation.
+    clock: Mutex<Option<device_clock::MaintainedClock>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -828,6 +828,11 @@ impl Player {
                     };
                     match built {
                         Ok((stream, clock)) => {
+                            let clock = device_clock::MaintainedClock::start(clock)
+                                .map_err(|error| {
+                                    log::warn!("output clock maintenance unavailable: {error}");
+                                })
+                                .ok();
                             let input = match input {
                                 Some(r) => match r.start() {
                                     Ok(()) => HeldInput::Held(Some(r)),
@@ -867,7 +872,7 @@ impl Player {
                                 device_buffer: buffer,
                                 silent: false,
                                 input: Mutex::new(input),
-                                clock: Mutex::new(Some(clock)),
+                                clock: Mutex::new(clock),
                             };
                         }
                         Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
@@ -1001,7 +1006,6 @@ impl Player {
     /// Per-UI-frame housekeeping: drops retired instances and services plugin editors. Returns
     /// the parameter edits made in open editors since the last call.
     pub fn idle(&self) -> Vec<EditorEdit> {
-        let _ = self.clock_report();
         if self.fault.failed.load(Ordering::Relaxed)
             && let Ok(mut held) = self.state.try_lock()
             && let Some(state) = held.as_mut()
@@ -1020,10 +1024,10 @@ impl Player {
         out
     }
 
-    /// Bounded off-callback fitting. None means no physical stream; stale/uncalibrated
-    /// models retain their explicit quality and never certify hardware latency.
+    /// Snapshot of independently maintained native fitting. None means no clock
+    /// service; stale/uncalibrated models never certify hardware latency.
     pub fn clock_report(&self) -> Option<device_clock::ClockReport> {
-        self.clock.lock().unwrap_or_else(PoisonError::into_inner).as_mut().map(device_clock::ClockReader::poll)
+        self.clock.lock().unwrap_or_else(PoisonError::into_inner).as_mut().map(device_clock::MaintainedClock::report)
     }
 
     /// True when the plugin in this slot has its own editor.

@@ -577,6 +577,11 @@ impl ClockReader {
 
     /// Control/UI only. Bounded even when the producer continues publishing concurrently.
     pub fn poll(&mut self) -> ClockReport {
+        let origin = self.inner.origin;
+        self.poll_with(|| origin.now_ns())
+    }
+
+    fn poll_with(&mut self, now: impl FnOnce() -> Option<u64>) -> ClockReport {
         let reader = &mut self.inner;
         for _ in 0..OBSERVATIONS {
             let Some(observation) = reader.observations.pop() else {
@@ -584,10 +589,45 @@ impl ClockReader {
             };
             let _ = reader.fitter.observe(observation);
         }
-        let map = reader.fitter.map().filter(|map| reader.origin.now_ns().is_some_and(|now| map.valid(map.key, now).is_ok()));
+        let now = now();
+        let map = reader.fitter.map().filter(|map| now.is_some_and(|now| map.valid(map.key, now).is_ok()));
         ClockReport { map, publication: reader.observations.counts(), fitting: reader.fitter.counts() }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod service;
+
+/// Native device clocks are maintained independently of UI progress. The web
+/// adapter retains the existing unavailable-host-clock behavior (no native worker).
+pub(crate) struct MaintainedClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    service: Box<service::ClockService>,
+    #[cfg(target_arch = "wasm32")]
+    reader: ClockReader,
+}
+impl MaintainedClock {
+    pub(crate) fn start(reader: ClockReader) -> std::io::Result<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Ok(Self { service: Box::new(service::ClockService::start(reader)?) })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self { reader })
+        }
+    }
+    pub(crate) fn report(&mut self) -> ClockReport {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.service.report()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.reader.poll()
+        }
+    }
+}
