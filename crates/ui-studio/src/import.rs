@@ -47,6 +47,9 @@ struct Batch {
     files: usize,
     committed: usize,
     closed: usize,
+    /// Files the engine refused to prepare, and how many were asked for.
+    refused: Vec<String>,
+    asked: usize,
 }
 
 /// One outline, as last drawn (for `ui.inspect`).
@@ -101,6 +104,7 @@ impl StudioApp {
         self.imports.next_batch += 1;
         let mut queued = 0;
         let mut last_err = None;
+        let mut refused = Vec::new();
         for f in files {
             let name = crate::browser::file_name(f);
             match self.engine.execute("file.prepare_import", &json!({"path": f.to_string_lossy()})) {
@@ -110,14 +114,21 @@ impl StudioApp {
                     self.imports.items.push(Item { id, name, batch, state: "queued".into(), percent: 0, error: None, frames, frames_seen: 0 });
                     queued += 1;
                 }
-                Err(e) => last_err = Some(format!("Couldn't import {name}: {e}")),
+                Err(e) => {
+                    last_err = Some(format!("Couldn't import {name}: {e}"));
+                    refused.push(name);
+                }
             }
         }
         if queued == 0 {
             self.status = last_err.unwrap_or_else(|| "Nothing to import".into());
             return Err(self.status.clone());
         }
-        self.imports.batches.insert(batch, Batch { track, at, next: at, files: queued, committed: 0, closed });
+        let asked = files.len();
+        if !refused.is_empty() {
+            self.status = not_prepared(&refused, asked);
+        }
+        self.imports.batches.insert(batch, Batch { track, at, next: at, files: queued, committed: 0, closed, refused, asked });
         if let Some(ctx) = &self.browser.ctx {
             ctx.request_repaint();
         }
@@ -210,6 +221,9 @@ impl StudioApp {
                             if b.closed == 1 { "" } else { "s" }
                         ));
                     }
+                    if !b.refused.is_empty() {
+                        msg.push_str(&format!("; {}", not_prepared(&b.refused, b.asked)));
+                    }
                     self.status = msg;
                     self.forget_batches();
                 }
@@ -220,6 +234,11 @@ impl StudioApp {
             Err(e) => self.drop_item(0, format!("Couldn't import {}: {e}", it.name)),
         }
     }
+}
+
+/// "2 of 18 could not be prepared: a.wav, b.wav".
+fn not_prepared(names: &[String], asked: usize) -> String {
+    format!("{} of {asked} could not be prepared: {}", names.len(), names.join(", "))
 }
 
 /// Once a frame (from `logic`): poll progress (at most ten times a second), commit what is ready
@@ -302,6 +321,14 @@ fn poll(app: &mut StudioApp) {
     }
 }
 
+/// Where the label and the × of an outline at `r` go: at the visible part of it, so a file longer
+/// than the view still shows both. Returns the label's top-left and the × rect.
+pub(crate) fn pinned(r: Rect, tl: Rect) -> (egui::Pos2, Rect) {
+    let vis = r.intersect(tl);
+    let x = Rect::from_center_size(pos2((vis.max.x - 10.0).max(vis.min.x + 10.0), r.min.y + 10.0), vec2(16.0, 16.0));
+    (pos2(vis.min.x + 6.0, r.min.y + 4.0), x)
+}
+
 /// The outlines where the clips will land, with their progress and an × that cancels. Call after
 /// the arrangement is drawn.
 pub fn paint(app: &mut StudioApp, ctx: &egui::Context) {
@@ -345,8 +372,8 @@ pub fn paint(app: &mut StudioApp, ctx: &egui::Context) {
                 let fill = Rect::from_min_max(pos2(r.min.x, r.max.y - 3.0), pos2(r.min.x + r.width() * it.percent as f32 / 100.0, r.max.y));
                 painter.rect_filled(fill, 0.0, TOKENS.accent);
                 let label = format!("{} {}%", it.name, it.percent);
-                painter.text(pos2(r.min.x + 6.0, r.min.y + 4.0), Align2::LEFT_TOP, label, FontId::proportional(11.5), TOKENS.text);
-                let x = Rect::from_center_size(pos2(r.max.x - 10.0, r.min.y + 10.0), vec2(16.0, 16.0));
+                let (text_at, x) = pinned(r, tl);
+                painter.text(text_at, Align2::LEFT_TOP, label, FontId::proportional(11.5), TOKENS.text);
                 let id = egui::Id::new(("import-cancel", it.id));
                 let resp = egui::Area::new(id)
                     .order(egui::Order::Foreground)

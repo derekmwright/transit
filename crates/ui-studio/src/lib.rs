@@ -416,6 +416,10 @@ impl StudioApp {
                 obj.insert(k.clone(), v.clone());
             }
         }
+        // A test seam, not state: `imports_pace` fakes a slow prepare (frames per file; null off).
+        if let Some(v) = p.get("imports_pace") {
+            self.imports.pace = v.as_u64().and_then(|n| u32::try_from(n).ok());
+        }
         let ns: UiState = serde_json::from_value(cur).map_err(|e| format!("bad ui state: {e}"))?;
         if ns.plugin_dirs != self.ui.plugin_dirs {
             return Err("plugin folders can't be changed over the control channel".into());

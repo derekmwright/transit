@@ -1007,3 +1007,60 @@ fn a_new_session_while_importing_stops_the_import() {
     assert!(!t.app.imports.active());
     assert_eq!(t.app.status, "The import of loop 90.wav stopped: the session changed");
 }
+
+#[test]
+fn the_x_of_a_clip_longer_than_the_view_stays_inside_the_viewport() {
+    let mut t = T::new();
+    t.add_and_expand();
+    t.app.imports.pace = Some(1_000_000);
+    let audio = t.track(TrackKind::Audio);
+    drop_on_lane(&mut t, "loop 90.wav", audio);
+    let tl = t.app.arrange.layout.timeline;
+    // A 19-minute file: the engine's own length report would replace this, so retry across a poll.
+    let mut x = None;
+    for _ in 0..8 {
+        t.app.imports.items[0].frames = Samples::from(t.rate) * 60 * 19;
+        t.frames(1);
+        let item = &t.app.imports.layout.items[0];
+        if item.rect.is_some_and(|r| r[2] > tl[2] + 1_000.0) {
+            x = item.cancel;
+            break;
+        }
+    }
+    let x = x.expect("an x on a long outline");
+    assert!(x[0] >= tl[0] && x[2] <= tl[2] && x[1] >= tl[1] && x[3] <= tl[3], "x {x:?} inside the timeline {tl:?}");
+}
+
+#[test]
+fn pinned_keeps_the_label_and_x_on_the_visible_part() {
+    let tl = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(900.0, 400.0));
+    for r in [
+        egui::Rect::from_min_max(egui::pos2(300.0, 60.0), egui::pos2(53_707.0, 100.0)),
+        egui::Rect::from_min_max(egui::pos2(-5_000.0, 60.0), egui::pos2(53_707.0, 100.0)),
+        egui::Rect::from_min_max(egui::pos2(300.0, 60.0), egui::pos2(324.0, 100.0)),
+    ] {
+        let (text, x) = crate::import::pinned(r, tl);
+        assert!(x.max.x <= tl.max.x && x.min.x >= tl.min.x - 1.0 || r.width() < 30.0, "{x:?} in {tl:?}");
+        assert!(text.x >= tl.min.x, "{text:?}");
+    }
+}
+
+#[test]
+fn files_the_engine_would_not_prepare_are_named_in_the_status() {
+    let mut t = T::new();
+    t.add_and_expand();
+    let audio = t.track(TrackKind::Audio);
+    let ok = t.dir.0.join("loop 90.wav");
+    let outside = std::env::temp_dir().join(format!("transit-outside-{}", std::process::id())).join("elsewhere.wav");
+    let roots = soundcraft_engine::file_access::AutomationRoots::new(Some(&t.dir.0), None).unwrap();
+    let files = vec![ok, outside];
+    let app = &mut t.app;
+    soundcraft_engine::file_access::confine(roots.as_ref(), || app.queue_imports(&files, Some(audio), 0, 0)).unwrap();
+    assert!(t.app.status.starts_with("1 of 2 could not be prepared: elsewhere.wav"), "{}", t.app.status);
+    t.settle_imports();
+    assert!(
+        t.app.status.starts_with("Imported loop 90.wav to") && t.app.status.ends_with("1 of 2 could not be prepared: elsewhere.wav"),
+        "{}",
+        t.app.status
+    );
+}
