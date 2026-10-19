@@ -5,8 +5,9 @@
 
 use std::f32::consts::TAU;
 
-use super::synth::{EventKind, EventQueue, MAX_EVENTS};
+use super::synth::{EventKind, EventQueue, run_block};
 use crate::biquad::{Biquad, FilterType};
+use crate::event::PluginEvent;
 use crate::params::{Params, lin, log, param_plumbing};
 use crate::util::{Rng, Smoother, frames_in, ms_to_samples, sane_channels, sane_sr};
 use crate::{Category, ParamInfo, Plugin, PluginInfo, Unit, db_to_gain};
@@ -337,35 +338,16 @@ impl Plugin for DrumSynth {
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         let ch = self.ch.min(io.len());
         let frames = frames_in(io, frames, ch);
-        let mut evs = [(0usize, EventKind::AllOff); MAX_EVENTS];
-        let count = {
-            let sorted = self.events.sorted();
-            for (d, s) in evs.iter_mut().zip(sorted) {
-                *d = (s.offset, s.kind);
-            }
-            sorted.len().min(MAX_EVENTS)
-        };
-        self.events.clear();
-        let mut next = 0;
-        for n in 0..frames {
-            while next < count {
-                let Some(&(off, kind)) = evs.get(next) else { break };
-                if off > n && n + 1 < frames {
-                    break;
-                }
-                self.apply(kind);
-                next += 1;
-            }
-            let y = self.render() * self.level.next();
+        let evs = self.events.take_sorted();
+        run_block(self, &evs, frames, Self::apply, |p, n| {
+            let y = p.render() * p.level.next();
             for b in io.iter_mut().take(ch) {
                 if let Some(x) = b.get_mut(n) {
                     *x = y;
                 }
             }
-        }
-        for &(_, kind) in evs.iter().take(count).skip(next) {
-            self.apply(kind);
-        }
+        });
+        self.events.restore(evs);
     }
 
     fn tail_samples(&self) -> usize {
@@ -373,7 +355,11 @@ impl Plugin for DrumSynth {
     }
 
     fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
-        self.events.push(offset, EventKind::On(note, velocity));
+        self.events.push(offset, EventKind::On(0, note.min(127), velocity.min(127), -1));
+    }
+
+    fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        EventKind::from_event(ev).is_none_or(|kind| self.events.push(offset as usize, kind))
     }
 
     fn note_off(&mut self, _offset: usize, _note: u8) {}
@@ -386,8 +372,8 @@ impl Plugin for DrumSynth {
 impl DrumSynth {
     fn apply(&mut self, kind: EventKind) {
         match kind {
-            EventKind::On(n, v) => self.trigger(n, v),
-            EventKind::Off(_) | EventKind::Sustain(_) | EventKind::Bend(_) | EventKind::ResetControllers => {}
+            EventKind::On(_, n, v, _) => self.trigger(n, v),
+            EventKind::Off(..) | EventKind::Sustain(..) | EventKind::Sostenuto(..) | EventKind::Bend(..) | EventKind::ResetControllers(_) => {}
             EventKind::AllOff => {
                 let fast = decay60(30.0, self.sr);
                 for v in &mut self.voices {

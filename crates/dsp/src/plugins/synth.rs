@@ -1,22 +1,82 @@
 //! Subtractive Synth: 16-voice polyphonic, two PolyBLEP oscillators, resonant state-variable
 //! low-pass (TPT form) with its own ADSR, amp ADSR, optional glide.
 
+use crate::event::{CC_ALL_NOTES_OFF, CC_ALL_SOUND_OFF, CC_RESET_CONTROLLERS, CC_SOSTENUTO, CC_SUSTAIN, Message, PluginEvent};
 use crate::osc::{Osc, Waveform};
 use crate::params::{Params, choice, lin, log, param_plumbing};
 use crate::util::{Smoother, frames_in, ms_to_samples, note_hz, sane_channels, sane_sr, sort_events};
 use crate::{Category, ParamInfo, Plugin, PluginInfo, Unit, db_to_gain};
 
-pub(crate) const MAX_EVENTS: usize = 512;
+/// Capacity of a built-in instrument's event queue.
+pub(crate) const MAX_EVENTS: usize = 1024;
+/// Queue entries kept for releases: one per note and pedal entry the mix can hold open (224 +
+/// 32), plus one reset (F10). Other events are refused once only these remain.
+pub(crate) const RELEASE_RESERVE: usize = 257;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EventKind {
-    On(u8, u8),
-    Off(u8),
+    /// Channel, key, velocity, voice id (-1: none).
+    On(u8, u8, u8, i32),
+    /// Channel, key, voice id (-1: match by channel and key).
+    Off(u8, u8, i32),
     AllOff,
-    Sustain(bool),
-    /// Pitch bend as a frequency ratio.
-    Bend(f32),
-    ResetControllers,
+    /// Channel, down.
+    Sustain(u8, bool),
+    /// Channel, down.
+    Sostenuto(u8, bool),
+    /// Channel, pitch bend as a frequency ratio.
+    Bend(u8, f32),
+    /// Channel.
+    ResetControllers(u8),
+}
+
+impl EventKind {
+    /// What must never be refused: releases (see [`Message::is_release`]).
+    fn is_release(&self) -> bool {
+        matches!(
+            self,
+            EventKind::Off(..) | EventKind::AllOff | EventKind::Sustain(_, false) | EventKind::Sostenuto(_, false) | EventKind::ResetControllers(_)
+        )
+    }
+
+    /// The built-in instruments' reading of a plug-in event: notes, pedals, bend and the
+    /// channel-mode messages. Anything else is `None` (ignored).
+    pub(crate) fn from_event(ev: &PluginEvent) -> Option<EventKind> {
+        let ch = ev.channel & 0x0F;
+        Some(match ev.message {
+            Message::NoteOn { key, velocity, .. } => EventKind::On(ch, key.min(127), velocity.min(127), ev.note_id),
+            Message::NoteOff { key, .. } => EventKind::Off(ch, key.min(127), ev.note_id),
+            Message::Control { cc, value } => EventKind::from_cc(ch, cc, value)?,
+            Message::PitchBend { value } => EventKind::bend(ch, value),
+            _ => return None,
+        })
+    }
+
+    fn from_cc(ch: u8, cc: u8, value: u8) -> Option<EventKind> {
+        Some(match cc {
+            CC_SUSTAIN => EventKind::Sustain(ch, value >= 64),
+            CC_SOSTENUTO => EventKind::Sostenuto(ch, value >= 64),
+            CC_ALL_SOUND_OFF | CC_ALL_NOTES_OFF => EventKind::AllOff,
+            CC_RESET_CONTROLLERS => EventKind::ResetControllers(ch),
+            _ => return None,
+        })
+    }
+
+    fn bend(ch: u8, value: u16) -> EventKind {
+        let v = i32::from(value.min(16383)) - 8192;
+        EventKind::Bend(ch, 2f32.powf(v as f32 / 8192.0 * BEND_RANGE / 12.0))
+    }
+
+    /// A MIDI 1.0 channel message (the legacy [`Plugin::midi`] path).
+    pub(crate) fn from_midi(msg: [u8; 3]) -> Option<EventKind> {
+        let [status, d1, d2] = msg;
+        let ch = status & 0x0F;
+        match status & 0xF0 {
+            0xB0 => EventKind::from_cc(ch, d1 & 0x7F, d2 & 0x7F),
+            0xE0 => Some(EventKind::bend(ch, u16::from(d2 & 0x7F) << 7 | u16::from(d1 & 0x7F))),
+            _ => None,
+        }
+    }
 }
 
 /// Pitch bend range, semitones each way.
@@ -28,7 +88,9 @@ pub(crate) struct Event {
     pub(crate) kind: EventKind,
 }
 
-/// Fixed-capacity event queue (never reallocates on the audio thread).
+/// Fixed-capacity event queue (never reallocates on the audio thread). The last
+/// [`RELEASE_RESERVE`] entries only take releases, so a note-off is never refused while notes
+/// fill the queue.
 #[derive(Debug)]
 pub(crate) struct EventQueue {
     ev: Vec<Event>,
@@ -39,21 +101,65 @@ impl EventQueue {
         Self { ev: Vec::with_capacity(MAX_EVENTS) }
     }
 
-    pub(crate) fn push(&mut self, offset: usize, kind: EventKind) {
-        if self.ev.len() < MAX_EVENTS {
+    /// Queues an event; `false` when it was refused (never logs: this runs on the audio thread).
+    pub(crate) fn push(&mut self, offset: usize, kind: EventKind) -> bool {
+        let room = if kind.is_release() { MAX_EVENTS } else { MAX_EVENTS - RELEASE_RESERVE };
+        if self.ev.len() < room {
             self.ev.push(Event { offset, kind });
+            true
         } else {
-            log::warn!("instrument event queue full; dropping event");
+            false
         }
     }
 
-    pub(crate) fn sorted(&mut self) -> &[Event] {
-        sort_events(&mut self.ev, |e| e.offset);
-        &self.ev
+    /// Takes the queued events, sorted by offset (stable), leaving the queue empty. Give the
+    /// vector back with [`EventQueue::restore`] so its capacity is reused (no allocation).
+    pub(crate) fn take_sorted(&mut self) -> Vec<Event> {
+        let mut ev = std::mem::take(&mut self.ev);
+        sort_events(&mut ev, |e| e.offset);
+        ev
+    }
+
+    /// Hands back the vector [`EventQueue::take_sorted`] took, emptied (`apply` never queues, so
+    /// nothing was queued meanwhile).
+    pub(crate) fn restore(&mut self, mut ev: Vec<Event>) {
+        ev.clear();
+        self.ev = ev;
     }
 
     pub(crate) fn clear(&mut self) {
         self.ev.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.ev.len()
+    }
+}
+
+/// Runs a block's events against `frames` samples: `apply` for each event when its offset is
+/// reached, `render` once per sample. Events past the block take effect at its last sample;
+/// for an empty block, at once.
+pub(crate) fn run_block<P>(
+    p: &mut P,
+    events: &[Event],
+    frames: usize,
+    mut apply: impl FnMut(&mut P, EventKind),
+    mut render: impl FnMut(&mut P, usize),
+) {
+    let mut next = 0;
+    for n in 0..frames {
+        while let Some(e) = events.get(next) {
+            if e.offset > n && n + 1 < frames {
+                break;
+            }
+            apply(p, e.kind);
+            next += 1;
+        }
+        render(p, n);
+    }
+    for e in events.iter().skip(next) {
+        apply(p, e.kind);
     }
 }
 
@@ -219,8 +325,13 @@ struct Voice {
     svf: Svf,
     age: u64,
     held: bool,
-    /// Released while the sustain pedal was down.
+    /// Released while a pedal held it (sustain, or sostenuto when `latched`).
     sustained: bool,
+    /// MIDI channel and host voice id (-1: none).
+    ch: u8,
+    id: i32,
+    /// Held when its channel's sostenuto pedal went down: it sounds on until the pedal comes up.
+    latched: bool,
 }
 
 impl Voice {
@@ -238,6 +349,9 @@ impl Voice {
             age: 0,
             held: false,
             sustained: false,
+            ch: 0,
+            id: -1,
+            latched: false,
         }
     }
 
@@ -260,8 +374,10 @@ pub struct SubtractiveSynth {
     counter: u64,
     level: Smoother,
     cutoff: Smoother,
-    sustain: bool,
-    bend: f32,
+    /// Per MIDI channel: the sustain and sostenuto pedals and the pitch bend (a frequency ratio).
+    sustain: [bool; 16],
+    sostenuto: [bool; 16],
+    bend: [f32; 16],
 }
 
 impl Default for SubtractiveSynth {
@@ -289,8 +405,9 @@ impl SubtractiveSynth {
             counter: 0,
             level: Smoother::new(0.5),
             cutoff: Smoother::new(2000.0),
-            sustain: false,
-            bend: 1.0,
+            sustain: [false; 16],
+            sostenuto: [false; 16],
+            bend: [1.0; 16],
         };
         s.update();
         s
@@ -307,18 +424,20 @@ impl SubtractiveSynth {
         self.cutoff.set(v(5));
     }
 
-    fn start_note(&mut self, note: u8, vel: u8) {
+    fn start_note(&mut self, ch: u8, note: u8, vel: u8, id: i32) {
         if vel == 0 {
-            self.stop_note(note);
+            self.stop_note(ch, note, id);
             return;
         }
         self.counter += 1;
         let freq = note_hz(f32::from(note.min(127)));
-        // Reuse a voice already playing this note, else a free one, else steal.
+        // Reuse a voice already playing this note on this channel (with a voice id only a
+        // releasing one: another id on the same key is another voice), else a free one, else
+        // steal.
         let idx = self
             .voices
             .iter()
-            .position(|v| v.active() && v.note == note)
+            .position(|v| v.active() && v.ch == ch && v.note == note && (id < 0 || !v.held))
             .or_else(|| self.voices.iter().position(|v| !v.active()))
             .or_else(|| {
                 self.voices
@@ -352,15 +471,20 @@ impl SubtractiveSynth {
             v.age = counter;
             v.held = true;
             v.sustained = false;
+            v.latched = false;
+            v.ch = ch;
+            v.id = id;
         }
         self.last_freq = Some(freq);
     }
 
-    fn stop_note(&mut self, note: u8) {
-        let sustain = self.sustain;
-        for v in self.voices.iter_mut().filter(|v| v.held && v.note == note) {
+    /// Releases the voice with host id `id`, or without an id the held voices playing `note` on
+    /// channel `ch`. A pedal keeps it sounding.
+    fn stop_note(&mut self, ch: u8, note: u8, id: i32) {
+        let sustain = self.sustain.get(usize::from(ch & 0x0F)).copied().unwrap_or(false);
+        for v in self.voices.iter_mut().filter(|v| v.held && v.ch == ch && if id >= 0 { v.id == id } else { v.note == note }) {
             v.held = false;
-            if sustain {
+            if sustain || v.latched {
                 v.sustained = true;
             } else {
                 v.amp.gate_off();
@@ -369,34 +493,66 @@ impl SubtractiveSynth {
         }
     }
 
-    fn set_sustain(&mut self, on: bool) {
-        self.sustain = on;
+    /// Releases channel `ch`'s pedal-held voices that no pedal holds any more.
+    fn release_pedalled(&mut self, ch: u8) {
+        let sustain = self.sustain.get(usize::from(ch & 0x0F)).copied().unwrap_or(false);
+        for v in self.voices.iter_mut().filter(|v| v.ch == ch && v.sustained && !sustain && !v.latched) {
+            v.sustained = false;
+            v.amp.gate_off();
+            v.filt.gate_off();
+        }
+    }
+
+    fn set_sustain(&mut self, ch: u8, on: bool) {
+        if let Some(s) = self.sustain.get_mut(usize::from(ch & 0x0F)) {
+            *s = on;
+        }
         if !on {
-            for v in self.voices.iter_mut().filter(|v| v.sustained) {
-                v.sustained = false;
-                v.amp.gate_off();
-                v.filt.gate_off();
-            }
+            self.release_pedalled(ch);
+        }
+    }
+
+    /// Sostenuto down latches the voices held on the channel at that moment; up lets them go.
+    fn set_sostenuto(&mut self, ch: u8, on: bool) {
+        let Some(s) = self.sostenuto.get_mut(usize::from(ch & 0x0F)) else { return };
+        if *s == on {
+            return;
+        }
+        *s = on;
+        for v in self.voices.iter_mut().filter(|v| v.ch == ch) {
+            v.latched = on && v.held;
+        }
+        if !on {
+            self.release_pedalled(ch);
         }
     }
 
     fn apply(&mut self, kind: EventKind) {
         match kind {
-            EventKind::On(n, v) => self.start_note(n, v),
-            EventKind::Off(n) => self.stop_note(n),
+            EventKind::On(c, n, v, id) => self.start_note(c, n, v, id),
+            EventKind::Off(c, n, id) => self.stop_note(c, n, id),
             EventKind::AllOff => {
                 for v in &mut self.voices {
                     v.held = false;
                     v.sustained = false;
+                    v.latched = false;
                     v.amp.gate_off();
                     v.filt.gate_off();
                 }
             }
-            EventKind::Sustain(on) => self.set_sustain(on),
-            EventKind::Bend(ratio) => self.bend = ratio,
-            EventKind::ResetControllers => {
-                self.set_sustain(false);
-                self.bend = 1.0;
+            EventKind::Sustain(c, on) => self.set_sustain(c, on),
+            EventKind::Sostenuto(c, on) => self.set_sostenuto(c, on),
+            EventKind::Bend(c, ratio) => {
+                if let Some(b) = self.bend.get_mut(usize::from(c & 0x0F)) {
+                    *b = ratio;
+                }
+            }
+            EventKind::ResetControllers(c) => {
+                self.set_sustain(c, false);
+                self.set_sostenuto(c, false);
+                if let Some(b) = self.bend.get_mut(usize::from(c & 0x0F)) {
+                    *b = 1.0;
+                }
             }
         }
     }
@@ -412,7 +568,6 @@ impl SubtractiveSynth {
         let env_oct = self.p.v(7) / 100.0 * 6.0;
         let cutoff = self.cutoff.next();
         let nyq = sr * 0.45;
-        let bend = self.bend;
         let mut out = 0.0;
         for v in &mut self.voices {
             if !v.active() {
@@ -423,6 +578,7 @@ impl SubtractiveSynth {
             } else {
                 v.freq = v.target;
             }
+            let bend = self.bend.get(usize::from(v.ch & 0x0F)).copied().unwrap_or(1.0);
             let a = v.amp.next(&self.amp_rates);
             let fe = v.filt.next(&self.filt_rates);
             let s1 = v.osc1.next(w1, v.freq * bend / sr);
@@ -457,43 +613,24 @@ impl Plugin for SubtractiveSynth {
         self.last_freq = None;
         self.level.snap();
         self.cutoff.snap();
-        self.sustain = false;
-        self.bend = 1.0;
+        self.sustain = [false; 16];
+        self.sostenuto = [false; 16];
+        self.bend = [1.0; 16];
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         let ch = self.ch.min(io.len());
         let frames = frames_in(io, frames, ch);
-        let mut evs = [Event { offset: 0, kind: EventKind::AllOff }; MAX_EVENTS];
-        let count = {
-            let sorted = self.events.sorted();
-            for (d, s) in evs.iter_mut().zip(sorted) {
-                *d = *s;
-            }
-            sorted.len().min(MAX_EVENTS)
-        };
-        self.events.clear();
-        let mut next = 0;
-        for n in 0..frames {
-            while let Some(e) = evs.get(next).filter(|_| next < count) {
-                if e.offset > n && n + 1 < frames {
-                    break;
-                }
-                let kind = e.kind;
-                self.apply(kind);
-                next += 1;
-            }
-            let y = self.render_sample() * self.level.next();
+        let evs = self.events.take_sorted();
+        run_block(self, &evs, frames, Self::apply, |p, n| {
+            let y = p.render_sample() * p.level.next();
             for b in io.iter_mut().take(ch) {
                 if let Some(x) = b.get_mut(n) {
                     *x = y;
                 }
             }
-        }
-        // Events for an empty block take effect immediately.
-        for e in evs.iter().take(count).skip(next) {
-            self.apply(e.kind);
-        }
+        });
+        self.events.restore(evs);
     }
 
     fn tail_samples(&self) -> usize {
@@ -501,29 +638,144 @@ impl Plugin for SubtractiveSynth {
     }
 
     fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
-        self.events.push(offset, EventKind::On(note, velocity));
+        self.events.push(offset, EventKind::On(0, note.min(127), velocity.min(127), -1));
     }
 
     fn note_off(&mut self, offset: usize, note: u8) {
-        self.events.push(offset, EventKind::Off(note));
+        self.events.push(offset, EventKind::Off(0, note.min(127), -1));
     }
 
     fn midi(&mut self, offset: usize, msg: [u8; 3]) {
-        let [status, d1, d2] = msg;
-        let kind = match (status & 0xF0, d1) {
-            (0xB0, 64) => EventKind::Sustain(d2 >= 64),
-            (0xB0, 120 | 123) => EventKind::AllOff,
-            (0xB0, 121) => EventKind::ResetControllers,
-            (0xE0, _) => {
-                let v = (i32::from(d2 & 0x7F) << 7 | i32::from(d1 & 0x7F)) - 8192;
-                EventKind::Bend(2f32.powf(v as f32 / 8192.0 * BEND_RANGE / 12.0))
-            }
-            _ => return,
-        };
-        self.events.push(offset, kind);
+        if let Some(kind) = EventKind::from_midi(msg) {
+            self.events.push(offset, kind);
+        }
+    }
+
+    fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        EventKind::from_event(ev).is_none_or(|kind| self.events.push(offset as usize, kind))
     }
 
     fn all_notes_off(&mut self) {
         self.events.push(0, EventKind::AllOff);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::NoteId;
+
+    fn ev(channel: u8, note_id: i32, message: Message) -> PluginEvent {
+        PluginEvent { channel, note_id, message }
+    }
+
+    fn on(ch: u8, key: u8, id: i32) -> PluginEvent {
+        ev(ch, id, Message::NoteOn { key, velocity: 100, id: NoteId::NONE })
+    }
+
+    fn off(ch: u8, key: u8, id: i32) -> PluginEvent {
+        ev(ch, id, Message::NoteOff { key, velocity: 0, id: NoteId::NONE })
+    }
+
+    fn cc(ch: u8, cc: u8, value: u8) -> PluginEvent {
+        ev(ch, -1, Message::Control { cc, value })
+    }
+
+    fn synth() -> SubtractiveSynth {
+        let mut s = SubtractiveSynth::new();
+        s.prepare(48_000.0, 64, 2);
+        s
+    }
+
+    fn run(s: &mut SubtractiveSynth) {
+        let mut io = vec![vec![0.0; 64]; 2];
+        s.process(&mut io, 64);
+    }
+
+    fn held(s: &SubtractiveSynth) -> Vec<(u8, u8, i32)> {
+        s.voices.iter().filter(|v| v.held || v.sustained).map(|v| (v.ch, v.note, v.id)).collect()
+    }
+
+    #[test]
+    fn every_admitted_note_on_gets_its_off_through_a_full_queue() {
+        let mut s = synth();
+        for _ in 0..700 {
+            s.event(0, &ev(0, -1, Message::PitchBend { value: 9000 }));
+        }
+        let ons: Vec<bool> = (0..300).map(|i| s.event(1, &on((i % 16) as u8, (i % 128) as u8, i))).collect();
+        let offs: Vec<bool> = (0..300).map(|i| s.event(2, &off((i % 16) as u8, (i % 128) as u8, i))).collect();
+        let admitted = ons.iter().filter(|a| **a).count();
+        assert_eq!(admitted, MAX_EVENTS - RELEASE_RESERVE - 700, "non-releases stop at the reserve");
+        for (i, (a, b)) in ons.iter().zip(&offs).enumerate() {
+            assert!(!*a || *b, "note {i} was admitted but its off was refused");
+        }
+        assert_eq!(s.events.len(), MAX_EVENTS);
+        assert!(!s.event(3, &on(0, 1, 999)), "a full queue refuses a note-on");
+        run(&mut s);
+        assert!(held(&s).is_empty(), "every admitted note was released: {:?}", held(&s));
+        assert_eq!(s.events.len(), 0);
+    }
+
+    #[test]
+    fn voices_match_by_id_else_by_channel_and_key() {
+        let mut s = synth();
+        s.event(0, &on(0, 60, 1));
+        s.event(0, &on(0, 60, 2));
+        s.event(0, &on(1, 60, -1));
+        run(&mut s);
+        assert_eq!(held(&s).len(), 3, "two ids on one key are two voices; channel 1 is a third");
+        s.event(0, &off(0, 60, 1));
+        run(&mut s);
+        let mut h = held(&s);
+        h.sort_unstable();
+        assert_eq!(h, vec![(0, 60, 2), (1, 60, -1)], "only id 1 released");
+        s.event(0, &off(1, 60, -1));
+        run(&mut s);
+        assert_eq!(held(&s), vec![(0, 60, 2)], "a key off finds its channel only");
+    }
+
+    #[test]
+    fn pedals_and_bend_are_per_channel() {
+        let mut s = synth();
+        s.event(0, &cc(1, 64, 127));
+        s.event(0, &on(0, 60, -1));
+        s.event(0, &on(1, 62, -1));
+        s.event(10, &off(0, 60, -1));
+        s.event(10, &off(1, 62, -1));
+        s.event(20, &ev(1, -1, Message::PitchBend { value: 16383 }));
+        run(&mut s);
+        assert_eq!(held(&s), vec![(1, 62, -1)], "channel 1's sustain holds only its own note");
+        assert_eq!(s.bend[0], 1.0);
+        assert!(s.bend[1] > 1.1);
+        s.event(0, &cc(1, 121, 0));
+        run(&mut s);
+        assert!(held(&s).is_empty(), "reset controllers lifts the pedal");
+        assert_eq!(s.bend[1], 1.0);
+    }
+
+    #[test]
+    fn sostenuto_holds_only_what_was_down_when_it_went_down() {
+        let mut s = synth();
+        s.event(0, &on(0, 60, -1));
+        s.event(1, &cc(0, 66, 127));
+        s.event(2, &on(0, 64, -1));
+        s.event(3, &off(0, 60, -1));
+        s.event(3, &off(0, 64, -1));
+        run(&mut s);
+        assert_eq!(held(&s), vec![(0, 60, -1)], "the latched note sounds on, the later one does not");
+        s.event(0, &cc(0, 66, 0));
+        run(&mut s);
+        assert!(held(&s).is_empty());
+    }
+
+    #[test]
+    fn the_legacy_midi_path_reads_the_channel_nibble() {
+        let mut s = synth();
+        s.midi(0, [0xB3, 64, 127]);
+        s.note_on(0, 60, 100);
+        s.note_off(1, 60);
+        run(&mut s);
+        assert!(held(&s).is_empty(), "sustain on channel 4 does not hold a channel 1 note");
+        assert!(s.sustain[3]);
     }
 }

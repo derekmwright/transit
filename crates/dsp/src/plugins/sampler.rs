@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use super::synth::{Adsr, AdsrRates, Event, EventKind, EventQueue, MAX_EVENTS, Stage};
+use super::synth::{Adsr, AdsrRates, EventKind, EventQueue, Stage, run_block};
+use crate::event::PluginEvent;
 use crate::params::{Params, choice, lin, log, param_plumbing, toggle};
 use crate::util::{Smoother, frames_in, ms_to_samples, sane_channels, sane_sr};
 use crate::{Category, ParamInfo, Plugin, PluginInfo, SampleSource, Unit, db_to_gain};
@@ -82,6 +83,9 @@ enum LoopMode {
 #[derive(Debug, Clone, Copy)]
 struct Voice {
     note: u8,
+    /// MIDI channel and host voice id (-1: none).
+    ch: u8,
+    id: i32,
     /// Key still down (gate mode only; one-shot voices are never held).
     held: bool,
     gain: f32,
@@ -95,7 +99,7 @@ struct Voice {
 
 impl Voice {
     const fn new() -> Self {
-        Self { note: 0, held: false, gain: 0.0, pos: 0.0, step: 1.0, forward: true, looping: false, env: Adsr::new() }
+        Self { note: 0, ch: 0, id: -1, held: false, gain: 0.0, pos: 0.0, step: 1.0, forward: true, looping: false, env: Adsr::new() }
     }
 
     fn active(&self) -> bool {
@@ -242,9 +246,9 @@ impl Sampler {
         (b - a >= 1.0).then_some((a, b))
     }
 
-    fn start_note(&mut self, note: u8, vel: u8) {
+    fn start_note(&mut self, ch: u8, note: u8, vel: u8, id: i32) {
         if vel == 0 {
-            self.stop_note(note);
+            self.stop_note(ch, note, id);
             return;
         }
         let d = self.d;
@@ -257,9 +261,10 @@ impl Sampler {
         if !step.is_finite() || step <= 0.0 {
             return;
         }
-        if !d.one_shot {
-            // Retriggering a held key releases the earlier voice instead of stacking it.
-            self.stop_note(note);
+        if !d.one_shot && id < 0 {
+            // Retriggering a held key releases the earlier voice instead of stacking it. A note
+            // with a voice id is its own voice: the host releases the earlier one by its id.
+            self.stop_note(ch, note, -1);
         }
         let idx = self
             .voices
@@ -277,13 +282,15 @@ impl Sampler {
         let looping = self.loop_frames().is_some_and(|(_, end)| start < end);
         let gain = (1.0 - d.sens) + d.sens * f32::from(vel) / 127.0;
         if let Some(v) = self.voices.get_mut(idx) {
-            *v = Voice { note, held: !d.one_shot, gain, pos: start, step: step.min(MAX_STEP), forward: true, looping, env: Adsr::new() };
+            *v = Voice { note, ch, id, held: !d.one_shot, gain, pos: start, step: step.min(MAX_STEP), forward: true, looping, env: Adsr::new() };
             v.env.gate_on();
         }
     }
 
-    fn stop_note(&mut self, note: u8) {
-        for v in self.voices.iter_mut().filter(|v| v.held && v.note == note) {
+    /// Releases the voice with host id `id`, or without an id the held voices playing `note` on
+    /// channel `ch`.
+    fn stop_note(&mut self, ch: u8, note: u8, id: i32) {
+        for v in self.voices.iter_mut().filter(|v| v.held && v.ch == ch && if id >= 0 { v.id == id } else { v.note == note }) {
             v.held = false;
             v.env.gate_off();
         }
@@ -291,15 +298,15 @@ impl Sampler {
 
     fn apply(&mut self, kind: EventKind) {
         match kind {
-            EventKind::On(n, v) => self.start_note(n, v),
-            EventKind::Off(n) => self.stop_note(n),
+            EventKind::On(c, n, v, id) => self.start_note(c, n, v, id),
+            EventKind::Off(c, n, id) => self.stop_note(c, n, id),
             EventKind::AllOff => {
                 for v in &mut self.voices {
                     v.held = false;
                     v.env.gate_off();
                 }
             }
-            EventKind::Sustain(_) | EventKind::Bend(_) | EventKind::ResetControllers => {}
+            EventKind::Sustain(..) | EventKind::Sostenuto(..) | EventKind::Bend(..) | EventKind::ResetControllers(_) => {}
         }
     }
 
@@ -383,32 +390,12 @@ impl Plugin for Sampler {
         for b in io.iter_mut().take(ch) {
             b.iter_mut().take(frames).for_each(|x| *x = 0.0);
         }
-        let mut evs = [Event { offset: 0, kind: EventKind::AllOff }; MAX_EVENTS];
-        let count = {
-            let sorted = self.events.sorted();
-            for (d, s) in evs.iter_mut().zip(sorted) {
-                *d = *s;
-            }
-            sorted.len().min(MAX_EVENTS)
-        };
-        self.events.clear();
-        let mut next = 0;
-        for n in 0..frames {
-            while let Some(e) = evs.get(next).filter(|_| next < count) {
-                if e.offset > n && n + 1 < frames {
-                    break;
-                }
-                let kind = e.kind;
-                self.apply(kind);
-                next += 1;
-            }
-            let level = self.level.next();
-            self.render_frame(io, ch, n, level);
-        }
-        // Events for an empty block take effect immediately.
-        for e in evs.iter().take(count).skip(next) {
-            self.apply(e.kind);
-        }
+        let evs = self.events.take_sorted();
+        run_block(self, &evs, frames, Self::apply, |p, n| {
+            let level = p.level.next();
+            p.render_frame(io, ch, n, level);
+        });
+        self.events.restore(evs);
     }
 
     fn tail_samples(&self) -> usize {
@@ -420,11 +407,15 @@ impl Plugin for Sampler {
     }
 
     fn note_on(&mut self, offset: usize, note: u8, velocity: u8) {
-        self.events.push(offset, EventKind::On(note, velocity));
+        self.events.push(offset, EventKind::On(0, note.min(127), velocity.min(127), -1));
     }
 
     fn note_off(&mut self, offset: usize, note: u8) {
-        self.events.push(offset, EventKind::Off(note));
+        self.events.push(offset, EventKind::Off(0, note.min(127), -1));
+    }
+
+    fn event(&mut self, offset: u32, ev: &PluginEvent) -> bool {
+        EventKind::from_event(ev).is_none_or(|kind| self.events.push(offset as usize, kind))
     }
 
     fn all_notes_off(&mut self) {
