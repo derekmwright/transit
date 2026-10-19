@@ -523,6 +523,7 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
 // ---- extensions ----
 
 unsafe extern "C" fn params_count(p: *const clap_plugin) -> u32 {
+    // SAFETY: the host passes this live fixture's plugin pointer for the callback.
     let f = unsafe { fx(p) };
     if f.events {
         1

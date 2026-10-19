@@ -1180,16 +1180,12 @@ impl IMessageTrait for HostMessage {
     }
 }
 
-/// One parameter's points for one block. SoundCraft sends at most one point per block; a
-/// plugin writing output changes may add more, of which only the last is kept.
-#[derive(Default)]
-
 /// One parameter point the host sends: its time in the block, the parameter, its class
 /// (0: automation and host values, 1: a mapped MIDI controller, which follows automation at the
 /// same offset), the order it was set in, and the normalized value. `release`: a controller
 /// from a release-class message ([`Message::survives_reset`](soundcraft_dsp::event::Message)),
 /// which the host keeps through a plug-in reset.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct ParamPoint {
     pub time: u32,
     pub id: u32,
