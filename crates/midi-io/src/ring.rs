@@ -40,6 +40,9 @@ impl Default for InputConfig {
 }
 
 /// A snapshot of an input port's counters. Counts are cumulative since the port opened.
+///
+/// These independent relaxed counters are diagnostic, not a coherent sequence boundary. Use
+/// [`InputBoundary::cutoff`] to cancel raw events, including offers not yet published to the ring.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputCounters {
     /// Backend callbacks received.
@@ -59,6 +62,9 @@ pub struct InputCounters {
     pub malformed_bytes: u64,
     /// Messages filtered by configuration (active sensing).
     pub filtered: u64,
+    /// Otherwise eligible messages refused because the per-open sequence was exhausted.
+    /// These take no sequence number and are not included in the ring-full drop counters.
+    pub exhausted_dropped: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +77,7 @@ pub(crate) struct Counters {
     sysex_bytes_dropped: AtomicU64,
     malformed_bytes: AtomicU64,
     filtered: AtomicU64,
+    exhausted_dropped: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, by: u64) {
@@ -81,6 +88,8 @@ fn bump(counter: &AtomicU64, by: u64) {
 #[derive(Default)]
 pub(crate) struct PortShared {
     pub(crate) counters: Counters,
+    /// Exclusive offered-sequence boundary, released before ring publication. MAX is terminal.
+    offered: AtomicU64,
     /// Set by a [`PortWatcher`](crate::PortWatcher) when the port leaves the backend's list.
     pub(crate) disconnected: AtomicBool,
 }
@@ -98,6 +107,7 @@ impl PortShared {
             sysex_bytes_dropped: get(&c.sysex_bytes_dropped),
             malformed_bytes: get(&c.malformed_bytes),
             filtered: get(&c.filtered),
+            exhausted_dropped: get(&c.exhausted_dropped),
         }
     }
 
@@ -107,6 +117,53 @@ impl PortShared {
 
     pub(crate) fn mark_disconnected(&self) {
         self.disconnected.store(true, Ordering::Release);
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.offered.load(Ordering::Acquire) == u64::MAX
+    }
+}
+
+/// An exclusive per-open input sequence boundary: cancel events with `event.seq < cutoff`.
+///
+/// Only compare with events from the same open input. Zero covers no offers; `u64::MAX` is
+/// terminal and covers every possible event from that open input (MAX itself is never assigned).
+pub type SeqCutoff = u64;
+
+/// A cloneable, read-only, `Send + Sync` view of one open input's offered sequence.
+///
+/// Keep this on playback control while moving the [`InputConsumer`] to an ingress worker.
+/// It neither owns the connection nor keeps it open. Reopening a port starts a new sequence;
+/// an old boundary continues to refer to the old open input.
+#[derive(Clone)]
+pub struct InputBoundary {
+    pub(crate) shared: Arc<PortShared>,
+}
+
+impl InputBoundary {
+    /// Captures the exclusive offered-sequence cutoff with one Acquire load.
+    ///
+    /// The producer publishes the next sequence with Release ordering **before** publishing
+    /// its event to the ring. Every already-published event has `seq < cutoff`, even if another
+    /// thread has drained it. An offer exposed before this capture is also covered when its
+    /// ring publication is delayed. Offers after the capture have `seq >= cutoff`; a racing
+    /// offer falls on the side selected by this load. Drops consume sequence numbers too.
+    ///
+    /// This is per open port, not a cross-port atomic snapshot. Retain the cutoff to reject
+    /// delayed publications as well as queued events; it does not imply the ring is drained.
+    #[must_use]
+    pub fn cutoff(&self) -> SeqCutoff {
+        self.shared.offered.load(Ordering::Acquire)
+    }
+
+    /// All sequence numbers have been assigned; playback should revoke this source.
+    ///
+    /// This stays true until the open input is discarded. The last valid offer (`MAX - 1`)
+    /// may still publish after this becomes true. Further offers are refused and counted in
+    /// [`InputCounters::exhausted_dropped`]. Reopen as a new source to resume ingress.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.shared.is_exhausted()
     }
 }
 
@@ -131,6 +188,10 @@ pub(crate) struct InputSink {
     pass_active_sensing: bool,
     origin: Instant,
     next_seq: u64,
+    #[cfg(test)]
+    pub(crate) before_publish: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)]
+    pub(crate) after_publish: Option<Box<dyn FnMut() + Send>>,
     /// A SysEx message continues from the previous callback (WinMM delivers long SysEx in
     /// 1024-byte buffers; continuation chunks start with data bytes).
     in_sysex: bool,
@@ -148,6 +209,10 @@ impl InputSink {
             pass_active_sensing: config.pass_active_sensing,
             origin: config.host_origin,
             next_seq: 0,
+            #[cfg(test)]
+            before_publish: None,
+            #[cfg(test)]
+            after_publish: None,
             in_sysex: false,
         };
         (sink, InputConsumer { consumer, shared: Arc::clone(&shared) }, shared)
@@ -243,19 +308,40 @@ impl InputSink {
 
     fn offer(&mut self, bytes: [u8; 3], len: usize, backend_time_us: u64, host_arrival_ns: u64) {
         let seq = self.next_seq;
-        self.next_seq = seq.wrapping_add(1);
+        let Some(next_seq) = seq.checked_add(1) else {
+            bump(&self.shared.counters.exhausted_dropped, 1);
+            return;
+        };
+        self.next_seq = next_seq;
+        // This store is the offer's boundary, including offers dropped for lack of room.
+        // It must precede ring publication so control can also cancel a delayed publication.
+        self.shared.offered.store(next_seq, Ordering::Release);
+        #[cfg(test)]
+        if let Some(hook) = &mut self.before_publish {
+            hook();
+        }
         let event = InputEvent { bytes, len: len as u8, backend_time_us, host_arrival_ns, seq };
         let release = is_release(event.message());
         let free = self.producer.slots();
         let admit = if release { free > 0 } else { free > self.reserve };
         let counters = &self.shared.counters;
         if admit && self.producer.push(event).is_ok() {
+            #[cfg(test)]
+            if let Some(hook) = &mut self.after_publish {
+                hook();
+            }
             bump(&counters.delivered, 1);
         } else if release {
             bump(&counters.dropped_releases, 1);
         } else {
             bump(&counters.dropped, 1);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_sequence(&mut self, next_seq: u64) {
+        self.next_seq = next_seq;
+        self.shared.offered.store(next_seq, Ordering::Release);
     }
 }
 
@@ -281,7 +367,7 @@ impl InputConsumer {
         self.consumer.peek().ok()
     }
 
-    /// Events pending.
+    /// Events pending. This is not an offer boundary: use [`InputBoundary::cutoff`] for that.
     #[must_use]
     pub fn len(&self) -> usize {
         self.consumer.slots()
@@ -305,6 +391,19 @@ impl InputConsumer {
     #[must_use]
     pub fn is_disconnected(&self) -> bool {
         self.shared.is_disconnected()
+    }
+
+    /// A read-only boundary that can stay on control while this consumer moves to a worker.
+    #[must_use]
+    pub fn boundary(&self) -> InputBoundary {
+        InputBoundary { shared: Arc::clone(&self.shared) }
+    }
+
+    /// The sequence is terminal; playback should revoke this source. See
+    /// [`InputBoundary::is_exhausted`] for the last offer's possible delayed publication.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.shared.is_exhausted()
     }
 
     /// The port's counters (atomics, readable from any thread).

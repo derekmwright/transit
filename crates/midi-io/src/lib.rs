@@ -27,7 +27,11 @@
 //!   rest. Only when the whole ring is full is a release dropped, counted separately in
 //!   [`InputCounters::dropped_releases`].
 //! * **Order**: events leave the ring in backend delivery order; [`InputEvent::seq`] numbers every
-//!   message offered to the ring, so drops show as gaps.
+//!   message offered to the ring, so drops show as gaps. [`InputBoundary::cutoff`] captures an
+//!   exclusive per-open-port cutoff independently of the consumer, including delayed offers.
+//!   It is not a cross-port atomic snapshot. Sequences never wrap: at the terminal cutoff
+//!   (`u64::MAX`), [`InputBoundary::is_exhausted`] tells playback to revoke the source, and
+//!   further ingress is refused and counted in [`InputCounters::exhausted_dropped`].
 //! * **Scheduled output** is out of scope: [`OutputHandle::send`] sends immediately.
 //!
 //! # Timestamps
@@ -53,7 +57,7 @@ mod tests;
 pub use clock::{host_now_ns, host_ns_since, host_origin};
 pub use event::{InputEvent, is_release};
 pub use port::{BackendId, Direction, PortInfo, PortKey};
-pub use ring::{InputConfig, InputConsumer, InputCounters};
+pub use ring::{InputBoundary, InputConfig, InputConsumer, InputCounters, SeqCutoff};
 
 use backend::{Backend, InputConnection, OutputConnection};
 use port::PortIdentity;
@@ -221,6 +225,12 @@ impl InputHandle {
     #[must_use]
     pub fn key(&self) -> &PortKey {
         &self.key
+    }
+
+    /// A read-only boundary for this open input, independent of the consumer's owner.
+    #[must_use]
+    pub fn boundary(&self) -> InputBoundary {
+        InputBoundary { shared: Arc::clone(&self.shared) }
     }
 
     /// The port's counters (atomics, readable from any thread).

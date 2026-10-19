@@ -24,6 +24,162 @@ fn drain(consumer: &mut InputConsumer) -> Vec<InputEvent> {
     std::iter::from_fn(|| consumer.pop()).collect()
 }
 
+/// Two-way handshake: the test captures a cutoff while the callback is paused. Bounded waits
+/// make a broken hook fail instead of hanging the suite; assertions run after releasing it.
+fn publication_pause() -> (Box<dyn FnMut() + Send>, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let hook = Box::new(move || {
+        paused_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(30)).expect("test did not resume publication");
+    });
+    (hook, paused_rx, resume_tx)
+}
+
+#[test]
+fn cutoff_covers_published_events_drained_by_another_owner_before_counters_update() {
+    fn assert_traits<T: Clone + Send + Sync>() {}
+    assert_traits::<InputBoundary>();
+
+    let fake = Fake::default();
+    let (_io, handle, mut consumer) = open(&fake, "Keys", config(4, 1));
+    let boundary = handle.boundary().clone();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    let (hook, paused, resume) = publication_pause();
+    slot.with_sink(|sink| sink.after_publish = Some(hook)).unwrap();
+    let callback = std::thread::spawn(move || slot.deliver(0, &[0x90, 60, 100]));
+    paused.recv_timeout(Duration::from_secs(30)).unwrap();
+    // Ingress already took the event; neither ring length nor delivered can be the boundary.
+    let event = std::thread::spawn(move || consumer.pop()).join().unwrap();
+    let cutoff = boundary.cutoff();
+    let delivered = handle.counters().delivered;
+    resume.send(()).unwrap();
+    assert!(callback.join().unwrap());
+
+    assert_eq!(delivered, 0);
+    assert_eq!(event.unwrap().seq, 0);
+    assert!(event.unwrap().seq < cutoff, "published event escaped cutoff {cutoff}");
+    assert_eq!(cutoff, 1);
+}
+
+#[test]
+fn cutoff_covers_exposed_offer_before_publication_but_not_a_later_offer() {
+    let fake = Fake::default();
+    let (_io, handle, mut consumer) = open(&fake, "Keys", config(4, 1));
+    let boundary = handle.boundary();
+    assert_eq!(boundary.cutoff(), 0);
+    assert!(!boundary.is_exhausted());
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    let (hook, paused, resume) = publication_pause();
+    slot.with_sink(|sink| sink.before_publish = Some(hook)).unwrap();
+    let producer = slot.clone();
+    let callback = std::thread::spawn(move || producer.deliver(0, &[0x90, 60, 100]));
+    paused.recv_timeout(Duration::from_secs(30)).unwrap();
+    let empty = consumer.is_empty();
+    let cutoff = boundary.cutoff();
+    let consumer_cutoff = consumer.boundary().cutoff();
+    resume.send(()).unwrap();
+    assert!(callback.join().unwrap());
+    slot.with_sink(|sink| sink.before_publish = None).unwrap();
+    let delayed = consumer.pop().unwrap();
+    assert!(slot.deliver(1, &[0x80, 60, 0]));
+    let later = consumer.pop().unwrap();
+
+    assert!(empty, "the first offer was paused before publication");
+    assert!(delayed.seq < cutoff, "exposed offer escaped cutoff {cutoff}");
+    assert_eq!(cutoff, 1);
+    assert_eq!(consumer_cutoff, cutoff);
+    assert!(later.seq >= cutoff);
+    assert_eq!(later.seq, cutoff);
+    assert_eq!(boundary.cutoff(), 2);
+}
+
+#[test]
+fn cutoff_counts_ring_saturation_and_release_drop_gaps() {
+    let fake = Fake::default();
+    let (_io, handle, mut consumer) = open(&fake, "Keys", config(1, 1));
+    let boundary = handle.boundary();
+    let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+    slot.deliver(0, &[0x90, 60, 100, 61, 100, 0x80, 60, 0, 61, 0, 0x90, 62, 100]);
+    let cutoff = boundary.cutoff();
+    // Filtered, malformed and SysEx bytes never receive a sequence.
+    slot.deliver(1, &[0xFE, 0x40, 0xF0, 1, 0xF7]);
+    let events = drain(&mut consumer);
+    assert_eq!(cutoff, 5);
+    assert_eq!(boundary.cutoff(), cutoff);
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 2]);
+    assert!(events.iter().all(|e| e.seq < cutoff));
+    let counters = handle.counters();
+    assert_eq!((counters.delivered, counters.dropped, counters.dropped_releases), (2, 2, 1));
+    slot.deliver(2, &[0x90, 63, 100]);
+    assert_eq!(consumer.pop().unwrap().seq, cutoff);
+}
+
+#[test]
+fn cutoff_exhaustion_never_wraps_even_when_the_last_offer_is_dropped() {
+    for drop_last in [false, true] {
+        let fake = Fake::default();
+        let (_io, handle, mut consumer) = open(&fake, "Keys", config(1, 0));
+        let boundary = handle.boundary();
+        let slot = fake.input_port(&Fake::key("Keys", 0)).unwrap();
+        slot.with_sink(|sink| sink.seed_sequence(u64::MAX - 2)).unwrap();
+        assert_eq!(boundary.cutoff(), u64::MAX - 2);
+        assert!(!boundary.is_exhausted());
+        slot.deliver(0, &[0x90, 60, 100]);
+        assert_eq!(boundary.cutoff(), u64::MAX - 1);
+        assert!(!consumer.is_exhausted());
+        if !drop_last {
+            assert_eq!(consumer.pop().unwrap().seq, u64::MAX - 2);
+        }
+        slot.deliver(1, &[0x90, 61, 100]);
+        let terminal = boundary.cutoff();
+        assert_eq!(terminal, u64::MAX);
+        assert!(boundary.is_exhausted() && consumer.is_exhausted());
+        assert_eq!(handle.counters().exhausted_dropped, 0);
+        let last = consumer.pop().unwrap();
+        assert_eq!(last.seq, if drop_last { u64::MAX - 2 } else { u64::MAX - 1 });
+        assert!(last.seq < terminal);
+        assert!(consumer.is_empty());
+
+        let ((), stats) = measure(|| {
+            // A free ring must still reject notes, releases and real-time messages forever.
+            for _ in 0..4 {
+                slot.deliver(2, &[0x90, 62, 100, 0x80, 60, 0, 0xF8]);
+            }
+        });
+        assert!(stats.is_zero(), "exhausted ingress allocated: {stats:?}");
+        assert!(consumer.is_empty(), "exhausted input reused a sequence");
+        assert_eq!(boundary.cutoff(), terminal);
+        assert!(boundary.is_exhausted() && consumer.is_exhausted());
+        let counters = handle.counters();
+        assert_eq!(counters.exhausted_dropped, 12);
+        assert_eq!(counters.dropped, u64::from(drop_last));
+        assert_eq!(counters.dropped_releases, 0);
+    }
+}
+
+#[test]
+fn cutoffs_are_per_open_port_and_boundary_does_not_keep_connection_open() {
+    let fake = Fake::default();
+    let (io, first, mut first_consumer) = open(&fake, "First", config(4, 1));
+    let (_io, second, _second_consumer) = open(&fake, "Second", config(4, 1));
+    let old = first.boundary();
+    let other = second.boundary();
+    let slot = fake.input_port(&Fake::key("First", 0)).unwrap();
+    slot.deliver(0, &[0x90, 60, 100]);
+    assert_eq!((old.cutoff(), other.cutoff()), (1, 0));
+    drop(first);
+    assert!(first_consumer.is_closed());
+    assert!(!slot.deliver(1, &[0x90, 61, 100]));
+    assert!(first_consumer.pop().unwrap().seq < old.cutoff());
+    let (reopened, mut consumer) = io.open_input(&Fake::key("First", 0), config(4, 1)).unwrap();
+    let fresh = reopened.boundary();
+    assert_eq!((old.cutoff(), fresh.cutoff()), (1, 0));
+    slot.deliver(2, &[0x90, 62, 100, 63, 100]);
+    assert_eq!(consumer.pop().unwrap().seq, 0);
+    assert_eq!((old.cutoff(), fresh.cutoff(), other.cutoff()), (1, 2, 0));
+}
+
 #[test]
 fn messages_keep_order_running_status_is_expanded_and_seq_counts_up() {
     let fake = Fake::default();

@@ -73,6 +73,11 @@ impl std::fmt::Debug for Fake {
 pub struct FakeInputPort(Slot);
 
 impl FakeInputPort {
+    #[cfg(test)]
+    pub(crate) fn with_sink<R>(&self, f: impl FnOnce(&mut InputSink) -> R) -> Option<R> {
+        lock(&self.0).as_mut().map(f)
+    }
+
     /// Plays the backend callback: hands `bytes` (one or more messages) stamped `backend_time_us`
     /// to the connected sink. Returns whether a connection was open.
     pub fn deliver(&self, backend_time_us: u64, bytes: &[u8]) -> bool {

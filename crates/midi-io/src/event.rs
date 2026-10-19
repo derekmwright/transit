@@ -25,6 +25,9 @@ pub struct InputEvent {
     /// Per-open sequence number, starting at 0, incremented for every message offered to the
     /// ring, including messages dropped because the ring was full. A gap seen by the consumer
     /// therefore marks where events were dropped. SysEx and filtered messages take no number.
+    /// Never wraps: `u64::MAX` is reserved as the terminal exclusive cutoff, so the last valid
+    /// sequence is `MAX - 1`. See [`InputBoundary`](crate::InputBoundary) for cancellation and
+    /// exhaustion independently of ring consumption.
     pub seq: u64,
 }
 
