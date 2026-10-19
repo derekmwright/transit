@@ -446,6 +446,8 @@ pub struct AutoState {
     /// counter after the pass's latest write: if it still holds at the end, the pass is the newest step.
     spans: HashMap<(TrackId, String), Vec<(Samples, Samples)>>,
     pass_mark: u64,
+    /// `undo_pushes` when the pass wrote its first point.
+    pass_p0: u64,
     /// What the last thinning removed, for `ui.inspect`.
     pub thinned: usize,
 }
@@ -1236,6 +1238,9 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             continue;
         }
         let key = (id, lane.id());
+        if !app.auto.writing {
+            app.auto.pass_p0 = app.engine.undo_pushes();
+        }
         let mut from = app.auto.last.get(&key).copied();
         let started = from.is_none();
         let v = lane.static_value(t);
@@ -1303,12 +1308,14 @@ fn removable(lane: Option<&soundcraft_model::AutomationLane>, range: Option<(Sam
 /// named "Thin".
 fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
     let mut plan: Vec<(TrackId, String, Samples, Samples)> = Vec::new();
+    let mut wrote = false;
     {
         let s = app.engine.session_arc();
         for id in tracks {
             let keys: Vec<(TrackId, String)> = app.auto.spans.keys().filter(|k| k.0 == *id).cloned().collect();
             for k in keys {
                 let Some(segs) = app.auto.spans.remove(&k) else { continue };
+                wrote = true;
                 let (Some(t), Some(lane)) = (s.track(k.0), Lane::parse(&k.1)) else { continue };
                 for (start, end) in segs.into_iter().filter(|(a, b)| b > a) {
                     for param in lane.param_ids(t) {
@@ -1321,28 +1328,46 @@ fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId], squash: bool) {
         }
     }
     // The session handle is dropped: holding it would make every command copy the document.
-    if !app.ui.thin_after_write || plan.is_empty() || app.engine.can_redo() {
+    if !wrote || app.engine.can_redo() {
         return;
     }
     let contiguous = app.engine.revision == app.auto.pass_mark;
-    let n0 = app.engine.undo_history().len();
+    let top0 = app.engine.undo_label().map(str::to_string);
     let mut removed = 0;
-    for (id, param, start, end) in plan {
-        let p = json!({"tracks": [id.0], "param": param, "start": start, "end": end, "tolerance": THIN_TOLERANCE});
-        if let Ok(r) = app.engine.execute_merged("automation.thin", &p, PASS) {
-            removed += r["removed"].as_u64().unwrap_or(0) as usize;
+    if app.ui.thin_after_write {
+        for (id, param, start, end) in plan {
+            let p = json!({"tracks": [id.0], "param": param, "start": start, "end": end, "tolerance": THIN_TOLERANCE});
+            if let Ok(r) = app.engine.execute_merged("automation.thin", &p, PASS) {
+                removed += r["removed"].as_u64().unwrap_or(0) as usize;
+            }
         }
+        app.auto.thinned = removed;
     }
-    app.auto.thinned = removed;
-    let added = app.engine.undo_history().len().saturating_sub(n0);
+    // The thins share the pass's merge key, so they add at most one step: a "Thin" on top of a
+    // stack that did not end in one. (The history length cannot say: at the cap it stays put.)
+    let added = usize::from(app.engine.undo_label() == Some("Thin") && top0.as_deref() != Some("Thin"));
     let plural = if removed == 1 { "" } else { "s" };
     if squash && contiguous {
-        let _ = app.engine.squash_undo(added + 1, "Write Automation");
-        app.status = format!("Thinned the write pass: {removed} point{plural} removed");
+        // The pass is one step labeled for what it is, thinned or not.
+        // Normally the pass is one merged step. At the history cap the engine stops merging (it
+        // looks for the history to grow), so every command of the pass is a step of its own and
+        // `undo_pushes` counts them; never fold more than the history holds.
+        let len = app.engine.undo_history().len();
+        let n = if len >= app.engine.history_limit {
+            usize::try_from(app.engine.undo_pushes().saturating_sub(app.auto.pass_p0)).unwrap_or(len).min(len)
+        } else {
+            added + 1
+        };
+        if n > 0 {
+            let _ = app.engine.squash_undo(n, "Write Automation");
+        }
+        if removed > 0 {
+            app.status = format!("Thinned the write pass: {removed} point{plural} removed");
+        }
     } else if added > 0 {
         app.status =
             format!("Thinned the write pass as its own step (Thin), since the pass is no longer the newest step: {removed} point{plural} removed");
-    } else {
+    } else if removed > 0 {
         app.status = format!("Thinned the write pass: {removed} point{plural} removed");
     }
 }

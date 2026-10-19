@@ -1170,3 +1170,47 @@ fn a_latch_pass_with_a_regrab_is_one_step_after_stop() {
     t.frames(3);
     assert_one_pass_step(&mut t, a, before, true);
 }
+
+#[test]
+fn a_pass_at_the_history_cap_is_still_one_step() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    for i in 0..205 {
+        set_point(&mut t, a, 1_000_000 + i * 1_000, -6.0 - (i % 7) as f32);
+    }
+    assert_eq!(t.undo_len(), t.app.engine.history_limit, "the history is full");
+    t.key("Space");
+    touch_drag(&mut t, a, 100.0, 12);
+    t.frames(30);
+    touch_drag(&mut t, a, -100.0, 12);
+    assert_eq!(t.app.pass_spans(a).len(), 2);
+    let marker = t.app.engine.undo_history()[t.undo_len() - 2].clone();
+    t.key("Space");
+    t.frames(3);
+    let h = t.app.engine.undo_history();
+    assert_eq!(h.last().unwrap(), "Write Automation", "{:?}", &h[h.len() - 3..]);
+    assert_ne!(h[h.len() - 2], "Thin", "no Thin step is left under the pass");
+    let _ = marker;
+    assert!(t.app.auto.thinned > 0, "the pass was thinned at the cap too");
+    let thin = t.points(a, &AutoParam::Volume);
+    t.app.run("edit.undo", json!({})).unwrap();
+    let pts = t.points(a, &AutoParam::Volume);
+    assert_eq!(pts.len(), 205, "one Undo removes the whole pass and nothing else: {}", pts.len());
+    t.app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume), thin);
+}
+
+#[test]
+fn a_pass_with_nothing_to_thin_is_still_labeled_as_a_pass() {
+    let mut t = T::new();
+    let a = touch_mode(&mut t);
+    t.app.ui.show_mixer = true;
+    t.frames(3);
+    let before = t.undo_len();
+    t.key("Space");
+    fader_drag(&mut t, a, -8.0, 6);
+    t.key("Space");
+    t.frames(3);
+    assert_eq!(t.undo_len(), before + 1);
+    assert_eq!(t.app.engine.undo_history().last().unwrap(), "Write Automation");
+}
