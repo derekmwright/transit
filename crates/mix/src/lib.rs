@@ -2643,6 +2643,12 @@ mod click {
     }
 }
 
+/// Channel-width law (shared by legacy, prepared-plan and consolidate rendering): when the
+/// source is wider, destination j averages source channels j, j + destination_width, ... .
+/// Mono therefore gets the mean of ALL channels, (L + R) / 2 for stereo. This is an ordinal,
+/// layout-agnostic fold, not a speaker-aware surround matrix: six channels into stereo become
+/// (0 + 2 + 4) / 3 and (1 + 3 + 5) / 3, including LFE if present. Nothing is discarded.
+/// Equal widths map directly; narrower sources retain cyclic duplication (mono to both sides).
 fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
@@ -2657,8 +2663,10 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
     let i1 = usize::try_from(isect.end - pos).unwrap_or(0).min(frames);
     // Gain is evaluated every 32 samples and interpolated (fades and envelopes stay smooth).
     const STEP: usize = 32;
+    let ndst = buf.len();
     for (ch, dst) in buf.iter_mut().enumerate() {
         let src = audio.buffer.channels.get(ch % nsrc).map(Vec::as_slice).unwrap_or(&[]);
+        let contributors = if nsrc > ndst { (nsrc - 1 - ch) / ndst + 1 } else { 1 };
         let mut i = i0;
         while i < i1 {
             let seg_end = (i + STEP).min(i1);
@@ -2671,15 +2679,22 @@ fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut 
             let n = (seg_end - i).saturating_sub(1).max(1) as f32;
             for k in i..seg_end {
                 let rel = pos.saturating_add(k as i64).saturating_sub(clip.start);
-                let v = if (stretch - 1.0).abs() < 1e-9 {
-                    usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                let sample = |src: &[f32]| {
+                    if (stretch - 1.0).abs() < 1e-9 {
+                        usize::try_from(offset.saturating_add(rel)).ok().and_then(|x| src.get(x)).copied().unwrap_or(0.0)
+                    } else {
+                        let f = offset as f64 + rel as f64 / stretch;
+                        let x0 = f.floor();
+                        let fr = (f - x0) as f32;
+                        let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
+                        let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
+                        a + (b - a) * fr
+                    }
+                };
+                let v = if nsrc > ndst {
+                    audio.buffer.channels.iter().skip(ch).step_by(ndst).map(|src| sample(src)).sum::<f32>() / contributors as f32
                 } else {
-                    let f = offset as f64 + rel as f64 / stretch;
-                    let x0 = f.floor();
-                    let fr = (f - x0) as f32;
-                    let a = if x0 >= 0.0 { src.get(x0 as usize).copied().unwrap_or(0.0) } else { 0.0 };
-                    let b = if x0 + 1.0 >= 0.0 { src.get((x0 as usize).saturating_add(1)).copied().unwrap_or(0.0) } else { 0.0 };
-                    a + (b - a) * fr
+                    sample(src)
                 };
                 let t = (k - i) as f32 / n;
                 if let Some(d) = dst.get_mut(k) {
