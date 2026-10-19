@@ -1499,12 +1499,12 @@ fn wheel(app: &mut StudioApp, ui: &Ui, map: &Map, body: Rect) {
         }
         return;
     }
-    let (dx, dy) = if mods.shift && delta.x.abs() < 0.1 { (delta.y, 0.0) } else { (delta.x, delta.y) };
-    if dx.abs() > 0.1 {
-        app.keys.scroll -= f64::from(dx) / map.ppt;
+    // Shift+vertical arrives as a horizontal delta already (see `arrange::wheel_pan`).
+    if delta.x.abs() > 0.1 {
+        app.keys.scroll -= crate::arrange::wheel_pan(ui, delta.x) * f64::from(body.max.x - map.gx0) / map.ppt;
     }
-    if dy.abs() > 0.1 {
-        app.keys.top += dy / map.kh;
+    if delta.y.abs() > 0.1 {
+        app.keys.top += delta.y / map.kh;
     }
 }
 

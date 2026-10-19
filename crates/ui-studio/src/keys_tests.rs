@@ -581,3 +581,90 @@ fn ctrl_t_adds_an_audio_track_and_ctrl_shift_t_an_instrument_track_and_neither_s
     t.key("E", json!({"cmd": true}));
     assert_eq!(track_order(&t).len(), n + 2, "Ctrl+E still splits only");
 }
+
+// ---- Shift+wheel and horizontal-wheel panning (arrangement and piano roll) ----
+
+/// Fraction of the visible width one wheel notch pans.
+const NOTCH: f64 = 0.10;
+
+impl T {
+    fn notch(&mut self, at: (f32, f32), extra: Value) {
+        // A real keyboard reports Shift as held, which synthetic wheel events alone do not.
+        let shift = extra.get("shift").and_then(Value::as_bool).unwrap_or(false);
+        if shift {
+            self.app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        }
+        self.input("ui.scroll", merged(json!({"x": at.0, "y": at.1, "unit": "line", "steps": 1}), extra));
+        if shift {
+            self.app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            self.frames(2);
+        }
+    }
+}
+
+fn arrange_view(t: &T) -> (f64, f64) {
+    let l = &t.app.arrange.layout;
+    (l.scroll as f64, f64::from(l.timeline[2] - l.timeline[0]) * l.samples_per_px)
+}
+
+fn pan_cases(mut scroll: impl FnMut(&mut T, Value) -> (f64, f64)) {
+    // (extra wheel params, direction sign): wheel down and a right tilt move later in time.
+    let cases =
+        [(json!({"dy": -1, "shift": true}), 1.0), (json!({"dy": 1, "shift": true}), -1.0), (json!({"dx": -1}), 1.0), (json!({"dx": 1}), -1.0)];
+    for ppp in [1.0f32, 1.5] {
+        for (i, (extra, sign)) in cases.iter().enumerate() {
+            let mut t = T::open();
+            t.ctx.set_pixels_per_point(ppp);
+            let (moved, visible) = scroll(&mut t, extra.clone());
+            let want = sign * NOTCH * visible;
+            assert!((moved - want).abs() <= 0.02 * visible, "case {i} ppp {ppp}: moved {moved}, want {want} (visible {visible})");
+        }
+    }
+}
+
+#[test]
+fn shift_wheel_and_a_horizontal_wheel_pan_the_arrangement_a_tenth_of_the_view_per_notch_at_any_zoom() {
+    for spp in [100.0, 1500.0] {
+        pan_cases(|t, extra| {
+            t.app.run("view.zoom_set", json!({"samples_per_px": spp})).unwrap();
+            t.app.run("view.scroll", json!({"to": 4_000_000})).unwrap();
+            t.frames(3);
+            let (s0, visible) = arrange_view(t);
+            let l = &t.app.arrange.layout;
+            let at = ((l.timeline[0] + l.timeline[2]) / 2.0, (l.timeline[1] + l.timeline[3]) / 2.0);
+            t.notch(at, extra);
+            (arrange_view(t).0 - s0, visible)
+        });
+    }
+}
+
+#[test]
+fn shift_wheel_and_a_horizontal_wheel_pan_the_piano_roll_a_tenth_of_the_view_per_notch_at_any_zoom() {
+    for ppq in [60.0f32, 240.0] {
+        pan_cases(|t, extra| {
+            t.app.ui.keys.px_per_quarter = ppq;
+            t.app.keys.scroll = 5000.0;
+            t.frames(3);
+            let g = t.app.keys.layout.grid;
+            let visible = f64::from(g[2] - g[0]) / t.app.keys.layout.px_per_tick;
+            let s0 = t.app.keys.scroll;
+            t.notch(mid(g), extra);
+            (t.app.keys.scroll - s0, visible)
+        });
+    }
+}
+
+#[test]
+fn the_plain_wheel_still_scrolls_rows_and_pitches_and_never_time() {
+    let mut t = T::open();
+    let g = mid(t.app.keys.layout.grid);
+    let (s0, top) = (t.app.keys.scroll, t.app.keys.layout.top_pitch);
+    t.notch(g, json!({"dy": 1}));
+    assert_eq!(t.app.keys.scroll, s0, "plain wheel does not pan time");
+    assert!(t.app.keys.layout.top_pitch != top, "plain wheel scrolls pitches");
+    let sc = t.app.arrange.layout.scroll;
+    let l = &t.app.arrange.layout;
+    let at = ((l.timeline[0] + l.timeline[2]) / 2.0, l.timeline[1] + 5.0);
+    t.notch(at, json!({"dy": -1}));
+    assert_eq!(t.app.arrange.layout.scroll, sc, "plain wheel does not pan the arrangement");
+}

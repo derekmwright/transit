@@ -904,23 +904,38 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
     }
 }
 
+/// Fraction of the visible width one wheel notch pans.
+const PAN_PER_NOTCH: f64 = 0.10;
+
+/// A horizontal wheel delta in points as a fraction of the visible width (positive: content moves
+/// right, so the view moves earlier). A notch is `line_scroll_speed` points, so the pan does not
+/// depend on zoom or on `pixels_per_point`. egui's wheel state already folds Shift+vertical into
+/// `x` (`egui::input_state::wheel_state::on_wheel_event`: `delta = vec2(delta.x + delta.y, 0.0)`),
+/// so callers must not test Shift and read `y` themselves.
+pub(crate) fn wheel_pan(ui: &Ui, dx: f32) -> f64 {
+    let notch = ui.ctx().options(|o| o.input_options.line_scroll_speed).max(1.0);
+    f64::from(dx / notch) * PAN_PER_NOTCH
+}
+
 /// Wheel scrolls the rows, Shift+wheel or a sideways swipe scrolls time, Ctrl+wheel or a pinch zooms.
 fn scroll_and_zoom(app: &mut StudioApp, ui: &Ui, map: Map, full: Rect, tl: Rect, content_h: f32) {
     let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
     if !full.contains(pos) {
         return;
     }
-    let (delta, zoom, shift) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers.shift));
+    let (delta, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
     if (zoom - 1.0).abs() > 1e-4 {
         let _ = app.engine.execute("view.zoom_by", &json!({"factor": zoom, "x": (pos.x - tl.min.x).max(0.0)}));
         return;
     }
-    let (dx, dy) = if shift { (delta.y, 0.0) } else { (delta.x, delta.y) };
-    if dx.abs() > 0.1 {
-        let _ = app.engine.execute("view.scroll", &json!({"by_px": -dx}));
+    // egui has already turned Shift+vertical wheel into a horizontal delta (see `wheel_pan`), so
+    // time pans on `delta.x` alone, whether it came from Shift, a tilt wheel or a swipe.
+    if delta.x.abs() > 0.1 {
+        let by_px = -wheel_pan(ui, delta.x) * f64::from(tl.width());
+        let _ = app.engine.execute("view.scroll", &json!({"by_px": by_px}));
     }
-    if dy.abs() > 0.1 {
-        app.arrange.vscroll = (app.arrange.vscroll - dy).clamp(0.0, (content_h - tl.height()).max(0.0));
+    if delta.y.abs() > 0.1 {
+        app.arrange.vscroll = (app.arrange.vscroll - delta.y).clamp(0.0, (content_h - tl.height()).max(0.0));
     }
     let _ = map;
 }
