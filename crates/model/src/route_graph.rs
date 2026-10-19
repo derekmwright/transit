@@ -13,12 +13,12 @@
 //! Routes to a bus that does not exist, to hardware, or to nothing are not edges (the mix drops
 //! them). An audio track's bus input is not an edge either: audio tracks hear hardware input only.
 //!
-//! Commands use [`would_create_cycle`] to refuse a route that closes a loop (L22). The mix uses
-//! [`RouteGraph::layering`] for its render order and delay compensation (F05): a session loaded
-//! from an older file can still hold a loop, so `layering` breaks every loop deterministically
-//! and reports the edges it cut.
+//! Commands use [`would_create_cycle`] and [`new_cycle`] to refuse an edit that closes a loop
+//! (L22). The mix renders in [`RouteScratch::order`] and drops exactly [`RouteScratch::dropped`]
+//! (F05): a session loaded from an older file can still hold a loop, and every loop is broken
+//! deterministically, in time linear in the graph per round of cuts.
 
-use crate::{Route, Session, Track, TrackId, TrackKind};
+use crate::{BusId, Route, Session, Track, TrackId, TrackKind};
 
 /// A node of the routing graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -32,7 +32,7 @@ pub enum RouteNode {
 }
 
 /// What an edge of the routing graph is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EdgeKind {
     /// The track's main output.
     Output,
@@ -102,9 +102,10 @@ pub struct Layering {
     /// nothing feeds). Every edge that is not cut goes from a smaller depth to a larger one, so
     /// ordering tracks by (depth, index) renders every producer before its consumers.
     pub depth: Vec<usize>,
-    /// The edges cut to break loops, in the order they were cut. Empty for an acyclic session.
+    /// The edges cut to break loops, in edge order: exactly the edges the mix drops (each writes
+    /// a bus that a track earlier in the render order already read). Empty for an acyclic session.
     pub cut: Vec<RouteEdge>,
-    /// The loop each cut broke (same order as `cut`).
+    /// For each cut edge (same order), a loop it closed.
     pub loops: Vec<RouteCycle>,
 }
 
@@ -118,14 +119,6 @@ impl Layering {
     }
 }
 
-/// The routing graph of one session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteGraph {
-    ids: Vec<TrackId>,
-    busses: usize,
-    edges: Vec<RouteEdge>,
-}
-
 /// Whether a track of this kind is on the graph.
 fn on_graph(t: &Track) -> bool {
     !matches!(t.kind, TrackKind::Master | TrackKind::Vca)
@@ -134,6 +127,443 @@ fn on_graph(t: &Track) -> bool {
 /// Whether a track of this kind reads its input bus.
 fn reads_bus(t: &Track) -> bool {
     matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
+}
+
+const NONE: usize = usize::MAX;
+
+/// Working storage for the routing graph of a session: the edges, the loop cuts, the render
+/// order and the dropped edges. Reuse one across sessions: after [`RouteScratch::reserve`] for a
+/// session, [`RouteScratch::layer`] of that session (or of any with no more tracks, busses and
+/// send slots) allocates nothing, so the mix can re-order on the audio thread.
+///
+/// Loops are broken in rounds: each round finds the strongly connected components (Tarjan,
+/// linear in the graph); in every component with a loop, the edges inside it that write the
+/// bus its first track (lowest index) reads are cut, so that aux keeps every source from outside
+/// the loop and loses only feedback. A session without loops takes one round; loops nested
+/// inside one another take one more round per level.
+#[derive(Debug, Clone, Default)]
+pub struct RouteScratch {
+    tracks: usize,
+    busses: usize,
+    /// Sorted (id, index): bus lookup without hashing.
+    bus_ids: Vec<(BusId, usize)>,
+    edges: Vec<RouteEdge>,
+    from: Vec<usize>,
+    to: Vec<usize>,
+    /// Out-edges by node (compressed rows): `adj[off[v]..off[v + 1]]`.
+    off: Vec<usize>,
+    adj: Vec<usize>,
+    cut: Vec<bool>,
+    index: Vec<usize>,
+    low: Vec<usize>,
+    on: Vec<bool>,
+    stack: Vec<usize>,
+    call: Vec<(usize, usize)>,
+    comp: Vec<usize>,
+    /// Per component: its lowest track index when it holds a loop, else `NONE`.
+    comp_min: Vec<usize>,
+    /// Per track: the bus node it reads, or `NONE`.
+    input: Vec<usize>,
+    indeg: Vec<usize>,
+    queue: Vec<usize>,
+    depth: Vec<usize>,
+    order: Vec<usize>,
+    pos: Vec<usize>,
+    /// Per bus: the render position of its first reader, or `NONE`.
+    reader: Vec<usize>,
+    dropped: Vec<usize>,
+}
+
+/// The node a route reaches: a bus (first one with that id) or the main mix.
+fn route_node(bus_ids: &[(BusId, usize)], r: &Route) -> Option<RouteNode> {
+    match r {
+        Route::Bus(b) => {
+            let i = bus_ids.partition_point(|(id, _)| id < b);
+            bus_ids.get(i).filter(|(id, _)| id == b).map(|(_, k)| RouteNode::Bus(*k))
+        }
+        Route::Main => Some(RouteNode::Main),
+        _ => None,
+    }
+}
+
+/// Grows `v` to hold `n` without reallocating later.
+fn hold<T>(v: &mut Vec<T>, n: usize) {
+    v.clear();
+    v.reserve(n);
+}
+
+impl RouteScratch {
+    /// Empty storage.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Makes room for `s`'s graph (allocates when it is larger than any seen before).
+    pub fn reserve(&mut self, s: &Session) {
+        let n = s.tracks.len() + s.busses.len() + 1;
+        let e: usize = s.tracks.iter().map(|t| t.mixer.sends.len().saturating_add(2)).sum();
+        hold(&mut self.bus_ids, s.busses.len());
+        hold(&mut self.edges, e);
+        hold(&mut self.from, e);
+        hold(&mut self.to, e);
+        hold(&mut self.off, n + 1);
+        hold(&mut self.adj, e);
+        hold(&mut self.cut, e);
+        for v in
+            [&mut self.index, &mut self.low, &mut self.comp, &mut self.comp_min, &mut self.indeg, &mut self.queue, &mut self.depth, &mut self.stack]
+        {
+            hold(v, n);
+        }
+        hold(&mut self.on, n);
+        hold(&mut self.call, n);
+        hold(&mut self.input, s.tracks.len());
+        hold(&mut self.order, s.tracks.len());
+        hold(&mut self.pos, s.tracks.len());
+        hold(&mut self.reader, s.busses.len());
+        hold(&mut self.dropped, e);
+    }
+
+    /// Builds and solves the graph of `s`: loop cuts, depths, render order, dropped edges.
+    pub fn layer(&mut self, s: &Session) {
+        self.load(s, &[]);
+        self.solve();
+    }
+
+    /// The graph `s` would have after `changes` (applied in order; a later change to the same
+    /// route wins). Changes naming a missing track or send slot are ignored.
+    fn load(&mut self, s: &Session, changes: &[RouteChange]) {
+        self.tracks = s.tracks.len();
+        self.busses = s.busses.len();
+        self.bus_ids.clear();
+        self.bus_ids.extend(s.busses.iter().enumerate().map(|(i, b)| (b.id, i)));
+        self.bus_ids.sort_unstable();
+        self.edges.clear();
+        for (i, t) in s.tracks.iter().enumerate().filter(|(_, t)| on_graph(t)) {
+            let mut output = &t.mixer.output;
+            let mut input = &t.mixer.input;
+            for c in changes.iter().filter(|c| c.track() == t.id) {
+                match c {
+                    RouteChange::Output { route, .. } => output = route,
+                    RouteChange::Input { route, .. } => input = route,
+                    RouteChange::Send { .. } => {}
+                }
+            }
+            if reads_bus(t)
+                && let Route::Bus(_) = input
+                && let Some(from) = route_node(&self.bus_ids, input)
+            {
+                self.edges.push(RouteEdge { from, to: RouteNode::Track(i), kind: EdgeKind::Input });
+            }
+            if let Some(to) = route_node(&self.bus_ids, output) {
+                self.edges.push(RouteEdge { from: RouteNode::Track(i), to, kind: EdgeKind::Output });
+            }
+            for (slot, snd) in t.mixer.sends.iter().enumerate() {
+                let mut target = snd.as_ref().map(|x| &x.target);
+                for c in changes {
+                    if let RouteChange::Send { track, slot: k, route } = c
+                        && *track == t.id
+                        && *k == slot
+                    {
+                        target = Some(route);
+                    }
+                }
+                let Some(target @ Route::Bus(_)) = target else { continue };
+                let Some(to) = route_node(&self.bus_ids, target) else { continue };
+                let pre_fader = snd.as_ref().is_some_and(|x| x.pre_fader);
+                self.edges.push(RouteEdge { from: RouteNode::Track(i), to, kind: EdgeKind::Send { slot, pre_fader } });
+            }
+        }
+    }
+
+    fn nodes(&self) -> usize {
+        self.tracks + self.busses + 1
+    }
+
+    /// Adjacency (compressed rows) and per-track inputs of the loaded edges.
+    fn index_edges(&mut self) {
+        let n = self.nodes();
+        let (tracks, busses) = (self.tracks, self.busses);
+        let node = |x: RouteNode| match x {
+            RouteNode::Track(i) => i,
+            RouteNode::Bus(b) => tracks + b,
+            RouteNode::Main => tracks + busses,
+        };
+        self.from.clear();
+        self.to.clear();
+        self.from.extend(self.edges.iter().map(|e| node(e.from)));
+        self.to.extend(self.edges.iter().map(|e| node(e.to)));
+        self.off.clear();
+        self.off.resize(n + 1, 0);
+        for &f in &self.from {
+            if let Some(x) = self.off.get_mut(f + 1) {
+                *x += 1;
+            }
+        }
+        for v in 0..n {
+            let prev = self.off[v];
+            self.off[v + 1] += prev;
+        }
+        self.adj.clear();
+        self.adj.resize(self.edges.len(), 0);
+        // `indeg` as the fill cursor per node.
+        self.indeg.clear();
+        self.indeg.extend_from_slice(&self.off[..n]);
+        for (e, &f) in self.from.iter().enumerate() {
+            let at = self.indeg[f];
+            self.adj[at] = e;
+            self.indeg[f] += 1;
+        }
+        self.input.clear();
+        self.input.resize(self.tracks, NONE);
+        for (e, edge) in self.edges.iter().enumerate() {
+            if let (EdgeKind::Input, RouteNode::Track(t)) = (edge.kind, edge.to) {
+                self.input[t] = self.from[e];
+            }
+        }
+    }
+
+    /// Strongly connected components over the edges not cut. Fills `comp` and `comp_min`.
+    fn components(&mut self) {
+        let n = self.nodes();
+        self.index.clear();
+        self.index.resize(n, NONE);
+        self.low.clear();
+        self.low.resize(n, 0);
+        self.on.clear();
+        self.on.resize(n, false);
+        self.comp.clear();
+        self.comp.resize(n, NONE);
+        self.comp_min.clear();
+        self.stack.clear();
+        self.call.clear();
+        let mut counter = 0usize;
+        for root in 0..n {
+            if self.index[root] != NONE {
+                continue;
+            }
+            self.index[root] = counter;
+            self.low[root] = counter;
+            counter += 1;
+            self.stack.push(root);
+            self.on[root] = true;
+            self.call.push((root, self.off[root]));
+            while let Some(&(v, i)) = self.call.last() {
+                if i < self.off[v + 1] {
+                    if let Some(top) = self.call.last_mut() {
+                        top.1 += 1;
+                    }
+                    let e = self.adj[i];
+                    if self.cut[e] {
+                        continue;
+                    }
+                    let w = self.to[e];
+                    if self.index[w] == NONE {
+                        self.index[w] = counter;
+                        self.low[w] = counter;
+                        counter += 1;
+                        self.stack.push(w);
+                        self.on[w] = true;
+                        self.call.push((w, self.off[w]));
+                    } else if self.on[w] {
+                        self.low[v] = self.low[v].min(self.index[w]);
+                    }
+                } else {
+                    self.call.pop();
+                    if let Some(&(p, _)) = self.call.last() {
+                        self.low[p] = self.low[p].min(self.low[v]);
+                    }
+                    if self.low[v] == self.index[v] {
+                        let c = self.comp_min.len();
+                        let (mut size, mut first) = (0usize, NONE);
+                        while let Some(w) = self.stack.pop() {
+                            self.on[w] = false;
+                            self.comp[w] = c;
+                            size += 1;
+                            if w < self.tracks {
+                                first = first.min(w);
+                            }
+                            if w == v {
+                                break;
+                            }
+                        }
+                        self.comp_min.push(if size > 1 { first } else { NONE });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cuts loops, then layers, orders and finds the dropped edges.
+    fn solve(&mut self) {
+        self.index_edges();
+        self.cut.clear();
+        self.cut.resize(self.edges.len(), false);
+        loop {
+            self.components();
+            let mut any = false;
+            for e in 0..self.edges.len() {
+                let (u, v) = (self.from[e], self.to[e]);
+                if self.cut[e] || self.comp[u] != self.comp[v] {
+                    continue;
+                }
+                let first = self.comp_min[self.comp[u]];
+                if first != NONE && self.input[first] == v {
+                    self.cut[e] = true;
+                    any = true;
+                }
+            }
+            if !any {
+                break;
+            }
+        }
+        // Depths: longest chain of tracks, in topological order of the edges not cut.
+        let n = self.nodes();
+        self.indeg.clear();
+        self.indeg.resize(n, 0);
+        for e in 0..self.edges.len() {
+            if !self.cut[e] {
+                self.indeg[self.to[e]] += 1;
+            }
+        }
+        self.depth.clear();
+        self.depth.resize(n, 0);
+        self.queue.clear();
+        self.queue.extend((0..n).filter(|&v| self.indeg[v] == 0));
+        let mut head = 0;
+        while let Some(&v) = self.queue.get(head) {
+            head += 1;
+            for i in self.off[v]..self.off[v + 1] {
+                let e = self.adj[i];
+                if self.cut[e] {
+                    continue;
+                }
+                let w = self.to[e];
+                let d = self.depth[v] + usize::from(w < self.tracks);
+                self.depth[w] = self.depth[w].max(d);
+                self.indeg[w] -= 1;
+                if self.indeg[w] == 0 {
+                    self.queue.push(w);
+                }
+            }
+        }
+        self.order.clear();
+        self.order.extend(0..self.tracks);
+        let depth = &self.depth;
+        self.order.sort_unstable_by_key(|&i| (depth[i], i));
+        self.pos.clear();
+        self.pos.resize(self.tracks, 0);
+        for (k, &t) in self.order.iter().enumerate() {
+            self.pos[t] = k;
+        }
+        self.reader.clear();
+        self.reader.resize(self.busses, NONE);
+        for t in 0..self.tracks {
+            let b = self.input[t];
+            if b != NONE {
+                let r = &mut self.reader[b - self.tracks];
+                *r = (*r).min(self.pos[t]);
+            }
+        }
+        // The edges the mix drops: a track writing a bus that a track before it already read.
+        self.dropped.clear();
+        for e in 0..self.edges.len() {
+            let (u, v) = (self.from[e], self.to[e]);
+            if u < self.tracks && v >= self.tracks && v < self.tracks + self.busses && self.pos[u] >= self.reader[v - self.tracks] {
+                self.dropped.push(e);
+            }
+        }
+    }
+
+    /// Track indices in render order: by depth, then track index.
+    #[must_use]
+    pub fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// The depth of a track (see [`Layering::depth`]).
+    #[must_use]
+    pub fn depth(&self, track: usize) -> usize {
+        self.depth.get(track).copied().unwrap_or(0)
+    }
+
+    /// Every edge.
+    #[must_use]
+    pub fn edges(&self) -> &[RouteEdge] {
+        &self.edges
+    }
+
+    /// The edges the render drops (loop feedback), in edge order.
+    pub fn dropped(&self) -> impl Iterator<Item = &RouteEdge> {
+        self.dropped.iter().filter_map(|&e| self.edges.get(e))
+    }
+
+    /// Whether any edge is dropped (the session holds a loop).
+    #[must_use]
+    pub fn has_loops(&self) -> bool {
+        !self.dropped.is_empty()
+    }
+
+    /// The index of bus `id` in the session (the first with that id).
+    #[must_use]
+    pub fn bus_slot(&self, id: BusId) -> Option<usize> {
+        match route_node(&self.bus_ids, &Route::Bus(id)) {
+            Some(RouteNode::Bus(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// A path of edges from node `from` to node `to`, breadth first, inside `from`'s component of
+    /// the uncut graph when `within` is given. Allocates (diagnostics and commands only).
+    fn path(&self, from: usize, to: usize, within: Option<&[usize]>) -> Option<Vec<usize>> {
+        let n = self.nodes();
+        let mut via: Vec<usize> = vec![NONE; n];
+        let mut seen = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        seen[from] = true;
+        queue.push_back(from);
+        let same = |w: usize| within.is_none_or(|c| c.get(w) == c.get(from));
+        while let Some(at) = queue.pop_front() {
+            if at == to {
+                let mut out = Vec::new();
+                let mut cur = to;
+                while cur != from {
+                    let e = via[cur];
+                    if e == NONE {
+                        break;
+                    }
+                    out.push(e);
+                    cur = self.from[e];
+                }
+                out.reverse();
+                return Some(out);
+            }
+            for i in self.off[at]..self.off[at + 1] {
+                let e = self.adj[i];
+                let w = self.to[e];
+                if !seen[w] && same(w) {
+                    seen[w] = true;
+                    via[w] = e;
+                    queue.push_back(w);
+                }
+            }
+        }
+        None
+    }
+
+    /// A loop closed by edge `e`, as its edges in signal order starting with `e`.
+    fn loop_through(&self, e: usize, within: Option<&[usize]>) -> Option<Vec<usize>> {
+        let mut edges = self.path(self.to[e], self.from[e], within)?;
+        edges.insert(0, e);
+        Some(edges)
+    }
+}
+
+/// The routing graph of one session.
+#[derive(Debug, Clone)]
+pub struct RouteGraph {
+    ids: Vec<TrackId>,
+    scratch: RouteScratch,
 }
 
 impl RouteGraph {
@@ -147,271 +577,71 @@ impl RouteGraph {
     /// route wins). Changes naming a missing track or send slot are ignored.
     #[must_use]
     pub fn with_changes(s: &Session, changes: &[RouteChange]) -> Self {
-        let bus = |r: &Route| match r {
-            Route::Bus(b) => s.busses.iter().position(|x| x.id == *b).map(RouteNode::Bus),
-            Route::Main => Some(RouteNode::Main),
-            _ => None,
-        };
-        let mut edges = Vec::new();
-        for (i, t) in s.tracks.iter().enumerate().filter(|(_, t)| on_graph(t)) {
-            let mut output = &t.mixer.output;
-            let mut input = &t.mixer.input;
-            let mut sends: Vec<Option<&Route>> = t.mixer.sends.iter().map(|x| x.as_ref().map(|x| &x.target)).collect();
-            for c in changes.iter().filter(|c| c.track() == t.id) {
-                match c {
-                    RouteChange::Output { route, .. } => output = route,
-                    RouteChange::Input { route, .. } => input = route,
-                    RouteChange::Send { slot, route, .. } => {
-                        if let Some(x) = sends.get_mut(*slot) {
-                            *x = Some(route);
-                        }
-                    }
-                }
-            }
-            if reads_bus(t)
-                && let Route::Bus(_) = input
-                && let Some(from) = bus(input)
-            {
-                edges.push(RouteEdge { from, to: RouteNode::Track(i), kind: EdgeKind::Input });
-            }
-            if let Some(to) = bus(output) {
-                edges.push(RouteEdge { from: RouteNode::Track(i), to, kind: EdgeKind::Output });
-            }
-            for (slot, target) in sends.iter().enumerate() {
-                let Some(target @ Route::Bus(_)) = target else { continue };
-                let Some(to) = bus(target) else { continue };
-                let pre_fader = t.mixer.sends.get(slot).and_then(Option::as_ref).is_some_and(|x| x.pre_fader);
-                edges.push(RouteEdge { from: RouteNode::Track(i), to, kind: EdgeKind::Send { slot, pre_fader } });
-            }
-        }
-        RouteGraph { ids: s.tracks.iter().map(|t| t.id).collect(), busses: s.busses.len(), edges }
+        let mut scratch = RouteScratch::new();
+        scratch.reserve(s);
+        scratch.load(s, changes);
+        scratch.solve();
+        RouteGraph { ids: s.tracks.iter().map(|t| t.id).collect(), scratch }
     }
 
-    /// Every edge, grouped by source track in track order (inputs first, then output, then sends).
+    /// Every edge, grouped by source track in track order (input first, then output, then sends).
     #[must_use]
     pub fn edges(&self) -> &[RouteEdge] {
-        &self.edges
+        &self.scratch.edges
     }
 
-    fn node_count(&self) -> usize {
-        self.ids.len() + self.busses + 1
-    }
-
-    fn index(&self, n: RouteNode) -> usize {
-        match n {
-            RouteNode::Track(i) => i,
-            RouteNode::Bus(b) => self.ids.len() + b,
-            RouteNode::Main => self.ids.len() + self.busses,
-        }
-    }
-
-    fn track_id(&self, n: RouteNode) -> Option<TrackId> {
-        match n {
-            RouteNode::Track(i) => self.ids.get(i).copied(),
-            _ => None,
-        }
-    }
-
-    /// A path from `from` to `to` over the edges not in `skip` (breadth first, so the shortest),
-    /// as the edges taken. `None` when `to` is unreachable.
-    fn path(&self, from: RouteNode, to: RouteNode, skip: &[bool]) -> Option<Vec<usize>> {
-        let n = self.node_count();
-        let mut via: Vec<Option<usize>> = vec![None; n];
-        let mut seen = vec![false; n];
-        let mut queue = std::collections::VecDeque::new();
-        seen[self.index(from)] = true;
-        queue.push_back(from);
-        while let Some(at) = queue.pop_front() {
-            if at == to {
-                let mut out = Vec::new();
-                let mut cur = to;
-                while cur != from {
-                    let Some(e) = via[self.index(cur)] else { break };
-                    out.push(e);
-                    cur = self.edges[e].from;
-                }
-                out.reverse();
-                return Some(out);
-            }
-            for (k, e) in self.edges.iter().enumerate() {
-                if e.from != at || skip.get(k).copied().unwrap_or(false) {
-                    continue;
-                }
-                let j = self.index(e.to);
-                if !seen[j] {
-                    seen[j] = true;
-                    via[j] = Some(k);
-                    queue.push_back(e.to);
-                }
-            }
-        }
-        None
-    }
-
-    /// The tracks on a loop of edges, in signal order.
-    fn loop_tracks(&self, edges: &[usize]) -> Vec<TrackId> {
-        edges.iter().filter_map(|&e| self.track_id(self.edges[e].from)).collect()
-    }
-
-    /// A loop closed by edge `e`, as the loop's edges starting with `e`.
-    fn loop_through(&self, e: usize, skip: &[bool]) -> Option<Vec<usize>> {
-        let edge = self.edges.get(e)?;
-        if edge.from == edge.to {
-            return Some(vec![e]);
-        }
-        let mut rest = self.path(edge.to, edge.from, skip)?;
-        rest.insert(0, e);
-        Some(rest)
+    fn tracks_of(&self, edges: &[usize]) -> Vec<TrackId> {
+        edges
+            .iter()
+            .filter_map(|&e| match self.scratch.edges.get(e).map(|x| x.from) {
+                Some(RouteNode::Track(i)) => self.ids.get(i).copied(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Some loop in the graph, if there is one: the tracks on it in signal order.
     #[must_use]
     pub fn find_cycle(&self) -> Option<RouteCycle> {
-        let l = self.layering();
-        l.loops.into_iter().next()
+        let e = *self.scratch.dropped.first()?;
+        self.cycle_through(e)
+    }
+
+    fn cycle_through(&self, e: usize) -> Option<RouteCycle> {
+        // The loop lies inside the component of the graph with no cuts: compute it once here.
+        let mut whole = self.scratch.clone();
+        whole.cut.iter_mut().for_each(|c| *c = false);
+        whole.components();
+        let edges = whole.loop_through(e, Some(&whole.comp))?;
+        Some(RouteCycle { tracks: self.tracks_of(&edges) })
     }
 
     /// Track indices in render order when the graph is acyclic, else the first loop found.
     pub fn topological_order(&self) -> Result<Vec<usize>, RouteCycle> {
-        let l = self.layering();
-        match l.loops.first() {
-            Some(c) => Err(c.clone()),
-            None => Ok(l.order()),
+        match self.find_cycle() {
+            Some(c) => Err(c),
+            None => Ok(self.scratch.order.clone()),
         }
     }
 
-    /// Breaks every loop and layers the tracks.
-    ///
-    /// Loops are broken deterministically: Kahn's algorithm takes every node it can; the nodes
-    /// left over all sit on or behind a loop. From the leftover node of the lowest index, walking
-    /// back along each node's first leftover input edge reaches a loop. On that loop, the edge cut
-    /// is the one that writes into the bus the loop's first track (lowest track index) reads:
-    /// that aux keeps every other source on its input, and only the feedback is lost. Repeat
-    /// until no node is left over.
+    /// Breaks every loop and layers the tracks (see [`RouteScratch`] for the rule). The cut set
+    /// is exactly what the mix drops.
     #[must_use]
     pub fn layering(&self) -> Layering {
-        let n = self.node_count();
-        let mut cut_mask = vec![false; self.edges.len()];
-        let mut cut = Vec::new();
-        let mut loops = Vec::new();
-        loop {
-            let (order, left) = self.kahn(&cut_mask);
-            if !left.iter().any(|l| *l) {
-                let mut depth = vec![0usize; self.ids.len()];
-                // Longest chain of tracks: a track's depth is one more than the deepest track
-                // feeding a bus it reads.
-                let mut node_depth = vec![0usize; n];
-                for &v in &order {
-                    for (k, e) in self.edges.iter().enumerate() {
-                        if cut_mask[k] || self.index(e.from) != v {
-                            continue;
-                        }
-                        let step = usize::from(matches!(e.to, RouteNode::Track(_)));
-                        let d = node_depth[v].saturating_add(step);
-                        let j = self.index(e.to);
-                        node_depth[j] = node_depth[j].max(d);
-                    }
-                }
-                for (i, d) in depth.iter_mut().enumerate() {
-                    *d = node_depth[i];
-                }
-                return Layering { depth, cut, loops };
-            }
-            let Some(edges) = self.leftover_loop(&left, &cut_mask) else {
-                // Unreachable for a finite graph: leftover nodes always contain a loop. Keep the
-                // order total anyway by cutting every leftover edge.
-                for (k, e) in self.edges.iter().enumerate() {
-                    if !cut_mask[k] && left[self.index(e.from)] && left[self.index(e.to)] {
-                        cut_mask[k] = true;
-                        cut.push(*e);
-                    }
-                }
-                continue;
-            };
-            let tracks = self.loop_tracks(&edges);
-            // The loop's first track (lowest index) and the edge writing into the bus it reads.
-            let first = edges
-                .iter()
-                .enumerate()
-                .filter_map(|(pos, &k)| match self.edges[k].to {
-                    RouteNode::Track(i) => Some((i, pos)),
-                    _ => None,
-                })
-                .min();
-            let victim = match first {
-                Some((_, pos)) => {
-                    // edges[pos] is bus → track; the edge before it writes into that bus.
-                    let before = (pos + edges.len() - 1) % edges.len();
-                    edges[before]
-                }
-                None => edges[0],
-            };
-            cut_mask[victim] = true;
-            cut.push(self.edges[victim]);
-            let start = self.track_id(self.edges[victim].from);
-            let mut tracks = tracks;
-            if let Some(start) = start
-                && let Some(p) = tracks.iter().position(|t| *t == start)
-            {
-                tracks.rotate_left(p);
-            }
-            loops.push(RouteCycle { tracks });
-        }
-    }
-
-    /// Kahn's algorithm over the edges not cut, taking ready nodes lowest index first. Returns the
-    /// order taken and, per node, whether it was left over.
-    fn kahn(&self, cut: &[bool]) -> (Vec<usize>, Vec<bool>) {
-        let n = self.node_count();
-        let mut indeg = vec![0usize; n];
-        for (k, e) in self.edges.iter().enumerate() {
-            if !cut[k] {
-                indeg[self.index(e.to)] += 1;
+        let sc = &self.scratch;
+        let depth = sc.depth.get(..sc.tracks).map(<[usize]>::to_vec).unwrap_or_default();
+        let cut: Vec<RouteEdge> = sc.dropped().copied().collect();
+        let mut loops = Vec::with_capacity(cut.len());
+        if !cut.is_empty() {
+            let mut whole = sc.clone();
+            whole.cut.iter_mut().for_each(|c| *c = false);
+            whole.components();
+            for &e in &sc.dropped {
+                let edges = whole.loop_through(e, Some(&whole.comp)).unwrap_or_else(|| vec![e]);
+                loops.push(RouteCycle { tracks: self.tracks_of(&edges) });
             }
         }
-        let mut ready: std::collections::BTreeSet<usize> = (0..n).filter(|&v| indeg[v] == 0).collect();
-        let mut order = Vec::with_capacity(n);
-        let mut done = vec![false; n];
-        while let Some(v) = ready.pop_first() {
-            order.push(v);
-            done[v] = true;
-            for (k, e) in self.edges.iter().enumerate() {
-                if cut[k] || self.index(e.from) != v {
-                    continue;
-                }
-                let j = self.index(e.to);
-                indeg[j] = indeg[j].saturating_sub(1);
-                if indeg[j] == 0 {
-                    ready.insert(j);
-                }
-            }
-        }
-        let left = done.iter().map(|d| !d).collect();
-        (order, left)
-    }
-
-    /// A loop among the leftover nodes, as its edges in signal order.
-    fn leftover_loop(&self, left: &[bool], cut: &[bool]) -> Option<Vec<usize>> {
-        let n = self.node_count();
-        let start = (0..n).find(|&v| left[v])?;
-        // Each leftover node's first leftover input edge.
-        let pred =
-            |v: usize| self.edges.iter().enumerate().find(|(k, e)| !cut[*k] && self.index(e.to) == v && left[self.index(e.from)]).map(|(k, _)| k);
-        let mut seen_at: Vec<Option<usize>> = vec![None; n];
-        let mut walk: Vec<usize> = Vec::new();
-        let mut v = start;
-        loop {
-            if let Some(at) = seen_at[v] {
-                // walk[at..] are the edges into the loop's nodes, walking backwards.
-                let mut edges: Vec<usize> = walk.get(at..)?.to_vec();
-                edges.reverse();
-                return Some(edges);
-            }
-            seen_at[v] = Some(walk.len());
-            let e = pred(v)?;
-            walk.push(e);
-            v = self.index(self.edges[e].from);
-        }
+        Layering { depth, cut, loops }
     }
 }
 
@@ -437,26 +667,83 @@ pub fn would_create_cycle(s: &Session, change: &RouteChange) -> Option<Vec<Track
 pub fn would_create_cycle_all(s: &Session, changes: &[RouteChange]) -> Option<Vec<TrackId>> {
     let before = RouteGraph::new(s);
     let after = RouteGraph::with_changes(s, changes);
-    let none = vec![false; after.edges.len()];
-    for (k, e) in after.edges.iter().enumerate() {
+    let changed: Vec<usize> = changes.iter().filter_map(|c| s.track_index(c.track())).collect();
+    let touches = |e: &RouteEdge| match (e.from, e.to) {
+        (RouteNode::Track(i), _) | (_, RouteNode::Track(i)) => changed.contains(&i),
+        _ => false,
+    };
+    let old: Vec<&RouteEdge> = before.edges().iter().filter(|e| touches(e)).collect();
+    for (k, e) in after.edges().iter().enumerate() {
         // Only edges the changes add can close a new loop.
-        if before.edges.contains(e) {
+        if !touches(e) || old.contains(&e) {
             continue;
         }
-        if let Some(edges) = after.loop_through(k, &none) {
-            let mut tracks = after.loop_tracks(&edges);
-            if tracks.is_empty() {
-                // The new edge is an input (bus → track): the loop starts at that track.
-                if let Some(t) = after.track_id(e.to) {
-                    tracks.push(t);
-                }
-            }
-            // Start at the changed track.
-            let changed: Vec<TrackId> = changes.iter().map(RouteChange::track).collect();
-            if let Some(p) = tracks.iter().position(|t| changed.contains(t)) {
+        if let Some(edges) = after.scratch.loop_through(k, None) {
+            let mut tracks = after.tracks_of(&edges);
+            let ids: Vec<TrackId> = changes.iter().map(RouteChange::track).collect();
+            if let Some(p) = tracks.iter().position(|t| ids.contains(t)) {
                 tracks.rotate_left(p);
             }
             return Some(tracks);
+        }
+    }
+    None
+}
+
+/// Whether two sessions route alike (same tracks, kinds, inputs, outputs, send targets and busses,
+/// in the same order): then no edit between them can have closed a loop. Allocates nothing.
+fn same_routing(a: &Session, b: &Session) -> bool {
+    a.tracks.len() == b.tracks.len()
+        && a.busses.len() == b.busses.len()
+        && a.busses.iter().zip(&b.busses).all(|(x, y)| x.id == y.id)
+        && a.tracks.iter().zip(&b.tracks).all(|(x, y)| {
+            x.id == y.id
+                && x.kind == y.kind
+                && x.mixer.input == y.mixer.input
+                && x.mixer.output == y.mixer.output
+                && x.mixer.sends.len() == y.mixer.sends.len()
+                && x.mixer.sends.iter().zip(&y.mixer.sends).all(|(p, q)| p.as_ref().map(|z| &z.target) == q.as_ref().map(|z| &z.target))
+        })
+}
+
+/// A node by identity (not index), to compare the graphs of two sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NodeKey {
+    Track(TrackId),
+    Bus(BusId),
+    Main,
+}
+
+fn edge_keys(s: &Session, g: &RouteGraph) -> Vec<(NodeKey, NodeKey, EdgeKind)> {
+    let key = |n: RouteNode| match n {
+        RouteNode::Track(i) => s.tracks.get(i).map_or(NodeKey::Main, |t| NodeKey::Track(t.id)),
+        RouteNode::Bus(i) => s.busses.get(i).map_or(NodeKey::Main, |b| NodeKey::Bus(b.id)),
+        RouteNode::Main => NodeKey::Main,
+    };
+    g.edges().iter().map(|e| (key(e.from), key(e.to), e.kind)).collect()
+}
+
+/// Whether `after` (an edit of `before`) holds a loop through an edge `before` did not have: the
+/// loop's tracks in signal order starting at that edge's track. Loops `before` already had (an
+/// older file) are not reported. Compares by track and bus identity, so edits that add, delete,
+/// reorder or import tracks and busses are covered.
+#[must_use]
+pub fn new_cycle(before: &Session, after: &Session) -> Option<Vec<TrackId>> {
+    if same_routing(before, after) {
+        return None;
+    }
+    let a = RouteGraph::new(after);
+    if !a.scratch.has_loops() {
+        return None;
+    }
+    let mut old = edge_keys(before, &RouteGraph::new(before));
+    old.sort_unstable();
+    for (k, key) in edge_keys(after, &a).into_iter().enumerate() {
+        if old.binary_search(&key).is_ok() {
+            continue;
+        }
+        if let Some(edges) = a.scratch.loop_through(k, None) {
+            return Some(a.tracks_of(&edges));
         }
     }
     None
@@ -578,5 +865,43 @@ mod tests {
         set_output(&mut s, a, Route::Bus(ab));
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("T"));
         assert!(would_create_cycle(&s, &RouteChange::Output { track: t, route: Route::Bus(ab) }).is_none());
+    }
+
+    /// 1,024 auxes, each feeding its own input (a self-loop) and sending to the one before.
+    fn self_looped(n: usize) -> Session {
+        let mut s = session();
+        let mut prev: Option<BusId> = None;
+        for i in 0..n {
+            let (a, b) = aux(&mut s, &format!("a{i}"));
+            set_output(&mut s, a, Route::Bus(b));
+            if let (Some(p), Some(t)) = (prev, s.track_mut(a)) {
+                for k in 0..4 {
+                    t.mixer.sends[k] = Some(SendSlot::new(Route::Bus(p)));
+                }
+            }
+            prev = Some(b);
+        }
+        s
+    }
+
+    #[test]
+    fn many_self_loops_are_each_cut_once() {
+        let s = self_looped(64);
+        let l = s.route_graph().layering();
+        assert_eq!(l.cut.len(), 64, "one feedback edge per aux");
+        assert!(l.cut.iter().all(|e| e.kind == EdgeKind::Output));
+    }
+
+    /// Release build: `cargo test -p soundcraft-model --release -- --ignored layering_is_fast`.
+    #[test]
+    #[ignore = "timing; run in release"]
+    fn layering_is_fast() {
+        let s = self_looped(1024);
+        let t0 = std::time::Instant::now();
+        let l = s.route_graph().layering();
+        let took = t0.elapsed();
+        println!("1024 self-looped auxes, 4 sends each: layering {took:?}, {} cuts", l.cut.len());
+        assert_eq!(l.cut.len(), 1024);
+        assert!(took < std::time::Duration::from_millis(20), "{took:?}");
     }
 }
