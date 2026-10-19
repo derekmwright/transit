@@ -196,6 +196,7 @@ pub struct Recorder {
     pub monitor: Arc<InputRing>,
     #[cfg(not(target_os = "freebsd"))]
     _stream: Option<cpal::Stream>,
+    clock: Option<crate::device_clock::ClockReader>,
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
@@ -213,7 +214,7 @@ fn build_input<T>(
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
     monitor: &Arc<InputRing>,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<(cpal::Stream, crate::device_clock::ClockReader), cpal::BuildStreamError>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
@@ -224,10 +225,14 @@ where
     let mon = Arc::clone(monitor);
     let mut scratch = vec![0.0f32; 8192 * usize::from(config.channels).max(1)];
     let chunk = scratch.len();
-    device.build_input_stream(
+    let channels = usize::from(config.channels).max(1);
+    let (mut clock, reader) = crate::device_clock::stream_clock(crate::device_clock::Direction::Input, config.sample_rate.0)
+        .map_err(|error| cpal::BackendSpecificError { description: error.into() })?;
+    let stream = device.build_input_stream(
         config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
+        move |data: &[T], info: &cpal::InputCallbackInfo| {
             crate::mark_audio_thread();
+            clock.cpal.input(data.len() / channels, info, clock.origin.now_ns());
             sh.guarded(|| {
                 // One admission covers the entire device callback, including scratch chunks.
                 let capture = sh.begin_capture();
@@ -252,7 +257,8 @@ where
             log::warn!("input stream error: {e}");
         },
         None,
-    )
+    )?;
+    Ok((stream, reader))
 }
 
 /// Whether an input config can be opened: some drivers report a default input with no channels,
@@ -370,13 +376,23 @@ impl Recorder {
         let ring = CaptureRing::new((config.sample_rate.0 as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
         let shared = Arc::new(Shared::new(ring));
         let monitor = InputRing::new(usize::from(config.channels), config.sample_rate.0);
-        let stream = match cfg.sample_format() {
+        let (stream, clock) = match cfg.sample_format() {
             cpal::SampleFormat::I32 => build_input::<i32>(device, &config, &shared, &monitor),
             cpal::SampleFormat::I16 => build_input::<i16>(device, &config, &shared, &monitor),
             _ => build_input::<f32>(device, &config, &shared, &monitor),
         }?;
         let seen = (0, Instant::now());
-        Ok(Recorder { monitor, shared, _stream: Some(stream), device_name: name, sample_rate: config.sample_rate.0, channels, writer: None, seen })
+        Ok(Recorder {
+            monitor,
+            shared,
+            _stream: Some(stream),
+            clock: Some(clock),
+            device_name: name,
+            sample_rate: config.sample_rate.0,
+            channels,
+            writer: None,
+            seen,
+        })
     }
 
     /// Start the input stream.
@@ -397,6 +413,7 @@ impl Recorder {
             monitor: InputRing::new(1, 48_000),
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
+            clock: None,
             device_name: name.into(),
             sample_rate: 48_000,
             channels: 1,
@@ -441,6 +458,7 @@ impl Recorder {
     /// Why the input can't go on, if it can't: the device went away or, while recording, stopped
     /// sending audio; its callback hit a bug; or writing a take failed (reported once).
     pub fn trouble(&mut self) -> Option<Trouble> {
+        let _ = self.clock_report();
         if let Some(e) = self.shared.failed.lock().unwrap_or_else(PoisonError::into_inner).take() {
             return Some(Trouble::Disk(e));
         }
@@ -461,6 +479,11 @@ impl Recorder {
     pub fn lost_ms(&self) -> u64 {
         let frames = self.shared.dropped.load(Ordering::Relaxed) / self.channels.max(1);
         (frames as u64).saturating_mul(1000) / u64::from(self.sample_rate.max(1))
+    }
+
+    /// Control-side input clock fit; separate from the output even at the same nominal rate.
+    pub fn clock_report(&mut self) -> Option<crate::device_clock::ClockReport> {
+        self.clock.as_mut().map(crate::device_clock::ClockReader::poll)
     }
 
     pub fn finish(&mut self) -> Takes {
@@ -651,6 +674,7 @@ mod tests {
             monitor: InputRing::new(1, 48_000),
             #[cfg(not(target_os = "freebsd"))]
             _stream: None,
+            clock: None,
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,

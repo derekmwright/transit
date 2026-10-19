@@ -24,12 +24,14 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod action_lane;
+pub mod device_clock;
 pub mod devices;
 pub mod plan_bridge;
 pub mod publication;
 pub mod record;
 pub mod scheduling;
 pub mod telemetry;
+pub mod timeline_map;
 
 pub use devices::AudioConfig;
 
@@ -644,6 +646,8 @@ pub struct Player {
     pub silent: bool,
     /// The input opened with the output, on ASIO ([`Player::open_input`]).
     input: Mutex<HeldInput>,
+    /// Control owns the observation consumer until after the stream is closed.
+    clock: Mutex<Option<device_clock::ClockReader>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -801,7 +805,7 @@ impl Player {
                         _ => build_output::<f32>(&device, &config, &state, channels, &fault, &shared),
                     };
                     match built {
-                        Ok(stream) => {
+                        Ok((stream, clock)) => {
                             let input = match input {
                                 Some(r) => match r.start() {
                                     Ok(()) => HeldInput::Held(Some(r)),
@@ -841,6 +845,7 @@ impl Player {
                                 device_buffer: buffer,
                                 silent: false,
                                 input: Mutex::new(input),
+                                clock: Mutex::new(Some(clock)),
                             };
                         }
                         Err(e) => log::warn!("cannot open audio stream ({:?}): {e}", config.buffer_size),
@@ -929,6 +934,7 @@ impl Player {
             device_buffer: None,
             silent: true,
             input: Mutex::new(HeldInput::No),
+            clock: Mutex::new(None),
         }
     }
 
@@ -954,6 +960,7 @@ impl Player {
             device_buffer: None,
             silent: true,
             input: Mutex::new(HeldInput::No),
+            clock: Mutex::new(None),
         }
     }
 
@@ -972,6 +979,7 @@ impl Player {
     /// Per-UI-frame housekeeping: drops retired instances and services plugin editors. Returns
     /// the parameter edits made in open editors since the last call.
     pub fn idle(&self) -> Vec<EditorEdit> {
+        let _ = self.clock_report();
         let mut side = self.side();
         side.collect_garbage();
         let mut out = Vec::new();
@@ -982,6 +990,12 @@ impl Player {
         }
         self.shared.editors_open.store(side.editors.values().any(|e| e.is_open()), Ordering::Relaxed);
         out
+    }
+
+    /// Bounded off-callback fitting. None means no physical stream; stale/uncalibrated
+    /// models retain their explicit quality and never certify hardware latency.
+    pub fn clock_report(&self) -> Option<device_clock::ClockReport> {
+        self.clock.lock().unwrap_or_else(PoisonError::into_inner).as_mut().map(device_clock::ClockReader::poll)
     }
 
     /// True when the plugin in this slot has its own editor.
@@ -1206,9 +1220,17 @@ impl OutputCallback {
         Self { scratch: vec![0.0; 8192 * channels.max(1)], channels: channels.max(1), rate, timing: telemetry::Accumulator::default() }
     }
 
-    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T], state: &Holder, fault: &Fault, shared: &Shared) {
+    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(
+        &mut self,
+        data: &mut [T],
+        state: &Holder,
+        fault: &Fault,
+        shared: &Shared,
+        observe: impl FnOnce(),
+    ) {
         let started = telemetry::Timer::start();
         mark_audio_thread();
+        observe();
         let channels = self.channels;
         self.fill_with(data, |s, _plans, _actions| {
             render_held(state, fault, shared, s, channels);
@@ -1258,21 +1280,25 @@ fn build_output<T>(
     channels: usize,
     fault: &Arc<Fault>,
     shared: &Arc<Shared>,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<(cpal::Stream, device_clock::ClockReader), cpal::BuildStreamError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
     use cpal::traits::DeviceTrait;
     let mut output = OutputCallback::new(channels, config.sample_rate.0);
+    let (mut clock, reader) = device_clock::stream_clock(device_clock::Direction::Output, config.sample_rate.0)
+        .map_err(|error| cpal::BackendSpecificError { description: error.into() })?;
     let (failed, guard, gone, held) = (Arc::clone(fault), Arc::clone(shared), Arc::clone(fault), Arc::clone(state));
-    device.build_output_stream(
+    let stream = device.build_output_stream(
         config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            output.fill(data, &held, &failed, &guard);
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let frames = data.len() / channels.max(1);
+            output.fill(data, &held, &failed, &guard, || clock.cpal.output(frames, info, clock.origin.now_ns()));
         },
         output_error_callback(gone),
         None,
-    )
+    )?;
+    Ok((stream, reader))
 }
 
 /// Open the output device `cfg` chooses (else the default) at the chosen rate (else the session
@@ -1390,16 +1416,16 @@ mod tests {
         let mut data = vec![1i16; 2 * (8192 + 64)];
         // Two scratch chunks are still exactly one device callback, with conversion included.
         let locked = holder.lock().unwrap();
-        callback.fill(&mut data, &holder, &fault, &shared);
+        callback.fill(&mut data, &holder, &fault, &shared, || {});
         drop(locked);
         assert!(data.iter().all(|&x| x == 0));
         let s = fault.telemetry.snapshot();
         assert_eq!((s.callbacks, s.frames, s.contention_silence_frames), (1, 8256, 8256));
         assert_eq!((s.unavailable_silence_frames, s.fault_silence_frames), (0, 0));
         fault.failed.store(true, Ordering::Relaxed);
-        callback.fill(&mut data[..128], &holder, &fault, &shared);
+        callback.fill(&mut data[..128], &holder, &fault, &shared, || {});
         holder.lock().unwrap().take();
-        callback.fill(&mut data[..128], &holder, &fault, &shared);
+        callback.fill(&mut data[..128], &holder, &fault, &shared, || {});
         let s = fault.telemetry.snapshot();
         assert_eq!((s.callbacks, s.frames), (3, 8384));
         assert_eq!((s.contention_silence_frames, s.fault_silence_frames, s.unavailable_silence_frames), (8256, 64, 64));
