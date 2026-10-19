@@ -183,14 +183,18 @@ fn stalled(seen: &mut Option<(u64, std::time::Instant)>, beats: u64, playing: bo
 }
 
 /// Fill one block with `fill`. If it panics, the block and every later one are silent and the
-/// transport stops, rather than the panic taking the app down.
-fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fill: impl FnOnce(&mut [f32])) {
+/// transport stops, rather than the panic taking the app down. The caller must retain
+/// an error payload for owner-thread destruction, never discard it on the callback.
+fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fill: impl FnOnce(&mut [f32])) -> std::thread::Result<()> {
     fault.beats.fetch_add(1, Ordering::Relaxed);
-    if fault.failed.load(Ordering::Relaxed) || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(out))).is_err() {
+    let failed = fault.failed.load(Ordering::Relaxed);
+    let result = if failed { Ok(()) } else { std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(out))) };
+    if failed || result.is_err() {
         fault.failed.store(true, Ordering::Relaxed);
         shared.playing.store(false, Ordering::Relaxed);
         out.fill(0.0);
     }
+    result
 }
 
 /// Where the audio state lives: the callback (or the silent clock) renders from it, and the
@@ -215,11 +219,12 @@ fn render_held(holder: &Mutex<Option<AudioState>>, fault: &Fault, shared: &Share
     };
     match held.as_mut() {
         Some(st) => {
-            if fault.failed.load(Ordering::Relaxed) {
-                // Never `fill` again; keep what the UI thread sends from piling up unseen.
-                st.discard_after_fault();
+            if let Err(payload) = guarded_block(fault, shared, out, |o| st.fill(o, channels)) {
+                // The fault latch prevents another fill, so this slot is written
+                // once. Retain arbitrary user destruction until control takes
+                // this main-anchored state after callback quiescence.
+                st.panic_payload = Some(payload);
             }
-            guarded_block(fault, shared, out, |o| st.fill(o, channels));
             if fault.failed.load(Ordering::Relaxed) {
                 fault.telemetry.fault_silence_frames.fetch_add((out.len() / channels.max(1)) as u64, Ordering::Relaxed);
             }
@@ -235,6 +240,8 @@ fn render_held(holder: &Mutex<Option<AudioState>>, fault: &Fault, shared: &Share
 
 /// State the audio callback renders from (inside a [`Holder`]).
 struct AudioState {
+    /// A caught unwind is owned here until Player teardown on its owner thread.
+    panic_payload: Option<Box<dyn std::any::Any + Send>>,
     rx: Receiver<Cmd>,
     shared: Arc<Shared>,
     session: Arc<Session>,
@@ -268,6 +275,21 @@ struct AudioState {
     release_flush_pending: bool,
 }
 
+impl Drop for AudioState {
+    fn drop(&mut self) {
+        // The holder is anchored on control until callback quiescence. Isolate
+        // arbitrary payload cleanup before any plug-in fields are destroyed,
+        // including when Player itself is being dropped during an unwind.
+        if let Some(payload) = self.panic_payload.take()
+            && let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)))
+        {
+            // The secondary payload can itself have a panicking destructor.
+            // Retain it rather than recurse through unbounded foreign cleanup.
+            std::mem::forget(secondary);
+        }
+    }
+}
+
 fn new_engine(sr: f32) -> MixEngine {
     let mut m = MixEngine::new(sr, BLOCK);
     m.set_external_instances(true);
@@ -288,6 +310,7 @@ impl AudioState {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
         AudioState {
+            panic_payload: None,
             hosted: session_has_hosted(&session),
             #[cfg(test)]
             renders: 0,
@@ -314,17 +337,15 @@ impl AudioState {
         }
     }
 
-    /// After the engine has faulted nothing drains the queue any more: take every pending command
-    /// off it. New third-party instances go back down the garbage channel, so they drop on the UI
-    /// thread (a failed send means the receiver is gone and nothing is left to do); everything
-    /// else is dropped here, which frees nothing that matters (snapshots are `Arc<Session>`).
-    /// The instance vector is converted in place (`PreparedInstance` is a whole multiple of
-    /// `Box<dyn Plugin>` in size), so nothing new is allocated here.
+    /// Control-thread fault housekeeping. A terminal callback leaves the queue
+    /// untouched: even receiving or forwarding an empty command can allocate or
+    /// free a channel block, and a queued snapshot can be its final owner.
+    /// Bound each UI service pass; remaining commands stay anchored until the
+    /// next pass or owner-thread teardown.
     fn discard_after_fault(&mut self) {
-        while let Ok(c) = self.rx.try_recv() {
-            if let Cmd::Session(_, instances) = c {
-                let _ = self.garbage.send(instances.into_iter().map(|i| i.plugin).collect());
-            }
+        for _ in 0..64 {
+            let Ok(command) = self.rx.try_recv() else { break };
+            drop(command);
         }
     }
 
@@ -981,6 +1002,12 @@ impl Player {
     /// the parameter edits made in open editors since the last call.
     pub fn idle(&self) -> Vec<EditorEdit> {
         let _ = self.clock_report();
+        if self.fault.failed.load(Ordering::Relaxed)
+            && let Ok(mut held) = self.state.try_lock()
+            && let Some(state) = held.as_mut()
+        {
+            state.discard_after_fault();
+        }
         let mut side = self.side();
         side.collect_garbage();
         let mut out = Vec::new();
@@ -1391,10 +1418,11 @@ mod tests {
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
-        guarded_block(&fault, &shared, &mut out, |o| o.fill(0.25));
+        guarded_block(&fault, &shared, &mut out, |o| o.fill(0.25)).unwrap();
         assert_eq!((out, fault.trouble(false)), ([0.25; 8], None));
-        guarded_block(&fault, &shared, &mut out, |_| std::panic::panic_any("a bug in the mix"));
-        guarded_block(&fault, &shared, &mut out, |o| o.fill(0.25));
+        let payload = guarded_block(&fault, &shared, &mut out, |_| std::panic::panic_any("a bug in the mix")).unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"a bug in the mix"));
+        guarded_block(&fault, &shared, &mut out, |o| o.fill(0.25)).unwrap();
         assert_eq!(out, [0.0; 8]);
         assert!(!shared.playing.load(Ordering::Relaxed));
         assert_eq!((fault.trouble(false), fault.trouble(false)), (Some(OutputTrouble::Bug), None));
@@ -2000,8 +2028,18 @@ mod tests {
         assert_eq!(dropped_on, Some(here), "teardown must run on the player's thread even when the callback has stopped: {log:?}");
     }
 
-    /// Like `ThreadLog`, but `process` panics; records where `drop` ran.
+    /// Records where an arbitrary caught panic payload is destroyed.
+    struct PanicPayloadLog(Arc<Mutex<Option<std::thread::ThreadId>>>);
+
+    impl Drop for PanicPayloadLog {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(std::thread::current().id());
+        }
+    }
+
+    /// Like `ThreadLog`, but `process` panics; records both destruction threads.
     struct PanicLog {
+        payload_dropped_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
         inner: Box<dyn Plugin>,
         dropped_on: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
     }
@@ -2023,7 +2061,7 @@ mod tests {
             self.inner.param(id)
         }
         fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {
-            std::panic::panic_any("a plug-in bug");
+            std::panic::panic_any(PanicPayloadLog(Arc::clone(&self.payload_dropped_on)));
         }
     }
 
@@ -2037,7 +2075,7 @@ mod tests {
     /// drop still gets the instances back and tears them down on its own thread.
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn plugin_teardown_never_runs_on_the_audio_thread_after_a_fault() {
+    fn plugin_and_panic_payload_teardown_never_run_on_the_audio_thread_after_a_fault() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
@@ -2054,7 +2092,12 @@ mod tests {
         let (gtx, grx) = channel();
         let player = Player::silent_clock_with(shared, tx.clone(), rx, Arc::clone(&s), Mutex::new(Side::new(48_000.0, grx)), gtx);
         let dropped_on = Arc::new(std::sync::Mutex::new(None));
-        let plugin = PanicLog { inner: soundcraft_dsp::create("gain").unwrap(), dropped_on: Arc::clone(&dropped_on) };
+        let payload_dropped_on = Arc::new(Mutex::new(None));
+        let plugin = PanicLog {
+            inner: soundcraft_dsp::create("gain").unwrap(),
+            dropped_on: Arc::clone(&dropped_on),
+            payload_dropped_on: Arc::clone(&payload_dropped_on),
+        };
         tx.send(Cmd::Session(
             Arc::clone(&s),
             vec![PreparedInstance {
@@ -2072,9 +2115,17 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the plug-in never faulted the engine");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // Synchronize with completion of the callback, not merely its fault flag.
+        // The silent-clock callback and the real device share render_held.
+        {
+            let held = player.state.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(held.as_ref().unwrap().panic_payload.is_some());
+            assert_eq!(*payload_dropped_on.lock().unwrap(), None, "the callback must retain the caught payload");
+        }
         drop(player);
         let here = std::thread::current().id();
         assert_eq!(*dropped_on.lock().unwrap(), Some(here), "after a fault, teardown must still run on the player's thread");
+        assert_eq!(*payload_dropped_on.lock().unwrap(), Some(here), "panic payload teardown must also run on the player's thread");
     }
 
     /// Like `ThreadLog`, but `process` is slow and says when it started and finished.
@@ -2156,10 +2207,10 @@ mod tests {
         assert_eq!(at("dropped").map(|i| log[i].1), Some(here), "teardown must run on the player's thread: {log:?}");
     }
 
-    /// Review finding (PR 752): once the engine has faulted nothing drains the queue; commands the
-    /// UI keeps sending are taken off it, and their new instances go back to the UI thread.
+    /// Fault callbacks retain queued owners; Main services at most 64 per pass.
     #[test]
-    fn commands_after_a_fault_are_not_kept() {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn postfault_commands_wait_for_bounded_control_reclamation() {
         use soundcraft_model::{ChannelFormat, Insert, TrackKind};
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
@@ -2175,25 +2226,45 @@ mod tests {
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
         let holder: Holder = Arc::new(Mutex::new(Some(AudioState::new(rx, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, gtx))));
-        let fault = Fault::default();
+        let fault = Arc::new(Fault::default());
         let mut out = vec![0.0f32; 8];
-        guarded_block(&fault, &shared, &mut out, |_| std::panic::panic_any("a plug-in bug"));
+        let _payload = guarded_block(&fault, &shared, &mut out, |_| std::panic::panic_any("a plug-in bug")).unwrap_err();
         assert!(fault.failed.load(Ordering::Relaxed));
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        for _ in 0..2 {
-            let plugin = ThreadLog { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(&log) };
+        // ThreadLog coalesces consecutive equal lifecycle events. Each owner
+        // gets its own witness so the count is not hidden by that coalescing.
+        let logs: Vec<_> = (0..65).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        for log in &logs {
+            let plugin = ThreadLog { inner: soundcraft_dsp::create("gain").unwrap(), log: Arc::clone(log) };
             let late =
                 PreparedInstance { track: t, slot: soundcraft_mix::INSTRUMENT_SLOT, id: "clap:test.late".into(), ch: 2, plugin: Box::new(plugin) };
             tx.send(Cmd::Session(Arc::clone(&s), vec![late])).unwrap();
         }
         tx.send(Cmd::Stop).unwrap();
-        assert!(render_held(&holder, &fault, &shared, &mut out, 2));
-        assert!(log.lock().unwrap().iter().all(|(w, _)| *w != "drop"), "returned, not dropped on the audio side");
-        let returned: Vec<_> = std::iter::from_fn(|| grx.try_recv().ok()).collect();
-        assert_eq!(returned.iter().map(Vec::len).sum::<usize>(), 2, "the instances sent after the fault must come back to the UI thread");
-        let held = holder.lock().unwrap();
-        let pending = held.as_ref().map(|st| st.rx.try_recv().is_ok());
-        assert_eq!(pending, Some(false), "nothing may be left waiting in the queue");
+        let player = Player::silent(shared, fault, tx, Mutex::new(Side::new(48_000.0, grx)), holder, 48_000);
+        let (held, fault, shared) = (Arc::clone(&player.state), Arc::clone(&player.fault), Arc::clone(&player.shared));
+        let heap = std::thread::spawn(move || {
+            let mut out = [1.0; 8];
+            let (alive, heap) = soundcraft_rt::testing::measure(|| render_held(&held, &fault, &shared, &mut out, 2));
+            assert!(alive);
+            assert_eq!(out, [0.0; 8]);
+            heap
+        })
+        .join()
+        .unwrap();
+        assert!(heap.is_zero(), "fault callbacks leave queued owners untouched: {heap:?}");
+        let untouched = logs.iter().all(|log| log.lock().unwrap().is_empty());
+        assert!(untouched);
+        player.idle();
+        // Release every witness lock before asserting: a failed assertion must
+        // not poison a log that a still-queued owner's destructor will use.
+        let first = logs.iter().filter(|log| !log.lock().unwrap().is_empty()).count();
+        assert_eq!(first, 64, "Main service is bounded");
+        player.idle();
+        let observed: Vec<_> = logs.iter().flat_map(|log| log.lock().unwrap().clone()).collect();
+        assert_eq!(observed.len(), 65);
+        assert!(observed.iter().all(|(what, id)| *what == "drop" && *id == std::thread::current().id()));
+        let held = player.state.lock().unwrap();
+        assert!(held.as_ref().unwrap().rx.try_recv().is_err());
     }
 
     #[test]
@@ -2546,3 +2617,6 @@ mod tests {
         assert!(matches!(&*player.input.lock().unwrap(), HeldInput::No));
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod panic_cleanup_tests;
