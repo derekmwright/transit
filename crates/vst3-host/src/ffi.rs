@@ -973,10 +973,10 @@ impl HostAttributeList {
 
     /// # Safety
     /// `id` must be null or a readable NUL-terminated SDK attribute ID for this call.
-    unsafe fn get<T>(&self, id: sv::IAttributeList_::AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Option<T> {
+    unsafe fn get<T>(&self, id: sv::IAttributeList_::AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Result<T, sb::tresult> {
         // SAFETY: forwarded SDK string contract; the closure cannot retain the key or value borrow.
-        let key = unsafe { host_string(id.cast::<u8>(), ATTR_STRING_MAX) }.ok()?;
-        f(self.attrs.lock().unwrap_or_else(PoisonError::into_inner).get(key)?)
+        let key = unsafe { host_string(id.cast::<u8>(), ATTR_STRING_MAX) }?;
+        self.attrs.lock().unwrap_or_else(PoisonError::into_inner).get(key).and_then(f).ok_or(sb::kResultFalse)
     }
 }
 
@@ -999,11 +999,11 @@ impl IAttributeListTrait for HostAttributeList {
         let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
         // SAFETY: forwards the SDK attribute ID contract; only the scalar is copied.
         match unsafe { self.get(id, |a| if let Attr::Int(v) = a { Some(*v) } else { None }) } {
-            Some(v) => {
+            Ok(v) => {
                 *out = v;
                 sb::kResultOk
             }
-            None => sb::kResultFalse,
+            Err(e) => e,
         }
     }
     /// # Safety
@@ -1019,16 +1019,19 @@ impl IAttributeListTrait for HostAttributeList {
         let Some(out) = (unsafe { value.as_mut() }) else { return sb::kInvalidArgument };
         // SAFETY: forwards the SDK attribute ID contract; only the scalar is copied.
         match unsafe { self.get(id, |a| if let Attr::Float(v) = a { Some(*v) } else { None }) } {
-            Some(v) => {
+            Ok(v) => {
                 *out = v;
                 sb::kResultOk
             }
-            None => sb::kResultFalse,
+            Err(e) => e,
         }
     }
     /// # Safety
     /// `id` and `string` must be null or readable NUL-terminated SDK strings.
     unsafe fn setString(&self, id: sv::IAttributeList_::AttrID, string: *const sv::TChar) -> sb::tresult {
+        if id.is_null() {
+            return sb::kInvalidArgument;
+        }
         // SAFETY: the SDK supplies a terminated UTF-16 string; the helper rejects null/oversize.
         let source = match unsafe { host_string(string, ATTR_STRING_MAX) } {
             Ok(s) => s,
@@ -1062,12 +1065,15 @@ impl IAttributeListTrait for HostAttributeList {
                 }
             })
         }
-        .map_or(sb::kResultFalse, |()| sb::kResultOk)
+        .map_or_else(|e| e, |()| sb::kResultOk)
     }
     /// # Safety
     /// `id` must be null or terminated. Nonempty `data` must have size_in_bytes readable bytes;
     /// rejected oversized buffers are never read.
     unsafe fn setBinary(&self, id: sv::IAttributeList_::AttrID, data: *const c_void, size_in_bytes: u32) -> sb::tresult {
+        if id.is_null() {
+            return sb::kInvalidArgument;
+        }
         let len = size_in_bytes as usize;
         if len > ATTR_BINARY_MAX {
             return sb::kOutOfMemory;
@@ -1097,12 +1103,16 @@ impl IAttributeListTrait for HostAttributeList {
         // attribute is replaced or the list is released (the SDK's contract).
         // SAFETY: forwards the SDK ID contract; the caller synchronizes borrowed pointer use.
         match unsafe { self.get(id, |a| if let Attr::Binary(b) = a { Some((b.as_ptr().cast::<c_void>(), b.len())) } else { None }) } {
-            Some((p, len)) => {
+            Ok((p, len)) => {
                 *d = p;
                 *n = u32::try_from(len).unwrap_or(u32::MAX);
                 sb::kResultOk
             }
-            None => sb::kResultFalse,
+            Err(e) => {
+                *d = std::ptr::null();
+                *n = 0;
+                e
+            }
         }
     }
 }
@@ -2638,7 +2648,9 @@ mod tests {
         assert_eq!(r, sb::kResultOk);
         // SAFETY: an IMessage with one reference owned here.
         let msg = unsafe { ComPtr::from_raw(obj.cast::<sv::IMessage>()) }.expect("message");
-        // SAFETY: valid message; static NUL-terminated id; the attribute list lives with it.
+        // SAFETY: the owned message keeps its attribute list alive; IDs/text are terminated or
+        // null (rejected), and buffers have the reported sizes. Outputs are distinct and writable;
+        // successful binary output is read before any replacement or release.
         unsafe {
             assert!(msg.getMessageID().is_null());
             msg.setMessageID(c"Hello".as_ptr());
@@ -2655,7 +2667,7 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(p.cast::<u8>(), n as usize), [1, 2, 3]);
             let mut i = 0i64;
             assert_eq!(attrs.getInt(c"b".as_ptr(), &mut i), sb::kResultFalse, "wrong type");
-            assert_eq!(attrs.getInt(std::ptr::null(), &mut i), sb::kResultFalse, "no id, no value");
+            assert_eq!(attrs.getInt(std::ptr::null(), &mut i), sb::kInvalidArgument, "null id is invalid");
         }
         let (r, obj) = create_host_object(&host, sv::IAttributeList::IID, FUnknown::IID);
         assert_eq!(r, sb::kResultOk);

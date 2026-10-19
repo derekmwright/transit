@@ -54,6 +54,59 @@ fn create_as<I: Interface>(host: &ComWrapper<HostContext>) -> ComPtr<I> {
 }
 
 #[test]
+fn sdk_reference_null_id_result() {
+    let host = ComWrapper::new(HostContext::default());
+    let list = create_as::<sv::IAttributeList>(&host);
+    let text = [b'x' as u16, 0];
+    let bytes = [7u8];
+    for allocation_failure in [false, true] {
+        let check = || {
+            let (mut integer, mut float, mut string, mut data, mut size) = (0, 0.0, [0u16; 2], std::ptr::null(), 0);
+            // SAFETY: the owned list accepts null IDs; text is terminated, byte input has the
+            // reported length, and outputs are distinct, aligned, writable and correctly sized.
+            let results = unsafe {
+                [
+                    ("setInt", list.setInt(std::ptr::null(), 1)),
+                    ("getInt", list.getInt(std::ptr::null(), &mut integer)),
+                    ("setFloat", list.setFloat(std::ptr::null(), 0.5)),
+                    ("getFloat", list.getFloat(std::ptr::null(), &mut float)),
+                    ("setString", list.setString(std::ptr::null(), text.as_ptr())),
+                    ("getString", list.getString(std::ptr::null(), string.as_mut_ptr(), 4)),
+                    ("setBinary", list.setBinary(std::ptr::null(), bytes.as_ptr().cast(), 1)),
+                    ("getBinary", list.getBinary(std::ptr::null(), &mut data, &mut size)),
+                ]
+            };
+            for (method, result) in results {
+                assert_eq!(result, sb::kInvalidArgument, "{method}, allocation failure: {allocation_failure}");
+            }
+        };
+        if allocation_failure {
+            fail_after(0, check);
+        } else {
+            check();
+        }
+    }
+}
+
+#[test]
+fn sdk_reference_missing_binary_zeros_size() {
+    let host = ComWrapper::new(HostContext::default());
+    let list = create_as::<sv::IAttributeList>(&host);
+    // SAFETY: the list stays owned, IDs are terminated, and the scalar setter needs no buffer.
+    assert_eq!(unsafe { list.setInt(c"integer".as_ptr(), 42) }, sb::kResultOk);
+    for (id, expected) in [(c"missing".as_ptr(), sb::kResultFalse), (c"integer".as_ptr(), sb::kResultFalse), (std::ptr::null(), sb::kInvalidArgument)]
+    {
+        let sentinel = 7u8;
+        let (mut data, mut size) = (std::ptr::from_ref(&sentinel).cast::<c_void>(), 123u32);
+        // SAFETY: the owned list accepts terminated or null IDs; output locations are distinct,
+        // aligned and writable. The sentinel pointer is only compared, never dereferenced.
+        assert_eq!(unsafe { list.getBinary(id, &mut data, &mut size) }, expected);
+        assert_eq!(size, 0);
+        assert!(data.is_null());
+    }
+}
+
+#[test]
 fn allocation_failure_during_creation_clears_output() {
     let host = ComWrapper::new(HostContext::default());
     for (cid, allocations) in [(sv::IAttributeList::IID, 1), (sv::IMessage::IID, 2)] {
