@@ -17,6 +17,9 @@ mod control_server;
 mod graphics;
 mod logging;
 
+#[cfg(test)]
+mod audio_review_tests;
+
 use soundcraft_engine::Engine;
 use soundcraft_ui_studio::{Services, StudioApp, UiState};
 use std::sync::Arc;
@@ -190,8 +193,12 @@ fn save_prefs(ui: &UiState) {
     if !prefs_enabled() {
         return;
     }
+    let mut saved = ui.clone();
+    // save_good_audio persists each choice after two seconds of healthy callbacks. Keep that
+    // latest verified choice (or defaults on first launch), even if quit follows Apply immediately.
+    saved.audio = load_prefs().map(|previous| previous.audio).unwrap_or_default();
     if let Some(path) = prefs_path()
-        && let Err(error) = config::save_ui(&path, ui)
+        && let Err(error) = config::save_ui(&path, &saved)
     {
         log::warn!("{error}");
     }
