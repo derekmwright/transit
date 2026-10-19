@@ -11,6 +11,15 @@
 //!   its edit controller). No audio input, one stereo output, one event input; every output
 //!   sample is the velocity of the held note (sample-accurate), 0 when none. Poly pressure, and
 //!   MIDI CC 7 through `IMidiMapping` (hidden parameter 1), set it to their value too.
+//!   For the host-request tests (audit F08, ADR 0012 G7) it takes commands as a component state
+//!   to load: `LEARN:<cc>` maps that controller to the volume instead (a "MIDI learn") and calls
+//!   `restartComponent(kMidiCCAssignmentChanged)`; `LATENCY:<n>` reports `n` samples after the
+//!   next `setActive(true)` and calls `restartComponent(kLatencyChanged)`; `RESTART:<flags>`
+//!   calls `restartComponent` with those flags; `ARM:<command>` runs the command at the next
+//!   `getState` instead (a main-thread call the host makes while the processor runs elsewhere,
+//!   like a learn in the plug-in's own window). Its component state is a report: the OS thread of
+//!   the `getState` call (`me=`) and the threads that ran `getMidiControllerAssignment`,
+//!   `setActive`, `process` and `getLatencySamples`.
 //!
 //! Probe mode (`VST3_FIXTURE_PROBES` set; see "probe mode" below) checks VST3's edit-controller
 //! threading rule and reports the Freq values Gain's processor receives.
@@ -509,7 +518,81 @@ impl IEditControllerTrait for GainController {
 
 struct Synth {
     level: AtomicU32,
+    /// The MIDI controller `IMidiMapping` assigns to the volume (7 until a learn).
+    cc: AtomicI64,
+    latency: AtomicU32,
+    /// Latency to report after the next `setActive(true)` (-1: none).
+    next_latency: AtomicI64,
+    /// The host's component handler (alive as long as this controller).
+    handler: AtomicPtr<IComponentHandler>,
+    /// A command for the next `getState`.
+    armed: std::sync::Mutex<Option<String>>,
+    /// (call, OS thread), each pair once.
+    threads: std::sync::Mutex<Vec<(&'static str, usize)>>,
     _live: Live,
+}
+
+impl Synth {
+    fn new() -> Synth {
+        Synth {
+            level: AtomicU32::new(0),
+            cc: AtomicI64::new(7),
+            latency: AtomicU32::new(0),
+            next_latency: AtomicI64::new(-1),
+            handler: AtomicPtr::new(std::ptr::null_mut()),
+            armed: std::sync::Mutex::new(None),
+            threads: std::sync::Mutex::new(Vec::new()),
+            _live: Live::new(&OBJECTS),
+        }
+    }
+
+    fn note_thread(&self, call: &'static str) {
+        let me = os_thread();
+        let mut t = self.threads.lock().unwrap();
+        if !t.contains(&(call, me)) {
+            t.push((call, me));
+        }
+    }
+
+    fn restart(&self, flags: i32) {
+        if let Some(h) = unsafe { ComRef::from_raw(self.handler.load(Ordering::SeqCst)) } {
+            unsafe { h.restartComponent(flags) };
+        }
+    }
+
+    /// Runs a command (see the crate docs). False for an unknown one.
+    fn command(&self, cmd: &str) -> bool {
+        let (verb, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
+        match verb {
+            "LEARN" => {
+                self.cc.store(arg.parse().unwrap_or(7), Ordering::SeqCst);
+                self.restart(RestartFlags_::kMidiCCAssignmentChanged as i32);
+            }
+            "LATENCY" => {
+                self.next_latency.store(arg.parse().unwrap_or(0), Ordering::SeqCst);
+                self.restart(RestartFlags_::kLatencyChanged as i32);
+            }
+            "RESTART" => self.restart(arg.parse().unwrap_or(0)),
+            "ARM" => *self.armed.lock().unwrap() = Some(arg.to_string()),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The component "state": the report (see the crate docs).
+    fn report(&self) -> String {
+        let threads = self.threads.lock().unwrap();
+        let of = |call: &str| threads.iter().filter(|(c, _)| *c == call).map(|(_, t)| t.to_string()).collect::<Vec<_>>().join(",");
+        format!(
+            "me={};map={};active={};process={};get_latency={};latency={}",
+            os_thread(),
+            of("map"),
+            of("active"),
+            of("process"),
+            of("latency"),
+            self.latency.load(Ordering::SeqCst)
+        )
+    }
 }
 
 impl Class for Synth {
@@ -521,7 +604,8 @@ const VOLUME_PARAM: ParamID = 1;
 
 impl IMidiMappingTrait for Synth {
     unsafe fn getMidiControllerAssignment(&self, bus: i32, channel: i16, ctrl: CtrlNumber, id: *mut ParamID) -> tresult {
-        if bus == 0 && channel == 0 && ctrl == 7 {
+        self.note_thread("map");
+        if bus == 0 && channel == 0 && i64::from(ctrl) == self.cc.load(Ordering::SeqCst) {
             unsafe { *id = VOLUME_PARAM };
             kResultOk
         } else {
@@ -582,14 +666,37 @@ impl IComponentTrait for Synth {
     unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        self.note_thread("active");
+        if state != 0 {
+            let next = self.next_latency.swap(-1, Ordering::SeqCst);
+            if next >= 0 {
+                self.latency.store(next as u32, Ordering::SeqCst);
+            }
+        }
         kResultOk
     }
-    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+    unsafe fn setState(&self, state: *mut IBStream) -> tresult {
+        // A command, or (anything else) an empty state.
+        let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
+        let mut bytes = [0u8; 64];
+        let mut n = 0;
+        if unsafe { s.read(bytes.as_mut_ptr().cast(), 64, &mut n) } == kResultOk
+            && let Ok(text) = std::str::from_utf8(&bytes[..n.max(0) as usize])
+        {
+            self.command(text);
+        }
         kResultOk
     }
-    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
-        kResultOk
+    unsafe fn getState(&self, state: *mut IBStream) -> tresult {
+        let armed = self.armed.lock().unwrap().take();
+        if let Some(cmd) = armed {
+            self.command(&cmd);
+        }
+        let Some(s) = (unsafe { ComRef::from_raw(state) }) else { return kInvalidArgument };
+        let mut text = self.report().into_bytes();
+        let mut n = 0;
+        unsafe { s.write(text.as_mut_ptr().cast(), text.len() as i32, &mut n) }
     }
 }
 
@@ -608,7 +715,8 @@ impl IAudioProcessorTrait for Synth {
         if size == SymbolicSampleSizes_::kSample32 as i32 { kResultOk } else { kNotImplemented }
     }
     unsafe fn getLatencySamples(&self) -> u32 {
-        0
+        self.note_thread("latency");
+        self.latency.load(Ordering::SeqCst)
     }
     unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
         kResultOk
@@ -617,6 +725,7 @@ impl IAudioProcessorTrait for Synth {
         kResultOk
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        self.note_thread("process");
         let d = unsafe { &*data };
         if d.numOutputs != 1 {
             return kResultOk;
@@ -706,7 +815,8 @@ impl IEditControllerTrait for Synth {
     unsafe fn setParamNormalized(&self, _id: u32, _v: f64) -> tresult {
         kResultOk
     }
-    unsafe fn setComponentHandler(&self, _handler: *mut IComponentHandler) -> tresult {
+    unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
+        self.handler.store(handler, Ordering::SeqCst);
         kResultOk
     }
     unsafe fn createView(&self, _name: FIDString) -> *mut IPlugView {
@@ -769,7 +879,7 @@ impl IPluginFactoryTrait for Factory {
             })
             .to_com_ptr::<FUnknown>()
         } else if cid == SYNTH_CID {
-            ComWrapper::new(Synth { level: AtomicU32::new(0), _live: Live::new(&OBJECTS) }).to_com_ptr::<FUnknown>()
+            ComWrapper::new(Synth::new()).to_com_ptr::<FUnknown>()
         } else {
             None
         };
