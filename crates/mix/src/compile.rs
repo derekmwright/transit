@@ -1,0 +1,841 @@
+//! The control-thread plan compiler: turns an `Arc<Session>` plus the confirmed active plan into
+//! a [`PlanEnvelope`] whose tables are sized and bounded before the audio thread sees them.
+
+use super::plan::{Attach, CellKind, CellLoc, CellMove, PlanTables, PreparedPlan, Shape, needs_storage};
+use super::*;
+use std::collections::{BTreeMap, HashMap};
+
+/// Resource limits of one plan. Every size is checked (with checked arithmetic) before anything
+/// is allocated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanLimits {
+    pub tracks: u16,
+    pub buses: u16,
+    /// Insert slots per strip.
+    pub slots_per_strip: u16,
+    /// Clips with clip effects per strip.
+    pub clip_fx_per_strip: u16,
+    /// Largest delay-line capacity (samples per channel) a plan prepares.
+    pub delay_samples: u32,
+    /// Cap on the bytes one plan prepares (buffers, delay lines, parameter storage, tables).
+    pub prepared_bytes: usize,
+}
+
+impl Default for PlanLimits {
+    fn default() -> Self {
+        PlanLimits {
+            tracks: 1024,
+            buses: 1024,
+            slots_per_strip: 64,
+            clip_fx_per_strip: 4096,
+            delay_samples: MAX_LATENCY as u32,
+            prepared_bytes: 1 << 30,
+        }
+    }
+}
+
+/// Why [`PlanCompiler::compile`] made no plan. Nothing was published and the compiler is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileError {
+    /// `base` is not the confirmed active generation.
+    BaseNotActive { base: PlanGeneration, active: PlanGeneration },
+    /// `next` does not advance past the last generation this compiler issued.
+    GenerationNotIncreasing { last: PlanGeneration, next: PlanGeneration },
+    /// The generation counter is at its end; it never wraps.
+    GenerationExhausted,
+    /// The Session's sample rate is not the compiler's target rate (a runtime transition).
+    TargetMismatch { compiler: RenderTarget },
+    /// A count or the prepared bytes exceed the limits (`need` is `usize::MAX` on overflow).
+    ResourceLimit { what: &'static str, need: usize, limit: usize },
+    /// A plan is still in flight (N = 1): reclaim its envelope first.
+    InFlight { pending: PlanGeneration },
+}
+
+/// Smallest delay-line capacity a plan prepares (samples per channel).
+pub const MIN_DELAY_CAPACITY: usize = 8_192;
+
+/// A slot the compiler knows the active plan holds.
+#[derive(Clone)]
+struct ShadowSlot {
+    cell: u16,
+    /// [`SlotGen::VACANT`]: the factory made nothing for it (not retried until the spec changes).
+    generation: SlotGen,
+    spec: InstanceSpec,
+    kind: CellKind,
+    layout: u16,
+    /// Length of its prepared long-map storage (0: none).
+    heap: usize,
+    /// Identity of the sample it was handed (0: none).
+    sample: usize,
+    latency: usize,
+}
+
+#[derive(Clone)]
+struct ShadowStrip {
+    track: TrackId,
+    generation: SlotGen,
+    ch: u16,
+    layout: u16,
+}
+
+/// The structure a plan has, compared to decide whether a new plan needs tables at all.
+#[derive(Clone, Default, PartialEq)]
+struct Desc {
+    /// Per strip, in table order: track, track index, region, channels, layout, insert count,
+    /// clips with effects (id, eq, comp).
+    strips: Vec<(TrackId, u16, u8, u16, u16, usize, Vec<(u64, bool, bool)>)>,
+    /// Per slot: key, kind, plugin id, channels, layout, long map length (0 inline), sample.
+    slots: Vec<((TrackId, usize), CellKind, String, usize, u16, usize, usize)>,
+    busses: Vec<(BusId, ChannelFormat)>,
+    main: Option<ChannelFormat>,
+    cap: usize,
+}
+
+/// What the compiler knows of one plan's tables.
+#[derive(Clone, Default)]
+struct Shadow {
+    generation: PlanGeneration,
+    /// `None` for the empty plan of a fresh engine.
+    desc: Option<Desc>,
+    strips: Vec<ShadowStrip>,
+    slots: HashMap<(TrackId, usize), ShadowSlot>,
+    cells: usize,
+    tracks: Box<[(TrackId, u16)]>,
+}
+
+impl Shadow {
+    /// The longest insert chain latency of any strip (allocates nothing).
+    fn max_latency(&self) -> usize {
+        self.strips
+            .iter()
+            .map(|st| {
+                self.slots
+                    .iter()
+                    .filter(|((t, _), sl)| *t == st.track && sl.kind == CellKind::Insert)
+                    .fold(0usize, |a, (_, sl)| a.saturating_add(sl.latency))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn live(&self, key: &(TrackId, usize)) -> bool {
+        self.slots.get(key).is_some_and(|s| s.generation != SlotGen::VACANT)
+    }
+}
+
+/// The plan in flight: its generation and shadow (`None`: Session-only, same tables).
+struct Pending {
+    generation: PlanGeneration,
+    shadow: Option<Shadow>,
+}
+
+/// A fresh instance from a refused plan, kept for the next compile.
+struct Pooled {
+    key: (TrackId, usize),
+    spec: InstanceSpec,
+    slot: PluginSlot,
+}
+
+/// Compiles Sessions into plans for one realtime engine (one [`RenderTarget`]). Control thread.
+///
+/// Holds the shadow of the confirmed active plan plus at most one plan in flight, and a bounded
+/// pool of the fresh instances of the last refused plan.
+pub struct PlanCompiler {
+    target: RenderTarget,
+    limits: PlanLimits,
+    active: Shadow,
+    pending: Option<Pending>,
+    last: PlanGeneration,
+    slot_gen: u64,
+    pool: Vec<Pooled>,
+    released: Vec<(TrackId, usize)>,
+    latency_hint: usize,
+}
+
+/// The planned content of one slot cell.
+enum SlotPlan {
+    Move { from: u16, generation: SlotGen, applied: Option<usize>, sample: Option<Option<Arc<SourceAudio>>> },
+    Fresh(Box<PluginSlot>),
+    Absent,
+}
+
+/// The planned content of one slot cell, with what the shadow needs.
+struct PlannedSlot {
+    key: (TrackId, usize),
+    kind: CellKind,
+    index: u16,
+    spec: InstanceSpec,
+    params: usize,
+    sample: Option<Arc<SourceAudio>>,
+    plan: SlotPlan,
+}
+
+/// Stable code of a channel format (its place in [`ChannelFormat::ALL`]).
+pub(crate) fn layout_code(f: ChannelFormat) -> u16 {
+    ChannelFormat::ALL.iter().position(|x| *x == f).map_or(u16::MAX, |i| u16::try_from(i + 1).unwrap_or(u16::MAX))
+}
+
+fn sample_id(a: Option<&Arc<SourceAudio>>) -> usize {
+    a.map_or(0, |a| Arc::as_ptr(a) as *const () as usize)
+}
+
+fn over(what: &'static str, need: usize, limit: usize) -> Result<(), CompileError> {
+    if need > limit { Err(CompileError::ResourceLimit { what, need, limit }) } else { Ok(()) }
+}
+
+/// `a * b`, or the overflow error.
+fn mul(a: usize, b: usize) -> Result<usize, CompileError> {
+    a.checked_mul(b).ok_or(CompileError::ResourceLimit { what: "prepared_bytes", need: usize::MAX, limit: usize::MAX })
+}
+
+fn add(a: usize, b: usize) -> Result<usize, CompileError> {
+    a.checked_add(b).ok_or(CompileError::ResourceLimit { what: "prepared_bytes", need: usize::MAX, limit: usize::MAX })
+}
+
+/// Bytes one strip's prepared storage takes: `buf`, `pre`, `outbuf` and `clipbuf` (channels ×
+/// block each), `scratch` (block), three delay lines (channels × capacity), and its slots.
+pub(crate) fn strip_bytes(ch: usize, block: usize, cap: usize, slots: usize) -> Result<usize, CompileError> {
+    let f = size_of::<f32>();
+    let bufs = mul(mul(mul(ch, block)?, 4)?, f)?;
+    let scratch = mul(block, f)?;
+    let delays = mul(mul(mul(ch, cap)?, 3)?, f)?;
+    let cells = mul(slots, size_of::<PluginSlot>())?;
+    add(add(add(add(bufs, scratch)?, delays)?, cells)?, size_of::<Strip>())
+}
+
+/// Checks every limit and the prepared bytes. Allocates nothing.
+fn measure(s: &Session, l: &PlanLimits, block: usize, cap: usize) -> Result<(), CompileError> {
+    over("tracks", s.tracks.len(), l.tracks.into())?;
+    over("buses", s.busses.len(), l.buses.into())?;
+    let main_ch = main_channels(s);
+    let mut bytes = 0usize;
+    let mut cells = 0usize;
+    for t in &s.tracks {
+        let ch = strip_channels(t, main_ch);
+        over("slots_per_strip", t.mixer.inserts.len(), l.slots_per_strip.into())?;
+        let clips = if t.kind == TrackKind::Audio {
+            t.clips().iter().filter(|c| c.is_audio()).filter(|c| clip_fx_modules(s, c.id.0) != (false, false)).count()
+        } else {
+            0
+        };
+        over("clip_fx_per_strip", clips, l.clip_fx_per_strip.into())?;
+        let slots = add(add(t.mixer.inserts.iter().flatten().count(), usize::from(t.instrument.is_some()))?, mul(clips, 2)?)?;
+        cells = add(add(cells, 1)?, slots)?;
+        bytes = add(bytes, strip_bytes(ch, block, cap, slots)?)?;
+        for ins in t.mixer.inserts.iter().flatten().chain(t.instrument.iter()) {
+            if needs_storage(ins.params.len()) {
+                bytes = add(bytes, mul(ins.params.len(), size_of::<f32>())?)?;
+            }
+        }
+    }
+    for b in &s.busses {
+        bytes = add(bytes, mul(mul(b.format.channels().clamp(1, MAX_CHANNELS), block)?, size_of::<f32>())?)?;
+    }
+    bytes = add(bytes, mul(mul(main_ch, block)?, size_of::<f32>())?)?;
+    bytes = add(bytes, mul(cells, size_of::<CellLoc>() + 2 * size_of::<bool>())?)?;
+    over("cells", cells, usize::from(u16::MAX))?;
+    over("prepared_bytes", bytes, l.prepared_bytes)
+}
+
+/// The strip index of each track in render order: live tracks other than auxes (processing
+/// order), every aux and folder (dependency order), then the rest in track order. Also the
+/// number of each of the first two groups.
+fn render_rows(s: &Session) -> (Vec<usize>, usize, usize) {
+    let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
+    let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
+    let mut order = Vec::new();
+    let mut depth = Vec::new();
+    processing_order(s, &mut order, &mut depth);
+    let track = |i: &usize| s.tracks.get(*i);
+    let mut rows: Vec<usize> = order.iter().copied().filter(|i| track(i).is_some_and(|t| live(t) && !is_aux(t))).collect();
+    let phase1 = rows.len();
+    rows.extend(order.iter().copied().filter(|i| track(i).is_some_and(is_aux)));
+    let aux_end = rows.len();
+    rows.extend((0..s.tracks.len()).filter(|i| track(i).is_some_and(|t| !is_aux(t) && !live(t))));
+    (rows, phase1, aux_end)
+}
+
+impl PlanCompiler {
+    /// A compiler for an engine made with [`MixEngine::realtime`]`(target)`.
+    #[must_use]
+    pub fn new(target: RenderTarget, limits: PlanLimits) -> Self {
+        PlanCompiler {
+            target: target.normalized(),
+            limits,
+            active: Shadow::default(),
+            pending: None,
+            last: PlanGeneration::EMPTY,
+            slot_gen: 0,
+            pool: Vec::new(),
+            released: Vec::new(),
+            latency_hint: 0,
+        }
+    }
+
+    /// The confirmed active generation.
+    #[must_use]
+    pub fn active(&self) -> PlanGeneration {
+        self.active.generation
+    }
+
+    /// The generation in flight, if any.
+    #[must_use]
+    pub fn pending(&self) -> Option<PlanGeneration> {
+        self.pending.as_ref().map(|p| p.generation)
+    }
+
+    /// Fresh instances kept from the last refused plan.
+    #[must_use]
+    pub fn pooled(&self) -> usize {
+        self.pool.len()
+    }
+
+    /// Takes a status the engine reported: a delay asked for beyond capacity makes the next
+    /// plans prepare that much.
+    pub fn observe(&mut self, status: &PlanStatus) {
+        self.latency_hint = self.latency_hint.max(status.required_latency as usize);
+    }
+
+    fn fresh_gen(&mut self) -> SlotGen {
+        self.slot_gen = self.slot_gen.saturating_add(1);
+        SlotGen(self.slot_gen)
+    }
+
+    /// Delay-line capacity for a delay of `need` samples: a power of two, at least
+    /// [`MIN_DELAY_CAPACITY`], at most the limit.
+    fn delay_capacity(&self, need: usize) -> usize {
+        let pow = need.checked_next_power_of_two().unwrap_or(usize::MAX);
+        pow.max(MIN_DELAY_CAPACITY).min(self.limits.delay_samples as usize)
+    }
+
+    /// The pool holds at most one plan's slots.
+    fn pool_bound(&self) -> usize {
+        usize::from(self.limits.tracks) * (usize::from(self.limits.slots_per_strip) + 1 + 2 * usize::from(self.limits.clip_fx_per_strip))
+    }
+
+    /// Compiles `session` into a plan replacing `base` (the confirmed active generation) with
+    /// generation `next`. `make` creates, restores and prepares each new instance (on the
+    /// format-required thread: this one). Every limit is checked before anything is allocated.
+    pub fn compile(
+        &mut self,
+        session: Arc<Session>,
+        base: PlanGeneration,
+        next: PlanGeneration,
+        make: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
+    ) -> Result<PlanEnvelope, CompileError> {
+        if let Some(p) = &self.pending {
+            return Err(CompileError::InFlight { pending: p.generation });
+        }
+        if base != self.active.generation {
+            return Err(CompileError::BaseNotActive { base, active: self.active.generation });
+        }
+        if self.last.checked_next().is_none() {
+            return Err(CompileError::GenerationExhausted);
+        }
+        if next <= self.last {
+            return Err(CompileError::GenerationNotIncreasing { last: self.last, next });
+        }
+        if session.sample_rate.hz() != self.target.sample_rate {
+            return Err(CompileError::TargetMismatch { compiler: self.target });
+        }
+        let block = self.target.block();
+        let cap0 = self.delay_capacity(self.latency_hint.max(self.active.max_latency()));
+        measure(&session, &self.limits, block, cap0)?;
+
+        let id = PlanIdentity { generation: next, base, target: self.target };
+        let (desc, rows, phase1, aux_end, specs) = self.describe(&session, cap0);
+        if self.active.desc.as_ref() == Some(&desc) {
+            self.last = next;
+            self.pending = Some(Pending { generation: next, shadow: None });
+            let plan = PreparedPlan {
+                id,
+                session,
+                tables: None,
+                moves: Box::new([]),
+                attach: Box::new([]),
+                src_claimed: Box::new([]),
+                dst_claimed: Box::new([]),
+                tracks: self.active.tracks.clone(),
+            };
+            self.drop_pool();
+            return Ok(PlanEnvelope::new(plan));
+        }
+        let built = self.build(&session, desc, &rows, phase1, aux_end, specs, make, cap0);
+        let (tables, moves, attach, shadow) = match built {
+            Ok(b) => b,
+            Err(e) => {
+                self.drop_pool();
+                return Err(e);
+            }
+        };
+        let tracks = tables.tracks.clone();
+        let plan = PreparedPlan {
+            id,
+            session,
+            src_claimed: vec![false; self.active.cells].into_boxed_slice(),
+            dst_claimed: vec![false; tables.cells.len()].into_boxed_slice(),
+            tables: Some(tables),
+            moves: moves.into_boxed_slice(),
+            attach: attach.into_boxed_slice(),
+            tracks,
+        };
+        self.last = next;
+        self.pending = Some(Pending { generation: next, shadow: Some(shadow) });
+        self.drop_pool();
+        Ok(PlanEnvelope::new(plan))
+    }
+
+    /// Drops what the pool still holds (on this thread) and reports the slots.
+    fn drop_pool(&mut self) {
+        let live =
+            |k: &(TrackId, usize), me: &Self| me.active.live(k) || me.pending.as_ref().and_then(|p| p.shadow.as_ref()).is_some_and(|s| s.live(k));
+        let keys: Vec<(TrackId, usize)> = self.pool.drain(..).map(|p| p.key).collect();
+        for k in keys {
+            if !live(&k, self) {
+                self.released.push(k);
+            }
+        }
+    }
+
+    /// The structure `s` needs: its description, the strips' tracks in render order (with the
+    /// sizes of the first two groups), and the instance specs by slot.
+    #[allow(clippy::type_complexity)]
+    fn describe(&self, s: &Session, cap: usize) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>) {
+        let main_ch = main_channels(s);
+        let specs: HashMap<(TrackId, usize), InstanceSpec> = realtime_instance_specs(s).into_iter().map(|x| ((x.track, x.slot), x)).collect();
+        let (rows, phase1, aux_end) = render_rows(s);
+        let mut desc = Desc { main: Some(s.main_format()), cap, ..Desc::default() };
+        for (r, &ti) in rows.iter().enumerate() {
+            let Some(t) = s.tracks.get(ti) else { continue };
+            let ch = strip_channels(t, main_ch);
+            let layout = layout_code(strip_format(t, ch));
+            let region = if r < phase1 {
+                0
+            } else if r < aux_end {
+                1
+            } else {
+                2
+            };
+            let clips = clip_entries(t.id, &specs);
+            let index = u16::try_from(ti).unwrap_or(u16::MAX);
+            desc.strips.push((
+                t.id,
+                index,
+                region,
+                ch as u16,
+                layout,
+                t.mixer.inserts.len(),
+                clips.iter().map(|(c, e, k)| (*c, e.is_some(), k.is_some())).collect(),
+            ));
+            for (key, kind, ins) in slot_keys(t, &clips) {
+                let Some(spec) = specs.get(&key) else { continue };
+                let params = ins.map_or(0, |i| i.params.len());
+                let sample = if kind == CellKind::Instrument { sample_id(instrument_sample(s, t).as_ref()) } else { 0 };
+                desc.slots.push((key, kind, spec.id.clone(), spec.ch, layout, if needs_storage(params) { params } else { 0 }, sample));
+            }
+        }
+        for b in &s.busses {
+            desc.busses.push((b.id, b.format));
+        }
+        (desc, rows, phase1, aux_end, specs)
+    }
+
+    /// Decides, for one slot, between moving the active one, leaving it absent, and a fresh one.
+    fn plan_slot(&mut self, p: &mut PlannedSlot, layout: u16, make: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>) {
+        let sample = sample_id(p.sample.as_ref());
+        let long = if needs_storage(p.params) { p.params } else { 0 };
+        if let Some(old) = self.active.slots.get(&p.key)
+            && old.kind == p.kind
+            && old.spec.id == p.spec.id
+            && old.spec.ch == p.spec.ch
+            && old.layout == layout
+        {
+            if old.generation == SlotGen::VACANT {
+                p.plan = SlotPlan::Absent;
+                return;
+            }
+            let sampler = old.spec.id == SAMPLER;
+            if old.sample == sample || sampler {
+                let applied = (long > 0 && long != old.heap).then_some(long);
+                let sample = (old.sample != sample).then(|| p.sample.clone());
+                p.plan = SlotPlan::Move { from: old.cell, generation: old.generation, applied, sample };
+                return;
+            }
+        }
+        let slot = self.pool.iter().position(|x| x.key == p.key && x.spec == p.spec).map(|i| self.pool.swap_remove(i).slot);
+        let slot = match slot {
+            Some(s) => Some(s),
+            None => make(&p.spec).map(|n| {
+                let mut s = PluginSlot::new(n.plugin, p.spec.id.clone(), p.spec.ch, p.key.1);
+                s.generation = self.fresh_gen();
+                s
+            }),
+        };
+        let Some(mut slot) = slot else {
+            p.plan = SlotPlan::Absent;
+            return;
+        };
+        slot.layout = layout;
+        if slot.applied.heap.len() != long || !slot.applied.fixed {
+            slot.applied = Applied::prepared(if long > 0 { vec![f32::NAN; long] } else { Vec::new() });
+        }
+        if p.kind == CellKind::Instrument && sample_id(slot.sample_audio.as_ref()) != sample {
+            let wrapper = p.sample.as_ref().map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
+            slot.plugin.set_sample(wrapper.clone());
+            slot.sample_audio = p.sample.clone();
+            slot.sample_wrapper = wrapper;
+        }
+        p.plan = SlotPlan::Fresh(Box::new(slot));
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn build(
+        &mut self,
+        s: &Session,
+        mut desc: Desc,
+        rows: &[usize],
+        phase1: usize,
+        aux_end: usize,
+        specs: HashMap<(TrackId, usize), InstanceSpec>,
+        make: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
+        cap0: usize,
+    ) -> Result<(PlanTables, Vec<CellMove>, Vec<Attach>, Shadow), CompileError> {
+        let block = self.target.block();
+        let main_ch = main_channels(s);
+        let sr = self.target.sample_rate as f32;
+        // Slots first: their instances tell the delay the strips need.
+        let mut per_strip: Vec<(usize, u16, Vec<PlannedSlot>, Vec<(u64, Option<InstanceSpec>, Option<InstanceSpec>)>)> = Vec::new();
+        for &ti in rows {
+            let Some(t) = s.tracks.get(ti) else { continue };
+            let ch = strip_channels(t, main_ch);
+            let layout = layout_code(strip_format(t, ch));
+            let clips = clip_entries(t.id, &specs);
+            let mut planned = Vec::new();
+            for (key, kind, ins) in slot_keys(t, &clips) {
+                let Some(spec) = specs.get(&key) else { continue };
+                let index = match kind {
+                    CellKind::Insert => key.1,
+                    CellKind::ClipEq | CellKind::ClipComp => {
+                        clip_fx_of_slot(key.1).and_then(|(c, _)| clips.iter().position(|(x, _, _)| *x == c)).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                let sample = if kind == CellKind::Instrument { instrument_sample(s, t) } else { None };
+                let mut p = PlannedSlot {
+                    key,
+                    kind,
+                    index: u16::try_from(index).unwrap_or(u16::MAX),
+                    spec: spec.clone(),
+                    params: ins.map_or(0, |i| i.params.len()),
+                    sample,
+                    plan: SlotPlan::Absent,
+                };
+                self.plan_slot(&mut p, layout, make);
+                planned.push(p);
+            }
+            per_strip.push((ti, layout, planned, clips));
+        }
+        let latency_of = |p: &PlannedSlot, me: &Self| match &p.plan {
+            SlotPlan::Move { .. } => me.active.slots.get(&p.key).map_or(0, |o| o.latency),
+            SlotPlan::Fresh(slot) => slot.plugin.latency(),
+            SlotPlan::Absent => 0,
+        };
+        let need = per_strip
+            .iter()
+            .map(|(_, _, ps, _)| ps.iter().filter(|p| p.kind == CellKind::Insert).fold(0usize, |a, p| a.saturating_add(latency_of(p, self))))
+            .max()
+            .unwrap_or(0);
+        let cap1 = self.delay_capacity(self.latency_hint.max(need));
+        let cap = if cap1 > cap0 {
+            if let Err(e) = measure(s, &self.limits, block, cap1) {
+                for (_, _, ps, _) in per_strip {
+                    for p in ps {
+                        if matches!(p.plan, SlotPlan::Fresh(_)) && !self.active.live(&p.key) {
+                            self.released.push(p.key);
+                        }
+                    }
+                }
+                return Err(e);
+            }
+            desc.cap = cap1;
+            cap1
+        } else {
+            cap0
+        };
+
+        // Strips and cells.
+        let mut tables = PlanTables { phase1, aux_end, main_fmt: s.main_format(), ..PlanTables::default() };
+        let mut cells: Vec<CellLoc> = Vec::new();
+        let mut moves = Vec::new();
+        let mut attach = Vec::new();
+        let mut shadow = Shadow { desc: None, ..Shadow::default() };
+        let old_strips: HashMap<TrackId, (usize, ShadowStrip)> =
+            self.active.strips.iter().cloned().enumerate().map(|(i, x)| (x.track, (i, x))).collect();
+        let mut strip_moves = Vec::new();
+        let mut aux = 0usize;
+        for (si, (ti, layout, _, clips)) in per_strip.iter().enumerate() {
+            let Some(t) = s.tracks.get(*ti) else { continue };
+            let ch = strip_channels(t, main_ch);
+            let mut st = Strip::new();
+            st.buf = vec![vec![0.0; block]; ch];
+            st.pre = (0..ch).map(|_| Vec::with_capacity(block)).collect();
+            st.scratch = vec![0.0; block];
+            st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
+            st.held = Vec::with_capacity(128);
+            st.clipbuf = vec![vec![0.0; block]; ch];
+            st.external = true;
+            st.align = DelayLine::with_capacity(ch, cap);
+            st.align_pre = DelayLine::with_capacity(ch, cap);
+            st.out_extra = DelayLine::with_capacity(ch, cap);
+            st.outbuf = (0..ch).map(|_| Vec::with_capacity(block)).collect();
+            st.track = u16::try_from(*ti).unwrap_or(u16::MAX);
+            st.id = t.id;
+            st.layout = *layout;
+            st.meter = StripMeter { peaks: vec![0.0; ch], ..StripMeter::default() };
+            st.clip_fx = ClipFxTable(clips.iter().map(|(c, _, _)| (*c, ClipFx::new(sr, ch, false))).collect());
+            let ch16 = u16::try_from(ch).unwrap_or(u16::MAX);
+            let generation = match old_strips.get(&t.id) {
+                Some((from, old)) if old.ch == ch16 && old.layout == *layout && old.generation != SlotGen::VACANT => {
+                    strip_moves.push(CellMove { kind: CellKind::Strip, from: *from as u16, to: si as u16, expect: old.generation });
+                    old.generation
+                }
+                _ => {
+                    let g = self.fresh_gen();
+                    st.generation = g;
+                    g
+                }
+            };
+            if matches!(t.kind, TrackKind::Aux | TrackKind::Folder) {
+                aux += 1;
+            }
+            cells.push(CellLoc { strip: si as u16, index: 0, shape: Shape { kind: CellKind::Strip, ch: ch16, layout: *layout } });
+            shadow.strips.push(ShadowStrip { track: t.id, generation, ch: ch16, layout: *layout });
+            tables.strips.push(st);
+        }
+        moves.extend(strip_moves);
+        for (si, (_, layout, planned, _)) in per_strip.into_iter().enumerate() {
+            for p in planned {
+                let cell = u16::try_from(cells.len()).unwrap_or(u16::MAX);
+                let loc = CellLoc {
+                    strip: si as u16,
+                    index: p.index,
+                    shape: Shape { kind: p.kind, ch: u16::try_from(p.spec.ch).unwrap_or(u16::MAX), layout },
+                };
+                cells.push(loc);
+                let long = if needs_storage(p.params) { p.params } else { 0 };
+                let mut sh = ShadowSlot {
+                    cell,
+                    generation: SlotGen::VACANT,
+                    spec: p.spec,
+                    kind: p.kind,
+                    layout,
+                    heap: long,
+                    sample: sample_id(p.sample.as_ref()),
+                    latency: 0,
+                };
+                match p.plan {
+                    SlotPlan::Move { from, generation, applied, sample } => {
+                        let old = self.active.slots.get(&p.key);
+                        sh.generation = generation;
+                        sh.latency = old.map_or(0, |o| o.latency);
+                        sh.heap = old.map_or(0, |o| o.heap);
+                        moves.push(CellMove { kind: p.kind, from, to: cell, expect: generation });
+                        if let Some(n) = applied {
+                            attach.push(Attach::Applied { cell, storage: vec![f32::NAN; n] });
+                            sh.heap = n;
+                        }
+                        if let Some(audio) = sample {
+                            let wrapper = audio.as_ref().map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
+                            attach.push(Attach::Sample { cell, audio, wrapper });
+                        }
+                    }
+                    SlotPlan::Fresh(slot) => {
+                        sh.generation = slot.generation;
+                        sh.latency = slot.plugin.latency();
+                        sh.heap = slot.applied.heap.len();
+                        if let Some(c) = tables.slot_mut(&loc) {
+                            *c = Some(*slot);
+                        }
+                    }
+                    SlotPlan::Absent => {}
+                }
+                shadow.slots.insert(p.key, sh);
+            }
+        }
+        let mut tracks: Vec<(TrackId, u16)> = tables.strips.iter().enumerate().map(|(i, st)| (st.id, i as u16)).collect();
+        tracks.sort_unstable();
+        tables.tracks = tracks.into_boxed_slice();
+        let mut busses: Vec<(BusId, BusBuf)> = s
+            .busses
+            .iter()
+            .map(|b| (b.id, BusBuf { fmt: b.format, buf: vec![vec![0.0; block]; b.format.channels().clamp(1, MAX_CHANNELS)] }))
+            .collect();
+        busses.sort_by_key(|(id, _)| *id);
+        busses.dedup_by_key(|(id, _)| *id);
+        tables.busses = BusTable(busses);
+        tables.main = vec![vec![0.0; block]; main_ch];
+        tables.main_meter = StripMeter { peaks: vec![0.0; main_ch], ..StripMeter::default() };
+        tables.aux_fed = Vec::with_capacity(aux.max(1));
+        shadow.cells = cells.len();
+        tables.cells = cells.into_boxed_slice();
+        shadow.tracks = tables.tracks.clone();
+        shadow.desc = Some(desc);
+        Ok((tables, moves, attach, shadow))
+    }
+
+    /// Takes back a returned, refused or never-serviced envelope (control thread) and drops what
+    /// it holds here. A returned plan becomes the confirmed active one; after a refusal the
+    /// active one stays, and the refused plan's fresh instances wait in the pool for the next
+    /// compile (anything that compile does not reuse is dropped at its end).
+    pub fn reclaim(&mut self, mut env: PlanEnvelope) {
+        let generation = env.plan.id.generation;
+        match self.pending.take() {
+            Some(p) if p.generation == generation => match env.state {
+                EnvelopeState::Returned { .. } => {
+                    match p.shadow {
+                        Some(sh) => self.active = Shadow { generation, ..sh },
+                        None => self.active.generation = generation,
+                    }
+                    if let Some(old) = &env.plan.tables {
+                        for key in live_keys(old) {
+                            if !self.active.live(&key) {
+                                self.released.push(key);
+                            }
+                        }
+                    }
+                }
+                EnvelopeState::Rejected { .. } | EnvelopeState::Pending => {
+                    if let (Some(sh), Some(tables)) = (p.shadow, env.plan.tables.as_mut()) {
+                        self.harvest(tables, &sh);
+                    }
+                }
+            },
+            other => self.pending = other,
+        }
+        drop(env);
+    }
+
+    /// Moves the fresh instances of a refused plan's tables into the pool, up to its bound.
+    fn harvest(&mut self, tables: &mut PlanTables, sh: &Shadow) {
+        let bound = self.pool_bound();
+        for st in &mut tables.strips {
+            let id = st.id;
+            let mut cells: Vec<(usize, &mut Option<PluginSlot>)> = st.plugins.iter_mut().enumerate().collect();
+            cells.push((INSTRUMENT_SLOT, &mut st.instrument));
+            for (clip, fx) in &mut st.clip_fx.0 {
+                if let Some(k) = clip_fx_slot(*clip, false) {
+                    cells.push((k, &mut fx.eq));
+                }
+                if let Some(k) = clip_fx_slot(*clip, true) {
+                    cells.push((k, &mut fx.comp));
+                }
+            }
+            for (k, cell) in cells {
+                let key = (id, k);
+                let (Some(slot), Some(shs)) = (cell.take(), sh.slots.get(&key)) else { continue };
+                if self.pool.len() < bound {
+                    self.pool.push(Pooled { key, spec: shs.spec.clone(), slot });
+                } else if !self.active.live(&key) {
+                    self.released.push(key);
+                }
+            }
+        }
+    }
+
+    /// Slots whose instances this compiler dropped and that hold no instance in the confirmed
+    /// active plan: playback forgets their editors and state readers.
+    pub fn take_released(&mut self) -> Vec<(TrackId, usize)> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// Each track of the plan in `env` and its strip index (sorted by track): playback sizes its
+    /// meters from it.
+    #[must_use]
+    pub fn track_ids<'a>(&self, env: &'a PlanEnvelope) -> &'a [(TrackId, u16)] {
+        &env.plan.tracks
+    }
+}
+
+/// Plug-in id of the native Sampler: the only plug-in whose sample changes in adoption.
+pub(crate) const SAMPLER: &str = "sampler";
+
+/// A track's clips with effects, sorted: (clip, EQ spec, compressor spec).
+fn clip_entries(t: TrackId, specs: &HashMap<(TrackId, usize), InstanceSpec>) -> Vec<(u64, Option<InstanceSpec>, Option<InstanceSpec>)> {
+    let mut m: BTreeMap<u64, (Option<InstanceSpec>, Option<InstanceSpec>)> = BTreeMap::new();
+    for ((tr, slot), spec) in specs {
+        if *tr != t {
+            continue;
+        }
+        if let Some((clip, comp)) = clip_fx_of_slot(*slot) {
+            let e = m.entry(clip).or_default();
+            if comp {
+                e.1 = Some(spec.clone());
+            } else {
+                e.0 = Some(spec.clone());
+            }
+        }
+    }
+    m.into_iter().map(|(c, (e, k))| (c, e, k)).collect()
+}
+
+/// A strip's slot keys in cell order: inserts, the instrument, then each clip's EQ and compressor.
+fn slot_keys<'a>(
+    t: &'a Track,
+    clips: &[(u64, Option<InstanceSpec>, Option<InstanceSpec>)],
+) -> Vec<((TrackId, usize), CellKind, Option<&'a soundcraft_model::Insert>)> {
+    let mut out = Vec::new();
+    for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        if let Some(ins) = ins {
+            out.push(((t.id, i), CellKind::Insert, Some(ins)));
+        }
+    }
+    if let Some(ins) = &t.instrument {
+        out.push(((t.id, INSTRUMENT_SLOT), CellKind::Instrument, Some(ins)));
+    }
+    for (clip, eq, comp) in clips {
+        if eq.is_some()
+            && let Some(k) = clip_fx_slot(*clip, false)
+        {
+            out.push(((t.id, k), CellKind::ClipEq, None));
+        }
+        if comp.is_some()
+            && let Some(k) = clip_fx_slot(*clip, true)
+        {
+            out.push(((t.id, k), CellKind::ClipComp, None));
+        }
+    }
+    out
+}
+
+/// The pool audio a track's instrument plays.
+fn instrument_sample(s: &Session, t: &Track) -> Option<Arc<SourceAudio>> {
+    t.instrument.as_ref().and_then(|i| i.sample).and_then(|id| s.pool.get(id)).cloned()
+}
+
+/// Keys of the live slots in `tables`.
+fn live_keys(tables: &PlanTables) -> Vec<(TrackId, usize)> {
+    let mut out = Vec::new();
+    for st in &tables.strips {
+        for (i, p) in st.plugins.iter().enumerate() {
+            if p.is_some() {
+                out.push((st.id, i));
+            }
+        }
+        if st.instrument.is_some() {
+            out.push((st.id, INSTRUMENT_SLOT));
+        }
+        for (clip, fx) in &st.clip_fx.0 {
+            if fx.eq.is_some()
+                && let Some(k) = clip_fx_slot(*clip, false)
+            {
+                out.push((st.id, k));
+            }
+            if fx.comp.is_some()
+                && let Some(k) = clip_fx_slot(*clip, true)
+            {
+                out.push((st.id, k));
+            }
+        }
+    }
+    out
+}

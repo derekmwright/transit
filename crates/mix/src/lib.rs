@@ -49,6 +49,17 @@
 //! instrument (the Sampler) is handed the decoded audio of its insert's
 //! [`Insert::sample`] source straight from the session's pool, shared and never copied.
 //!
+//! ## Prepared plans (realtime, F01b)
+//! An engine made with [`MixEngine::realtime`] never discovers structure on the audio thread.
+//! A [`PlanCompiler`] on the control thread turns each Session into a [`PlanEnvelope`] whose
+//! tables (strips, plug-in slots, clip effects, busses, main mix, delay lines, parameter
+//! storage) are sized and bounded by [`PlanLimits`]. [`MixEngine::adopt_plan`] validates it
+//! without changing anything, then only swaps: reused cells (a strip's running state, plug-in
+//! slots) move into the new tables, and everything the old plan owned goes back in the same
+//! envelope, to be dropped on the control thread at [`PlanCompiler::reclaim`].
+//! [`MixEngine::render_active`] renders the active plan. The `adopt`/`sync`/`render` path
+//! described above is unchanged and still drives offline renders and today's playback.
+//!
 //! [`Insert::state`]: soundcraft_model::Insert::state
 //! [`Insert::sample`]: soundcraft_model::Insert::sample
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -63,6 +74,16 @@ use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
+
+mod active;
+mod compile;
+mod plan;
+
+pub use compile::{CompileError, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
+pub use plan::{
+    Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
+    RenderTarget, Retired, SlotGen,
+};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -255,6 +276,37 @@ struct BusBuf {
     buf: Vec<Vec<f32>>,
 }
 
+/// Where strips find the busses they read and write: a map in legacy engines, a table sorted
+/// by id in plan mode.
+trait Busses {
+    fn bus(&self, id: BusId) -> Option<&BusBuf>;
+    fn bus_mut(&mut self, id: BusId) -> Option<&mut BusBuf>;
+}
+
+impl Busses for HashMap<BusId, BusBuf> {
+    fn bus(&self, id: BusId) -> Option<&BusBuf> {
+        self.get(&id)
+    }
+    fn bus_mut(&mut self, id: BusId) -> Option<&mut BusBuf> {
+        self.get_mut(&id)
+    }
+}
+
+/// Plan-mode busses, sorted by id.
+#[derive(Default)]
+struct BusTable(Vec<(BusId, BusBuf)>);
+
+impl Busses for BusTable {
+    fn bus(&self, id: BusId) -> Option<&BusBuf> {
+        let i = self.0.binary_search_by_key(&id, |(b, _)| *b).ok()?;
+        self.0.get(i).map(|(_, b)| b)
+    }
+    fn bus_mut(&mut self, id: BusId) -> Option<&mut BusBuf> {
+        let i = self.0.binary_search_by_key(&id, |(b, _)| *b).ok()?;
+        self.0.get_mut(i).map(|(_, b)| b)
+    }
+}
+
 /// Parameter maps up to this long are tracked inline in a [`PluginSlot`] (every built-in's is).
 const APPLIED_INLINE: usize = 64;
 
@@ -265,19 +317,35 @@ struct Applied {
     len: usize,
     inline: [f32; APPLIED_INLINE],
     heap: Vec<f32>,
+    /// Plan mode: `heap` is prepared off the audio thread (see `Attach::Applied`) and never
+    /// resized here. A map whose length does not match it pushes the values that fit.
+    fixed: bool,
+    /// Plan mode: how often a map did not match the prepared storage.
+    mismatch: u32,
 }
 
 impl Applied {
     const fn new() -> Self {
-        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap: Vec::new() }
+        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap: Vec::new(), fixed: false, mismatch: 0 }
     }
 
-    /// The `n` values, all NaN ("never pushed") when the map's length changed.
+    /// Plan mode: `heap` is the prepared storage (empty for a map that fits inline).
+    fn prepared(heap: Vec<f32>) -> Self {
+        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap, fixed: true, mismatch: 0 }
+    }
+
+    /// The `n` values, all NaN ("never pushed") when the map's length changed. In plan mode a
+    /// long map whose length differs from the prepared storage gets `min(n, storage)` values.
     fn values(&mut self, n: usize) -> &mut [f32] {
         if n != self.len {
             self.len = n;
             if n <= APPLIED_INLINE {
                 self.inline.fill(f32::NAN);
+            } else if self.fixed {
+                self.heap.fill(f32::NAN);
+                if self.heap.len() != n {
+                    self.mismatch = self.mismatch.saturating_add(1);
+                }
             } else {
                 self.heap = vec![f32::NAN; n];
             }
@@ -308,6 +376,38 @@ struct PluginSlot {
     /// A parameter was sent to the plugin since it last processed a block. Its next block is
     /// processed even while suspended, so the queued change reaches it.
     woken: bool,
+    /// Plan mode: the slot's identity across plans ([`SlotGen::VACANT`] in legacy engines).
+    generation: SlotGen,
+    /// Plan mode: channel-format code of the strip it was prepared for.
+    layout: u16,
+    /// Plan mode: the pool audio and the wrapper handed to the instrument with `set_sample`. Both
+    /// owners stay here, so the plug-in never drops the last one.
+    sample_audio: Option<Arc<SourceAudio>>,
+    sample_wrapper: Option<Arc<dyn SampleSource>>,
+}
+
+impl PluginSlot {
+    /// A slot for a new instance in slot `slot` ([`INSTRUMENT_SLOT`], an insert index or a
+    /// [`clip_fx_slot`]). Hosted plug-ins start `fresh`; hosted effect inserts are suspendable.
+    fn new(plugin: Box<dyn Plugin>, id: String, ch: usize, slot: usize) -> Self {
+        let third = is_third_party(&id);
+        PluginSlot {
+            id,
+            ch,
+            plugin,
+            applied: Applied::new(),
+            failed: false,
+            fresh: third,
+            suspendable: third && slot != INSTRUMENT_SLOT && clip_fx_of_slot(slot).is_none(),
+            quiet: 0,
+            output_silent: true,
+            woken: false,
+            generation: SlotGen::VACANT,
+            layout: 0,
+            sample_audio: None,
+            sample_wrapper: None,
+        }
+    }
 }
 
 struct Strip {
@@ -326,7 +426,7 @@ struct Strip {
     muted: bool,
     gr: f32,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
-    clip_fx: HashMap<u64, ClipFx>,
+    clip_fx: ClipFxTable,
     clipbuf: Vec<Vec<f32>>,
     /// The engine takes its instances from the host ([`MixEngine::set_external_instances`]):
     /// clip-effect modules come from `sync`, never from the render.
@@ -340,6 +440,17 @@ struct Strip {
     out_extra: DelayLine,
     outbuf: Vec<Vec<f32>>,
     failures: PluginFailures,
+    /// Plan mode: the strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that
+    /// waits for a move, in a strip whose state moved out, and in legacy engines.
+    generation: SlotGen,
+    /// Plan mode: index of the strip's track in the plan's session.
+    track: u16,
+    /// Plan mode: the track's id.
+    id: TrackId,
+    /// Plan mode: channel-format code of `buf`.
+    layout: u16,
+    /// Plan mode: the strip's meter (legacy engines keep theirs in [`MixEngine::meters`]).
+    meter: StripMeter,
 }
 
 /// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
@@ -352,16 +463,38 @@ struct DelayLine {
     bufs: Vec<Vec<f32>>,
     idx: usize,
     len: usize,
+    /// Plan mode: `bufs` were sized off the audio thread to this declared capacity and are never
+    /// resized; a longer delay is clamped to it.
+    cap: Option<usize>,
 }
 
 impl DelayLine {
-    fn set(&mut self, len: usize, ch: usize) {
+    /// A plan-mode delay line with `cap` samples of storage per channel.
+    fn with_capacity(ch: usize, cap: usize) -> Self {
+        DelayLine { bufs: vec![vec![0.0; cap]; ch], idx: 0, len: 0, cap: Some(cap) }
+    }
+
+    /// Sets the delay. Returns the delay asked for when a plan-mode line had to clamp it to its
+    /// capacity, else 0.
+    fn set(&mut self, len: usize, ch: usize) -> usize {
         let len = len.min(MAX_LATENCY);
+        if let Some(cap) = self.cap {
+            let fit = len.min(cap);
+            if fit != self.len {
+                self.len = fit;
+                self.idx = 0;
+                for b in &mut self.bufs {
+                    b.iter_mut().take(fit).for_each(|x| *x = 0.0);
+                }
+            }
+            return if len > cap { len } else { 0 };
+        }
         if len != self.len || self.bufs.len() != ch {
             self.len = len;
             self.idx = 0;
             self.bufs = vec![vec![0.0; len]; ch];
         }
+        0
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         if self.len == 0 {
@@ -384,7 +517,8 @@ impl DelayLine {
         self.idx = (start + frames) % self.len.max(1);
     }
     fn clear(&mut self) {
-        self.bufs.iter_mut().for_each(|b| b.fill(0.0));
+        let len = self.len;
+        self.bufs.iter_mut().for_each(|b| b.iter_mut().take(len).for_each(|x| *x = 0.0));
     }
 }
 
@@ -405,9 +539,41 @@ struct ClipFx {
     lazy: bool,
 }
 
-/// A clip-effect module and the plugin id it came with from the host (kept with it, so that
-/// string is not freed on the audio thread when the module arrives).
-type ClipModule = (Box<dyn Plugin>, String);
+/// A clip-effect module, in a slot like an insert's: the plugin id it came with from the host
+/// stays with it, so that string is not freed on the audio thread when the module arrives.
+type ClipModule = PluginSlot;
+
+/// A strip's clip-effect chains, sorted by clip id, so a lookup neither hashes nor allocates.
+#[derive(Default)]
+struct ClipFxTable(Vec<(u64, ClipFx)>);
+
+impl ClipFxTable {
+    fn get_mut(&mut self, clip: u64) -> Option<&mut ClipFx> {
+        let i = self.0.binary_search_by_key(&clip, |(c, _)| *c).ok()?;
+        self.0.get_mut(i).map(|(_, fx)| fx)
+    }
+
+    /// The chain of `clip`, made with `make` when there is none (may allocate: not in plan mode).
+    fn get_or_insert_with(&mut self, clip: u64, make: impl FnOnce() -> ClipFx) -> &mut ClipFx {
+        let i = match self.0.binary_search_by_key(&clip, |(c, _)| *c) {
+            Ok(i) => i,
+            Err(i) => {
+                self.0.insert(i, (clip, make()));
+                i
+            }
+        };
+        let (_, fx) = &mut self.0[i];
+        fx
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(u64, &mut ClipFx) -> bool) {
+        self.0.retain_mut(|(c, fx)| keep(*c, fx));
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ClipFx> {
+        self.0.iter_mut().map(|(_, fx)| fx)
+    }
+}
 
 /// Room for this many clip-effect chains per audio strip is reserved when the strip is made, so
 /// the first ones added during playback do not grow the table on the audio thread.
@@ -426,7 +592,7 @@ impl Strip {
             chase: true,
             muted: false,
             gr: 0.0,
-            clip_fx: HashMap::new(),
+            clip_fx: ClipFxTable::default(),
             clipbuf: Vec::new(),
             external: false,
             latency: 0,
@@ -435,6 +601,11 @@ impl Strip {
             out_extra: DelayLine::default(),
             outbuf: Vec::new(),
             failures: PluginFailures::default(),
+            generation: SlotGen::VACANT,
+            track: 0,
+            id: TrackId(0),
+            layout: 0,
+            meter: StripMeter::default(),
         }
     }
 }
@@ -492,6 +663,8 @@ pub struct MixEngine {
     work: Vec<(usize, Strip)>,
     /// Render every strip on the calling thread (tests compare it with the parallel render).
     serial: bool,
+    /// Plan mode ([`MixEngine::realtime`]): the active plan [`MixEngine::render_active`] renders.
+    plan: Option<Box<plan::ActivePlan>>,
 }
 
 /// What `sync` needs to fill a slot.
@@ -511,9 +684,7 @@ impl SlotCtx<'_> {
     }
 
     fn retire_module(&mut self, module: Option<ClipModule>) {
-        if let Some((plugin, _)) = module {
-            self.retired.push(plugin);
-        }
+        self.retire(module);
     }
 
     fn waiting_at(&self, t: TrackId, idx: usize) -> Option<usize> {
@@ -552,19 +723,7 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             (create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)?.plugin, ins.plugin.clone())
         };
-        let suspendable = third && idx != INSTRUMENT_SLOT;
-        Some(PluginSlot {
-            id,
-            ch,
-            plugin,
-            applied: Applied::new(),
-            failed: false,
-            fresh: third,
-            suspendable,
-            quiet: 0,
-            output_silent: true,
-            woken: false,
-        })
+        Some(PluginSlot::new(plugin, id, ch, idx))
     }
 }
 
@@ -616,7 +775,13 @@ impl MixEngine {
             order_depth: Vec::new(),
             work: Vec::new(),
             serial: false,
+            plan: None,
         }
+    }
+
+    /// Every strip: a legacy engine's, and the active plan's.
+    fn all_strips(&mut self) -> impl Iterator<Item = &mut Strip> {
+        self.strips.values_mut().chain(self.plan.iter_mut().flat_map(|p| p.tables.strips.iter_mut()))
     }
 
     /// Realtime mode: every plugin (built-in or third-party, inserts, instruments and clip
@@ -689,7 +854,7 @@ impl MixEngine {
             out.extend(st.plugins.iter_mut().filter_map(Option::take).map(|s| s.plugin));
             out.extend(st.instrument.take().map(|s| s.plugin));
             for fx in st.clip_fx.values_mut() {
-                out.extend(fx.eq.take().into_iter().chain(fx.comp.take()).map(|(p, _)| p));
+                out.extend(fx.eq.take().into_iter().chain(fx.comp.take()).map(|m| m.plugin));
             }
         }
         out.extend(self.adopt.drain(..).map(|p| p.plugin));
@@ -703,24 +868,28 @@ impl MixEngine {
 
     /// Format of the main mix as of the last sync.
     pub fn main_format(&self) -> ChannelFormat {
-        self.main_fmt
+        self.plan.as_deref().map_or(self.main_fmt, |p| p.tables.main_fmt)
     }
 
     /// Channels of the main mix as of the last sync.
     pub fn main_channels(&self) -> usize {
-        self.main.len()
+        self.plan.as_deref().map_or(self.main.len(), |p| p.tables.main.len())
     }
 
     /// Play (velocity > 0) or release (velocity 0) `pitch` on a track's instrument at the next
     /// block, outside the clips: the MIDI Editor's audition. Does nothing before `sync`.
     pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
-        let Some(inst) = self.strips.get_mut(&track).and_then(|s| s.instrument.as_mut()) else { return };
+        let strip = match self.plan.as_deref_mut() {
+            Some(p) => p.tables.strip_of(track).and_then(|i| p.tables.strips.get_mut(i)),
+            None => self.strips.get_mut(&track),
+        };
+        let Some(inst) = strip.and_then(|s| s.instrument.as_mut()) else { return };
         if velocity > 0 { inst.plugin.note_on(0, pitch.min(127), velocity.min(127)) } else { inst.plugin.note_off(0, pitch.min(127)) }
     }
 
     /// Reset all plugin state (on stop / seek).
     pub fn reset(&mut self) {
-        for s in self.strips.values_mut() {
+        for s in self.all_strips() {
             for p in s.plugins.iter_mut().flatten() {
                 p.plugin.reset();
                 p.failed = false;
@@ -738,12 +907,21 @@ impl MixEngine {
         }
         self.meters.clear();
         self.main_meter = StripMeter::default();
+        // Plan mode: meters are fixed storage, zeroed in place.
+        if let Some(p) = self.plan.as_deref_mut() {
+            for m in p.tables.strips.iter_mut().map(|s| &mut s.meter).chain(std::iter::once(&mut p.tables.main_meter)) {
+                m.peak = [0.0; 2];
+                m.peaks.fill(0.0);
+                m.gain_reduction_db = 0.0;
+                m.plugin_failures = PluginFailures::default();
+            }
+        }
     }
 
     /// Release every held note on every instrument now. Unlike `reset`, this leaves plugin state,
     /// the playback position and note chasing alone, so queued releases still sound out.
     pub fn all_notes_off(&mut self) {
-        for st in self.strips.values_mut() {
+        for st in self.all_strips() {
             if let Some(i) = &mut st.instrument {
                 i.plugin.all_notes_off();
             }
@@ -758,7 +936,7 @@ impl MixEngine {
     /// position is untouched, inserts do not run, and the output is discarded. Allocation-free.
     pub fn flush_releases(&mut self, frames: usize) {
         let frames = frames.min(self.max_block);
-        for st in self.strips.values_mut() {
+        for st in self.all_strips() {
             let Some(inst) = st.instrument.as_mut().filter(|i| !i.failed) else { continue };
             // Defensive: `sync` sizes `buf` and `scratch` to `max_block`, but a plug-in must never
             // be handed a buffer shorter than `frames`, so clamp to the shortest one.
@@ -1043,35 +1221,7 @@ impl MixEngine {
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);
         for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
             if let Some(strip) = self.strips.get_mut(&t.id) {
-                for (dst, src) in strip.buf.iter_mut().zip(self.main.iter()) {
-                    if let (Some(d), Some(sr)) = (dst.get_mut(..frames), src.get(..frames)) {
-                        d.copy_from_slice(sr);
-                    }
-                }
-                for (i, ins) in t.mixer.inserts.iter().enumerate() {
-                    if let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i))
-                        && ins.active
-                        && !ins.bypass
-                        && !slot.failed
-                    {
-                        apply_params(slot, ins, t, i, pos);
-                        if run_insert(slot, &mut strip.buf, frames, &transport, self.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
-                            strip.failures.record(i);
-                        }
-                    }
-                }
-                let v0 = volume_db_at(t, pos);
-                let v1 = volume_db_at(t, pos + frames as i64);
-                for (ch, src) in strip.buf.iter().enumerate().take(self.main.len()) {
-                    if let Some(m) = self.main.get_mut(ch) {
-                        for i in 0..frames {
-                            let g = lerp_gain(v0, v1, i, frames);
-                            if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
-                                *d = x * g;
-                            }
-                        }
-                    }
-                }
+                process_master(t, strip, &mut self.main, pos, frames, &transport, self.no_suspend);
                 let m = self.meters.entry(t.id).or_default();
                 m.measure(&self.main, frames, 0.0);
                 m.plugin_failures = strip.failures;
@@ -1126,8 +1276,24 @@ impl MixEngine {
         let m = self.meters.entry(t.id).or_default();
         m.measure(&strip.buf, frames, strip.gr);
         m.plugin_failures = strip.failures;
+        let mix = MixOut { busses: &mut self.busses, main: &mut self.main, main_fmt: self.main_fmt, law: self.pan_law };
+        route_into(t, strip, pos, frames, mix);
+    }
+}
+
+/// Where [`route_into`] sends a strip: the busses, the main mix and its format, and the pan law.
+struct MixOut<'a, B: Busses + ?Sized> {
+    busses: &'a mut B,
+    main: &'a mut [Vec<f32>],
+    main_fmt: ChannelFormat,
+    law: PanLaw,
+}
+
+/// Send and pan a processed (and metered) strip into the busses / main mix.
+fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) {
+    let MixOut { busses, main, main_fmt, law } = out;
+    {
         let src_fmt = strip_format(t, strip.buf.len());
-        let law = self.pan_law;
         for (i, snd) in t.mixer.sends.iter().enumerate() {
             let Some(snd) = snd else { continue };
             if snd.mute || strip.muted {
@@ -1137,7 +1303,7 @@ impl MixEngine {
             let gain = db_to_gain(lvl);
             let src = if snd.pre_fader { &strip.pre } else { &strip.buf };
             let Route::Bus(b) = &snd.target else { continue };
-            let Some(dst) = self.busses.get_mut(b) else { continue };
+            let Some(dst) = busses.bus_mut(*b) else { continue };
             if gain <= 0.0 {
                 continue;
             }
@@ -1161,9 +1327,9 @@ impl MixEngine {
             }
             _ => &strip.buf,
         };
-        let (dst, dst_fmt) = match &t.mixer.output {
-            Route::Main => (&mut self.main, self.main_fmt),
-            Route::Bus(b) => match self.busses.get_mut(b) {
+        let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
+            Route::Main => (main, main_fmt),
+            Route::Bus(b) => match busses.bus_mut(*b) {
                 Some(d) => (&mut d.buf, d.fmt),
                 None => return,
             },
@@ -1191,11 +1357,12 @@ struct LiveInput<'a> {
     no_suspend: bool,
 }
 
-fn process_strip(
+#[allow(clippy::too_many_arguments)]
+fn process_strip<B: Busses + ?Sized>(
     s: &Session,
     t: &Track,
     strip: &mut Strip,
-    busses: &HashMap<BusId, BusBuf>,
+    busses: &B,
     live: &LiveInput<'_>,
     pos: Samples,
     frames: usize,
@@ -1247,7 +1414,7 @@ fn process_strip(
                             // Realtime: `sync` placed the chain with its modules. A clip without
                             // one (only a gain, or modules still on their way) uses a chain
                             // without modules here, which allocates nothing.
-                            match strip.clip_fx.get_mut(&clip.id.0) {
+                            match strip.clip_fx.get_mut(clip.id.0) {
                                 Some(fx) => fx,
                                 None => {
                                     gain_only = ClipFx::new(sr, nch, false);
@@ -1255,7 +1422,7 @@ fn process_strip(
                                 }
                             }
                         } else {
-                            strip.clip_fx.entry(clip.id.0).or_insert_with(|| ClipFx::new(sr, nch, true))
+                            strip.clip_fx.get_or_insert_with(clip.id.0, || ClipFx::new(sr, nch, true))
                         };
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -1270,7 +1437,7 @@ fn process_strip(
         }
         TrackKind::Aux | TrackKind::Folder => {
             if let Route::Bus(b) = &t.mixer.input
-                && let Some(src) = busses.get(b)
+                && let Some(src) = busses.bus(*b)
             {
                 let (ns, nd) = (src.buf.len(), strip.buf.len());
                 let dst_fmt = strip_format(t, nd);
@@ -1392,6 +1559,41 @@ fn process_strip(
         for i in 0..frames {
             if let Some(x) = c.get_mut(i) {
                 *x *= lerp_gain(g0, g1, i, frames.saturating_sub(1));
+            }
+        }
+    }
+}
+
+/// A master fader over the main mix: copies the mix into the strip, runs its inserts and writes
+/// it back through the fader.
+fn process_master(t: &Track, strip: &mut Strip, main: &mut [Vec<f32>], pos: Samples, frames: usize, transport: &Transport, no_suspend: bool) {
+    for (dst, src) in strip.buf.iter_mut().zip(main.iter()) {
+        if let (Some(d), Some(sr)) = (dst.get_mut(..frames), src.get(..frames)) {
+            d.copy_from_slice(sr);
+        }
+    }
+    for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        if let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i))
+            && ins.active
+            && !ins.bypass
+            && !slot.failed
+        {
+            apply_params(slot, ins, t, i, pos);
+            if run_insert(slot, &mut strip.buf, frames, transport, no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
+                strip.failures.record(i);
+            }
+        }
+    }
+    let v0 = volume_db_at(t, pos);
+    let v1 = volume_db_at(t, pos + frames as i64);
+    let n = main.len();
+    for (ch, src) in strip.buf.iter().enumerate().take(n) {
+        if let Some(m) = main.get_mut(ch) {
+            for i in 0..frames {
+                let g = lerp_gain(v0, v1, i, frames);
+                if let (Some(d), Some(x)) = (m.get_mut(i), src.get(i)) {
+                    *d = x * g;
+                }
             }
         }
     }
@@ -1520,7 +1722,7 @@ impl ClipFx {
     fn make(&self, id: &str) -> Option<ClipModule> {
         soundcraft_dsp::create(id).map(|mut p| {
             p.prepare(self.sr, 16_384, self.ch.max(1));
-            (p, String::new())
+            PluginSlot::new(p, String::new(), self.ch, CLIP_FX_BIT)
         })
     }
     /// A module runs only while one of its parameters is set. Offline, modules are made and
@@ -1543,16 +1745,16 @@ impl ClipFx {
         }
         for (k, v) in params {
             if let Some(p) = k.strip_prefix("eq.") {
-                if let Some((eq, _)) = &mut self.eq
-                    && eq.param(p) != Some(v)
+                if let Some(eq) = &mut self.eq
+                    && eq.plugin.param(p) != Some(v)
                 {
-                    eq.set_param(p, v);
+                    eq.plugin.set_param(p, v);
                 }
             } else if let Some(p) = k.strip_prefix("comp.") {
-                if let Some((c, _)) = &mut self.comp
-                    && c.param(p) != Some(v)
+                if let Some(c) = &mut self.comp
+                    && c.plugin.param(p) != Some(v)
                 {
-                    c.set_param(p, v);
+                    c.plugin.set_param(p, v);
                 }
             } else if k == "gain" {
                 self.gain_db = v;
@@ -1560,11 +1762,11 @@ impl ClipFx {
         }
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        if let Some((eq, _)) = self.eq.as_mut().filter(|_| self.eq_on) {
-            eq.process(io, frames);
+        if let Some(eq) = self.eq.as_mut().filter(|_| self.eq_on) {
+            eq.plugin.process(io, frames);
         }
-        if let Some((c, _)) = self.comp.as_mut().filter(|_| self.comp_on) {
-            c.process(io, frames);
+        if let Some(c) = self.comp.as_mut().filter(|_| self.comp_on) {
+            c.plugin.process(io, frames);
         }
         if self.gain_db.abs() > 1e-6 {
             let g = db_to_gain(self.gain_db);
@@ -1586,8 +1788,8 @@ fn sync_clip_fx(strip: &mut Strip, t: &Track, s: &Session, ch: usize, cx: &mut S
         if strip.clipbuf.len() != ch || strip.clipbuf.first().map_or(0, Vec::len) < cx.mb {
             strip.clipbuf = vec![vec![0.0; cx.mb]; ch];
         }
-        if strip.clip_fx.capacity() == 0 {
-            strip.clip_fx.reserve(CLIP_FX_RESERVE);
+        if strip.clip_fx.0.capacity() == 0 {
+            strip.clip_fx.0.reserve(CLIP_FX_RESERVE);
         }
     }
     while let Some((clip, comp, p)) = cx.take_clip_module(t.id) {
@@ -1595,14 +1797,15 @@ fn sync_clip_fx(strip: &mut Strip, t: &Track, s: &Session, ch: usize, cx: &mut S
             cx.retired.push(p.plugin);
             continue;
         }
-        let fx = strip.clip_fx.entry(clip).or_insert_with(|| ClipFx::new(cx.sr, ch, !cx.external));
-        let module = Some((p.plugin, p.id));
+        let fx = strip.clip_fx.get_or_insert_with(clip, || ClipFx::new(cx.sr, ch, !cx.external));
+        let slot = clip_fx_slot(clip, comp).unwrap_or(CLIP_FX_BIT);
+        let module = Some(PluginSlot::new(p.plugin, p.id, p.ch, slot));
         let old = if comp { std::mem::replace(&mut fx.comp, module) } else { std::mem::replace(&mut fx.eq, module) };
         cx.retire_module(old);
     }
     strip.clip_fx.retain(|clip, fx| {
-        let exists = t.clips().iter().any(|c| c.id.0 == *clip);
-        let (eq, comp) = if exists { clip_fx_modules(s, *clip) } else { (false, false) };
+        let exists = t.clips().iter().any(|c| c.id.0 == clip);
+        let (eq, comp) = if exists { clip_fx_modules(s, clip) } else { (false, false) };
         if !eq {
             cx.retire_module(fx.eq.take());
         }
