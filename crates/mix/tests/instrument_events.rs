@@ -6,8 +6,8 @@
 use soundcraft_dsp::Plugin;
 use soundcraft_mix::{
     Adoption, Arrival, DeviceGeneration, Due, EngineEpoch, EventLimits, EventOutcome, INSTRUMENT_SLOT, InstanceSpec, InstrumentEvent, MAX_OPEN,
-    MAX_PEDALS, Message, MixEngine, NewInstance, NoteId, PlanCompiler, PlanGeneration, PlanLimits, PluginEvent, RenderFrame, RenderTarget, Shed,
-    SlotBinding, SlotGen, Source, TransportEpoch,
+    MAX_PEDALS, MAX_PORTS, Message, MixEngine, NewInstance, NoteId, PlanCompiler, PlanGeneration, PlanLimits, PluginEvent, RenderFrame, RenderTarget,
+    Shed, SlotBinding, SlotGen, Source, TransportEpoch,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
 use std::sync::{Arc, Mutex};
@@ -616,6 +616,20 @@ fn a_revoked_source_stays_revoked_until_a_newer_generation() {
     rig.render(1);
     assert_eq!(rig.heard_by(1).len(), 2);
     assert_eq!(rig.mix.event_status().refused_revoked, 2);
+}
+
+#[test]
+fn ports_beyond_the_table_are_refused_and_the_ui_port_is_not() {
+    let mut rig = Rig::new();
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(port(MAX_PORTS as u16, 0), now, on(60)), EventOutcome::PortOutOfRange);
+    assert_eq!(rig.send(port(0x8000, 0), now, on(60)), EventOutcome::PortOutOfRange);
+    rig.mix.revoke_source(0x8000, 1);
+    assert_eq!(rig.send(port(Source::UI, 0), now, on(61)), EventOutcome::Queued);
+    assert_eq!(rig.send(port(MAX_PORTS as u16 - 1, 0), now, on(62)), EventOutcome::Queued);
+    rig.mix.revoke_source(Source::UI, 1);
+    assert_eq!(rig.send(port(Source::UI, 0), now, on(63)), EventOutcome::RevokedSource);
+    assert_eq!(rig.send(Source { generation: 2, ..port(Source::UI, 0) }, now, on(63)), EventOutcome::Queued);
 }
 
 #[test]

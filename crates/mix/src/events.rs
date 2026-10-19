@@ -79,6 +79,15 @@ impl Source {
     /// Clips (the mix's own scheduling; never through the queue).
     pub const CLIP: u16 = 0xFFFF;
 
+    /// The slot of this source's port in the engine's revocation table.
+    fn port_slot(port: u16) -> Option<usize> {
+        match port {
+            Source::UI => Some(MAX_PORTS),
+            Source::CLIP => Some(MAX_PORTS + 1),
+            p => Some(usize::from(p)).filter(|&p| p < MAX_PORTS),
+        }
+    }
+
     /// The same port generation (any channel).
     fn sender_is(&self, port: u16, generation: u64) -> bool {
         self.port == port && self.generation == generation
@@ -134,6 +143,8 @@ pub enum EventOutcome {
     /// The source's port generation was revoked ([`MixEngine::revoke_source`]): a late event
     /// from it never starts anything.
     RevokedSource,
+    /// The source's port is neither below [`MAX_PORTS`] nor [`Source::UI`] or [`Source::CLIP`].
+    PortOutOfRange,
     /// The instrument at the target is another instance.
     StaleBinding,
     /// `transport` is `Some` and not current.
@@ -205,7 +216,7 @@ pub struct EventStatus {
     pub lateness_log2: [u32; 16],
     /// Refused: engine, binding, transport.
     pub refused_stale: [u64; 3],
-    /// Refused because their port generation was revoked.
+    /// Refused because their port generation was revoked, or their port is out of range.
     pub refused_revoked: u64,
     pub refused_no_instrument: u64,
     pub refused_too_early: u64,
@@ -305,6 +316,10 @@ pub struct TapRecord {
     pub message: Message,
     pub outcome: EventOutcome,
 }
+
+/// Ingress ports playback registers at once: ports `0..MAX_PORTS`, plus [`Source::UI`] and
+/// [`Source::CLIP`]. Events from other ports are refused ([`EventOutcome::PortOutOfRange`]).
+pub const MAX_PORTS: usize = 64;
 
 /// Queue slots per instrument.
 pub const QUEUE_CAP: usize = 512;
@@ -1026,15 +1041,13 @@ pub(crate) struct EngineEvents {
     pub(crate) transport: Option<TransportEpoch>,
     pub(crate) status: EventStatus,
     tap: Vec<TapRecord>,
-    /// Per port: one past the highest revoked generation (0: none). Sized for every port when
-    /// the engine takes events, so recording a revocation never allocates.
-    revoked: Vec<u64>,
+    /// Per port slot (see [`MAX_PORTS`]): one past the highest revoked generation (0: none).
+    revoked: [u64; MAX_PORTS + 2],
 }
 
 impl EngineEvents {
     pub(crate) fn new(epoch: Option<EngineEpoch>, limits: EventLimits) -> Self {
-        let revoked = if epoch.is_some() { vec![0; usize::from(u16::MAX) + 1] } else { Vec::new() };
-        EngineEvents { epoch, limits, next_frame: 0, transport: None, status: EventStatus::default(), tap: Vec::new(), revoked }
+        EngineEvents { epoch, limits, next_frame: 0, transport: None, status: EventStatus::default(), tap: Vec::new(), revoked: [0; MAX_PORTS + 2] }
     }
 }
 
@@ -1092,7 +1105,7 @@ impl MixEngine {
             }
             EventOutcome::Coalesced => bump(&mut st.coalesced),
             EventOutcome::StaleEngine => bump(&mut st.refused_stale[0]),
-            EventOutcome::RevokedSource => bump(&mut st.refused_revoked),
+            EventOutcome::RevokedSource | EventOutcome::PortOutOfRange => bump(&mut st.refused_revoked),
             EventOutcome::StaleBinding => bump(&mut st.refused_stale[1]),
             EventOutcome::StaleTransport => bump(&mut st.refused_stale[2]),
             EventOutcome::NoInstrument => bump(&mut st.refused_no_instrument),
@@ -1118,7 +1131,8 @@ impl MixEngine {
             return (EventOutcome::StaleEngine, None);
         }
         // Port generations only increase: one at or below the revoked one is gone for good.
-        if self.events.revoked.get(usize::from(ev.source.port)).is_some_and(|&r| ev.source.generation < r) {
+        let Some(port) = Source::port_slot(ev.source.port) else { return (EventOutcome::PortOutOfRange, None) };
+        if self.events.revoked.get(port).is_some_and(|&r| ev.source.generation < r) {
             return (EventOutcome::RevokedSource, None);
         }
         let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::StaleEngine, None) };
@@ -1198,7 +1212,7 @@ impl MixEngine {
             }
         }
         self.events.status.revoked = self.events.status.revoked.saturating_add(done);
-        if let Some(r) = self.events.revoked.get_mut(usize::from(port)) {
+        if let Some(r) = Source::port_slot(port).and_then(|i| self.events.revoked.get_mut(i)) {
             *r = (*r).max(generation.saturating_add(1));
         }
     }
