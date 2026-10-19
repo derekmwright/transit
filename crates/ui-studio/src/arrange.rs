@@ -568,7 +568,10 @@ pub(crate) fn width_item(app: &mut StudioApp, ui: &mut Ui, id: TrackId) -> Optio
         2 => ("Make Mono", "mono"),
         _ => return None,
     };
-    let reason = app.width_change_disabled_reason();
+    let reason = app
+        .width_change_disabled_reason()
+        .map(str::to_string)
+        .or_else(|| app.engine.session().track(id).and_then(|track| app.width_input(track, format).err()));
     let response = ui.add_enabled(reason.is_none(), egui::Button::new(label)).on_disabled_hover_text(reason.unwrap_or_default());
     if response.clicked() {
         let _ = app.run("track.change_width", json!({"tracks": [id.0], "format": format}));

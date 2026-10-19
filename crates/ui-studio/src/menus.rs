@@ -81,9 +81,9 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 });
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "File".into(), String::new(), file_menu.response.rect));
                 let edit_menu = ui.menu_button("Edit", |ui| {
-                    let items: [(&str, A, fn(&mut StudioApp)); 8] = [
-                        ("Undo", A::Undo, |a| drop(a.run("edit.undo", json!({})))),
-                        ("Redo", A::Redo, |a| drop(a.run("edit.redo", json!({})))),
+                    history_item(app, ui, false);
+                    history_item(app, ui, true);
+                    let items: [(&str, A, fn(&mut StudioApp)); 6] = [
                         ("Cut", A::Cut, |a| drop(a.copy_selected(true))),
                         ("Copy", A::Copy, |a| drop(a.copy_selected(false))),
                         ("Paste at Cursor", A::Paste, |a| drop(a.paste_at_cursor())),
@@ -285,6 +285,19 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 });
             });
         });
+}
+
+/// Both history actions share the recording refusal used by shortcuts and control requests.
+pub(crate) fn history_item(app: &mut StudioApp, ui: &mut egui::Ui, redo: bool) -> egui::Response {
+    let (text, action, command) = if redo { ("Redo", A::Redo, "edit.redo") } else { ("Undo", A::Undo, "edit.undo") };
+    let reason = app.history_disabled_reason();
+    let response =
+        ui.add_enabled(reason.is_none(), egui::Button::new(text).shortcut_text(label(action))).on_disabled_hover_text(reason.unwrap_or_default());
+    if response.clicked() {
+        let _ = app.run(command, json!({}));
+        ui.close();
+    }
+    response
 }
 
 /// Keyboard shortcuts, unless a text field has the keyboard. Keys come from [`crate::shortcuts`].

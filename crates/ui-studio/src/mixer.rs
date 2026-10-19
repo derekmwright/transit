@@ -443,7 +443,7 @@ pub fn output_choices(s: &Session, t: &Track) -> Vec<(String, String)> {
 /// The inputs a track can pick: hardware inputs (`In 1`.. or `In 1-2`..) and busses.
 pub fn input_choices(s: &Session, t: &Track, device_inputs: usize) -> Vec<(String, String)> {
     let mut v = Vec::new();
-    let n = device_inputs.max(2);
+    let n = device_inputs;
     if t.kind == TrackKind::Audio || t.kind == TrackKind::Aux {
         if t.channels() >= 2 {
             for i in (1..n).step_by(2) {
@@ -797,9 +797,9 @@ impl StudioApp {
         self.run("mix.send_level", json!({"track": t.0, "slot": slot, "pre_fader": pre}))
     }
 
-    /// The number of audio inputs offered in input dropdowns: the open input's, else 8.
-    fn device_inputs(&self) -> usize {
-        self.recorder.as_ref().map_or(8, |r| r.channels)
+    /// The open input's channel count (or the stand-in device's). Offline editing offers 8.
+    pub(crate) fn device_inputs(&self) -> usize {
+        self.recorder.as_ref().map_or_else(|| self.audio_devices.fake.as_ref().map_or(8, |f| f.input_channels_for(&self.ui.audio)), |r| r.channels)
     }
 }
 

@@ -60,6 +60,12 @@ pub struct FakeDevices {
 }
 
 impl FakeDevices {
+    pub(crate) fn input_channels_for(&self, cfg: &AudioConfig) -> usize {
+        let Some(sys) = pick_system(&self.systems, cfg.system.as_deref()) else { return 0 };
+        let named = cfg.input.as_deref().and_then(|w| sys.inputs.iter().find(|d| d.name == w));
+        named.or_else(|| sys.inputs.iter().find(|d| d.is_default)).map_or(0, |d| usize::from(d.max_channels))
+    }
+
     /// The output a real reopen would get for `cfg`: the named device when listed, else the
     /// system's default.
     fn output_for(&self, cfg: &AudioConfig) -> Option<String> {

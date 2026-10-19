@@ -3,12 +3,53 @@
 
 use crate::StudioApp;
 use serde_json::{Value, json};
-use soundcraft_model::{ClipId, Route, TrackId, TrackKind};
+use soundcraft_model::{ClipId, Route, Track, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 
 impl StudioApp {
     pub(crate) fn width_change_disabled_reason(&self) -> Option<&'static str> {
         self.engine.transport.recording.then_some("Stop recording before changing a track's channel width.")
+    }
+
+    pub(crate) fn history_disabled_reason(&self) -> Option<&'static str> {
+        self.engine.transport.recording.then_some("Stop recording before using Undo or Redo.")
+    }
+
+    /// Preflight the input before changing either the width or the route. The menu uses the
+    /// same check, including when an input selected on a previous device is now unavailable.
+    pub(crate) fn width_input(&self, track: &Track, format: &str) -> Result<Option<String>, String> {
+        if track.kind != TrackKind::Audio {
+            return Ok(None);
+        }
+        let input = match &track.mixer.input {
+            Route::Hardware(input) => input.as_str(),
+            Route::None => "In 1",
+            _ => return Ok(None),
+        };
+        let Some(first) = input.strip_prefix("In ").and_then(|v| v.split('-').next()).and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0) else {
+            return Ok(None);
+        };
+        let mapped = if format == "mono" {
+            if first > self.device_inputs() {
+                return Err(format!("Input {first} is unavailable on this device; pick an available input first"));
+            }
+            format!("In {first}")
+        } else {
+            let start = first - (first - 1) % 2;
+            let last = start
+                .checked_add(1)
+                .filter(|last| *last <= self.device_inputs())
+                .ok_or_else(|| format!("Input {first} has no stereo pair on this device; pick a stereo input first"))?;
+            format!("In {start}-{last}")
+        };
+        if mapped == input {
+            return Ok(None);
+        }
+        // `track.input` resolves bus names first; never turn hardware into a bus.
+        if self.engine.session().bus_by_name(&mapped).is_some() {
+            return Err("the hardware input name matches a bus; rename that bus first".into());
+        }
+        Ok(Some(mapped))
     }
 
     /// Keep hardware capture/monitoring and its label consistent with the new width, as one
@@ -19,32 +60,15 @@ impl StudioApp {
         if let Some(reason) = self.width_change_disabled_reason() {
             return Err(bad(COMMAND, reason));
         }
-        let format = params.get("format").and_then(Value::as_str);
-        if !matches!(format, Some("mono" | "stereo")) {
+        let Some(format @ ("mono" | "stereo")) = params.get("format").and_then(Value::as_str) else {
             return self.engine.execute(COMMAND, params);
-        }
+        };
         let tracks = tracks_required(&self.engine, COMMAND, params)?;
         let s = self.engine.session();
         let mut inputs = Vec::new();
         for id in tracks {
-            let Some(t) = s.track(id).filter(|t| t.kind == TrackKind::Audio) else { continue };
-            let Route::Hardware(input) = &t.mixer.input else { continue };
-            let Some(first) = input.strip_prefix("In ").and_then(|v| v.split('-').next()).and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0)
-            else {
-                continue;
-            };
-            let mapped = if format == Some("mono") {
-                format!("In {first}")
-            } else {
-                let first = first - (first - 1) % 2;
-                let last = first.checked_add(1).ok_or_else(|| bad(COMMAND, "input channel pair is out of range"))?;
-                format!("In {first}-{last}")
-            };
-            if mapped != *input {
-                // `track.input` resolves bus names first; never turn hardware into a bus.
-                if s.bus_by_name(&mapped).is_some() {
-                    return Err(bad(COMMAND, "the hardware input name matches a bus; rename that bus first"));
-                }
+            let Some(t) = s.track(id) else { continue };
+            if let Some(mapped) = self.width_input(t, format).map_err(|reason| bad(COMMAND, reason))? {
                 inputs.push((id, mapped));
             }
         }

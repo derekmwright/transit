@@ -367,6 +367,12 @@ impl StudioApp {
 
     /// Run a command; errors go to the status line. Plug-in state is captured before saves.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if matches!(id, "edit.undo" | "edit.redo")
+            && let Some(reason) = self.history_disabled_reason()
+        {
+            self.status = reason.into();
+            return Err(reason.into());
+        }
         if id == "ui.set" {
             return self.set_ui(&params);
         }
@@ -820,3 +826,5 @@ mod tests;
 
 #[cfg(test)]
 mod tempo_tests;
+#[cfg(test)]
+mod width_history_tests;
