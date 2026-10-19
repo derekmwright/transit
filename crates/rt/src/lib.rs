@@ -28,20 +28,15 @@
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-/// Test support: counts OS promotion attempts. Not in release builds (feature `testing`).
+/// Test support: counts OS promotion attempts and heap allocations ([`testing::CountingAlloc`]).
+/// Not in release builds (feature `testing`).
 #[cfg(any(test, feature = "testing"))]
-pub mod testing {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+pub mod testing;
 
-    pub(crate) static PROMOTION_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    /// How many times [`crate::promote_audio_thread`] has been called in this process, counted
-    /// before the platform call. A render path that must make no OS call asserts it stays put.
-    #[must_use]
-    pub fn promotion_calls() -> usize {
-        PROMOTION_CALLS.load(Ordering::Relaxed)
-    }
-}
+// This crate's own unit-test binary counts allocations; no other binary is affected.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: testing::CountingAlloc = testing::CountingAlloc;
 
 #[cfg(all(windows, not(feature = "force-fallback")))]
 mod windows;
