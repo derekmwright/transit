@@ -92,20 +92,42 @@ impl StudioApp {
         }
         let e = self.engine.session().edit.clone();
         let sel = e.selection;
-        if e.loop_playback && e.loop_record && !sel.is_empty() {
+        let cycle = e.loop_playback && !sel.is_empty();
+        if cycle && e.loop_record {
             self.record_start = sel.start;
             self.punch = None;
             self.start_play(sel.start, None, Some(sel));
             self.plan_recording(takes, Some(sel.len()));
+        } else if cycle {
+            // Slice 6: punch. With Cycle on (and Loop Record off), record just the cycle range:
+            // play from a count-in or pre-roll before it and stop at its end.
+            let lead = self.lead_in(sel.start);
+            self.record_start = (sel.start - lead).max(0);
+            self.punch = Some(sel);
+            self.start_play(self.record_start, Some(sel.end), None);
+            self.plan_recording(takes, None);
         } else {
-            let pre = if e.pre_post_roll { e.pre_roll } else { 0 };
             let at = self.cursor();
-            let from = (at - pre).max(0);
+            let from = (at - self.lead_in(at)).max(0);
             self.record_start = from;
-            self.punch = None;
+            // A count-in is heard, not kept: the take starts at the cursor. (A pre-roll is kept,
+            // as in SoundCraft.)
+            self.punch = (self.ui.count_in && from < at).then(|| Range::new(at, at.saturating_add(i64::MAX / 4)));
             self.start_play(from, None, None);
             self.plan_recording(takes, None);
         }
+    }
+
+    /// How long Record plays before `at`: one bar with the count-in on, else the pre-roll when
+    /// it is on. Never before the session start, so a count-in at bar 1 is cut short.
+    pub(crate) fn lead_in(&self, at: Samples) -> Samples {
+        let s = self.engine.session();
+        if self.ui.count_in {
+            let bar = s.tempo.bar_beat_at(at.max(0), s.sample_rate).bar;
+            let start = |b: i64| s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: b, beat: 1, tick: 0 }, s.sample_rate);
+            return (start(bar + 1) - start(bar)).max(1);
+        }
+        if s.edit.pre_post_roll { s.edit.pre_roll } else { 0 }
     }
 
     /// Remember where the armed `takes` go (split into passes of `pass` when loop recording) and
@@ -394,12 +416,67 @@ impl StudioApp {
         });
         self.punch = None;
         self.autosaved_rev = 0;
-        let ids = soundcraft_engine::io::place_recording(&mut self.engine, &plan, takes);
-        self.status =
-            if plan.pass.is_some() { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
+        let end = self.engine.transport.position;
+        self.place_takes(&plan, takes, end, tracks);
         if let Some(p) = problem {
             log::warn!("recording: {p}");
             self.status = format!("{} ({p})", self.status);
+        }
+    }
+
+    /// Slice 6: place finished take files. A take recorded over clips on its track goes on a new
+    /// playlist that copies the old one (`track.playlist_duplicate`), so the old clips stay as the
+    /// previous take (plan 06, L8: takes are track playlists). The new clips are selected and the
+    /// status line says what was recorded where. `end` is where the playhead stopped.
+    pub(crate) fn place_takes(
+        &mut self,
+        plan: &soundcraft_engine::io::Recording,
+        takes: Vec<(TrackId, std::path::PathBuf)>,
+        end: Samples,
+        tracks: usize,
+    ) {
+        let from = plan.punch.map_or(plan.start, |p| p.start.max(plan.start));
+        let to = plan.punch.map_or(end, |p| p.end.min(end));
+        let mut new_take = Vec::new();
+        if plan.pass.is_none() && to > from {
+            for (t, _) in &takes {
+                let over = self.engine.session().track(*t).is_some_and(|tr| tr.clips().iter().any(|c| c.start < to && c.end() > from));
+                if over && self.run("track.playlist_duplicate", json!({"track": t.0})).is_ok() {
+                    new_take.push(*t);
+                }
+            }
+        }
+        let ids = soundcraft_engine::io::place_recording(&mut self.engine, plan, takes);
+        if plan.pass.is_some() {
+            self.status = format!("Loop-recorded {} take(s)", ids.len() / tracks.max(1));
+            return;
+        }
+        let s = self.engine.session_arc();
+        let placed: Vec<(TrackId, &soundcraft_model::Clip)> = ids.iter().filter_map(|id| s.find_clip(*id)).collect();
+        let Some(longest) = placed.iter().map(|(_, c)| c.length).max() else {
+            self.status = "Recorded nothing".into();
+            return;
+        };
+        let mut names: Vec<String> = Vec::new();
+        for (t, _) in &placed {
+            if let Some(tr) = s.track(*t)
+                && !names.contains(&tr.name)
+            {
+                names.push(tr.name.clone());
+            }
+        }
+        let secs = s.sample_rate.seconds(longest);
+        let n = placed.len();
+        self.status = format!("Recorded {n} clip{} ({secs:.1} s) on {}", if n == 1 { "" } else { "s" }, names.join(", "));
+        if let [t] = new_take.as_slice()
+            && let Some(tr) = s.track(*t)
+        {
+            self.status.push_str(&format!(" as take {}", tr.active_playlist + 1));
+        }
+        let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
+        let _ = self.run("edit.select", json!({"clips": clips}));
+        if let Some((t, _)) = placed.first() {
+            self.ui.focus_track = Some(*t);
         }
     }
 

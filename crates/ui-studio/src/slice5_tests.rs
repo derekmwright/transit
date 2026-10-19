@@ -244,6 +244,7 @@ fn every_handler_takes_its_keys_from_the_table() {
         include_str!("transport.rs"),
         include_str!("telemetry.rs"),
         include_str!("lib.rs"),
+        include_str!("finish.rs"),
     ];
     for src in sources {
         for raw in ["consume_key(", "key_pressed(", "shortcut_text(\"", "Key::"] {
@@ -293,7 +294,7 @@ fn help_keyboard_shortcuts_opens_groups_by_scope_and_filters() {
     let w = t.inspect()["shortcuts"].clone();
     assert_eq!(w["open"], true);
     let scopes: Vec<String> = serde_json::from_value(w["scopes"].clone()).unwrap();
-    assert_eq!(scopes, ["Global", "Arrangement", "Piano roll", "Browser", "Mixer", "Dialogs"]);
+    assert_eq!(scopes, ["Global", "Arrangement", "Piano roll", "Browser", "Mixer", "Dialogs", "Name field"]);
     let all = w["rows"].as_array().unwrap().len();
     assert_eq!(all, crate::shortcuts::TABLE.len(), "every row shown");
     // Filter by typing in its box.

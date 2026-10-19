@@ -1745,6 +1745,8 @@ fn deleting_a_track_with_clips_asks_first_escape_cancels_enter_deletes() {
     assert!(app.dialog.is_none());
     assert!(app.engine.session().track(keys).is_some(), "Escape cancels");
     let undo = undo_len(&mut app);
+    // Wait out the double-click time: a second click on the name soon after renames (slice 6).
+    frames(&mut app, &ctx, 30, &mut time);
     let at = header_mid(&app, keys);
     click(&mut app, at);
     frames(&mut app, &ctx, 4, &mut time);

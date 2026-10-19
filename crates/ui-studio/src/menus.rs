@@ -49,7 +49,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(crate::theme::SPACE as i8, 2)))
         .show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
+                let file_menu = ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
                         app.run_or_ask("session.new", json!({}));
                         ui.close();
@@ -67,12 +67,20 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         app.save_as();
                     }
                     ui.separator();
+                    let b = ui.add(egui::Button::new("Bounce…").shortcut_text(label(A::Bounce)));
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Bounce…".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        ui.close();
+                        app.open_bounce();
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.close();
                         app.run_or_ask("app.quit", json!({}));
                     }
                 });
-                ui.menu_button("Edit", |ui| {
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "File".into(), String::new(), file_menu.response.rect));
+                let edit_menu = ui.menu_button("Edit", |ui| {
                     let items: [(&str, A, fn(&mut StudioApp)); 8] = [
                         ("Undo", A::Undo, |a| drop(a.run("edit.undo", json!({})))),
                         ("Redo", A::Redo, |a| drop(a.run("edit.redo", json!({})))),
@@ -89,7 +97,15 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    let b = ui.add(egui::Button::new("Undo History").shortcut_text(label(A::UndoHistory)));
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Undo History".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.ui.show_history = true;
+                        ui.close();
+                    }
                 });
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Edit".into(), String::new(), edit_menu.response.rect));
                 let track_menu = ui.menu_button("Track", |ui| {
                     if ui.add(egui::Button::new("Add Audio Track").shortcut_text(label(A::NewAudioTrack))).clicked() {
                         let _ = app.add_track("audio");
@@ -111,6 +127,19 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     if unused > 0 && ui.button(format!("Remove unused buses ({unused})")).clicked() {
                         let _ = app.remove_unused_busses();
                         ui.close();
+                    }
+                    ui.separator();
+                    let b = ui.add(egui::Button::new("Rename").shortcut_text(label(A::Rename)));
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Rename".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        ui.close();
+                        app.rename_selected();
+                    }
+                    let b = ui.button("Bounce in Place");
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Bounce in Place".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        ui.close();
+                        let _ = app.bounce_in_place();
                     }
                     ui.separator();
                     crate::groups::menu_items(app, ui, None);
@@ -154,7 +183,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 // Where the View menu and its entries sit, for `ui.inspect` and tests (slice 4).
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "View".into(), String::new(), view_menu.response.rect));
                 app.arrange.bar_menu.extend(view_items);
-                ui.menu_button("Transport", |ui| {
+                let transport_menu = ui.menu_button("Transport", |ui| {
                     let cycle = app.engine.session().edit.loop_playback;
                     let items: [(&str, A, &str, Value); 4] = [
                         ("Play / Stop", A::PlayStop, "transport.toggle", json!({})),
@@ -168,7 +197,17 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    // Slice 6: a preference, not the document.
+                    let on = app.ui.count_in;
+                    let b = ui.button(if on { "✓ Count-in (1 bar)" } else { "   Count-in (1 bar)" });
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Count-in (1 bar)".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.ui.count_in = !on;
+                        ui.close();
+                    }
                 });
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Transport".into(), String::new(), transport_menu.response.rect));
                 ui.menu_button("Audio", |ui| {
                     let name = app.player.as_ref().map_or("No audio device (--no-audio)".to_string(), |p| p.device_name.clone());
                     ui.label(egui::RichText::new(name).color(TOKENS.text_dim));

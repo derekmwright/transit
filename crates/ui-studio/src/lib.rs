@@ -12,6 +12,7 @@ pub mod browser;
 pub mod control;
 pub mod devices;
 pub mod fine;
+pub mod finish;
 pub mod groups;
 pub mod host;
 pub mod icons;
@@ -89,6 +90,16 @@ pub struct UiState {
     pub show_shortcuts: bool,
     #[serde(skip)]
     pub shortcuts_filter: String,
+    /// Transport > Count-in (slice 6): Record plays one bar before the cursor (or the cycle
+    /// range) and records from there. A preference, not part of the document.
+    pub count_in: bool,
+    /// Tracks whose take lanes are shown (slice 6). View state of the open session, never in the
+    /// document; shown by `ui.inspect`, never loaded.
+    #[serde(skip_deserializing)]
+    pub takes_open: Vec<TrackId>,
+    /// Edit > Undo History is open (view state, not saved).
+    #[serde(skip)]
+    pub show_history: bool,
 }
 
 impl Default for UiState {
@@ -114,6 +125,9 @@ impl Default for UiState {
             appearance: theme::Appearance::System,
             show_shortcuts: false,
             shortcuts_filter: String::new(),
+            count_in: false,
+            takes_open: Vec::new(),
+            show_history: false,
         }
     }
 }
@@ -146,6 +160,8 @@ pub enum Dialog {
     SaveChanges { then: (String, Value) },
     /// Delete several tracks, or tracks that hold clips (Delete key or the track menu).
     DeleteTracks { tracks: Vec<TrackId>, clips: bool },
+    /// File > Bounce: its form, then its progress (slice 6, `finish`).
+    Bounce,
 }
 
 /// An editor asked for (by `ui.set` or a menu) and not open yet: retried until the plug-in is
@@ -218,6 +234,8 @@ pub struct StudioApp {
     pub shortcuts_window: menus::ShortcutsLayout,
     /// The output-callback telemetry readout and its window (polled a few times a second).
     pub telemetry: telemetry::TelemetryState,
+    /// Slice 6: the name being typed, the bounce dialog and job, take lanes, the undo history.
+    pub finish: finish::FinishState,
 }
 
 impl StudioApp {
@@ -266,6 +284,7 @@ impl StudioApp {
             browser: browser::BrowserState::default(),
             shortcuts_window: menus::ShortcutsLayout::default(),
             telemetry: telemetry::TelemetryState::default(),
+            finish: finish::FinishState::default(),
         }
     }
 
@@ -321,7 +340,10 @@ impl StudioApp {
             self.clear_clip_latches();
             return Ok(json!({"cleared": true}));
         }
-        if id.starts_with("session.save") || id.starts_with("file.bounce") {
+        if finish::refuses(self, id) {
+            return Err(self.status.clone());
+        }
+        if id.starts_with("session.save") || id.starts_with("file.bounce") || matches!(id, "track.bounce" | "track.commit") {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states();
         }
@@ -342,8 +364,10 @@ impl StudioApp {
         match result {
             Ok(v) => {
                 if replacing {
-                    // Collapsed groups belong to the session that was open.
+                    // Collapsed groups and open take lanes belong to the session that was open.
                     self.ui.collapsed.clear();
+                    self.ui.takes_open.clear();
+                    self.finish.rename = None;
                 }
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
@@ -376,6 +400,7 @@ impl StudioApp {
         let mut ns = ns;
         (ns.cursor, ns.cursor_track, ns.focus_track) = (self.ui.cursor, self.ui.cursor_track, self.ui.focus_track);
         ns.collapsed = std::mem::take(&mut self.ui.collapsed);
+        ns.takes_open = std::mem::take(&mut self.ui.takes_open);
         let before = std::mem::replace(&mut self.ui, ns);
         // Editors no longer listed close; newly listed ones open (retried until loaded).
         for key in before.plugin_windows.iter().filter(|k| !self.ui.plugin_windows.contains(k)) {
@@ -499,6 +524,7 @@ impl StudioApp {
         }
         self.watch_output();
         self.watch_input();
+        finish::step_bounce(self, ctx);
         // Stop the old playback before sending a replacement session to the audio thread.
         self.handle_transport(dt);
         if self.engine.revision != self.last_rev {
@@ -593,9 +619,11 @@ impl StudioApp {
         let ctx = ui.ctx().clone();
         theme::follow(&ctx);
         ui.set_style(ctx.global_style());
+        finish::rename_keys(self, &ctx); // slice 6: a name being typed owns Escape and Enter
         keys::shortcuts(self, &ctx); // slice 3: before the arrangement's keys
         groups::shortcuts(self, &ctx);
         browser::shortcuts(self, &ctx);
+        finish::shortcuts(self, &ctx);
         menus::shortcuts(self, &ctx);
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
@@ -610,7 +638,10 @@ impl StudioApp {
         } else {
             arrange::show(self, ui);
         }
+        finish::rename_field(self, &ctx);
         menus::dialogs(self, &ctx);
+        finish::bounce_dialog(self, &ctx);
+        finish::history_window(self, &ctx);
         menus::recovery(self, &ctx);
         menus::shortcuts_window(self, &ctx);
         telemetry::window(self, &ctx);
@@ -641,6 +672,7 @@ impl StudioApp {
             "dialog": self.dialog.as_ref().map(|d| match d {
                 Dialog::SaveChanges { .. } => "save_changes",
                 Dialog::DeleteTracks { .. } => "delete_tracks",
+                Dialog::Bounce => "bounce",
             }),
             "frame_ms": self.frame_ms,
             "audio_device": self.player.as_ref().map(|p| p.device_name.clone()),
@@ -665,6 +697,7 @@ impl StudioApp {
             "browser": self.browser.layout,
             "shortcuts": self.shortcuts_window,
             "telemetry": self.telemetry.layout,
+            "finish": self.finish.inspect(),
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }
@@ -678,5 +711,7 @@ mod groups_tests;
 mod keys_tests;
 #[cfg(test)]
 mod slice5_tests;
+#[cfg(test)]
+mod slice6_tests;
 #[cfg(test)]
 mod tests;

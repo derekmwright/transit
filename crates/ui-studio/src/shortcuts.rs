@@ -28,10 +28,12 @@ pub enum Scope {
     Mixer,
     /// Modal questions (save changes, delete tracks).
     Dialog,
+    /// A track or clip name being typed in place (slice 6).
+    Rename,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 6] = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Browser, Scope::Mixer, Scope::Dialog];
+    pub const ALL: [Scope; 7] = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Browser, Scope::Mixer, Scope::Dialog, Scope::Rename];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -41,6 +43,7 @@ impl Scope {
             Scope::Browser => "Browser",
             Scope::Mixer => "Mixer",
             Scope::Dialog => "Dialogs",
+            Scope::Rename => "Name field",
         }
     }
 }
@@ -50,6 +53,11 @@ impl Scope {
 pub enum Action {
     PlayStop,
     Record,
+    Rename,
+    RenameApply,
+    RenameCancel,
+    Bounce,
+    UndoHistory,
     NewAudioTrack,
     NewInstrumentTrack,
     ReturnToZero,
@@ -140,15 +148,7 @@ pub const TABLE: &[Shortcut] = &[
         S::Global,
         "Logic. Cubase records on numpad *, which egui does not tell apart from *; Ableton has no bare-key record.",
     ),
-    row(
-        A::Record,
-        "Record",
-        CMD,
-        Key::R,
-        S::Global,
-        "Logic. Ableton uses Ctrl+R for Rename; there is no track rename yet, so it stays Record. It flips to Rename (Ableton) when track rename lands.",
-    ),
-    row(A::Record, "Record", NONE, Key::F9, S::Global, "Ableton and Cubase."),
+    row(A::Record, "Record", NONE, Key::F9, S::Global, "Ableton and Cubase. Ctrl+R is Rename (Ableton) since slice 6; Logic records on it."),
     row(A::NewAudioTrack, "New Audio Track", CMD, Key::T, S::Global, "Ableton (Insert Audio Track)."),
     row(A::NewInstrumentTrack, "New Instrument Track", CMD_SHIFT, Key::T, S::Global, "Ableton (Insert MIDI Track)."),
     row(A::ReturnToZero, "Return to Zero", NONE, Key::Home, S::Global, "Ableton and Cubase."),
@@ -173,10 +173,12 @@ pub const TABLE: &[Shortcut] = &[
     row(A::Open, "Open…", CMD, Key::O, S::Global, "All DAWs."),
     row(A::SaveAs, "Save As…", CMD_SHIFT, Key::S, S::Global, "All DAWs. Checked before Save."),
     row(A::Save, "Save", CMD, Key::S, S::Global, "All DAWs."),
+    row(A::Bounce, "Bounce…", CMD_SHIFT, Key::R, S::Global, "Ableton (Export Audio/Video). Checked before Rename."),
     // Undo.
     row(A::Redo, "Redo", CMD_SHIFT, Key::Z, S::Global, "Cubase and Logic. Checked before Undo."),
     row(A::Redo, "Redo", CMD, Key::Y, S::Global, "Ableton on Windows."),
     row(A::Undo, "Undo", CMD, Key::Z, S::Global, "All DAWs."),
+    row(A::UndoHistory, "Undo History", ALT, Key::Z, S::Global, "Logic; Ableton and Cubase have no key for it."),
     // Views.
     row(A::ToggleBrowser, "Browser", CMD_ALT, Key::B, S::Global, "Ableton."),
     row(A::ToggleMixer, "Mixer", CMD_ALT, Key::M, S::Global, "Ableton (mixer section). Cubase's F3 opens the full mixer below."),
@@ -208,6 +210,17 @@ pub const TABLE: &[Shortcut] = &[
         "Ableton. The piano roll's own Ctrl+A (notes) wins while it is active; Delete after it removes clips, never tracks.",
     ),
     row(A::SelectNone, "Select None", NONE, Key::Escape, S::Arrangement, "Ours."),
+    row(
+        A::Rename,
+        "Rename",
+        CMD,
+        Key::R,
+        S::Arrangement,
+        "Ableton: the selected clip, else the selected track. Logic records on Ctrl+R; R and F9 record here.",
+    ),
+    row(A::Rename, "Rename", NONE, Key::F2, S::Arrangement, "Windows' rename key; Cubase and Logic have none. Same as Ctrl+R."),
+    row(A::RenameApply, "Apply Name", NONE, Key::Enter, S::Rename, "Also a click elsewhere."),
+    row(A::RenameCancel, "Cancel Rename", NONE, Key::Escape, S::Rename, "All DAWs."),
     row(A::ZoomIn, "Zoom In", NONE, Key::Plus, S::Arrangement, "Ableton wins over Cubase (H)."),
     row(A::ZoomIn, "Zoom In", NONE, Key::Equals, S::Arrangement, "The unshifted + key."),
     row(A::ZoomIn, "Zoom In", SHIFT, Key::Plus, S::Arrangement, "The + key where it takes Shift."),

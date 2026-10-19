@@ -1459,6 +1459,10 @@ fn strip(
         let shift = ui.input(|i| i.modifiers.shift);
         app.focus_header(id, shift);
     }
+    // Slice 6: double-click the name to rename the track in place.
+    if resp.double_clicked() && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| name_r.contains(p)) {
+        app.start_rename(crate::finish::RenameTarget::Track(id), r4(name_r));
+    }
     let mut y = r.min.y + 26.0;
     // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));

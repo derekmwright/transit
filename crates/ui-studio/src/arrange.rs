@@ -43,6 +43,8 @@ pub struct TrackRow {
     /// The line under the name (an instrument track: the instrument).
     pub subtitle: String,
     pub header: R4,
+    /// The name in the header (double-click renames, slice 6).
+    pub name_rect: R4,
     pub lane: R4,
     pub mute: R4,
     pub solo: R4,
@@ -124,6 +126,47 @@ impl Map {
     }
 }
 
+/// Height of one take lane (slice 6).
+pub const TAKE_H: f32 = 22.0;
+
+/// Row geometry: each row's top (content coordinates, before scrolling) and full height. A row is
+/// the track's lane (`rh`) plus its take lanes when they are shown.
+pub(crate) struct RowGeo {
+    pub tops: Vec<f32>,
+    pub heights: Vec<f32>,
+    pub rh: f32,
+}
+
+impl RowGeo {
+    fn new(app: &StudioApp, rows: &[&Track], rh: f32) -> RowGeo {
+        let mut tops = Vec::with_capacity(rows.len());
+        let mut heights = Vec::with_capacity(rows.len());
+        let mut acc = 0.0;
+        for t in rows {
+            let h = rh + takes_shown(app, t) as f32 * TAKE_H;
+            tops.push(acc);
+            heights.push(h);
+            acc += h;
+        }
+        RowGeo { tops, heights, rh }
+    }
+    fn total(&self) -> f32 {
+        self.tops.last().zip(self.heights.last()).map_or(0.0, |(t, h)| t + h)
+    }
+    /// The row at content height `y`.
+    fn index_at(&self, y: f32) -> Option<usize> {
+        if y < 0.0 {
+            return None;
+        }
+        (0..self.tops.len()).find(|i| y >= self.tops[*i] && y < self.tops[*i] + self.heights[*i])
+    }
+}
+
+/// How many take lanes a track shows: all its playlists when it has several and they are open.
+fn takes_shown(app: &StudioApp, t: &Track) -> usize {
+    if t.playlists.len() > 1 && app.ui.takes_open.contains(&t.id) { t.playlists.len() } else { 0 }
+}
+
 /// A row in the track list: not hidden, and not in a collapsed group (view state, slice 2c).
 fn shown(app: &StudioApp, s: &Session, t: &Track) -> bool {
     !t.hidden && !app.tucked(s, t)
@@ -150,7 +193,10 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     // Rows.
     let rows: Vec<&Track> = s.tracks.iter().filter(|t| shown(app, &s, t)).collect();
     app.arrange.order = rows.iter().map(|t| t.id).collect();
-    let content_h = rows.len() as f32 * rh + 60.0;
+    let geo = RowGeo::new(app, &rows, rh);
+    let content_h = geo.total() + 60.0;
+    app.finish.layout.takes.clear();
+    app.finish.layout.chips.clear();
     app.arrange.vscroll = app.arrange.vscroll.clamp(0.0, (content_h - tl.height()).max(0.0));
     let mut layout = Layout {
         track_list: r4(list),
@@ -166,8 +212,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let focus = app.focus_track();
     app.arrange.menu.clear();
     for (i, t) in rows.iter().enumerate() {
-        let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
-        let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + rh));
+        let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
+        let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + geo.heights[i]));
         let lane = Rect::from_min_max(pos2(tl.min.x, y0), pos2(tl.max.x, y0 + rh));
         let mut row = TrackRow {
             id: t.id.0,
@@ -185,11 +231,12 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
             track_header(app, ui, t, header, list, selected, &mut row);
         }
         let lane_fill = if i % 2 == 0 { TOKENS.lane } else { TOKENS.lane_alt };
-        ui.painter().with_clip_rect(tl).rect_filled(lane, 0.0, lane_fill);
+        let row_rect = Rect::from_min_max(lane.min, pos2(lane.max.x, y0 + geo.heights[i]));
+        ui.painter().with_clip_rect(tl).rect_filled(row_rect, 0.0, lane_fill);
         layout.tracks.push(row);
     }
     // Add Track buttons below the rows.
-    let below = tl.min.y + rows.len() as f32 * rh - app.arrange.vscroll + 8.0;
+    let below = tl.min.y + geo.total() - app.arrange.vscroll + 8.0;
     let add_a = Rect::from_min_size(pos2(list.min.x + 8.0, below), vec2((hw - 24.0) / 2.0, 22.0));
     let add_i = Rect::from_min_size(pos2(add_a.max.x + 8.0, below), add_a.size());
     if add_a.min.y < list.max.y {
@@ -208,13 +255,14 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     ui.painter().line_segment([pos2(list.max.x, full.min.y), pos2(list.max.x, full.max.y)], Stroke::new(1.0, TOKENS.line));
 
     grid_and_ruler(app, ui, &s, map, ruler, tl);
-    clips(app, ui, &s, map, tl, &rows, rh, &mut layout);
+    clips(app, ui, &s, map, tl, &rows, &geo, &mut layout);
     group_summaries(app, ui, &s, map, tl, &mut layout);
     header_drag(app, ui, &s, &mut layout);
     crate::keys::lane_hints(app, ui, tl, &layout.tracks);
-    timeline_input(app, ui, &s, map, tl, &rows, rh, &layout);
+    timeline_input(app, ui, &s, map, tl, &rows, &geo, &layout);
+    takes(app, ui, &s, map, tl, list, &rows, &geo, &layout);
     ruler_input(app, ui, map, ruler);
-    overlays(app, ui, &s, map, ruler, tl, &rows, rh);
+    overlays(app, ui, &s, map, ruler, tl, &rows, &geo);
     scroll_and_zoom(app, ui, map, full, tl, content_h);
     follow_playhead(app, map, tl);
     app.arrange.layout = layout;
@@ -232,6 +280,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     p.rect_filled(Rect::from_min_size(pos2(r.min.x + indent, r.min.y), vec2(5.0, r.height())), 0.0, theme::rgb(t.color));
     p.line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, TOKENS.line));
     let name_rect = Rect::from_min_max(pos2(tx + 12.0, r.min.y + 4.0), pos2(r.max.x - 92.0, r.min.y + 20.0));
+    row.name_rect = r4(Rect::from_min_max(pos2(name_rect.min.x - 4.0, name_rect.min.y - 2.0), pos2(name_rect.max.x, name_rect.max.y + 2.0)));
     p.with_clip_rect(name_rect.intersect(list)).text(name_rect.left_center(), Align2::LEFT_CENTER, &t.name, FontId::proportional(13.0), TOKENS.text);
     let kind = match t.kind {
         TrackKind::Instrument => t.instrument.as_ref().map_or("Instrument".to_string(), |i| short_plugin(&app.plugin_name(&i.plugin, true))),
@@ -320,6 +369,10 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     if resp.clicked() {
         let m = ui.input(|i| i.modifiers);
         app.click_header(t.id, m.shift, m.command || m.ctrl);
+    }
+    // Slice 6: double-click the name to rename the track in place.
+    if resp.double_clicked() {
+        app.start_rename(crate::finish::RenameTarget::Track(t.id), row.name_rect);
     }
     if resp.drag_started() && t.kind != TrackKind::Master {
         app.arrange.header_drag = Some(crate::groups::HeaderDrag { track: t.id, drop: None });
@@ -526,7 +579,7 @@ fn grid_and_ruler(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, 
 }
 
 /// The clip being dragged, as it would land: (track, start, end).
-fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, rh: f32) -> Option<(ClipId, TrackId, Samples, Samples, bool)> {
+fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, geo: &RowGeo) -> Option<(ClipId, TrackId, Samples, Samples, bool)> {
     let Some(Gesture::Clip { clip, track, kind, press, start, end }) = app.arrange.gesture.clone() else { return None };
     let (pos, m) = ui.input(|i| (i.pointer.latest_pos(), i.modifiers));
     let pos = pos?;
@@ -535,11 +588,11 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, r
     Some(match kind {
         DragKind::Move => {
             let new_start = (start + dx).max(0);
-            let row = ((pos.y - tl.min.y + app.arrange.vscroll) / rh).floor();
-            let dest = if m.command || m.ctrl || row < 0.0 {
+            let row = geo.index_at(pos.y - tl.min.y + app.arrange.vscroll);
+            let dest = if m.command || m.ctrl {
                 track
             } else {
-                rows.get(row as usize).map(|t| t.id).filter(|t| app.holds_clips(*t)).unwrap_or(track)
+                row.and_then(|i| rows.get(i)).map(|t| t.id).filter(|t| app.holds_clips(*t)).unwrap_or(track)
             };
             (clip, dest, new_start, new_start + (end - start), m.alt)
         }
@@ -550,11 +603,12 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, r
 
 /// Clips as solid regions in the track color, with a name strip and their content.
 #[allow(clippy::too_many_arguments)]
-fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], rh: f32, layout: &mut Layout) {
+fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], geo: &RowGeo, layout: &mut Layout) {
     let p = ui.painter().with_clip_rect(tl);
     let sel = &s.edit.selected_clips;
-    let preview = drag_preview(app, ui, map, rows, tl, rh);
-    let row_y = |t: TrackId| rows.iter().position(|r| r.id == t).map(|i| tl.min.y + i as f32 * rh - app.arrange.vscroll);
+    let preview = drag_preview(app, ui, map, rows, tl, geo);
+    let rh = geo.rh;
+    let row_y = |t: TrackId| rows.iter().position(|r| r.id == t).map(|i| tl.min.y + geo.tops[i] - app.arrange.vscroll);
     for t in rows {
         let Some(y0) = row_y(t.id) else { continue };
         for c in t.clips() {
@@ -640,7 +694,7 @@ fn hit(layout: &Layout, pos: Pos2) -> (Option<(ClipId, TrackId, DragKind, Sample
 }
 
 #[allow(clippy::too_many_arguments)]
-fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], rh: f32, layout: &Layout) {
+fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], geo: &RowGeo, layout: &Layout) {
     let resp = ui.interact(tl, ui.id().with("timeline"), Sense::click_and_drag());
     if let Some(pos) = resp.hover_pos()
         && app.arrange.gesture.is_none()
@@ -665,7 +719,7 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         ui.ctx().set_cursor_icon(if copy { CursorIcon::Copy } else { CursorIcon::Grabbing });
     }
     if resp.drag_stopped() {
-        let preview = drag_preview(app, ui, map, rows, tl, rh);
+        let preview = drag_preview(app, ui, map, rows, tl, geo);
         let gesture = app.arrange.gesture.take();
         if let (Some(Gesture::Clip { kind, track, start, end, .. }), Some((clip, dest, a, b, copy))) = (gesture, preview) {
             commit_drag(app, kind, clip, track, dest, start, end, a, b, copy);
@@ -687,12 +741,23 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     {
         let _ = app.new_midi_clip(Some(track));
     }
-    // Slice 3: double-click a MIDI clip to edit it in the piano roll.
+    // Slice 3: double-click a MIDI clip to edit it in the piano roll; slice 6: double-click its
+    // name strip to rename it.
     if resp.double_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
         && let (Some((clip, ..)), _) = hit(layout, pos)
     {
-        app.open_keys(clip);
+        let strip = layout.clips.iter().find(|c| c.id == clip.0).map(|c| c.rect).filter(|r| pos.y <= r[1] + CLIP_NAME_H);
+        match strip {
+            Some(r) => {
+                let x0 = r[0].max(tl.min.x);
+                let field = [x0, r[1], r[2].min(tl.max.x).max(x0 + 160.0), r[1] + CLIP_NAME_H + 6.0];
+                app.start_rename(crate::finish::RenameTarget::Clip(clip), field);
+            }
+            None => {
+                app.open_keys(clip);
+            }
+        }
     }
     resp.context_menu(|ui| {
         if ui.button("Add Audio Track").clicked() {
@@ -769,20 +834,36 @@ fn ruler_input(app: &mut StudioApp, ui: &mut Ui, map: Map, ruler: Rect) {
 
 /// Cycle range, recording takes, cursor and playhead.
 #[allow(clippy::too_many_arguments)]
-fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Rect, rows: &[&Track], rh: f32) {
+fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Rect, rows: &[&Track], geo: &RowGeo) {
     let p = ui.painter();
     let sel = s.edit.selection;
     if s.edit.loop_playback && !sel.is_empty() {
         let r = Rect::from_min_max(pos2(map.x(sel.start), ruler.min.y + 14.0), pos2(map.x(sel.end), ruler.max.y - 1.0)).intersect(ruler);
         p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.55));
     }
-    if app.engine.transport.recording {
+    // The take being recorded grows on each armed track where it will land (slice 6: inside the
+    // punch range, after a count-in), with a "Recording" name strip.
+    let span = app.engine.transport.recording.then(|| {
+        let pass = app.take_plan.as_ref().and_then(|p| p.pass);
+        soundcraft_engine::io::live_span(app.record_start, pass, app.punch, (app.position() - app.record_start).max(0))
+    });
+    if let Some(Some((_, span))) = span {
         let rp = p.with_clip_rect(tl);
         for (i, t) in rows.iter().enumerate() {
             if t.mixer.record_arm {
-                let y0 = tl.min.y + i as f32 * rh - app.arrange.vscroll;
-                let r = Rect::from_min_max(pos2(map.x(app.record_start), y0 + 1.0), pos2(map.x(app.position()), y0 + rh - 1.0));
+                let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
+                let r = Rect::from_min_max(pos2(map.x(span.start), y0 + 1.0), pos2(map.x(span.end).max(map.x(span.start) + 2.0), y0 + geo.rh - 1.0));
                 rp.rect_filled(r, crate::theme::RADIUS, TOKENS.record.gamma_multiply(0.45));
+                let strip = Rect::from_min_max(r.min, pos2(r.max.x, (r.min.y + CLIP_NAME_H).min(r.max.y)));
+                rp.rect_filled(strip, crate::theme::top_corners(), TOKENS.record);
+                let tp = rp.with_clip_rect(strip.intersect(tl));
+                tp.text(
+                    pos2(strip.min.x + 4.0, strip.center().y),
+                    Align2::LEFT_CENTER,
+                    "Recording",
+                    FontId::proportional(11.0),
+                    theme::text_on(TOKENS.record),
+                );
             }
         }
     }
@@ -828,5 +909,119 @@ fn follow_playhead(app: &mut StudioApp, map: Map, tl: Rect) {
     if x > tl.max.x - 8.0 || x < tl.min.x {
         let to = app.engine.transport.position - (f64::from(tl.width()) * map.spp * 0.05) as Samples;
         let _ = app.engine.execute("view.scroll", &json!({"to": to.max(0)}));
+    }
+}
+
+/// Slice 6: a chip on each clip that other takes overlap ("2 takes", click to show or hide the
+/// track's take lanes), and the take lanes of tracks whose takes are shown: one lane per playlist
+/// with its clips as bars (click: that take plays), and in the track list its label with Promote
+/// (keep only this take) and Delete. Drawn after the timeline's input, so these take the clicks.
+#[allow(clippy::too_many_arguments)]
+fn takes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, list: Rect, rows: &[&Track], geo: &RowGeo, layout: &Layout) {
+    let _ = s;
+    for (i, t) in rows.iter().enumerate() {
+        if t.playlists.len() < 2 {
+            continue;
+        }
+        let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
+        let open = app.ui.takes_open.contains(&t.id);
+        for c in t.clips() {
+            let others = t
+                .playlists
+                .iter()
+                .enumerate()
+                .filter(|(k, pl)| *k != t.active_playlist && pl.clips.iter().any(|o| o.start < c.end() && o.end() > c.start))
+                .count();
+            let Some(cr) = layout.clips.iter().find(|r| r.id == c.id.0).map(|r| r.rect) else { continue };
+            let w = 64.0;
+            if others == 0 || cr[2] - cr[0] < w + 8.0 {
+                continue;
+            }
+            let chip = Rect::from_min_max(pos2(cr[2] - w - 2.0, cr[1] + 1.5), pos2(cr[2] - 2.0, cr[1] + CLIP_NAME_H - 0.5));
+            if !tl.intersects(chip) {
+                continue;
+            }
+            let resp = ui.interact(chip.intersect(tl), ui.id().with(("take_chip", c.id.0)), Sense::click());
+            let p = ui.painter().with_clip_rect(tl);
+            p.rect_filled(chip, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            let icon = if open { crate::icons::Icon::ChevronDown } else { crate::icons::Icon::ChevronRight };
+            crate::icons::paint(&p, pos2(chip.min.x + 8.0, chip.center().y), icon, 12.0, TOKENS.text);
+            p.text(
+                pos2(chip.min.x + 16.0, chip.center().y),
+                Align2::LEFT_CENTER,
+                format!("{} takes", others + 1),
+                FontId::proportional(10.5),
+                TOKENS.text,
+            );
+            if resp.on_hover_text(if open { "Hide the takes" } else { "Show the takes" }).clicked() {
+                app.toggle_takes(t.id);
+            }
+            app.finish.layout.chips.push(crate::finish::TakeChip { track: t.id.0, clip: c.id.0, takes: others + 1, open, rect: r4(chip) });
+        }
+        if !open {
+            continue;
+        }
+        let n = t.playlists.len();
+        for (k, pl) in t.playlists.iter().enumerate() {
+            let ly = y0 + geo.rh + k as f32 * TAKE_H;
+            let lane = Rect::from_min_max(pos2(tl.min.x, ly), pos2(tl.max.x, ly + TAKE_H));
+            let active = k == t.active_playlist;
+            let p = ui.painter().with_clip_rect(tl);
+            p.rect_filled(lane.shrink2(vec2(0.0, 1.0)), 0.0, if active { TOKENS.accent.gamma_multiply(0.2) } else { TOKENS.bg });
+            for c in &pl.clips {
+                let r = Rect::from_min_max(pos2(map.x(c.start), ly + 4.0), pos2(map.x(c.end()).max(map.x(c.start) + 2.0), ly + TAKE_H - 4.0));
+                let col = theme::rgb(c.color.unwrap_or(t.color));
+                p.rect_filled(r, crate::theme::RADIUS_SM, if active { col } else { col.gamma_multiply(0.5) });
+            }
+            let lresp = ui.interact(lane.intersect(tl), ui.id().with(("take_lane", t.id.0, k)), Sense::click());
+            // In the track list: the take's label, Promote and Delete.
+            let lp = ui.painter().with_clip_rect(list);
+            let hl = Rect::from_min_max(pos2(list.min.x + 20.0, ly + 1.0), pos2(list.max.x - 6.0, ly + TAKE_H - 1.0));
+            let del = Rect::from_min_size(pos2(hl.max.x - 20.0, hl.min.y + 1.0), vec2(20.0, hl.height() - 2.0));
+            let pro = Rect::from_min_size(pos2(del.min.x - 70.0, hl.min.y + 1.0), vec2(66.0, hl.height() - 2.0));
+            let label = Rect::from_min_max(hl.min, pos2(pro.min.x - 4.0, hl.max.y));
+            let hresp = ui.interact(label.intersect(list), ui.id().with(("take_label", t.id.0, k)), Sense::click());
+            if active {
+                lp.rect_filled(label, crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.2));
+            }
+            let text = if active { format!("Take {} · playing", k + 1) } else { format!("Take {}", k + 1) };
+            lp.text(
+                pos2(label.min.x + 6.0, label.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                FontId::proportional(11.0),
+                if active { TOKENS.text } else { TOKENS.text_dim },
+            );
+            let presp = ui.interact(pro.intersect(list), ui.id().with(("take_promote", t.id.0, k)), Sense::click());
+            lp.rect_filled(pro, crate::theme::RADIUS_SM, if presp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+            lp.text(pro.center(), Align2::CENTER_CENTER, "Promote", FontId::proportional(10.5), TOKENS.text);
+            let can_delete = n == 2;
+            let dresp = ui.interact(del.intersect(list), ui.id().with(("take_delete", t.id.0, k)), Sense::click());
+            lp.rect_filled(del, crate::theme::RADIUS_SM, if dresp.hovered() && can_delete { TOKENS.button_hover } else { TOKENS.button });
+            let ink = if can_delete { TOKENS.text } else { TOKENS.text_dim.gamma_multiply(0.5) };
+            crate::icons::paint(&lp, del.center(), crate::icons::Icon::Remove, 12.0, ink);
+            app.finish.layout.takes.push(crate::finish::TakeRow {
+                track: t.id.0,
+                index: k,
+                active,
+                clips: pl.clips.len(),
+                lane: r4(lane),
+                label: r4(label),
+                promote: r4(pro),
+                delete: r4(del),
+                delete_enabled: can_delete,
+            });
+            if (lresp.clicked() || hresp.clicked()) && !active {
+                let _ = app.select_take(t.id, k);
+            }
+            if presp.on_hover_text("Keep this take and remove the others").clicked() {
+                let _ = app.promote_take(t.id, k);
+            }
+            let tip =
+                if can_delete { "Delete this take" } else { "Deleting one of three or more takes needs an engine command; promote a take instead" };
+            if dresp.on_hover_text(tip).clicked() && can_delete {
+                let _ = app.delete_take(t.id, k);
+            }
+        }
     }
 }
