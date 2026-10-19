@@ -7,6 +7,59 @@ use soundcraft_model::{ClipId, Route, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 
 impl StudioApp {
+    pub(crate) fn width_change_disabled_reason(&self) -> Option<&'static str> {
+        self.engine.transport.recording.then_some("Stop recording before changing a track's channel width.")
+    }
+
+    /// Keep hardware capture/monitoring and its label consistent with the new width, as one
+    /// undo step. Called by `run` so menu and control-channel invocations get the same checks.
+    pub(crate) fn change_track_width(&mut self, params: &Value) -> soundcraft_engine::Result<Value> {
+        use soundcraft_engine::cmd::{bad, tracks_required};
+        const COMMAND: &str = "track.change_width";
+        if let Some(reason) = self.width_change_disabled_reason() {
+            return Err(bad(COMMAND, reason));
+        }
+        let format = params.get("format").and_then(Value::as_str);
+        if !matches!(format, Some("mono" | "stereo")) {
+            return self.engine.execute(COMMAND, params);
+        }
+        let tracks = tracks_required(&self.engine, COMMAND, params)?;
+        let s = self.engine.session();
+        let mut inputs = Vec::new();
+        for id in tracks {
+            let Some(t) = s.track(id).filter(|t| t.kind == TrackKind::Audio) else { continue };
+            let Route::Hardware(input) = &t.mixer.input else { continue };
+            let Some(first) = input.strip_prefix("In ").and_then(|v| v.split('-').next()).and_then(|n| n.parse::<usize>().ok()).filter(|n| *n > 0)
+            else {
+                continue;
+            };
+            let mapped = if format == Some("mono") {
+                format!("In {first}")
+            } else {
+                let first = first - (first - 1) % 2;
+                let last = first.checked_add(1).ok_or_else(|| bad(COMMAND, "input channel pair is out of range"))?;
+                format!("In {first}-{last}")
+            };
+            if mapped != *input {
+                // `track.input` resolves bus names first; never turn hardware into a bus.
+                if s.bus_by_name(&mapped).is_some() {
+                    return Err(bad(COMMAND, "the hardware input name matches a bus; rename that bus first"));
+                }
+                inputs.push((id, mapped));
+            }
+        }
+        self.engine.end_merge();
+        let result = (|| {
+            let r = self.engine.execute_merged(COMMAND, params, COMMAND)?;
+            for (id, input) in inputs {
+                self.engine.execute_merged("track.input", &json!({"tracks": [id.0], "input": input, "create_bus": false}), COMMAND)?;
+            }
+            Ok(r)
+        })();
+        self.engine.end_merge();
+        result
+    }
+
     /// The selected clips and their tracks, in session order.
     pub fn selected_clips(&self) -> Vec<(TrackId, ClipId, Range)> {
         let s = self.engine.session();

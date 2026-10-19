@@ -561,17 +561,20 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
 
 /// "Make Stereo" on a mono audio track, "Make Mono" on a stereo one (`track.change_width`, one
 /// undo step). Other widths (surround) are left to the engine command.
-pub(crate) fn width_item(app: &mut StudioApp, ui: &mut Ui, id: TrackId) {
-    let Some(channels) = app.engine.session().track(id).map(|t| t.channels()) else { return };
+pub(crate) fn width_item(app: &mut StudioApp, ui: &mut Ui, id: TrackId) -> Option<egui::Response> {
+    let channels = app.engine.session().track(id)?.channels();
     let (label, format) = match channels {
         1 => ("Make Stereo", "stereo"),
         2 => ("Make Mono", "mono"),
-        _ => return,
+        _ => return None,
     };
-    if ui.button(label).clicked() {
+    let reason = app.width_change_disabled_reason();
+    let response = ui.add_enabled(reason.is_none(), egui::Button::new(label)).on_disabled_hover_text(reason.unwrap_or_default());
+    if response.clicked() {
         let _ = app.run("track.change_width", json!({"tracks": [id.0], "format": format}));
         ui.close();
     }
+    Some(response)
 }
 
 /// Track colors offered in the track menu (muted, distinguishable on the dark lanes).

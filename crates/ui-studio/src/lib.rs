@@ -391,7 +391,7 @@ impl StudioApp {
             let m = self.engine.session().edit.edit_mode;
             (self.slip_override(id), m)
         };
-        let result = self.engine.execute(id, &params);
+        let result = if id == "track.change_width" { self.change_track_width(&params) } else { self.engine.execute(id, &params) };
         if restore && self.engine.session().edit.edit_mode == soundcraft_model::EditMode::Slip {
             self.engine.session_mut().edit.edit_mode = mode;
         }

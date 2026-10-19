@@ -2009,3 +2009,145 @@ fn change_width_is_one_undo_step() {
     assert_eq!(app.engine.session().track(t).unwrap().channels(), 1);
     assert_eq!(app.engine.undo_history().len(), steps);
 }
+
+#[test]
+fn change_width_remaps_hardware_inputs_and_undo_restores_both() {
+    use soundcraft_model::{ChannelFormat, Route};
+    for (from, input, to, mapped, channels) in [
+        ("mono", "In 2", "stereo", "In 1-2", vec![0, 1]),
+        ("mono", "In 3", "stereo", "In 3-4", vec![2, 3]),
+        ("stereo", "In 1-2", "mono", "In 1", vec![0]),
+        ("stereo", "In 3-4", "mono", "In 3", vec![2]),
+    ] {
+        let mut app = app();
+        let r = app.add_audio_track(from);
+        let t = new_audio(&mut app, r);
+        // Use the command to make even default input labels explicit hardware routes.
+        app.run("track.input", json!({"tracks": [t.0], "input": input})).unwrap();
+        app.run("mix.record_arm", json!({"tracks": [t.0], "value": true})).unwrap();
+        let before = app.engine.session().track(t).unwrap().clone();
+        let steps = app.engine.undo_history().len();
+        app.run("track.change_width", json!({"tracks": [t.0], "format": to})).unwrap();
+        let tr = app.engine.session().track(t).unwrap();
+        assert_eq!(tr.format, ChannelFormat::from_id(to).unwrap());
+        assert_eq!(tr.mixer.input, Route::Hardware(mapped.into()));
+        assert_eq!(input_label(&app, t), mapped);
+        assert!(tr.mixer.record_arm);
+        assert_eq!(app.engine.undo_history().len(), steps + 1);
+        // Pure planning only: no recorder or hardware device is opened.
+        let takes = soundcraft_engine::io::plan_takes(&app.engine, std::path::Path::new(env!("CARGO_MANIFEST_DIR")), 4);
+        assert_eq!(takes[0].1, channels);
+        let mut mix = soundcraft_mix::MixEngine::new(48_000.0, 64);
+        mix.monitor_only = true;
+        mix.input = vec![vec![0.2; 64], vec![0.4; 64], vec![0.6; 64], vec![0.8; 64]];
+        let mut out = vec![vec![0.0; 64]; 2];
+        mix.render(app.engine.session(), 0, 64, &mut out);
+        for (c, output) in out.iter().enumerate() {
+            let expected =
+                if channels.len() == 1 { mix.input[channels[0]][32] * std::f32::consts::FRAC_1_SQRT_2 } else { mix.input[channels[c]][32] };
+            assert!((output[32] - expected).abs() < 1e-3, "{from} {input} -> {to}, channel {c}: {} vs {expected}", output[32]);
+        }
+        app.run("edit.undo", json!({})).unwrap();
+        let restored = app.engine.session().track(t).unwrap();
+        assert_eq!(restored.format, before.format);
+        assert_eq!(restored.mixer, before.mixer);
+        assert_eq!(app.engine.undo_history().len(), steps);
+        app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(input_label(&app, t), mapped);
+        assert_eq!(app.engine.session().track(t).unwrap().format, ChannelFormat::from_id(to).unwrap());
+        // A second width action is a separate undo step, even without intervening edits.
+        app.run("track.change_width", json!({"tracks": [t.0], "format": from})).unwrap();
+        assert_eq!(app.engine.undo_history().len(), steps + 2);
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(input_label(&app, t), mapped);
+    }
+}
+
+#[test]
+fn change_width_keeps_bus_inputs_in_both_directions() {
+    use soundcraft_model::{ChannelFormat, Route};
+    let mut app = app();
+    let r = app.add_audio_track("mono");
+    let t = new_audio(&mut app, r);
+    let bus = app.engine.session_mut().add_bus("Capture", ChannelFormat::Stereo);
+    app.run("track.input", json!({"tracks": [t.0], "input": "Capture"})).unwrap();
+    for format in ["stereo", "mono"] {
+        let steps = app.engine.undo_history().len();
+        app.run("track.change_width", json!({"tracks": [t.0], "format": format})).unwrap();
+        assert_eq!(app.engine.session().track(t).unwrap().mixer.input, Route::Bus(bus));
+        assert_eq!(app.engine.undo_history().len(), steps + 1);
+    }
+}
+
+#[test]
+fn change_width_refuses_recording_without_an_edit() {
+    for (from, to) in [("mono", "stereo"), ("stereo", "mono")] {
+        let mut app = app();
+        let r = app.add_audio_track(from);
+        let t = new_audio(&mut app, r);
+        app.engine.transport.recording = true;
+        let before = app.engine.session_arc();
+        let steps = app.engine.undo_history().len();
+        let error = app.run("track.change_width", json!({"tracks": [t.0], "format": to})).unwrap_err();
+        assert!(error.contains("Stop recording"), "{error}");
+        assert_eq!(app.status, error);
+        assert!(std::sync::Arc::ptr_eq(&before, &app.engine.session_arc()));
+        assert!(app.engine.transport.recording);
+        assert_eq!(app.engine.undo_history().len(), steps);
+        app.engine.transport.recording = false;
+        app.run("track.change_width", json!({"tracks": [t.0], "format": to})).unwrap();
+        assert_eq!(app.engine.undo_history().len(), steps + 1);
+    }
+}
+
+#[test]
+fn width_menu_is_disabled_while_recording() {
+    for format in ["mono", "stereo"] {
+        let mut app = app();
+        let r = app.add_audio_track(format);
+        let t = new_audio(&mut app, r);
+        let ctx = egui::Context::default();
+        for recording in [false, true, false] {
+            app.engine.transport.recording = recording;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = crate::arrange::width_item(&mut app, ui, t).unwrap();
+                assert_eq!(response.enabled(), !recording, "{format}: recording = {recording}");
+            });
+            out.textures_delta.clear();
+            assert_eq!(app.width_change_disabled_reason().is_some(), recording);
+        }
+    }
+}
+
+#[test]
+fn width_menu_explains_why_recording_disables_it() {
+    fn has_reason(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.text().contains("Stop recording before changing a track's channel width."),
+            egui::Shape::Vec(shapes) => shapes.iter().any(has_reason),
+            _ => false,
+        }
+    }
+    let mut app = app();
+    let r = app.add_audio_track("stereo");
+    let t = new_audio(&mut app, r);
+    app.engine.transport.recording = true;
+    let ctx = egui::Context::default();
+    ctx.all_styles_mut(|style| style.interaction.tooltip_delay = 0.0);
+    let mut at = egui::Pos2::ZERO;
+    let mut explained = false;
+    for frame in 0..5 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0))),
+            time: Some(frame as f64),
+            events: vec![egui::Event::PointerMoved(at)],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            at = crate::arrange::width_item(&mut app, ui, t).unwrap().rect.center();
+        });
+        explained |= out.shapes.iter().any(|s| has_reason(&s.shape));
+        out.textures_delta.clear();
+    }
+    assert!(explained, "hovering the disabled width action must explain how to enable it");
+}

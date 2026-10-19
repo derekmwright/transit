@@ -1563,7 +1563,9 @@ fn strip(
         app.start_rename(crate::finish::RenameTarget::Track(id), r4(name_r));
     }
     if t.kind == TrackKind::Audio {
-        resp.context_menu(|ui| crate::arrange::width_item(app, ui, id));
+        resp.context_menu(|ui| {
+            crate::arrange::width_item(app, ui, id);
+        });
     }
     let mut y = r.min.y + 26.0;
     // Input (audio and aux tracks; instrument input is MIDI and there is no MIDI device layer).
