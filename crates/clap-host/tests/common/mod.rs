@@ -1,4 +1,4 @@
-//! Shared by the integration tests: builds the fixture plugin (a cdylib outside the workspace)
+//! Shared by the integration tests: builds the fixture plugins (a cdylib outside the workspace)
 //! and installs it in a temp folder.
 
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ pub fn fixture_dir() -> &'static Path {
             std::fs::create_dir_all(dir.join("vendor")).unwrap();
             std::fs::copy(&built, dir.join("vendor/Fixture.clap")).unwrap();
         }
-        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 2);
+        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), 3);
         dir
     })
 }

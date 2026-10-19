@@ -9,6 +9,13 @@
 //! The gain plugin also implements `clap.state` (gain and mode as two little-endian f64s) and a
 //! floating-only `clap.gui` without a real window: showing it "edits" the gain to 0.25 in the GUI,
 //! reported as an output parameter event by the next `process`.
+//!
+//! - `org.soundcraft.test.requests`: a stereo gain effect (params as the gain plugin, latency 5,
+//!   no GUI) that sleeps (`CLAP_PROCESS_SLEEP`) after every block and exercises the host requests
+//!   (audit F08, ADR 0012 G7). It logs every lifecycle call with a token of the calling thread.
+//!   Commands arrive as a "state" to load, `CMD:<command>` (see `requests_command`); its saved
+//!   "state" is that log as text, with the token of the thread saving it (`me=`), so a test can
+//!   compare each call's thread with its own.
 #![allow(clippy::missing_safety_doc, non_upper_case_globals)]
 
 use clap_sys::audio_buffer::clap_audio_buffer;
@@ -35,6 +42,7 @@ unsafe impl<const N: usize> Sync for Features<N> {}
 
 static GAIN_FEATURES: Features<3> = Features([c"audio-effect".as_ptr(), c"stereo".as_ptr(), std::ptr::null()]);
 static SYNTH_FEATURES: Features<3> = Features([c"instrument".as_ptr(), c"synthesizer".as_ptr(), std::ptr::null()]);
+static REQUESTS_FEATURES: Features<2> = Features([c"audio-effect".as_ptr(), std::ptr::null()]);
 
 static GAIN_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -62,10 +70,53 @@ static SYNTH_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     features: SYNTH_FEATURES.0.as_ptr(),
 };
 
+static REQUESTS_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
+    clap_version: CLAP_VERSION,
+    id: c"org.soundcraft.test.requests".as_ptr(),
+    name: c"Fixture Requests".as_ptr(),
+    vendor: c"SoundCraft tests".as_ptr(),
+    url: std::ptr::null(),
+    manual_url: std::ptr::null(),
+    support_url: std::ptr::null(),
+    version: c"1.0.0".as_ptr(),
+    description: std::ptr::null(),
+    features: REQUESTS_FEATURES.0.as_ptr(),
+};
+
+/// A small number per OS thread, unique in this process, for the requests plugin's log.
+fn thread_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TOKEN: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TOKEN.with(|t| *t)
+}
+
+/// The host pointer, carried to the requests plugin's "IO" threads.
+#[derive(Clone, Copy)]
+struct HostPtr(*const clap_host);
+unsafe impl Send for HostPtr {}
+
+/// The plugin, for an "IO" thread's log entry.
+#[derive(Clone, Copy)]
+struct FxPtr(*const Fx);
+unsafe impl Send for FxPtr {}
+
 struct Fx {
     plugin: clap_plugin,
     host: *const clap_host,
     synth: bool,
+    /// The requests plugin (see the crate docs).
+    requests: bool,
+    latency: u32,
+    /// Latency to take at the next `activate` (requests plugin).
+    next_latency: Option<u32>,
+    /// Requests plugin: at this `process` call (1-based), ask for a restart to this latency.
+    restart_at: Option<(u64, u32)>,
+    processes: u64,
+    /// Requests plugin: (call, thread token) in order.
+    log: std::sync::Mutex<Vec<(String, u64)>>,
     gain: f64,
     mode: f64,
     level: f64,
@@ -78,6 +129,83 @@ struct Fx {
 
 unsafe fn fx<'a>(p: *const clap_plugin) -> &'a mut Fx {
     unsafe { &mut *((*p).plugin_data as *mut Fx) }
+}
+
+fn note(f: &Fx, what: &str) {
+    if f.requests {
+        f.log.lock().unwrap().push((what.to_string(), thread_token()));
+    }
+}
+
+/// The host's extension `id`, as `T` (null when it has none).
+unsafe fn host_ext<T>(host: *const clap_host, id: &CStr) -> *const T {
+    match unsafe { (*host).get_extension } {
+        Some(ge) => (unsafe { ge(host, id.as_ptr()) }) as *const T,
+        None => std::ptr::null(),
+    }
+}
+
+/// Runs `f` with the host pointer on a new thread (an "IO" thread of the plugin) and waits for it.
+fn on_io_thread(host: *const clap_host, f: impl FnOnce(HostPtr) + Send + 'static) {
+    let h = HostPtr(host);
+    std::thread::spawn(move || f(h)).join().unwrap();
+}
+
+/// `CMD:process-now`, `CMD:process-after:<ms>`, `CMD:flush-now`, `CMD:callback-now`,
+/// `CMD:restart-now:<latency>`, `CMD:restart-at:<process call>:<latency>`,
+/// `CMD:rescan-values:<gain>`. The `-now` requests come from another thread (an "IO" thread),
+/// joined before this returns; `process-after` leaves that thread running; `restart-at` asks from
+/// the audio thread (inside `process`); `rescan-values` changes the gain "internally" and calls
+/// `params.rescan` on this (main) thread, and then refuses the "state", so that the host learns of
+/// the values only through the rescan. True when the command was taken as a state.
+fn requests_command(f: &mut Fx, cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split(':').collect();
+    let num = |i: usize| parts.get(i).and_then(|x| x.parse::<u64>().ok());
+    match parts.first().copied() {
+        Some("process-now") => on_io_thread(f.host, |h| {
+            let host = unsafe { &*h.0 };
+            unsafe { (host.request_process.unwrap())(h.0) };
+        }),
+        Some("process-after") => {
+            // The test keeps the plugin alive until this thread has asked.
+            let ms = num(1).unwrap_or(100);
+            let h = HostPtr(f.host);
+            let me = FxPtr(f as *const Fx);
+            std::thread::spawn(move || {
+                let (h, me) = (h, me);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                note(unsafe { &*me.0 }, "request_process");
+                let host = unsafe { &*h.0 };
+                unsafe { (host.request_process.unwrap())(h.0) };
+            });
+        }
+        Some("flush-now") => on_io_thread(f.host, |h| {
+            let params = unsafe { host_ext::<clap_host_params>(h.0, CLAP_EXT_PARAMS).as_ref() }.expect("host params");
+            unsafe { (params.request_flush.unwrap())(h.0) };
+        }),
+        Some("callback-now") => on_io_thread(f.host, |h| {
+            let host = unsafe { &*h.0 };
+            unsafe { (host.request_callback.unwrap())(h.0) };
+        }),
+        Some("restart-now") => {
+            f.next_latency = num(1).map(|l| l as u32);
+            on_io_thread(f.host, |h| {
+                let host = unsafe { &*h.0 };
+                unsafe { (host.request_restart.unwrap())(h.0) };
+            });
+        }
+        Some("restart-at") => f.restart_at = num(1).zip(num(2).map(|l| l as u32)),
+        Some("rescan-values") => {
+            f.gain = parts.get(1).and_then(|x| x.parse::<f64>().ok()).unwrap_or(1.0);
+            let params = unsafe { host_ext::<clap_host_params>(f.host, CLAP_EXT_PARAMS).as_ref() }.expect("host params");
+            unsafe { (params.rescan.unwrap())(f.host, CLAP_PARAM_RESCAN_VALUES) };
+            note(f, &format!("cmd {cmd}"));
+            return false;
+        }
+        _ => return false,
+    }
+    note(f, &format!("cmd {cmd}"));
+    true
 }
 
 unsafe extern "C" fn init(p: *const clap_plugin) -> bool {
@@ -109,6 +237,14 @@ unsafe extern "C" fn activate(p: *const clap_plugin, sr: f64, min: u32, max: u32
         return false;
     }
     f.active = true;
+    note(f, "activate");
+    if let Some(l) = f.next_latency.take() {
+        // CLAP: the latency may change only while the plugin is (being) activated.
+        f.latency = l;
+        let lat = unsafe { host_ext::<clap_host_latency>(f.host, CLAP_EXT_LATENCY).as_ref() }.expect("host latency");
+        unsafe { (lat.changed.unwrap())(f.host) };
+        note(f, "latency.changed");
+    }
     true
 }
 
@@ -116,17 +252,21 @@ unsafe extern "C" fn deactivate(p: *const clap_plugin) {
     let f = unsafe { fx(p) };
     assert!(!f.processing, "deactivate while processing");
     f.active = false;
+    note(f, "deactivate");
 }
 
 unsafe extern "C" fn start_processing(p: *const clap_plugin) -> bool {
     let f = unsafe { fx(p) };
     assert!(f.active, "start_processing while inactive");
     f.processing = true;
+    note(f, "start_processing");
     true
 }
 
 unsafe extern "C" fn stop_processing(p: *const clap_plugin) {
-    unsafe { fx(p) }.processing = false;
+    let f = unsafe { fx(p) };
+    f.processing = false;
+    note(f, "stop_processing");
 }
 
 unsafe extern "C" fn reset(p: *const clap_plugin) {
@@ -221,6 +361,17 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         };
         assert!(unsafe { (out.try_push.unwrap())(pr.out_events, &note.header) });
     }
+    f.processes += 1;
+    note(f, "process");
+    if let Some((at, latency)) = f.restart_at
+        && at == f.processes
+    {
+        f.restart_at = None;
+        f.next_latency = Some(latency);
+        let host = unsafe { &*f.host };
+        unsafe { (host.request_restart.unwrap())(f.host) };
+        note(f, "request_restart");
+    }
     let mut next = 0u32;
     let mut last_time = 0u32;
     for i in 0..n {
@@ -247,7 +398,7 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             unsafe { *o.add(i) = v };
         }
     }
-    CLAP_PROCESS_CONTINUE
+    if f.requests { CLAP_PROCESS_SLEEP } else { CLAP_PROCESS_CONTINUE }
 }
 
 // ---- extensions ----
@@ -312,6 +463,7 @@ unsafe extern "C" fn params_flush(p: *const clap_plugin, inp: *const clap_input_
     for i in 0..n {
         apply(f, unsafe { &*(ev.get.unwrap())(inp, i) });
     }
+    note(f, "flush");
 }
 
 static PARAMS: clap_plugin_params = clap_plugin_params {
@@ -343,8 +495,8 @@ unsafe extern "C" fn ports_get(p: *const clap_plugin, index: u32, is_input: bool
 
 static PORTS: clap_plugin_audio_ports = clap_plugin_audio_ports { count: Some(ports_count), get: Some(ports_get) };
 
-unsafe extern "C" fn latency_get(_p: *const clap_plugin) -> u32 {
-    3
+unsafe extern "C" fn latency_get(p: *const clap_plugin) -> u32 {
+    unsafe { fx(p) }.latency
 }
 
 static LATENCY: clap_plugin_latency = clap_plugin_latency { get: Some(latency_get) };
@@ -367,8 +519,21 @@ unsafe extern "C" fn notes_get(_p: *const clap_plugin, index: u32, is_input: boo
 
 static NOTES: clap_plugin_note_ports = clap_plugin_note_ports { count: Some(notes_count), get: Some(notes_get) };
 
+/// The requests plugin's "state": its log as text (see the crate docs).
+fn requests_report(f: &Fx) -> String {
+    let log = f.log.lock().unwrap();
+    let entries: Vec<String> = log.iter().map(|(w, t)| format!("{w}@{t}")).collect();
+    format!("gain={};latency={};processes={};me={};log={}", f.gain, f.latency, f.processes, thread_token(), entries.join(","))
+}
+
 unsafe extern "C" fn state_save(p: *const clap_plugin, stream: *const clap_ostream) -> bool {
     let f = unsafe { fx(p) };
+    if f.requests {
+        let text = requests_report(f);
+        let s = unsafe { &*stream };
+        let n = unsafe { (s.write.unwrap())(stream, text.as_ptr().cast(), text.len() as u64) };
+        return n == text.len() as i64;
+    }
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&f.gain.to_le_bytes());
     bytes[8..].copy_from_slice(&f.mode.to_le_bytes());
@@ -382,17 +547,29 @@ unsafe extern "C" fn state_save(p: *const clap_plugin, stream: *const clap_ostre
 unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istream) -> bool {
     let f = unsafe { fx(p) };
     let s = unsafe { &*stream };
-    let mut bytes = [0u8; 17];
+    if f.requests {
+        let mut buf = vec![0u8; 256];
+        let n = unsafe { (s.read.unwrap())(stream, buf.as_mut_ptr().cast(), buf.len() as u64) };
+        let text = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+        return text.strip_prefix("CMD:").is_some_and(|c| requests_command(f, c));
+    }
+    let mut bytes = [0u8; 64];
     let mut got = 0usize;
     loop {
-        let n = unsafe { (s.read.unwrap())(stream, bytes[got..].as_mut_ptr().cast(), (17 - got) as u64) };
+        let n = unsafe { (s.read.unwrap())(stream, bytes[got..].as_mut_ptr().cast(), (64 - got) as u64) };
         if n <= 0 {
             break;
         }
         got += n as usize;
-        if got == 17 {
+        if got == 64 {
             break;
         }
+    }
+    // The gain plugin takes one command too: `CMD:rescan-values:<gain>`.
+    if let Some(cmd) = std::str::from_utf8(&bytes[..got]).ok().and_then(|t| t.strip_prefix("CMD:"))
+        && cmd.starts_with("rescan-values:")
+    {
+        return requests_command(f, &cmd.to_string());
     }
     if got != 16 {
         return false;
@@ -476,6 +653,19 @@ static GUI: clap_plugin_gui = clap_plugin_gui {
 unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> *const c_void {
     let id = unsafe { CStr::from_ptr(id) };
     let synth = unsafe { fx(p) }.synth;
+    if unsafe { fx(p) }.requests {
+        return if id == CLAP_EXT_PARAMS {
+            &PARAMS as *const _ as *const c_void
+        } else if id == CLAP_EXT_AUDIO_PORTS {
+            &PORTS as *const _ as *const c_void
+        } else if id == CLAP_EXT_LATENCY {
+            &LATENCY as *const _ as *const c_void
+        } else if id == CLAP_EXT_STATE {
+            &STATE as *const _ as *const c_void
+        } else {
+            std::ptr::null()
+        };
+    }
     if id == CLAP_EXT_PARAMS {
         &PARAMS as *const _ as *const c_void
     } else if id == CLAP_EXT_AUDIO_PORTS {
@@ -493,28 +683,33 @@ unsafe extern "C" fn get_extension(p: *const clap_plugin, id: *const c_char) -> 
     }
 }
 
-unsafe extern "C" fn on_main_thread(_p: *const clap_plugin) {}
+unsafe extern "C" fn on_main_thread(p: *const clap_plugin) {
+    note(unsafe { fx(p) }, "on_main_thread");
+}
 
 // ---- factory + entry ----
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
-    2
+    3
 }
 
 unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *const clap_plugin_descriptor {
     match i {
         0 => &GAIN_DESC,
         1 => &SYNTH_DESC,
+        2 => &REQUESTS_DESC,
         _ => std::ptr::null(),
     }
 }
 
 unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const clap_host, id: *const c_char) -> *const clap_plugin {
     let id = unsafe { CStr::from_ptr(id) };
-    let (desc, synth) = if id == c"org.soundcraft.test.gain" {
-        (&GAIN_DESC as *const _, false)
+    let (desc, synth, requests) = if id == c"org.soundcraft.test.gain" {
+        (&GAIN_DESC as *const _, false, false)
     } else if id == c"org.soundcraft.test.synth" {
-        (&SYNTH_DESC as *const _, true)
+        (&SYNTH_DESC as *const _, true, false)
+    } else if id == c"org.soundcraft.test.requests" {
+        (&REQUESTS_DESC as *const _, false, true)
     } else {
         return std::ptr::null();
     };
@@ -535,6 +730,12 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         },
         host,
         synth,
+        requests,
+        latency: if requests { 5 } else { 3 },
+        next_latency: None,
+        restart_at: None,
+        processes: 0,
+        log: std::sync::Mutex::new(Vec::new()),
         gain: 1.0,
         mode: 0.0,
         level: 0.0,
