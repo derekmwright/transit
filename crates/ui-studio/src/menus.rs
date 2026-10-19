@@ -148,6 +148,23 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 app.arrange.bar_menu.retain(|m| m.label != "Track");
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Track".into(), String::new(), track_menu.response.rect));
                 let mut view_items = Vec::new();
+                let auto_menu = ui.menu_button("Automation", |ui| {
+                    // Follow-ups: a preference, not the document.
+                    let on = app.ui.thin_after_write;
+                    let b = ui.button(if on { "✓ Thin after write" } else { "   Thin after write" });
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin after write".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.ui.thin_after_write = !on;
+                        ui.close();
+                    }
+                    let b = ui.add_enabled(app.focus_track().is_some(), egui::Button::new("Thin Focused Track"));
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin Focused Track".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        let _ = app.thin_focused();
+                        ui.close();
+                    }
+                });
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Automation".into(), String::new(), auto_menu.response.rect));
                 let view_menu = ui.menu_button("View", |ui| {
                     let u = &mut app.ui;
                     for (name, action, flag) in [

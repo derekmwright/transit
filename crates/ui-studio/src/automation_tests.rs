@@ -430,6 +430,7 @@ fn the_mode_menu_sets_the_track_mode_as_one_step() {
 #[test]
 fn write_records_the_fader_while_playing_as_one_undo_step() {
     let mut t = T::new();
+    t.app.ui.thin_after_write = false;
     let a = t.with_lane();
     t.click(mid(t.lane(a, "volume").mode));
     t.menu("Write");
@@ -607,6 +608,7 @@ fn write_mode(t: &mut T) -> TrackId {
 #[test]
 fn a_forward_locate_during_write_keeps_the_points_it_skips() {
     let mut t = T::new();
+    t.app.ui.thin_after_write = false;
     let a = write_mode(&mut t);
     let ahead = [400_000_i64, 450_000, 500_000, 550_000];
     for &at in &ahead {
@@ -628,6 +630,7 @@ fn a_forward_locate_during_write_keeps_the_points_it_skips() {
 #[test]
 fn a_still_fader_writes_no_points_after_the_first() {
     let mut t = T::new();
+    t.app.ui.thin_after_write = false;
     let a = write_mode(&mut t);
     t.key("Space");
     t.frames(60);
@@ -772,4 +775,83 @@ fn a_group_drag_stops_at_its_unselected_neighbors_and_at_the_range() {
     assert!(max <= crate::fine::DB_MAX + 1e-3, "in range: {max}");
     assert!(pts[..3].iter().all(|p| p.1 >= crate::fine::DB_MIN));
     assert!(pts[0].1 < pts[2].1 || pts[0].1 != pts[1].1, "the group keeps its shape instead of flattening");
+}
+
+/// A ramp of the fader, a straight line in dB, while playing: the control moves a little every
+/// other frame, as a hand on it would.
+fn ramp(t: &mut T, a: TrackId, n: usize) {
+    for i in 0..n {
+        t.app.set_value_merged(crate::fine::Target::Fader(a), -30.0 + i as f32 * 0.1, None).unwrap();
+        t.frames(2);
+    }
+}
+
+/// A Write pass with a ramp. Returns (points written, undo steps added).
+fn write_pass_with_ramp(t: &mut T, a: TrackId) -> (usize, usize) {
+    let before = t.undo_len();
+    t.key("Space");
+    ramp(t, a, 120);
+    let written = t.app.auto.layout.points_written;
+    t.key("Space");
+    t.frames(3);
+    (written, t.undo_len() - before)
+}
+
+#[test]
+fn a_write_pass_is_thinned_when_it_ends_as_part_of_the_pass() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    assert!(t.app.ui.thin_after_write, "thinning is on by default");
+    let (written, steps) = write_pass_with_ramp(&mut t, a);
+    let pts = t.points(a, &AutoParam::Volume);
+    assert!(written >= 60, "a dense pass: {written}");
+    assert!(pts.len() < written / 3 && pts.len() >= 2, "thinned to a few: {} of {written}", pts.len());
+    assert_eq!(steps, 1, "the pass and its thinning are one undo step");
+    assert!(t.app.auto.thinned > 0);
+    // One undo removes the whole pass.
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert!(t.points(a, &AutoParam::Volume).is_empty(), "undo takes the pass and the thinning together");
+    // Redo brings back the thinned curve, not the dense one.
+    t.app.run("edit.redo", json!({})).unwrap();
+    assert_eq!(t.points(a, &AutoParam::Volume).len(), pts.len());
+}
+
+#[test]
+fn thin_after_write_off_keeps_the_dense_pass_and_the_menu_toggles_it() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    t.app.ui.thin_after_write = false;
+    let (written, steps) = write_pass_with_ramp(&mut t, a);
+    assert_eq!(steps, 1);
+    assert!(t.points(a, &AutoParam::Volume).len() >= written.saturating_sub(2), "every point of the pass stays");
+    // The menu entry flips the preference and Thin Focused Track thins on demand, as its own step.
+    let r = t.app.arrange.bar_menu.iter().find(|m| m.label == "Automation").unwrap().rect;
+    t.click(mid(r));
+    let on = t.app.arrange.bar_menu.iter().find(|m| m.label == "Thin after write").unwrap().rect;
+    t.click(mid(on));
+    assert!(t.app.ui.thin_after_write, "the menu turned it on");
+    assert!(!t.app.engine.session().track(a).unwrap().automation.is_empty());
+    t.app.focus(a);
+    let before = t.undo_len();
+    let n = t.app.thin_focused().unwrap();
+    assert!(n > 0);
+    assert_eq!(t.undo_len(), before + 1);
+}
+
+#[test]
+fn leaving_write_mid_pass_thins_that_track_and_a_toggle_survives_ui_json() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    t.key("Space");
+    ramp(&mut t, a, 120);
+    let dense = t.points(a, &AutoParam::Volume).len();
+    t.app.run("mix.automation_mode", json!({"tracks": [a.0], "mode": "read"})).unwrap();
+    t.frames(5);
+    let thin = t.points(a, &AutoParam::Volume).len();
+    t.key("Space");
+    assert!(thin < dense / 3, "thinned when Write ended: {thin} of {dense}");
+    let json = serde_json::to_string(&t.app.ui).unwrap();
+    assert!(json.contains("\"thin_after_write\":true"));
+    let old: crate::UiState = serde_json::from_str("{}").unwrap();
+    assert!(old.thin_after_write, "an older ui.json thins by default");
 }

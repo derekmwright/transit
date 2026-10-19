@@ -437,6 +437,10 @@ pub struct AutoState {
     latched: Vec<(TrackId, String)>,
     writing: bool,
     pub points_written: usize,
+    /// The tracks the running pass wrote to (thinned when the pass or their Write ends).
+    passed: Vec<TrackId>,
+    /// What the last thinning removed, for `ui.inspect`.
+    pub thinned: usize,
 }
 
 impl StudioApp {
@@ -1113,14 +1117,29 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
     if !may {
         if app.auto.writing {
             app.auto.writing = false;
+            let tracks = std::mem::take(&mut app.auto.passed);
+            thin_after_pass(app, &tracks);
             app.engine.end_merge();
         }
+        app.auto.passed.clear();
         app.auto.last.clear();
         app.auto.last_v.clear();
         app.auto.skipped.clear();
         app.auto.latched.clear();
         app.auto.last_at = None;
         return;
+    }
+    // A track whose Write ended while others go on: thin what it wrote.
+    let done: Vec<TrackId> = app
+        .auto
+        .passed
+        .iter()
+        .copied()
+        .filter(|id| !app.engine.session().track(*id).is_some_and(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch)))
+        .collect();
+    if !done.is_empty() {
+        app.auto.passed.retain(|id| !done.contains(id));
+        thin_after_pass(app, &done);
     }
     let pos = app.engine.transport.position;
     let step = app.engine.session().sample_rate.samples(WRITE_STEP_S);
@@ -1201,9 +1220,36 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         if ok {
             app.auto.last_v.insert(key.clone(), v);
             app.auto.writing = true;
+            if !app.auto.passed.contains(&id) {
+                app.auto.passed.push(id);
+            }
             app.auto.points_written += 1;
             app.auto.last.insert(key, pos);
         }
+    }
+}
+
+/// `automation.thin` with the default tolerance on the tracks a pass wrote, under the pass's merge
+/// key so it is part of the pass's undo step. The engine thins every lane of a track (L42).
+fn thin_after_pass(app: &mut StudioApp, tracks: &[TrackId]) {
+    if !app.ui.thin_after_write || tracks.is_empty() {
+        return;
+    }
+    let ids: Vec<u64> = tracks.iter().map(|t| t.0).collect();
+    if let Ok(r) = app.engine.execute_merged("automation.thin", &json!({"tracks": ids}), PASS) {
+        app.auto.thinned = r["removed"].as_u64().unwrap_or(0) as usize;
+        app.status = format!("Thinned the write pass: {} point{} removed", app.auto.thinned, if app.auto.thinned == 1 { "" } else { "s" });
+    }
+}
+
+impl StudioApp {
+    /// Automation > Thin Focused Track: thin the focused track's lanes now, one undo step.
+    pub fn thin_focused(&mut self) -> Result<usize, String> {
+        let Some(t) = self.focus_track() else { return Err("No focused track".into()) };
+        let r = self.run("automation.thin", json!({"tracks": [t.0]}))?;
+        let n = r["removed"].as_u64().unwrap_or(0) as usize;
+        self.status = format!("Thinned the automation: {n} point{} removed", if n == 1 { "" } else { "s" });
+        Ok(n)
     }
 }
 

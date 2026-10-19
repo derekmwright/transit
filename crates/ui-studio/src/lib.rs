@@ -98,6 +98,9 @@ pub struct UiState {
     /// Transport > Count-in (slice 6): Record plays one bar before the cursor (or the cycle
     /// range) and records from there. A preference, not part of the document.
     pub count_in: bool,
+    /// Automation > Thin after write (follow-ups): when a write pass ends, `automation.thin`
+    /// runs on the tracks it wrote, as part of the pass's undo step. A preference.
+    pub thin_after_write: bool,
     /// Tracks whose take lanes are shown (slice 6). View state of the open session, never in the
     /// document; the lanes it opens are in `ui.inspect`'s slice 6 layout.
     #[serde(skip)]
@@ -138,6 +141,7 @@ impl Default for UiState {
             show_shortcuts: false,
             shortcuts_filter: String::new(),
             count_in: false,
+            thin_after_write: true,
             takes_open: Vec::new(),
             show_history: false,
             auto_shown: Vec::new(),
