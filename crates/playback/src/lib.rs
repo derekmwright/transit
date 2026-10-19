@@ -1208,14 +1208,28 @@ impl OutputCallback {
     fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T], state: &Holder, fault: &Fault, shared: &Shared) {
         let started = telemetry::Timer::start();
         mark_audio_thread();
+        let channels = self.channels;
+        self.fill_with(data, |s, _budget| {
+            render_held(state, fault, shared, s, channels);
+        });
+        self.timing.record(&fault.telemetry, data.len() / self.channels, self.rate, started.elapsed());
+    }
+
+    /// One device callback scope, shared by all scratch conversion chunks. The prepared
+    /// Player integration uses this token; it must never be reconstructed inside a chunk.
+    fn fill_with<T: cpal::SizedSample + cpal::FromSample<f32>>(
+        &mut self,
+        data: &mut [T],
+        mut render: impl FnMut(&mut [f32], &mut plan_bridge::CallbackBudget),
+    ) {
+        let mut budget = plan_bridge::callback_scope();
         for out in data.chunks_mut(self.scratch.len()) {
             let Some(s) = self.scratch.get_mut(..out.len()) else { break };
-            render_held(state, fault, shared, s, self.channels);
+            render(s, &mut budget);
             for (o, x) in out.iter_mut().zip(s.iter()) {
                 *o = T::from_sample(*x);
             }
         }
-        self.timing.record(&fault.telemetry, data.len() / self.channels, self.rate, started.elapsed());
     }
 }
 

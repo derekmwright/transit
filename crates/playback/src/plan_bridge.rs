@@ -15,7 +15,7 @@ use soundcraft_model::{Session, TrackId, TrackKind};
 use soundcraft_time::Samples;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Playback-owned sample/meter storage cap per publication, in addition to PlanLimits.
 const PLAYBACK_BYTES: usize = 16 << 20;
@@ -188,9 +188,47 @@ pub struct StatusReport {
 }
 
 /// Created once per actual device callback, then borrowed across scratch chunks and blocks.
-#[derive(Default)]
+/// There is no public constructor; the device adapter owns the scope.
+/// ```compile_fail
+/// let _ = soundcraft_playback::plan_bridge::CallbackBudget::default();
+/// ```
 pub struct CallbackBudget {
     serviced: bool,
+    deferral_counted: bool,
+}
+
+// Only the parent device adapter can mint production tokens. Tests are inside this
+// module so no public constructor or Default implementation is needed for fixtures.
+pub(super) fn callback_scope() -> CallbackBudget {
+    CallbackBudget { serviced: false, deferral_counted: false }
+}
+
+#[derive(Default)]
+struct Counters {
+    published: AtomicU64,
+    admitted: AtomicU64,
+    deferred: AtomicU64,
+    age: AtomicU64,
+    maximum_age: AtomicU64,
+}
+
+/// Independent diagnostic fields can straddle a callback. Age counts callbacks in
+/// which a pending publication could not be admitted; it is not physical latency.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeferralTelemetry {
+    pub published_generation: u64,
+    pub admitted_generation: u64,
+    pub deferred_callbacks: u64,
+    pub current_age_callbacks: u64,
+    pub maximum_age_callbacks: u64,
+}
+
+/// The disposition and requested identity are reported even for a torn adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnReport {
+    pub requested: PlanGeneration,
+    pub state: EnvelopeState,
+    pub torn: bool,
 }
 
 /// Main-thread compiler, publisher and reclaimer. Never held or dropped by a callback.
@@ -205,6 +243,7 @@ pub struct Control {
     pending_meters: Option<Arc<MeterBank>>,
     status_rx: rtrb::Consumer<StatusReport>,
     status: Option<StatusReport>,
+    counters: Arc<Counters>,
 }
 
 /// Borrowed by audio, anchored by control until quiescence. The caller owns transport and
@@ -214,6 +253,9 @@ pub struct Audio {
     mix: MixEngine,
     buffers: Buffers,
     status_tx: rtrb::Producer<StatusReport>,
+    counters: Arc<Counters>,
+    deferred_age: u64,
+    maximum_age: u64,
 }
 
 /// Prepare an empty fixed-target engine and one publication/return credit on control.
@@ -221,6 +263,7 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
     let target = RenderTarget { max_block: target.max_block.clamp(16, 16_384), ..target };
     let (port, audio_port) = publication::channel(NonZeroUsize::MIN);
     let (status_tx, status_rx) = rtrb::RingBuffer::new(1);
+    let counters = Arc::new(Counters::default());
     let meters = Arc::new(MeterBank { tracks: Vec::new(), main: AtomicMeter::new() });
     let buffers = Buffers {
         output: Vec::new(),
@@ -245,8 +288,9 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
             pending_meters: None,
             status_rx,
             status: None,
+            counters: Arc::clone(&counters),
         },
-        Audio { port: audio_port, mix, buffers, status_tx },
+        Audio { port: audio_port, mix, buffers, status_tx, counters, deferred_age: 0, maximum_age: 0 },
     )
 }
 
@@ -259,11 +303,11 @@ impl Control {
     /// Reclaim at most one return and observe one coherent status. Call before preparation.
     /// Drain [`Self::take_released`] after this and after every preparation attempt, even
     /// if the factory unwinds; handles are keyed by the entire SlotBinding.
-    pub fn poll(&mut self) -> Option<EnvelopeState> {
+    pub fn poll(&mut self) -> Option<ReturnReport> {
         let mut result = None;
         let Self { compiler, port, meters, pending_meters, .. } = self;
         port.reclaim_one(|env| {
-            result = Some(env.plan.state());
+            result = Some(ReturnReport { requested: env.plan.plan().id().generation, state: env.plan.state(), torn: env.plan.torn() });
             if matches!(env.plan.state(), EnvelopeState::Returned { .. })
                 && let Some(new_meters) = pending_meters.take()
             {
@@ -298,10 +342,13 @@ impl Control {
         let plan = self.compiler.compile(request.session, self.compiler.active(), next, make)?;
         self.issued = next;
         self.pending_meters = Some(Arc::clone(&buffers.meters));
+        let previous = self.counters.published.load(Ordering::Relaxed);
+        self.counters.published.store(next.get(), Ordering::Release);
         if let Err(env) = self.port.try_publish(Envelope { plan, buffers }) {
             // Defensive invariant failure: ownership remains on control; no overflow queue.
             self.pending_meters.take();
             self.compiler.reclaim(env.plan);
+            self.counters.published.store(previous, Ordering::Release);
             return Ok(false);
         }
         Ok(true)
@@ -321,6 +368,16 @@ impl Control {
     }
     pub fn status(&self) -> Option<StatusReport> {
         self.status.filter(|s| s.generation == self.compiler.active())
+    }
+
+    pub fn deferral_telemetry(&self) -> DeferralTelemetry {
+        DeferralTelemetry {
+            published_generation: self.counters.published.load(Ordering::Acquire),
+            admitted_generation: self.counters.admitted.load(Ordering::Acquire),
+            deferred_callbacks: self.counters.deferred.load(Ordering::Relaxed),
+            current_age_callbacks: self.counters.age.load(Ordering::Relaxed),
+            maximum_age_callbacks: self.counters.maximum_age.load(Ordering::Relaxed),
+        }
     }
 
     /// Control-only snapshot. Channel/track allocation, when needed, happens here.
@@ -345,38 +402,85 @@ impl Control {
 }
 
 impl Audio {
+    fn deferred(&mut self, budget: &mut CallbackBudget) {
+        if !budget.deferral_counted && self.counters.published.load(Ordering::Acquire) > self.counters.admitted.load(Ordering::Relaxed) {
+            budget.deferral_counted = true;
+            self.deferred_age = self.deferred_age.saturating_add(1);
+            self.maximum_age = self.maximum_age.max(self.deferred_age);
+            self.counters.deferred.fetch_add(1, Ordering::Relaxed);
+            self.counters.age.store(self.deferred_age, Ordering::Relaxed);
+            self.counters.maximum_age.store(self.maximum_age, Ordering::Relaxed);
+        }
+    }
+
+    fn reset_age(&mut self) {
+        self.deferred_age = 0;
+        self.counters.age.store(0, Ordering::Relaxed);
+    }
     /// Attempt at most one publication per device callback, only at a drained boundary.
     /// `ready` is false while old render-ahead samples still need their old layout/fold.
     pub fn service(&mut self, budget: &mut CallbackBudget, ready: bool) -> publication::Service {
         if budget.serviced || !ready {
+            self.deferred(budget);
             return publication::Service::Empty;
         }
         budget.serviced = true;
-        let Self { port, mix, buffers, .. } = self;
-        port.service_one(|env| {
+        let Self { port, mix, buffers, counters, .. } = self;
+        let result = port.service_one(|env| {
+            counters.admitted.store(env.plan.plan().id().generation.get(), Ordering::Release);
             if mix.adopt_plan(&mut env.plan) == Adoption::Adopted {
                 std::mem::swap(buffers, &mut env.buffers);
                 std::mem::swap(&mut mix.input, &mut buffers.input_storage);
                 // input_storage belongs to the displaced plan and travels back in the envelope.
                 std::mem::swap(&mut buffers.input_storage, &mut env.buffers.input_storage);
             }
-        })
+        });
+        if result == publication::Service::Empty {
+            self.deferred(budget);
+        } else {
+            self.reset_age();
+        }
+        result
     }
 
     /// Fault/stopped-device service: return unadopted or interrupted work without rendering.
     pub fn return_pending(&mut self, budget: &mut CallbackBudget) -> publication::Service {
         if budget.serviced {
+            self.deferred(budget);
             return publication::Service::Empty;
         }
         budget.serviced = true;
-        self.port.service_one(|_| {})
+        let counters = &self.counters;
+        let result = self.port.service_one(|env| {
+            counters.admitted.store(env.plan.plan().id().generation.get(), Ordering::Release);
+        });
+        if result == publication::Service::Empty {
+            self.deferred(budget);
+        } else {
+            self.reset_age();
+        }
+        result
     }
 
     pub fn engine(&self) -> &MixEngine {
         &self.mix
     }
-    pub fn engine_mut(&mut self) -> &mut MixEngine {
-        &mut self.mix
+    pub fn set_processing(&mut self, monitor_only: bool, recording: bool, editors_open: bool) {
+        self.mix.monitor_only = monitor_only;
+        self.mix.recording = recording;
+        self.mix.no_suspend = editors_open;
+    }
+    pub fn reset(&mut self) {
+        self.mix.reset();
+    }
+    pub fn all_notes_off(&mut self) {
+        self.mix.all_notes_off();
+    }
+    pub fn flush_releases(&mut self, frames: usize) {
+        self.mix.flush_releases(frames);
+    }
+    pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
+        self.mix.live_note(track, pitch, velocity);
     }
     pub fn output(&self) -> &[Vec<f32>] {
         &self.buffers.output
@@ -409,3 +513,6 @@ impl Audio {
         self.buffers.meters.clear();
     }
 }
+
+#[cfg(test)]
+mod tests;

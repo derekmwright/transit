@@ -1,15 +1,11 @@
 //! Exercise the production bridge, compiler and engine without opening a device.
 #![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
+use crate::{MeterSnapshot, plan_bridge, publication::Service, record::InputRing};
 use soundcraft_audio_io::AudioBuffer;
 use soundcraft_mix::{CompileError, DeviceGeneration, EnvelopeState, InstanceSpec, NewInstance, PlanGeneration, PlanLimits, RenderTarget, SlotGen};
 use soundcraft_model::{ChannelFormat, Clip, Insert, Session, SourceAudio, SourceId, TrackKind};
-use soundcraft_playback::{
-    MeterSnapshot,
-    plan_bridge::{self, CallbackBudget},
-    publication::Service,
-    record::InputRing,
-};
 use soundcraft_rt::testing::measure;
 use std::sync::{Arc, Mutex};
 
@@ -36,7 +32,7 @@ fn session(format: ChannelFormat) -> Session {
 }
 
 fn adopt(audio: &mut plan_bridge::Audio) {
-    let (result, stats) = measure(|| audio.service(&mut CallbackBudget::default(), true));
+    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), true));
     assert_eq!(result, Service::Returned);
     assert!(stats.is_zero(), "adoption: {stats:?}");
 }
@@ -65,7 +61,7 @@ fn coalescing_and_stalled_control_bound_construction_and_retirement() {
     assert_eq!(control.active(), PlanGeneration::EMPTY);
     assert_eq!(audio.engine().session().name, s.name);
     assert!(!control.prepare(&mut factory).unwrap(), "a returned but unreclaimed credit stays spent");
-    assert!(matches!(control.poll(), Some(EnvelopeState::Returned { .. })));
+    assert!(matches!(control.poll(), Some(super::ReturnReport { state: EnvelopeState::Returned { .. }, .. })));
     assert!(control.prepare(&mut factory).unwrap());
     adopt(&mut audio);
     assert_eq!(audio.engine().session().name, "edit 99");
@@ -89,7 +85,7 @@ fn a_layout_change_waits_for_the_boundary_and_cannot_readmit_within_one_callback
     let fold = *audio.fold();
     control.request(Arc::new(session(ChannelFormat::Stereo)), None);
     control.prepare(&mut make).unwrap();
-    let mut callback = CallbackBudget::default();
+    let mut callback = super::callback_scope();
     let (_, stats) = measure(|| {
         for _ in 0..4 {
             assert_eq!(audio.service(&mut callback, false), Service::Empty);
@@ -193,13 +189,13 @@ fn rejected_instances_keep_their_binding_when_reused_and_status_never_crosses_ge
     control.request(Arc::clone(&s), None);
     control.prepare(&mut make).unwrap();
     let binding = control.pending_bindings().unwrap();
-    *audio.engine_mut() = soundcraft_mix::MixEngine::realtime(RenderTarget { device: DeviceGeneration(2), ..target() });
+    audio.mix = soundcraft_mix::MixEngine::realtime(RenderTarget { device: DeviceGeneration(2), ..target() });
     adopt(&mut audio);
-    assert!(matches!(control.poll(), Some(EnvelopeState::Rejected { .. })));
+    assert!(matches!(control.poll(), Some(super::ReturnReport { state: EnvelopeState::Rejected { .. }, .. })));
     assert_eq!(control.active(), PlanGeneration::EMPTY);
     assert!(control.active_bindings().is_empty());
     assert!(control.take_released().is_empty(), "refused instance is retained in the bounded compiler pool");
-    *audio.engine_mut() = soundcraft_mix::MixEngine::realtime(target());
+    audio.mix = soundcraft_mix::MixEngine::realtime(target());
     control.request(Arc::clone(&s), None);
     control.prepare(&mut |_, _| panic!("pooled instance must be reused")).unwrap();
     assert_eq!(control.pending_bindings().unwrap(), binding);
@@ -277,7 +273,7 @@ fn shutdown_recovers_queued_returned_rejected_and_live_instances_on_control() {
             .unwrap();
         let bindings = control.pending_bindings().unwrap();
         if stage == 4 {
-            *audio.engine_mut() = soundcraft_mix::MixEngine::realtime(RenderTarget { device: DeviceGeneration(2), ..target() });
+            audio.mix = soundcraft_mix::MixEngine::realtime(RenderTarget { device: DeviceGeneration(2), ..target() });
         }
         if stage != 0 {
             // The owner stays on control in production; this harness returns the entire
@@ -285,9 +281,9 @@ fn shutdown_recovers_queued_returned_rejected_and_live_instances_on_control() {
             audio = std::thread::spawn(move || {
                 let (_, stats) = measure(|| {
                     if stage == 3 {
-                        audio.return_pending(&mut CallbackBudget::default());
+                        audio.return_pending(&mut super::callback_scope());
                     } else {
-                        audio.service(&mut CallbackBudget::default(), true);
+                        audio.service(&mut super::callback_scope(), true);
                     }
                 });
                 (audio, stats)
@@ -342,7 +338,7 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     control.prepare(&mut |_, _| panic!("instance must be reused")).unwrap();
     fault.store(true, Ordering::Relaxed);
     audio = std::thread::spawn(move || {
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audio.service(&mut CallbackBudget::default(), true))).is_err();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audio.service(&mut super::callback_scope(), true))).is_err();
         (audio, failed)
     })
     .join()
@@ -354,11 +350,155 @@ fn an_adoption_unwind_keeps_the_outer_envelope_until_control_teardown() {
     assert!(audio.engine().faulted());
     assert!(drops.lock().unwrap().is_empty());
     assert!(control.poll().is_none(), "in-flight envelope remains anchored on the audio endpoint after unwind");
-    let (result, stats) = measure(|| audio.return_pending(&mut CallbackBudget::default()));
+    let (result, stats) = measure(|| audio.return_pending(&mut super::callback_scope()));
     assert_eq!(result, Service::Returned);
     assert!(stats.is_zero());
     assert!(drops.lock().unwrap().is_empty());
+    let report = control.poll().unwrap();
+    assert!(report.torn);
+    assert_eq!(report.state, EnvelopeState::Pending);
     let released = control.retire(audio);
     assert_eq!(released, live);
     assert_eq!(*drops.lock().unwrap(), [std::thread::current().id()]);
+}
+
+#[test]
+fn the_device_adapter_carries_one_budget_across_conversion_chunks_and_fault_returns() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    control.request(Arc::new(session(ChannelFormat::Stereo)), None);
+    control.prepare(&mut make).unwrap();
+    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut device = vec![0.0f32; 40_000]; // three real scratch-conversion chunks
+    let mut chunks = 0;
+    callback.fill_with(&mut device, |_, budget| {
+        if chunks == 0 {
+            assert_eq!(audio.service(budget, true), Service::Returned);
+            // Emulate control running between chunks. Its allocations are not callback work.
+            control.poll();
+            control.request(Arc::new(session(ChannelFormat::Surround51)), None);
+            control.prepare(&mut make).unwrap();
+        } else {
+            let (result, stats) = measure(|| audio.return_pending(budget));
+            assert_eq!(result, Service::Empty, "fault-return must respect the same device budget");
+            assert!(stats.is_zero());
+            assert_eq!(audio.service(budget, true), Service::Empty);
+        }
+        chunks += 1;
+    });
+    assert_eq!(chunks, 3);
+    assert!(control.poll().is_none());
+    assert_eq!(audio.output().len(), 2);
+    callback.fill_with(&mut device[..128], |_, budget| {
+        audio.return_pending(budget);
+    });
+    let report = control.poll().unwrap();
+    assert_eq!(report.state, EnvelopeState::Pending);
+    assert!(!report.torn);
+    control.retire(audio);
+}
+
+#[test]
+fn prolonged_render_ahead_deferral_is_counted_once_per_actual_callback() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    control.request(Arc::new(session(ChannelFormat::Stereo)), None);
+    control.prepare(&mut make).unwrap();
+    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut device = vec![0.0f32; 40_000];
+    let ((), stats) = measure(|| {
+        for _ in 0..10 {
+            callback.fill_with(&mut device, |_, budget| {
+                audio.service(budget, false);
+            });
+        }
+    });
+    assert!(stats.is_zero());
+    let telemetry = control.deferral_telemetry();
+    assert_eq!(telemetry.deferred_callbacks, 10);
+    assert_eq!(telemetry.current_age_callbacks, 10);
+    assert_eq!(telemetry.maximum_age_callbacks, 10);
+    assert!(telemetry.published_generation > telemetry.admitted_generation);
+    callback.fill_with(&mut device[..128], |_, budget| {
+        audio.service(budget, true);
+    });
+    let telemetry = control.deferral_telemetry();
+    assert_eq!(telemetry.current_age_callbacks, 0);
+    assert_eq!(telemetry.maximum_age_callbacks, 10);
+    assert_eq!(telemetry.published_generation, telemetry.admitted_generation);
+    control.retire(audio);
+}
+
+#[test]
+fn displaced_input_storage_returns_in_the_same_envelope() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    let s = Arc::new(session(ChannelFormat::Stereo));
+    control.request(Arc::clone(&s), Some(InputRing::new(3, 48_000)));
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    control.poll();
+    let previous = audio.engine().input.as_ptr();
+    control.request(s, Some(InputRing::new(1, 48_000)));
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    assert!(control.port.reclaim_one(|env| {
+        assert_eq!(env.buffers.input_storage.len(), 3);
+        assert_eq!(env.buffers.input_storage.as_ptr(), previous);
+        control.compiler.reclaim(env.plan);
+    }));
+    control.retire(audio);
+}
+
+#[test]
+fn stale_status_cannot_change_the_compilers_delay_capacity_hints() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    let s = Arc::new(session(ChannelFormat::Stereo));
+    control.request(Arc::clone(&s), None);
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    control.poll();
+    let stale = control.active();
+    control.request(Arc::clone(&s), None);
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    audio
+        .status_tx
+        .push(super::StatusReport {
+            generation: stale,
+            status: soundcraft_mix::PlanStatus { capacity_exceeded: 1, required_latency: 16_384, ..Default::default() },
+        })
+        .unwrap();
+    control.poll();
+    let base = control.active();
+    let env = control.compiler.compile(s, base, base.checked_next().unwrap(), &mut make).unwrap();
+    assert!(!env.plan().is_structural(), "a stale delay hint must not cause a structural rebuild");
+    control.compiler.reclaim(env);
+    control.retire(audio);
+}
+
+#[test]
+fn a_rejected_plan_cannot_replace_output_input_fold_or_meter_owners() {
+    let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
+    control.request(Arc::new(session(ChannelFormat::Surround51)), Some(InputRing::new(3, 48_000)));
+    control.prepare(&mut make).unwrap();
+    adopt(&mut audio);
+    control.poll();
+    audio.render(0, 128);
+    let mut previous_meters = MeterSnapshot::default();
+    control.copy_meters(&mut previous_meters);
+    let previous_output = audio.output().to_vec();
+    let previous_fold = *audio.fold();
+    let previous_input = Arc::as_ptr(audio.buffers.input.as_ref().unwrap());
+    control.request(Arc::new(session(ChannelFormat::Stereo)), Some(InputRing::new(1, 48_000)));
+    control.prepare(&mut make).unwrap();
+    // Deliberately corrupt the target on control to exercise atomic rejection.
+    audio.mix = soundcraft_mix::MixEngine::realtime(RenderTarget { device: DeviceGeneration(2), ..target() });
+    adopt(&mut audio);
+    assert_eq!(audio.output(), previous_output);
+    assert_eq!(*audio.fold(), previous_fold);
+    assert_eq!(Arc::as_ptr(audio.buffers.input.as_ref().unwrap()), previous_input);
+    assert!(matches!(control.poll().unwrap().state, EnvelopeState::Rejected { .. }));
+    let mut meters = MeterSnapshot::default();
+    control.copy_meters(&mut meters);
+    assert_eq!(meters.main, previous_meters.main);
+    assert_eq!(meters.tracks, previous_meters.tracks);
+    control.retire(audio);
 }
