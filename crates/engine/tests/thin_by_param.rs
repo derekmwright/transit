@@ -139,3 +139,29 @@ fn reversed_range_is_normalized_like_range_param() {
     let r = e.execute("automation.thin", &json!({"tracks": [t.0], "start": 900_000, "end": 600_000})).unwrap();
     assert_eq!(r["removed"], 29);
 }
+
+#[test]
+fn end_or_length_without_start_is_bad_params() {
+    for extra in [json!({"end": 700_000}), json!({"length": 100}), json!({"start": null, "end": 700_000})] {
+        let (mut e, t, _) = ranged();
+        let before = snapshot(&e, t);
+        let mut p = json!({"tracks": [t.0], "param": "volume"});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert!(e.execute("automation.thin", &p).is_err(), "{p}");
+        assert_eq!(snapshot(&e, t), before);
+    }
+}
+
+#[test]
+fn null_bounds_mean_the_whole_lane() {
+    let (mut e, t, _) = ranged();
+    e.execute("automation.thin", &json!({"tracks": [t.0], "start": null, "end": null, "length": null})).unwrap();
+    assert_eq!(pts(&e, t, &AutoParam::Volume).len(), 2);
+}
+
+#[test]
+fn start_with_null_end_is_a_point_range() {
+    let (mut e, t, _) = ranged();
+    let r = e.execute("automation.thin", &json!({"tracks": [t.0], "start": 600_000, "end": null})).unwrap();
+    assert_eq!(r["removed"], 0);
+}

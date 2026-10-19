@@ -580,9 +580,22 @@ fn thin(e: &mut Engine, p: &Value, all: bool) -> Result<Value> {
         Some(Value::String(_)) => Some(lane_param(p, "automation.thin")?),
         Some(_) => return Err(bad("automation.thin", "`param` must be a lane address string")),
     };
-    // With `start`/`end`/`length`, only the points inside that range are thinned; its first and last points stay.
-    let ranged = !all && ["start", "end", "length"].iter().any(|k| p.get(k).is_some_and(|v| !v.is_null()));
-    let range = if ranged { Some(range_param(e, "automation.thin", p)?) } else { None };
+    // A null `start`, `end` or `length` counts as absent. With `start` (plus `end` or `length`), only the points
+    // inside that range are thinned; its first and last points stay. `end`/`length` alone are rejected, because
+    // `range_param` would fall back to the edit selection.
+    let given = |k: &str| !all && p.get(k).is_some_and(|v| !v.is_null());
+    if !given("start") && (given("end") || given("length")) {
+        return Err(bad("automation.thin", "`end`/`length` need `start`"));
+    }
+    let range = if given("start") {
+        let mut q = p.clone();
+        if let Some(o) = q.as_object_mut() {
+            o.retain(|k, v| !(matches!(k.as_str(), "start" | "end" | "length") && v.is_null()));
+        }
+        Some(range_param(e, "automation.thin", &q)?)
+    } else {
+        None
+    };
     let s = e.session_mut();
     let mut n = 0;
     for t in &tracks {
