@@ -84,6 +84,7 @@ struct Port {
     generation: AtomicU64,
     admitted: AtomicBool,
     invalidated: AtomicU64,
+    cutoff: AtomicU64,
     requested: AtomicU64,
     acknowledged: AtomicU64,
 }
@@ -120,6 +121,16 @@ impl Permit {
             && port.admitted.load(Ordering::Acquire)
             && port.invalidated.load(Ordering::Acquire) < self.token.generation
             && port.generation.load(Ordering::Acquire) == self.token.generation
+    }
+    /// Raw input sequence admission. Carry this original sequence through every
+    /// worker queue, then check it again on audio; a worker can race a Stop cutoff.
+    /// MAX is reserved by midi-io as the exclusive terminal cutoff, never an event.
+    pub fn admits_sequence(&self, sequence: u64) -> bool {
+        if sequence == u64::MAX || !self.admits() {
+            return false;
+        }
+        let Some(port) = self.shared.ports.get(usize::from(self.token.slot)) else { return false };
+        sequence >= port.cutoff.load(Ordering::Acquire) && port.generation.load(Ordering::Acquire) == self.token.generation
     }
     /// Disconnect or an unprotected dropped release closes this generation now.
     /// The audio source pass performs release without needing Main to poll. This
@@ -193,6 +204,7 @@ impl Control {
         let shared = &self.shared.ports[slot];
         shared.admitted.store(false, Ordering::Release);
         shared.port.store(u32::from(port), Ordering::Relaxed);
+        shared.cutoff.store(0, Ordering::Relaxed);
         shared.generation.store(generation, Ordering::Release);
         shared.admitted.store(true, Ordering::Release);
         self.entries[slot] = Some(Entry { token, request: None });
@@ -220,6 +232,19 @@ impl Control {
             return Err(Error::Revoked);
         }
         Ok(Permit { token, shared: Arc::clone(&self.shared) })
+    }
+    /// Main captures midi-io's InputBoundary cutoff, publishes it here, then admits
+    /// Stop to the action lane. This filters raw offers already drained by a worker
+    /// or delayed before publication; queue length and diagnostics cannot do that.
+    /// Only this !Send control may write cutoffs, so an old worker cannot reset or
+    /// advance the cutoff of a reused slot. Cutoffs never move backwards per open.
+    pub fn cancel_before(&mut self, token: Token, cutoff: u64) -> Result<(), Error> {
+        if self.faulted() {
+            return Err(Error::Faulted);
+        }
+        self.entry(token)?;
+        self.shared.ports[usize::from(token.slot)].cutoff.fetch_max(cutoff, Ordering::Release);
+        Ok(())
     }
     /// Idempotent while this registration exists. Repeated calls return the SAME
     /// request; they cannot consume new storage or postpone its acknowledgment.
@@ -310,6 +335,14 @@ impl Audio {
     /// this source since admission; the local tombstone also prevents a stale load
     /// of the shared admission flag from undoing an already acknowledged revoke.
     pub fn permits(&self, port: u16, generation: u64) -> bool {
+        self.permits_inner(port, generation, None)
+    }
+    /// Final raw-ingress check immediately before dispatch, including a Stop
+    /// cutoff that may have advanced since the worker admitted this event.
+    pub fn permits_sequence(&self, port: u16, generation: u64, sequence: u64) -> bool {
+        sequence != u64::MAX && self.permits_inner(port, generation, Some(sequence))
+    }
+    fn permits_inner(&self, port: u16, generation: u64, sequence: Option<u64>) -> bool {
         if self.shared.closed.load(Ordering::Acquire) || self.shared.faulted() {
             return false;
         }
@@ -322,6 +355,7 @@ impl Audio {
                 && shared.port.load(Ordering::Relaxed) == u32::from(port)
                 && shared.admitted.load(Ordering::Acquire)
                 && shared.invalidated.load(Ordering::Acquire) < generation
+                && sequence.is_none_or(|sequence| sequence >= shared.cutoff.load(Ordering::Acquire))
                 && shared.generation.load(Ordering::Acquire) == observed
         })
     }

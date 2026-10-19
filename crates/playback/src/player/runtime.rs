@@ -233,6 +233,12 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         self.sources.permit(source).map_err(PlayerError::Source)
     }
+    pub fn cancel_source_before(&mut self, source: sources::Token, cutoff: u64) -> Result<(), PlayerError> {
+        if self.faulted() {
+            return Err(PlayerError::Faulted);
+        }
+        self.sources.cancel_before(source, cutoff).map_err(PlayerError::Source)
+    }
     pub fn source_admitted(&self, source: sources::Token) -> bool {
         !self.faulted() && self.sources.admits(source)
     }

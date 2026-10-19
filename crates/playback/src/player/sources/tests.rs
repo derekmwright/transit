@@ -338,3 +338,46 @@ fn failed_worker_recovery_faults_every_source_without_acknowledging_release() {
     assert!(!audio.permits(2, other.generation()));
     assert_eq!(control.revoke(token), Err(Error::Faulted));
 }
+
+#[test]
+fn raw_stop_cutoff_covers_worker_backlog_and_only_the_original_open_generation() {
+    let (_bridge, mut plans, mut control, mut audio) = setup();
+    let token = control.register(4).unwrap();
+    let other = control.register(5).unwrap();
+    let permit = control.permit(token).unwrap();
+    let delayed = permit.clone();
+    let (admitted_send, admitted_recv) = std::sync::mpsc::sync_channel(1);
+    let (resume_send, resume_recv) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        assert!(permit.admits_sequence(12));
+        admitted_send.send(()).unwrap(); // event already left the backend queue
+        resume_recv.recv().unwrap();
+        assert!(!permit.admits_sequence(12));
+        assert!(permit.admits_sequence(13));
+    });
+    admitted_recv.recv().unwrap();
+    control.cancel_before(token, 13).unwrap();
+    control.cancel_before(token, 9).unwrap(); // an older cutoff cannot resurrect input
+    resume_send.send(()).unwrap();
+    worker.join().unwrap();
+    let ((), heap) = measure(|| {
+        assert!(!audio.permits_sequence(4, token.generation(), 12), "final dispatch rejects worker backlog");
+        assert!(audio.permits_sequence(4, token.generation(), 13));
+        assert!(audio.permits_sequence(5, other.generation(), 0), "another port has its own sequence domain");
+        assert!(!audio.permits_sequence(4, token.generation(), u64::MAX));
+    });
+    assert!(heap.is_zero(), "{heap:?}");
+    control.cancel_before(token, u64::MAX).unwrap();
+    assert!(!delayed.admits_sequence(u64::MAX - 1));
+    assert!(!delayed.admits_sequence(u64::MAX));
+    let revoke = control.revoke(token).unwrap();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _, _| Ok(()));
+    control.release(revoke).unwrap();
+    let replacement = control.register(4).unwrap();
+    assert_eq!(replacement.slot, token.slot);
+    let new_permit = control.permit(replacement).unwrap();
+    assert_eq!(control.cancel_before(token, u64::MAX), Err(Error::StaleToken));
+    assert!(!delayed.admits_sequence(0));
+    assert!(new_permit.admits_sequence(0), "new open starts its own sequence at zero");
+    assert!(audio.permits_sequence(4, replacement.generation(), 0));
+}
