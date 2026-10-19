@@ -152,3 +152,25 @@ proptest! {
         prop_assert_eq!(back, orig);
     }
 }
+
+/// Replay a fixed op sequence the way the proptest does, checking invariants after each step.
+fn replay(ops: &[(usize, i64, i64, usize)]) {
+    let mut e = soundcraft_engine::demo::demo_engine();
+    let names = ["Kick", "Snare", "Bass", "Pad", "Keys"];
+    for &(i, a, b, t) in ops {
+        let track = names[t % names.len()];
+        let id = CMDS[i % CMDS.len()];
+        let _ = e.execute("edit.select", &json!({"tracks": [track], "start": a.min(b).max(0), "end": a.max(b).max(0)}));
+        let _ = e.execute(id, &params(i % CMDS.len(), a, b, track));
+        if let Err(msg) = check_invariants(&e) {
+            panic!("after {id}: {msg}");
+        }
+    }
+}
+
+/// E14: `edit.fades_delete` trimmed overlapping neighbours back to the midpoint without
+/// re-sorting, leaving the playlist out of order.
+#[test]
+fn regression_fades_delete_keeps_playlist_sorted() {
+    replay(&[(4, 697_744, 886_155, 2), (10, 1_772_309, 0, 2), (11, 0, 0, 2)]);
+}

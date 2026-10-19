@@ -805,6 +805,8 @@ pub fn create_fades(s: &mut Session, track: TrackId, range: Range, shape: FadeSh
             made += 1;
         }
     }
+    // Crossfade handles pull clip starts earlier, which can pass a neighbour's start.
+    pl.sort();
     made
 }
 
@@ -835,6 +837,8 @@ pub fn delete_fades(s: &mut Session, track: TrackId, range: Range) -> usize {
             }
         }
     }
+    // Trimming a chain of overlaps can move a start past its successor's.
+    pl.sort();
     n
 }
 
