@@ -20,6 +20,14 @@ pub fn requests_fixture_dir() -> &'static Path {
     DIR.get_or_init(|| install(&["--features", "requests"], "clap-requests-fixture-target", "clap-requests-install", "Requests", 1))
 }
 
+/// Builds the fixture with its `events` feature once and returns a folder containing
+/// `Events.clap` (only the events plug-in, F10).
+#[allow(dead_code)]
+pub fn events_fixture_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| install(&["--features", "events"], "clap-events-fixture-target", "clap-events-install", "Events", 1))
+}
+
 fn install(features: &[&str], target_dir: &str, install_dir: &str, name: &str, plugins: usize) -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(target_dir);

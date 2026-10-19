@@ -17,6 +17,13 @@
 //!   Commands arrive as a "state" to load, `CMD:<command>` (see `requests_command`); its saved
 //!   "state" is that log as text, with the token of the thread saving it (`me=`), so a test can
 //!   compare each call's thread with its own.
+//! - `org.soundcraft.test.events` (only in the build with the `events` feature, which lists
+//!   nothing else; F10): the synth with param 5 "Probe" (0..1) that writes every input event into
+//!   its output instead of a level, one record of four samples each, in the order it reads them:
+//!   `[code, time, a, b]` with code 1 note on, 2 note off (a = channel * 1000 + key, b = note id),
+//!   3 pressure expression (a as for notes, b = value * 1e6), 4 parameter (a = id,
+//!   b = value * 1e6), 5 MIDI (a = the three bytes, big-endian, b = 0). It keeps the sorted and
+//!   in-block assertions. Integers below 2^24 are exact in `f32`.
 #![allow(clippy::missing_safety_doc, non_upper_case_globals)]
 
 use clap_sys::audio_buffer::clap_audio_buffer;
@@ -24,17 +31,17 @@ use clap_sys::entry::clap_plugin_entry;
 use clap_sys::events::*;
 use clap_sys::ext::audio_ports::*;
 use clap_sys::ext::gui::*;
-use clap_sys::ext::state::*;
-use clap_sys::stream::*;
 use clap_sys::ext::latency::*;
 use clap_sys::ext::log::*;
 use clap_sys::ext::note_ports::*;
 use clap_sys::ext::params::*;
+use clap_sys::ext::state::*;
 use clap_sys::factory::plugin_factory::*;
 use clap_sys::host::clap_host;
 use clap_sys::id::clap_id;
 use clap_sys::plugin::*;
 use clap_sys::process::*;
+use clap_sys::stream::*;
 use clap_sys::version::CLAP_VERSION;
 use std::ffi::{CStr, c_char, c_void};
 
@@ -44,6 +51,19 @@ unsafe impl<const N: usize> Sync for Features<N> {}
 static GAIN_FEATURES: Features<3> = Features([c"audio-effect".as_ptr(), c"stereo".as_ptr(), std::ptr::null()]);
 static SYNTH_FEATURES: Features<3> = Features([c"instrument".as_ptr(), c"synthesizer".as_ptr(), std::ptr::null()]);
 static REQUESTS_FEATURES: Features<2> = Features([c"audio-effect".as_ptr(), std::ptr::null()]);
+
+static EVENTS_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
+    clap_version: CLAP_VERSION,
+    id: c"org.soundcraft.test.events".as_ptr(),
+    name: c"Fixture Events".as_ptr(),
+    vendor: c"SoundCraft tests".as_ptr(),
+    url: std::ptr::null(),
+    manual_url: std::ptr::null(),
+    support_url: std::ptr::null(),
+    version: c"1.0.0".as_ptr(),
+    description: std::ptr::null(),
+    features: SYNTH_FEATURES.0.as_ptr(),
+};
 
 static GAIN_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
@@ -110,6 +130,8 @@ struct Fx {
     synth: bool,
     /// The requests plugin (see the crate docs).
     requests: bool,
+    /// The events plugin (see the crate docs).
+    events: bool,
     latency: u32,
     /// Latency to take at the next `activate` (requests plugin).
     next_latency: Option<u32>,
@@ -399,6 +421,48 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         unsafe { (host.request_restart.unwrap())(f.host) };
         note(f, "request_restart");
     }
+    if f.events {
+        let mut rec: Vec<f32> = Vec::new();
+        let mut last_time = 0u32;
+        for k in 0..count {
+            let h = unsafe { &*(ev.get.unwrap())(pr.in_events, k) };
+            assert!(h.time >= last_time, "events not sorted");
+            assert!((h.time as usize) < n, "event time outside the block");
+            last_time = h.time;
+            if h.space_id != CLAP_CORE_EVENT_SPACE_ID {
+                continue;
+            }
+            let (code, a, b) = match h.type_ {
+                CLAP_EVENT_NOTE_ON | CLAP_EVENT_NOTE_OFF => {
+                    let e = unsafe { &*(h as *const clap_event_header as *const clap_event_note) };
+                    (if h.type_ == CLAP_EVENT_NOTE_ON { 1.0 } else { 2.0 }, f32::from(e.channel) * 1000.0 + f32::from(e.key), e.note_id as f32)
+                }
+                CLAP_EVENT_NOTE_EXPRESSION => {
+                    let e = unsafe { &*(h as *const clap_event_header as *const clap_event_note_expression) };
+                    assert_eq!(e.expression_id, CLAP_NOTE_EXPRESSION_PRESSURE);
+                    (3.0, f32::from(e.channel) * 1000.0 + f32::from(e.key), (e.value * 1e6).round() as f32)
+                }
+                CLAP_EVENT_PARAM_VALUE => {
+                    let e = unsafe { &*(h as *const clap_event_header as *const clap_event_param_value) };
+                    (4.0, e.param_id as f32, (e.value * 1e6).round() as f32)
+                }
+                CLAP_EVENT_MIDI => {
+                    let e = unsafe { &*(h as *const clap_event_header as *const clap_event_midi) };
+                    (5.0, (u32::from(e.data[0]) << 16 | u32::from(e.data[1]) << 8 | u32::from(e.data[2])) as f32, 0.0)
+                }
+                _ => continue,
+            };
+            rec.extend([code, h.time as f32, a, b]);
+        }
+        for c in 0..out.channel_count as usize {
+            let o = unsafe { std::slice::from_raw_parts_mut(*out.data32.add(c), n) };
+            o.fill(0.0);
+            for (d, r) in o.iter_mut().zip(&rec) {
+                *d = *r;
+            }
+        }
+        return CLAP_PROCESS_CONTINUE;
+    }
     let mut next = 0u32;
     let mut last_time = 0u32;
     for i in 0..n {
@@ -431,7 +495,14 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
 // ---- extensions ----
 
 unsafe extern "C" fn params_count(p: *const clap_plugin) -> u32 {
-    if unsafe { fx(p) }.synth { 0 } else { 3 }
+    let f = unsafe { fx(p) };
+    if f.events {
+        1
+    } else if f.synth {
+        0
+    } else {
+        3
+    }
 }
 
 fn write_name(dst: &mut [c_char], s: &CStr) {
@@ -440,9 +511,11 @@ fn write_name(dst: &mut [c_char], s: &CStr) {
     }
 }
 
-unsafe extern "C" fn params_get_info(_p: *const clap_plugin, index: u32, info: *mut clap_param_info) -> bool {
+unsafe extern "C" fn params_get_info(p: *const clap_plugin, index: u32, info: *mut clap_param_info) -> bool {
+    let events = unsafe { fx(p) }.events;
     let info = unsafe { &mut *info };
     let (id, name, flags, min, max, def): (clap_id, &CStr, u32, f64, f64, f64) = match index {
+        0 if events => (5, c"Probe", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 1.0, 0.0),
         0 => (7, c"Gain", CLAP_PARAM_IS_AUTOMATABLE, 0.0, 2.0, 1.0),
         1 => (3, c"Mode", CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_ENUM, 0.0, 2.0, 0.0),
         2 => (9, c"Secret", CLAP_PARAM_IS_HIDDEN, 0.0, 1.0, 0.0),
@@ -464,7 +537,7 @@ unsafe extern "C" fn params_get_value(p: *const clap_plugin, id: clap_id, out: *
     let v = match id {
         7 => f.gain,
         3 => f.mode,
-        9 => 0.0,
+        9 | 5 => 0.0,
         _ => return false,
     };
     unsafe { *out = v };
@@ -719,10 +792,12 @@ unsafe extern "C" fn on_main_thread(p: *const clap_plugin) {
 /// The plug-ins this binary lists: the gain and the synth, or (feature `requests`) only the
 /// requests plug-in, built as a binary of its own so that tests counting the default fixture's
 /// plug-ins (here and in other crates) are unaffected.
-#[cfg(not(feature = "requests"))]
+#[cfg(not(any(feature = "requests", feature = "events")))]
 static DESCS: [&clap_plugin_descriptor; 2] = [&GAIN_DESC, &SYNTH_DESC];
 #[cfg(feature = "requests")]
 static DESCS: [&clap_plugin_descriptor; 1] = [&REQUESTS_DESC];
+#[cfg(all(feature = "events", not(feature = "requests")))]
+static DESCS: [&clap_plugin_descriptor; 1] = [&EVENTS_DESC];
 
 unsafe extern "C" fn factory_count(_f: *const clap_plugin_factory) -> u32 {
     DESCS.len() as u32
@@ -734,12 +809,14 @@ unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *co
 
 unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const clap_host, id: *const c_char) -> *const clap_plugin {
     let id = unsafe { CStr::from_ptr(id) };
-    let (desc, synth, requests) = if id == c"org.soundcraft.test.gain" {
-        (&GAIN_DESC as *const _, false, false)
+    let (desc, synth, requests, events) = if id == c"org.soundcraft.test.gain" {
+        (&GAIN_DESC as *const _, false, false, false)
     } else if id == c"org.soundcraft.test.synth" {
-        (&SYNTH_DESC as *const _, true, false)
+        (&SYNTH_DESC as *const _, true, false, false)
     } else if id == c"org.soundcraft.test.requests" {
-        (&REQUESTS_DESC as *const _, false, true)
+        (&REQUESTS_DESC as *const _, false, true, false)
+    } else if id == c"org.soundcraft.test.events" {
+        (&EVENTS_DESC as *const _, true, false, true)
     } else {
         return std::ptr::null();
     };
@@ -761,6 +838,7 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         host,
         synth,
         requests,
+        events,
         latency: if requests { 5 } else { 3 },
         next_latency: None,
         restart_at: None,

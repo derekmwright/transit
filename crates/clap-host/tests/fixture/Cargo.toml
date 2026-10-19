@@ -18,5 +18,7 @@ clap-sys = "0.5"
 [features]
 # Builds a binary that lists only the requests plug-in (see src/lib.rs).
 requests = []
+# Builds a binary that lists only the events plug-in (F10, see src/lib.rs).
+events = []
 
 [workspace]
