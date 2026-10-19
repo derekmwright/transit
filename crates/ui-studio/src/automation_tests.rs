@@ -562,3 +562,78 @@ fn send_lanes_are_offered_and_take_points() {
     assert_eq!(t.points(a, &AutoParam::SendPan(0)).len(), 1);
     assert_eq!(t.lane(a, "send_a_pan").points.len(), 1);
 }
+
+// ---- Review fixes: off-grid drags, locates during a pass, a still fader ----
+
+fn set_point(t: &mut T, a: TrackId, at: i64, v: f32) {
+    t.app.run("automation.set_point", json!({"track": a.0, "param": "volume", "at": at, "value": v})).unwrap();
+}
+
+#[test]
+fn vertical_drag_of_an_off_grid_point_keeps_its_time() {
+    let mut t = T::new();
+    let a = t.with_lane();
+    // Write-pass-like points: off the grid and close together.
+    for (i, at) in [3_137_i64, 20_211, 90_309].into_iter().enumerate() {
+        set_point(&mut t, a, at, -6.0 - i as f32);
+    }
+    t.frames(3);
+    let before_pts = t.points(a, &AutoParam::Volume);
+    assert_eq!(before_pts.len(), 3);
+    let p = t.lane(a, "volume").points[1].clone();
+    let before = t.undo_len();
+    t.drag((p.x, p.y), (p.x, p.y + 12.0), json!({}));
+    let pts = t.points(a, &AutoParam::Volume);
+    assert_eq!(pts.len(), 3);
+    assert_eq!(pts[1].0, before_pts[1].0, "a vertical drag never moves the time");
+    assert!((pts[1].1 - before_pts[1].1).abs() > 0.01, "the value changed");
+    assert_eq!(t.undo_len(), before + 1, "one undo entry");
+    // Sideways past the slop: the time is snapped.
+    let p = t.lane(a, "volume").points[1].clone();
+    t.drag((p.x, p.y), (p.x + 40.0, p.y), json!({}));
+    let pts = t.points(a, &AutoParam::Volume);
+    let s = t.app.engine.session_arc();
+    assert_ne!(pts[1].0, before_pts[1].0);
+    assert_eq!(pts[1].0, snap(&s, s.edit.zoom.samples_per_px, pts[1].0), "the moved time is snapped");
+}
+
+fn write_mode(t: &mut T) -> TrackId {
+    let a = t.with_lane();
+    t.click(mid(t.lane(a, "volume").mode));
+    t.menu("Write");
+    a
+}
+
+#[test]
+fn a_forward_locate_during_write_keeps_the_points_it_skips() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    let ahead = [400_000_i64, 450_000, 500_000, 550_000];
+    for &at in &ahead {
+        set_point(&mut t, a, at, -3.0);
+    }
+    t.key("Space");
+    t.frames(30);
+    t.app.run("transport.locate", json!({"at": 900_000})).unwrap();
+    t.frames(30);
+    t.key("Space");
+    t.frames(3);
+    let pts = t.points(a, &AutoParam::Volume);
+    for at in ahead {
+        assert!(pts.iter().any(|p| p.0 == at), "point at {at} survived the locate: {pts:?}");
+    }
+    assert!(pts.iter().any(|p| p.0 >= 900_000), "the pass continued from the new position");
+}
+
+#[test]
+fn a_still_fader_writes_no_points_after_the_first() {
+    let mut t = T::new();
+    let a = write_mode(&mut t);
+    t.key("Space");
+    t.frames(60);
+    t.key("Space");
+    t.frames(3);
+    let pts = t.points(a, &AutoParam::Volume);
+    assert!(!pts.is_empty(), "the first point is written");
+    assert!(pts.len() <= 2, "a still fader adds nothing (first point and the hold's end): {}", pts.len());
+}

@@ -765,12 +765,12 @@ impl StudioApp {
         self.run("mix.send_remove", json!({"track": t.0, "slot": slot}))
     }
 
-    /// Pre-fader or post-fader (`mix.send_level {pre_fader}`).
     /// A send's mute (slice 7): one undo step.
     pub fn set_send_mute(&mut self, t: TrackId, slot: usize, mute: bool) -> Result<Value, String> {
         self.run("mix.send_level", json!({"track": t.0, "slot": slot, "mute": mute}))
     }
 
+    /// Pre-fader or post-fader (`mix.send_level {pre_fader}`).
     pub fn set_send_pre(&mut self, t: TrackId, slot: usize, pre: bool) -> Result<Value, String> {
         self.run("mix.send_level", json!({"track": t.0, "slot": slot, "pre_fader": pre}))
     }

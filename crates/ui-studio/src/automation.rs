@@ -42,6 +42,10 @@ const PAD: f32 = 7.0;
 const GRAB: f32 = 7.0;
 /// The write pass writes a point at most this often (seconds).
 const WRITE_STEP_S: f64 = 0.02;
+/// A point drag moves in time only after the pointer travels this far sideways (points).
+const DRAG_SLOP: f32 = 3.0;
+/// A gap of more than this many write steps is a locate: the pass starts a new segment.
+const WRITE_GAP_STEPS: i64 = 4;
 /// The merge key of a write pass.
 const PASS: &str = "automation_pass";
 /// The modes the mode menu offers (Logic's terms; the engine's Touch/Latch and Trim are left out).
@@ -387,6 +391,9 @@ pub struct AutoState {
     /// lanes of Latch tracks, and how many points it wrote.
     last: HashMap<(TrackId, String), Samples>,
     last_at: Option<Samples>,
+    /// Per lane: the value last written, and where a still value skipped its latest step.
+    last_v: HashMap<(TrackId, String), f32>,
+    skipped: HashMap<(TrackId, String), Samples>,
     latched: Vec<(TrackId, String)>,
     writing: bool,
     pub points_written: usize,
@@ -776,8 +783,16 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
         let d = now - press;
         let k = lane.norm(t, orig_v) - d.y / (ys.h - 2.0 * PAD).max(1.0) * ratio;
         let v = lane.denorm(t, k);
+        // A vertical drag changes the value only: off-grid points (a write pass makes them all)
+        // keep their time until the pointer moves sideways past a small threshold.
         let raw = orig_at + (f64::from(d.x * ratio) * map.spp).round() as Samples;
-        let at = if fine_drag { raw } else { snap(s, map.spp, raw) };
+        let at = if d.x.abs() < DRAG_SLOP {
+            orig_at
+        } else if fine_drag {
+            raw
+        } else {
+            snap(s, map.spp, raw)
+        };
         // A point stays between its neighbours (moving past one would replace it).
         let lo = pts.iter().map(|p| p.0).filter(|a| *a < cur_at).max().map_or(0, |a| a + 1);
         let hi = pts.iter().map(|p| p.0).filter(|a| *a > cur_at).min().map_or(Samples::MAX, |a| a - 1);
@@ -1022,6 +1037,8 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             app.engine.end_merge();
         }
         app.auto.last.clear();
+        app.auto.last_v.clear();
+        app.auto.skipped.clear();
         app.auto.latched.clear();
         app.auto.last_at = None;
         return;
@@ -1032,8 +1049,15 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         if pos < last {
             // A loop or a locate: the next points start a new run.
             app.auto.last.clear();
+            app.auto.last_v.clear();
+            app.auto.skipped.clear();
         } else if pos - last < step {
             return;
+        } else if pos - last > step * WRITE_GAP_STEPS {
+            // A forward locate: a new segment, so the skipped range is not cleared.
+            app.auto.last.clear();
+            app.auto.last_v.clear();
+            app.auto.skipped.clear();
         }
     }
     app.auto.last_at = Some(pos);
@@ -1073,13 +1097,30 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
             continue;
         }
         let key = (id, lane.id());
-        let from = app.auto.last.get(&key).copied();
+        let mut from = app.auto.last.get(&key).copied();
         let v = lane.static_value(t);
+        let held_lane = touched.as_ref().is_some_and(|(i, l)| *i == id && *l == lane);
         let mut ok = true;
+        if let Some(old) = app.auto.last_v.get(&key).copied() {
+            if !held_lane && (old - v).abs() <= f32::EPSILON {
+                // Still: no point, but remember where the hold ran to.
+                app.auto.skipped.insert(key, pos);
+                continue;
+            }
+            if let Some(hold) = app.auto.skipped.remove(&key) {
+                // The value moved after a hold: close the hold at its old value first.
+                for (cmd, p) in lane.set_cmds(t, hold, old, from) {
+                    ok &= app.engine.execute_merged(cmd, &p, PASS).is_ok();
+                }
+                from = Some(hold);
+            }
+        }
+        app.auto.skipped.remove(&key);
         for (cmd, p) in lane.set_cmds(t, pos, v, from) {
             ok &= app.engine.execute_merged(cmd, &p, PASS).is_ok();
         }
         if ok {
+            app.auto.last_v.insert(key.clone(), v);
             app.auto.writing = true;
             app.auto.points_written += 1;
             app.auto.last.insert(key, pos);
