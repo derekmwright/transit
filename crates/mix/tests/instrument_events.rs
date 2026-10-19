@@ -406,12 +406,12 @@ fn pedals_from_two_ports_are_ored_and_a_revocation_releases_the_last_holder() {
     assert_eq!(rig.send(b, now + 10, cc(64, 100)), EventOutcome::Queued);
     assert_eq!(rig.send(a, now + 20, cc(64, 0)), EventOutcome::Queued);
     rig.render(1);
-    assert_eq!(pedal_edges(&rig.heard_by(1), 64), vec![(now, true)], "B still holds the pedal: A's up is absorbed");
+    assert_eq!(pedal_values(&rig.heard_by(1), 64), vec![(now, 127), (now + 20, 100)], "B still holds the pedal: A's up leaves B's value");
     rig.mix.revoke_source(2, 1);
     rig.render(1);
-    assert_eq!(pedal_edges(&rig.heard_by(1), 64), vec![(now, true), (now + BLOCK as u64, false)], "B's revocation lifts it");
+    assert_eq!(pedal_values(&rig.heard_by(1), 64), vec![(now, 127), (now + 20, 100), (now + BLOCK as u64, 0)], "B's revocation lifts it");
     let st = rig.mix.event_status();
-    assert_eq!(st.absorbed_pedal_edges, 2, "B's down and A's up");
+    assert_eq!(st.absorbed_pedal_edges, 1, "B's down, below A's value");
     assert!(st.revoked >= 1);
 }
 
@@ -716,6 +716,34 @@ fn a_release_with_a_stale_transport_is_still_delivered() {
     let heard = rig.heard_by(1);
     assert_eq!(every_on_has_its_off(&heard), 1);
     assert_eq!(pedal_values(&heard, 64), vec![(now, 127), (now + 300, 0)]);
+    assert!(!rig.mix.has_pending_events());
+}
+
+/// Review F10-3: one holder's half-pedal values pass through exactly.
+#[test]
+fn half_pedal_values_pass_through() {
+    let mut rig = Rig::new();
+    let now = rig.mix.next_frame().0;
+    for (at, v) in [(0, 127), (10, 90), (20, 70), (30, 0)] {
+        assert_eq!(rig.send(port(1, 0), now + at, cc(64, v)), EventOutcome::Queued);
+    }
+    rig.render(1);
+    assert_eq!(pedal_values(&rig.heard_by(1), 64), vec![(now, 127), (now + 10, 90), (now + 20, 70), (now + 30, 0)]);
+    assert!(!rig.mix.has_pending_events());
+}
+
+/// Review F10-3: with two holders the plug-in gets the maximum of their values.
+#[test]
+fn two_holders_give_the_plug_in_their_maximum() {
+    let mut rig = Rig::new();
+    let (a, b) = (port(1, 0), port(2, 0));
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(a, now, cc(64, 100)), EventOutcome::Queued);
+    assert_eq!(rig.send(b, now + 10, cc(64, 60)), EventOutcome::Queued);
+    assert_eq!(rig.send(a, now + 20, cc(64, 0)), EventOutcome::Queued);
+    assert_eq!(rig.send(b, now + 30, cc(64, 0)), EventOutcome::Queued);
+    rig.render(1);
+    assert_eq!(pedal_values(&rig.heard_by(1), 64), vec![(now, 100), (now + 20, 60), (now + 30, 0)]);
     assert!(!rig.mix.has_pending_events());
 }
 
