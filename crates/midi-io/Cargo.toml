@@ -1,0 +1,20 @@
+[package]
+name = "soundcraft-midi-io"
+description = "SoundCraft MIDI device transport: midir-backed port enumeration, hot-plug polling, and a preallocated lock-free input ring with arrival timestamps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+midir.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Dev-only: the counting global allocator for the push-path allocation test (xtask allows dev edges).
+soundcraft-rt = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

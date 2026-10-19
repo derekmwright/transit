@@ -15,6 +15,7 @@ repository = "https://github.com/storytold/soundcraft"
 soundcraft-time = { path = "crates/time" }
 soundcraft-rt = { path = "crates/rt" }
 soundcraft-audio-io = { path = "crates/audio-io" }
+soundcraft-midi-io = { path = "crates/midi-io" }
 soundcraft-midi = { path = "crates/midi" }
 soundcraft-video = { path = "crates/video" }
 soundcraft-dsp = { path = "crates/dsp" }
@@ -46,6 +47,8 @@ zip = { version = "9", default-features = false }
 cpal = "=0.16.0"
 # Publication protocol depends on bounded single-element push/pop; review every version bump.
 rtrb = "=0.4.0"
+# MIDI device transport (soundcraft-midi-io). Pinned: the input callback contract is reviewed per bump.
+midir = "=0.10.4"
 
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
