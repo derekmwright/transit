@@ -41,7 +41,7 @@ use soundcraft_dsp::Transport;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Most plugins one factory may report (hostile-input cap).
@@ -303,13 +303,19 @@ impl Drop for Bundle {
 
 // ---- host side -----------------------------------------------------------------------------
 
-/// Flags the plugin raises through the host callbacks (any thread).
+/// Flags the plugin raises through the host callbacks (any thread). Who services each (audit F08):
+/// `process` is read by the audio side (`ClapPlugin::process_status` keeps a sleeping plugin
+/// processed until a block clears it); `restart`, `callback` and `params_rescan` are serviced on
+/// the instance's main thread (`plugin::Shared::service`); `latency_changed` is only legal during
+/// `activate`, after which the host reads the latency anyway.
 pub(crate) struct HostState {
     pub restart: AtomicBool,
     pub process: AtomicBool,
     pub callback: AtomicBool,
     pub latency_changed: AtomicBool,
     pub params_rescan: AtomicBool,
+    /// The `clap_param_rescan_flags` of every `params.rescan` since the last service, or-ed.
+    pub params_rescan_flags: AtomicU32,
     /// `clap_host_state.mark_dirty`.
     pub dirty: AtomicBool,
     /// `clap_host_gui` requests, serviced by the editor's `idle` on the main thread.
@@ -332,6 +338,7 @@ impl Default for HostState {
             callback: AtomicBool::new(false),
             latency_changed: AtomicBool::new(false),
             params_rescan: AtomicBool::new(false),
+            params_rescan_flags: AtomicU32::new(0),
             dirty: AtomicBool::new(false),
             gui_closed: AtomicBool::new(false),
             gui_destroyed: AtomicBool::new(false),
@@ -386,10 +393,11 @@ unsafe extern "C" fn host_log(_host: *const clap_host, severity: clap_log_severi
     }
 }
 
-unsafe extern "C" fn host_params_rescan(host: *const clap_host, _flags: clap_param_rescan_flags) {
+unsafe extern "C" fn host_params_rescan(host: *const clap_host, flags: clap_param_rescan_flags) {
     // SAFETY: the plugin passes back the host pointer we gave it.
     if let Some(s) = unsafe { state(host) } {
-        s.params_rescan.store(true, Ordering::Relaxed);
+        s.params_rescan_flags.fetch_or(flags, Ordering::Relaxed);
+        s.params_rescan.store(true, Ordering::Release);
     }
 }
 
@@ -1202,6 +1210,22 @@ impl Instance {
         &self.state
     }
 
+    /// A counted reference to the request flags, for the audio side and the main-thread service.
+    pub fn host_state(&self) -> Arc<HostState> {
+        Arc::clone(&self.state)
+    }
+
+    /// The editor/state link, whether or not the plugin has an editor (its `idle` also runs a
+    /// requested `on_main_thread`).
+    pub fn link(&self) -> Arc<GuiLink> {
+        Arc::clone(&self.gui)
+    }
+
+    /// Between `start_processing` and `stop_processing`.
+    pub fn is_processing(&self) -> bool {
+        self.processing
+    }
+
     /// The editor link shared with editor handles (`None` when the plugin has no `clap.gui`).
     pub fn gui(&self) -> Option<Arc<GuiLink>> {
         self.gui.available().then(|| Arc::clone(&self.gui))
@@ -1355,7 +1379,8 @@ impl Instance {
         }
     }
 
-    fn stop_processing(&mut self) {
+    /// CLAP `stop_processing` (audio thread) when processing.
+    pub fn stop_processing(&mut self) {
         if self.processing {
             if let Some(f) = self.vt().stop_processing {
                 // SAFETY: valid instance in the processing state.

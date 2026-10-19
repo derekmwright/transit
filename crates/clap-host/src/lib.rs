@@ -42,7 +42,7 @@ mod registry;
 mod scan_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use plugin::ClapPlugin;
+pub use plugin::{ClapPlugin, Serviced};
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
@@ -149,6 +149,9 @@ mod api {
     pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         registry::plugin_info(id)
     }
+    pub fn service_requests() -> Serviced {
+        plugin::service_requests()
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -200,6 +203,20 @@ mod api {
     pub fn plugin_info(_id: &str) -> Option<&'static PluginInfo> {
         None
     }
+    pub fn service_requests() -> Serviced {
+        Serviced::default()
+    }
+}
+
+/// What one [`service_requests`] call did (no plug-ins on this platform).
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Serviced {
+    pub restarted: usize,
+    pub restarts_waiting: usize,
+    pub callbacks: usize,
+    pub rescans: usize,
+    pub other_thread: usize,
 }
 
 /// Every plugin in the standard CLAP folders, `CLAP_PATH` and folders added with
@@ -328,6 +345,18 @@ pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
             None
         }
     }
+}
+
+/// Services what live CLAP plug-ins asked of the host (audit F08, ADR 0012 G7): `request_restart`
+/// (deactivate and reactivate, then the new latency is reported), `request_callback` for plug-ins
+/// without an editor, and `params.rescan`. Call it on the main thread every UI frame (the thread
+/// that created the instances; calls on other threads leave their requests alone). Restarting an
+/// instance that is processing takes two calls: the first asks the audio thread to stop
+/// processing it (one block), a later one restarts it. Never blocks on the audio thread.
+/// `request_process` and `params.request_flush` need no call: the audio side wakes the plug-in.
+/// Editor handles' `idle` services their own instance as well.
+pub fn service_requests() -> Serviced {
+    api::service_requests()
 }
 
 /// The description of a `clap:<id>` plugin. The first call for a type instantiates it once to

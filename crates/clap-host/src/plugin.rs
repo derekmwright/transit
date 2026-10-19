@@ -1,16 +1,61 @@
 //! `ClapPlugin`: a loaded CLAP instance behind the safe `soundcraft_dsp::Plugin` trait.
+//!
+//! # Requests a plug-in makes of the host (audit F08, ADR 0012 G7)
+//!
+//! CLAP lets a plug-in ask the host for work from any thread (`clap_host` in `host.h`). Each
+//! request is serviced on the thread CLAP requires:
+//!
+//! - `request_process` ("the host will then activate and start processing the plugin", useful to
+//!   wake it from sleep) and `clap_host_params.request_flush` ("the host will then schedule a call
+//!   to either `process` or `flush`"): the audio side answers. [`ClapPlugin::process_status`]
+//!   reports `Continue` while such a request is pending, so the mixer runs the next block even
+//!   with silent input, no editor and a plug-in that said `CLAP_PROCESS_SLEEP`; that block clears
+//!   the request. No `flush` call is needed: a plug-in in the engine is active, so a block is the
+//!   answer CLAP allows.
+//! - `request_restart` ("deactivate and then reactivate the plugin"): `deactivate` and `activate`
+//!   are main-thread calls and `stop_processing` an audio-thread call, while the instance is owned
+//!   by the audio thread. [`Shared::service`] (main thread) asks the audio side to park the
+//!   instance; the next block calls `stop_processing` on the audio thread and stops calling the
+//!   plug-in; the service then deactivates, re-reads the audio ports, activates at the same rate
+//!   and block size, reads the latency (where `clap_host_latency.changed` is legal: during
+//!   `activate`) and releases it. The instance and its state stay as they are; the new latency
+//!   reaches delay compensation through [`Plugin::latency`], which the mixer reads every block.
+//!   An instance that is not in the processing state (it never processed since its activation) is
+//!   restarted at once, under the same lock.
+//! - `request_callback`: `on_main_thread`, by the editor's `idle` or, for plug-ins without an
+//!   editor, by [`Shared::service`].
+//! - `clap_host_params.rescan` (main thread): `CLAP_PARAM_RESCAN_VALUES` re-reads every value on
+//!   the main thread and reports it as an editor edit (the path a GUI edit takes into the
+//!   session). The parameter list and its info are fixed per plug-in type (`PluginInfo` is
+//!   `'static`), so `INFO`, `TEXT` and `ALL` changes are logged as unsupported.
+//!
+//! Main-thread servicing happens in [`crate::service_requests`] (every instance) and in each
+//! editor handle's `idle`, only on the thread that created the instance (CLAP creates plug-ins
+//! on the main thread); other threads leave the requests alone.
 
-use crate::ffi::{EVENT_CAP, Event, GuiLink, Instance, NotePort, PortBuffers};
+use crate::ffi::{EVENT_CAP, Event, GuiLink, HostState, Instance, NotePort, PortBuffers};
 use clap_sys::ext::note_ports::{CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_MIDI};
+use clap_sys::ext::params::{CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_PARAM_RESCAN_TEXT, CLAP_PARAM_RESCAN_VALUES};
 use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL, clap_process_status};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
+use std::thread::ThreadId;
 
 /// Largest block we activate a plugin for.
 const MAX_BLOCK: usize = 1 << 16;
 /// Most channels a host strip may ask for.
 const MAX_CHANNELS: usize = 64;
+
+/// [`Shared::life`]: the audio side may process.
+const RUNNING: u8 = 0;
+/// The main thread waits to restart the instance: the next block stops processing and parks.
+const PARK: u8 = 1;
+/// The audio side stopped processing and does not touch the instance until it is `RUNNING`.
+const PARKED: u8 = 2;
+/// Parameter values one service call re-reads for `params.rescan`: it holds the instance (the
+/// audio side skips a block it would start meanwhile), so the hold stays short.
+const RESCAN_CHUNK: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum NoteMode {
@@ -19,29 +64,248 @@ enum NoteMode {
     Midi,
 }
 
+/// What one [`crate::service_requests`] call did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Serviced {
+    /// Instances deactivated and reactivated for `request_restart`.
+    pub restarted: usize,
+    /// Restarts waiting for the audio thread to stop processing (done by a later call).
+    pub restarts_waiting: usize,
+    /// `on_main_thread` callbacks run for plug-ins without an editor.
+    pub callbacks: usize,
+    /// `params.rescan` requests handled.
+    pub rescans: usize,
+    /// Instances skipped because this is not the thread that created them.
+    pub other_thread: usize,
+}
+
+/// What the activation decides: the plugin's audio port buffers, sized on the main thread.
+struct Core {
+    inst: Instance,
+    inputs: PortBuffers,
+    outputs: PortBuffers,
+    in_main: Option<usize>,
+    out_main: Option<usize>,
+    /// The block size and rate it is activated for (0 before the first `prepare`).
+    max_block: usize,
+    sample_rate: f64,
+}
+
+impl Core {
+    /// Reads the audio ports, sizes their buffers and activates (inactive instance, main thread).
+    /// Returns the latency read after a successful activation.
+    fn activate(&mut self, id: &str) -> usize {
+        let ins = self.inst.audio_ports(true);
+        let outs = self.inst.audio_ports(false);
+        self.in_main = pick_main(&ins);
+        self.out_main = pick_main(&outs);
+        self.inputs = PortBuffers::new(&ins.iter().map(|p| p.channels).collect::<Vec<_>>(), self.max_block);
+        self.outputs = PortBuffers::new(&outs.iter().map(|p| p.channels).collect::<Vec<_>>(), self.max_block);
+        match self.inst.activate(self.sample_rate, 1, u32::try_from(self.max_block).unwrap_or(u32::MAX)) {
+            Ok(()) => {
+                // `clap_host_latency.changed` is only legal during `activate`: reading the latency
+                // now covers it.
+                self.inst.state().latency_changed.store(false, Ordering::Relaxed);
+                self.inst.latency() as usize
+            }
+            Err(e) => {
+                log::warn!("{id}: {e}");
+                0
+            }
+        }
+    }
+}
+
+/// The part of an instance both its owner (the audio thread, once in the engine) and the main
+/// thread reach. The audio side only ever `try_lock`s `core` and the main thread only `try_lock`s
+/// it while the instance may be processing, so neither waits for the other.
+pub(crate) struct Shared {
+    core: Mutex<Core>,
+    /// `RUNNING`, `PARK` or `PARKED`: the restart handshake. Only the main thread moves it
+    /// `RUNNING` → `PARK` and `PARKED` → `RUNNING`; only the audio side moves it `PARK` → `PARKED`.
+    life: AtomicU8,
+    /// The latency read after the last activation (the mixer reads it every block).
+    latency: AtomicUsize,
+    /// The thread that created the instance: its main thread.
+    main: ThreadId,
+    host: Arc<HostState>,
+    link: Arc<GuiLink>,
+    info: &'static PluginInfo,
+    /// CLAP id of each `info.params` entry (same order).
+    ids: Vec<u32>,
+    /// A `params.rescan` in progress (main thread only).
+    rescan: Mutex<Rescan>,
+}
+
+/// A `params.rescan` of the values being serviced: the next parameter to re-read.
+#[derive(Default)]
+struct Rescan {
+    next: usize,
+    active: bool,
+}
+
+fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
+/// For callers that own the plugin (`&mut ClapPlugin`): nobody else can be holding it then.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Every instance alive, for [`crate::service_requests`]. Weak: the list never keeps a plugin.
+fn live() -> &'static Mutex<Vec<Weak<Shared>>> {
+    static LIVE: OnceLock<Mutex<Vec<Weak<Shared>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Services the requests of every live instance created on this thread (see the module docs).
+pub(crate) fn service_requests() -> Serviced {
+    let mut out = Serviced::default();
+    let all: Vec<Arc<Shared>> = {
+        let mut l = lock(live());
+        l.retain(|w| w.strong_count() > 0);
+        l.iter().filter_map(Weak::upgrade).collect()
+    };
+    // The list lock is released before calling into plug-ins. An instance whose owner dropped it
+    // meanwhile goes here, on the main thread, where CLAP wants `destroy`.
+    for s in all {
+        s.service(&mut out);
+    }
+    out
+}
+
+impl Shared {
+    /// Main-thread service of this instance's requests (see the module docs).
+    pub(crate) fn service(&self, out: &mut Serviced) {
+        if std::thread::current().id() != self.main {
+            out.other_thread += 1;
+            return;
+        }
+        if !self.link.available() && self.host.callback.load(Ordering::Relaxed) {
+            // No editor handle runs `idle` for this plug-in: run it here for `on_main_thread`.
+            // (Its edit queue has no reader without an editor; this drains it too.)
+            let _ = self.link.idle();
+            out.callbacks += 1;
+        }
+        if self.rescan() {
+            out.rescans += 1;
+        }
+        if self.host.restart.load(Ordering::Acquire) {
+            if self.restart_when_parked() {
+                out.restarted += 1;
+            } else {
+                out.restarts_waiting += 1;
+            }
+        }
+    }
+
+    /// `params.rescan` (CLAP: a main-thread call). True when a rescan finished in this call. The
+    /// values are re-read `RESCAN_CHUNK` at a time, while the instance is free; a busy instance is
+    /// retried by the next call.
+    fn rescan(&self) -> bool {
+        let mut st = lock(&self.rescan);
+        if !st.active {
+            if !self.host.params_rescan.swap(false, Ordering::Acquire) {
+                return false;
+            }
+            let flags = self.host.params_rescan_flags.swap(0, Ordering::Relaxed);
+            if flags & (CLAP_PARAM_RESCAN_INFO | CLAP_PARAM_RESCAN_TEXT | CLAP_PARAM_RESCAN_ALL) != 0 {
+                log::info!("{}: the plugin changed its parameter list or info; unsupported, the list read at load stays", self.info.id);
+            }
+            if flags & (CLAP_PARAM_RESCAN_VALUES | CLAP_PARAM_RESCAN_ALL) == 0 {
+                return true;
+            }
+            *st = Rescan { next: 0, active: true };
+        }
+        let Some(core) = try_lock(&self.core) else { return false };
+        let ids = self.ids.get(st.next..).unwrap_or(&[]);
+        let n = ids.len().min(RESCAN_CHUNK);
+        let values: Vec<(u32, f64)> = ids.iter().take(n).filter_map(|&id| core.inst.param_value(id).map(|v| (id, v))).collect();
+        drop(core);
+        // The values go where GUI edits go (the editor handle reports them to the session).
+        let mut edits = lock(&self.host.edits);
+        for (id, v) in values {
+            if let Some(e) = edits.iter_mut().find(|(i, _)| *i == id) {
+                e.1 = v;
+            } else if edits.len() < edits.capacity() {
+                edits.push((id, v));
+            }
+        }
+        st.next += n;
+        if st.next < self.ids.len() {
+            return false;
+        }
+        *st = Rescan::default();
+        true
+    }
+
+    /// `request_restart`. True when it restarted now; false while the audio side has not parked.
+    fn restart_when_parked(&self) -> bool {
+        match self.life.load(Ordering::Acquire) {
+            PARKED => {
+                // The audio side stopped processing and no longer touches the instance.
+                let Some(mut core) = try_lock(&self.core) else { return false };
+                self.restart(&mut core);
+                drop(core);
+                self.life.store(RUNNING, Ordering::Release);
+                true
+            }
+            PARK => false,
+            _ => {
+                if let Some(mut core) = try_lock(&self.core)
+                    && !core.inst.is_processing()
+                {
+                    // Not in the processing state: nothing to stop on the audio thread. The lock
+                    // keeps the audio side out while it restarts.
+                    self.restart(&mut core);
+                    return true;
+                }
+                // (The lock, if taken, is released here.)
+                self.life.store(PARK, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    /// Deactivates and reactivates at the same rate and block size (main thread, not processing).
+    fn restart(&self, core: &mut Core) {
+        // Cleared first: a request made while it reactivates asks again.
+        self.host.restart.store(false, Ordering::Relaxed);
+        core.inst.deactivate();
+        let latency = core.activate(self.info.id);
+        self.latency.store(latency, Ordering::Release);
+        // The host starts processing again (CLAP: start_processing on the audio thread before
+        // the next process); one block lets it, after which it may sleep again.
+        self.host.process.store(true, Ordering::Release);
+    }
+}
+
 /// A hosted CLAP plugin. Parameter ids are the CLAP param ids as decimal strings ("0", "17", …);
 /// their human names are in `info().params`.
 pub struct ClapPlugin {
-    inst: Instance,
+    shared: Arc<Shared>,
+    /// The request flags (also in `shared`), for lock-free reads on the audio thread.
+    host: Arc<HostState>,
     info: &'static PluginInfo,
     /// CLAP id of each `info.params` entry (same order).
     ids: Vec<u32>,
     values: Vec<f32>,
     /// Pending events, kept sorted by time (stable for equal times). Never grows past `EVENT_CAP`.
     queue: Vec<Event>,
-    inputs: PortBuffers,
-    outputs: PortBuffers,
-    in_main: Option<usize>,
-    out_main: Option<usize>,
     notes: NoteMode,
     /// The note port takes raw MIDI (controllers, pitch bend, program changes).
     midi_in: bool,
     held: [bool; 128],
     channels: usize,
-    max_block: usize,
-    latency: usize,
     steady: i64,
     transport: Option<Transport>,
+    /// Every audio input of the next block is silent (CLAP `constant_mask`).
+    silent: bool,
     /// What the plugin returned from its last `process` call (`Continue` before the first).
     status: ProcessStatus,
     /// The tail (`clap.tail`) read after the last `process` call, as [`tail_samples_from`] maps it.
@@ -52,24 +316,42 @@ impl ClapPlugin {
     pub(crate) fn new(inst: Instance, info: &'static PluginInfo) -> ClapPlugin {
         let ids: Vec<u32> = info.params.iter().map(|p| p.id.parse::<u32>().unwrap_or(u32::MAX)).collect();
         let values = info.params.iter().zip(&ids).map(|(p, id)| inst.param_value(*id).map_or(p.default, |v| p.clamp(v as f32))).collect();
+        let host = inst.host_state();
+        let link = inst.link();
+        let shared = Arc::new(Shared {
+            core: Mutex::new(Core {
+                inst,
+                inputs: PortBuffers::new(&[], 0),
+                outputs: PortBuffers::new(&[], 0),
+                in_main: None,
+                out_main: None,
+                max_block: 0,
+                sample_rate: 48_000.0,
+            }),
+            life: AtomicU8::new(RUNNING),
+            latency: AtomicUsize::new(0),
+            main: std::thread::current().id(),
+            host: Arc::clone(&host),
+            link,
+            info,
+            ids: ids.clone(),
+            rescan: Mutex::new(Rescan::default()),
+        });
+        lock(live()).push(Arc::downgrade(&shared));
         ClapPlugin {
-            inst,
+            shared,
+            host,
             info,
             ids,
             values,
             queue: Vec::with_capacity(EVENT_CAP),
-            inputs: PortBuffers::new(&[], 0),
-            outputs: PortBuffers::new(&[], 0),
-            in_main: None,
-            out_main: None,
             notes: NoteMode::None,
             midi_in: false,
             held: [false; 128],
             channels: 2,
-            max_block: 0,
-            latency: 0,
             steady: 0,
             transport: None,
+            silent: false,
             status: ProcessStatus::Continue,
             tail: 0,
         }
@@ -77,11 +359,13 @@ impl ClapPlugin {
 
     /// Re-reads every parameter value from the plugin (after a state load).
     fn refresh_values(&mut self) {
+        let core = lock(&self.shared.core);
         for ((v, p), id) in self.values.iter_mut().zip(self.info.params).zip(&self.ids) {
-            if let Some(x) = self.inst.param_value(*id) {
+            if let Some(x) = core.inst.param_value(*id) {
                 *v = p.clamp(x as f32);
             }
         }
+        drop(core);
         // Pending changes from before the load would undo it.
         self.queue.retain(|e| !matches!(e, Event::Param { .. }));
     }
@@ -157,34 +441,30 @@ impl Plugin for ClapPlugin {
         let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
         let mb = max_block.clamp(1, MAX_BLOCK);
         self.channels = channels.clamp(1, MAX_CHANNELS);
-        self.inst.deactivate();
-        self.inst.service_callback();
-        let ins = self.inst.audio_ports(true);
-        let outs = self.inst.audio_ports(false);
-        self.in_main = pick_main(&ins);
-        self.out_main = pick_main(&outs);
-        self.inputs = PortBuffers::new(&ins.iter().map(|p| p.channels).collect::<Vec<_>>(), mb);
-        self.outputs = PortBuffers::new(&outs.iter().map(|p| p.channels).collect::<Vec<_>>(), mb);
-        let port = self.inst.note_port();
+        let shared = Arc::clone(&self.shared);
+        let mut core = lock(&shared.core);
+        core.inst.deactivate();
+        core.inst.service_callback();
+        core.sample_rate = sr;
+        core.max_block = mb;
+        let port = core.inst.note_port();
         self.notes = note_mode(port);
         self.midi_in = port.is_some_and(|p| p.supported & CLAP_NOTE_DIALECT_MIDI != 0);
-        self.max_block = mb;
         self.status = ProcessStatus::Continue;
-        self.inst.state().restart.store(false, Ordering::Relaxed);
-        match self.inst.activate(sr, 1, u32::try_from(mb).unwrap_or(u32::MAX)) {
-            Ok(()) => {
-                self.latency = self.inst.latency() as usize;
-                self.inst.state().latency_changed.store(false, Ordering::Relaxed);
-            }
-            Err(e) => {
-                log::warn!("{}: {e}", self.info.id);
-                self.latency = 0;
-            }
-        }
+        // A full (re)activation answers any restart request, including one left half done.
+        self.host.restart.store(false, Ordering::Relaxed);
+        let latency = core.activate(self.info.id);
+        drop(core);
+        shared.latency.store(latency, Ordering::Release);
+        shared.life.store(RUNNING, Ordering::Release);
     }
 
     fn reset(&mut self) {
-        self.inst.reset();
+        // `reset` is an audio-thread call on an active plugin; while the main thread restarts it,
+        // the reactivation resets it anyway.
+        if let Some(mut core) = try_lock(&self.shared.core) {
+            core.inst.reset();
+        }
         keep_releases_on_reset(&mut self.queue, &mut self.held, self.notes);
     }
 
@@ -210,7 +490,25 @@ impl Plugin for ClapPlugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        if !self.inst.is_active() || self.max_block == 0 {
+        let shared: &Shared = &self.shared;
+        match shared.life.load(Ordering::Acquire) {
+            RUNNING => {}
+            PARK => {
+                // The main thread waits to restart it: leave the processing state here, on the
+                // audio thread (CLAP `stop_processing`), then keep out until it is done.
+                if let Some(mut core) = try_lock(&shared.core) {
+                    core.inst.stop_processing();
+                    drop(core);
+                    shared.life.store(PARKED, Ordering::Release);
+                }
+                return;
+            }
+            _ => return,
+        }
+        // Held by the main thread only while it restarts or rescans an instance: skip the block.
+        let Some(mut guard) = try_lock(&shared.core) else { return };
+        let core = &mut *guard;
+        if !core.inst.is_active() || core.max_block == 0 {
             return;
         }
         let ch = self.channels.min(io.len());
@@ -218,6 +516,10 @@ impl Plugin for ClapPlugin {
         if frames == 0 || ch == 0 {
             return;
         }
+        // This block answers a pending `request_process` or `params.request_flush` (one made
+        // during it asks again).
+        self.host.process.store(false, Ordering::Relaxed);
+        core.inputs.set_constant(self.silent);
         let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
         for e in &mut self.queue {
             if e.time() > last {
@@ -226,13 +528,13 @@ impl Plugin for ClapPlugin {
         }
         let mut start = 0usize;
         while start < frames {
-            let n = (frames - start).min(self.max_block);
+            let n = (frames - start).min(core.max_block);
             let end = u32::try_from(start + n).unwrap_or(u32::MAX);
             // Feed the main input port (mono sources fill every port channel).
-            if let Some(p) = self.in_main {
-                for c in 0..self.inputs.channels(p) {
+            if let Some(p) = core.in_main {
+                for c in 0..core.inputs.channels(p) {
                     let src = io.get(c.min(ch - 1)).and_then(|s| s.get(start..start + n));
-                    if let (Some(src), Some(dst)) = (src, self.inputs.channel_mut(p, c).and_then(|d| d.get_mut(..n))) {
+                    if let (Some(src), Some(dst)) = (src, core.inputs.channel_mut(p, c).and_then(|d| d.get_mut(..n))) {
                         dst.copy_from_slice(src);
                     }
                 }
@@ -240,24 +542,24 @@ impl Plugin for ClapPlugin {
             let k = self.queue.iter().position(|e| e.time() >= end).unwrap_or(self.queue.len());
             let offset = u32::try_from(start).unwrap_or(u32::MAX);
             let events = self.queue.get(..k).unwrap_or(&[]);
-            let r = self.inst.process(n, self.steady, &mut self.inputs, &mut self.outputs, events, offset, self.transport.as_ref());
+            let r = core.inst.process(n, self.steady, &mut core.inputs, &mut core.outputs, events, offset, self.transport.as_ref());
             self.queue.drain(..k);
-            let tail = self.inst.tail();
+            let tail = core.inst.tail();
             self.tail = tail_samples_from(tail);
             self.status = r.as_ref().map_or(ProcessStatus::Continue, |&s| status_from_clap(s, tail));
             self.steady = self.steady.saturating_add(i64::try_from(n).unwrap_or(0));
-            match (r, self.out_main) {
+            match (r, core.out_main) {
                 (Ok(_), Some(p)) => {
-                    let oc = self.outputs.channels(p);
+                    let oc = core.outputs.channels(p);
                     for (c, dst) in io.iter_mut().take(ch).enumerate() {
                         let Some(dst) = dst.get_mut(start..start + n) else { continue };
                         if ch == 1 && oc >= 2 {
-                            if let (Some(l), Some(r)) = (self.outputs.channel(p, 0), self.outputs.channel(p, 1)) {
+                            if let (Some(l), Some(r)) = (core.outputs.channel(p, 0), core.outputs.channel(p, 1)) {
                                 for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
                                     *d = 0.5 * (a + b);
                                 }
                             }
-                        } else if let Some(src) = self.outputs.channel(p, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
+                        } else if let Some(src) = core.outputs.channel(p, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
                             dst.copy_from_slice(src);
                         }
                     }
@@ -270,11 +572,18 @@ impl Plugin for ClapPlugin {
     }
 
     fn latency(&self) -> usize {
-        self.latency
+        self.shared.latency.load(Ordering::Acquire)
     }
 
+    /// What the plugin said after its last block, except that a pending request keeps it
+    /// processed: `request_process` / `params.request_flush` (CLAP: the host schedules a
+    /// `process`), and a restart waiting for this side to stop processing.
     fn process_status(&self) -> ProcessStatus {
-        self.status
+        if self.host.process.load(Ordering::Relaxed) || self.shared.life.load(Ordering::Relaxed) == PARK {
+            ProcessStatus::Continue
+        } else {
+            self.status
+        }
     }
 
     fn tail_samples(&self) -> usize {
@@ -282,7 +591,7 @@ impl Plugin for ClapPlugin {
     }
 
     fn set_input_silent(&mut self, silent: bool) {
-        self.inputs.set_constant(silent);
+        self.silent = silent;
     }
 
     fn set_transport(&mut self, transport: &Transport) {
@@ -335,7 +644,7 @@ impl Plugin for ClapPlugin {
     }
 
     fn load_state(&mut self, data: &[u8]) -> bool {
-        let ok = self.inst.load_state(data);
+        let ok = lock(&self.shared.core).inst.load_state(data);
         if ok {
             self.refresh_values();
         }
@@ -343,23 +652,24 @@ impl Plugin for ClapPlugin {
     }
 
     fn open_editor(&mut self) -> Result<(), String> {
-        let link = self.inst.gui().ok_or_else(|| "this plugin has no editor".to_string())?;
+        let link = lock(&self.shared.core).inst.gui().ok_or_else(|| "this plugin has no editor".to_string())?;
         link.open(self.info.name)
     }
 
     fn close_editor(&mut self) {
-        if let Some(link) = self.inst.gui() {
+        let link = lock(&self.shared.core).inst.gui();
+        if let Some(link) = link {
             link.close();
         }
     }
 
     fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
-        let link = self.inst.gui()?;
-        Some(Box::new(ClapEditor { link, info: self.info, ids: self.ids.clone() }))
+        let link = lock(&self.shared.core).inst.gui()?;
+        Some(Box::new(ClapEditor { link, info: self.info, ids: self.ids.clone(), shared: Arc::downgrade(&self.shared) }))
     }
 
     fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
-        let link = self.inst.state_link()?;
+        let link = lock(&self.shared.core).inst.state_link()?;
         Some(Box::new(move || link.save_state()))
     }
 }
@@ -369,6 +679,8 @@ struct ClapEditor {
     link: Arc<GuiLink>,
     info: &'static PluginInfo,
     ids: Vec<u32>,
+    /// The instance's requests, serviced on each `idle` (the host calls it every UI frame).
+    shared: Weak<Shared>,
 }
 
 impl PluginEditor for ClapEditor {
@@ -387,6 +699,9 @@ impl PluginEditor for ClapEditor {
     }
 
     fn idle(&mut self) -> Vec<(String, f32)> {
+        if let Some(s) = self.shared.upgrade() {
+            s.service(&mut Serviced::default());
+        }
         let raw = self.link.idle();
         let _ = self.link.host().dirty.swap(false, Ordering::Relaxed);
         let mut out: Vec<(String, f32)> = Vec::new();
