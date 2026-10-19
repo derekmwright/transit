@@ -1052,3 +1052,126 @@ fn seek_releases_clip_pedals_to_live_values_without_resetting_the_channel() {
         assert_eq!(pedal_values(&rig.heard_by(1), pedal).last().unwrap().1, 0);
     }
 }
+
+fn add_event_clip(rig: &mut Rig, start: i64, seq: soundcraft_midi::Sequence) {
+    let mut s = rig.session.clone();
+    let cid = s.new_clip_id();
+    s.track_mut(rig.track).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::midi(cid, "timing", start, 48_000, seq));
+    rig.publish(&s);
+    rig.session = s;
+}
+
+#[test]
+fn clip_pairs_in_time_order_release_within_and_across_blocks() {
+    let mut rig = Rig::new();
+    let mut seq = soundcraft_midi::Sequence::default();
+    // Deliberately unordered, all on the same key. The last pair spans a block boundary.
+    for (start, length) in [(8, 1), (1, 1), (10, 2), (4, 1)] {
+        seq.notes.push(soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 0, channel: 0, start, length });
+    }
+    add_event_clip(&mut rig, 0, seq);
+    rig.pos = 0;
+    let now = rig.mix.next_frame().0;
+    rig.render(1);
+    let notes: Vec<_> = rig.heard_by(1).into_iter().filter(|(_, e)| matches!(e.message, Message::NoteOn { .. } | Message::NoteOff { .. })).collect();
+    assert_eq!(notes.iter().map(|(f, _)| f - now).collect::<Vec<_>>(), [25, 50, 100, 125, 200, 225, 250]);
+    assert_eq!(every_on_has_its_off(&notes[..6]), 3);
+    assert!(rig.mix.has_pending_events(), "only the cross-block note remains");
+    rig.render(1);
+    let heard = rig.heard_by(1);
+    assert_eq!(every_on_has_its_off(&heard), 4);
+    assert_eq!(heard.last().unwrap().0, now + 300);
+    assert!(!rig.mix.has_pending_events());
+}
+
+#[test]
+fn clip_same_offset_off_precedes_restrike_across_clips() {
+    let mut rig = Rig::new();
+    // Put the later note in the first clip to catch ordering that only sorts within a clip.
+    for (start, length) in [(4, 2), (1, 3)] {
+        let mut seq = soundcraft_midi::Sequence::default();
+        seq.notes.push(soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 0, channel: 0, start, length });
+        add_event_clip(&mut rig, 0, seq);
+    }
+    rig.pos = 0;
+    let now = rig.mix.next_frame().0;
+    rig.render(1);
+    let notes: Vec<_> = rig.heard_by(1).into_iter().filter(|(_, e)| matches!(e.message, Message::NoteOn { .. } | Message::NoteOff { .. })).collect();
+    assert_eq!(notes.iter().map(|(f, _)| f - now).collect::<Vec<_>>(), [25, 100, 100, 150]);
+    assert!(matches!(notes[1].1.message, Message::NoteOff { .. }));
+    assert!(matches!(notes[2].1.message, Message::NoteOn { .. }));
+    assert_ne!(notes[0].1.note_id, notes[2].1.note_id);
+    assert_eq!(every_on_has_its_off(&notes), 2);
+    assert!(!rig.mix.has_pending_events());
+}
+
+#[test]
+fn clip_live_pedals_merge_in_both_time_orders() {
+    for pedal in [64, 66, 67, 69] {
+        for live_at in [10, 88, 140] {
+            let mut rig = Rig::new();
+            let src = port(1, 0);
+            let now = rig.mix.next_frame().0;
+            assert_eq!(rig.send(src, now, cc(pedal, 127)), EventOutcome::Queued);
+            rig.render(1);
+            let mut seq = soundcraft_midi::Sequence::default();
+            for (tick, value) in [(4, 127), (8, 63)] {
+                seq.ctrls.push(soundcraft_midi::CtrlEvent { tick, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(pedal), value });
+            }
+            let start = rig.pos;
+            add_event_clip(&mut rig, start, seq);
+            rig.heard.lock().unwrap().clear();
+            let now = rig.mix.next_frame().0;
+            assert_eq!(rig.send(src, now + live_at, cc(pedal, 63)), EventOutcome::Queued);
+            rig.render(1);
+            let expected = if live_at == 10 { vec![(now + 10, 63), (now + 88, 127), (now + 188, 63)] } else { vec![(now + 188, 63)] };
+            assert_eq!(pedal_values(&rig.heard_by(1), pedal), expected, "CC{pedal}, live offset: {live_at}");
+            assert!(!rig.mix.has_pending_events());
+        }
+    }
+}
+
+#[test]
+fn clip_live_pedal_or_tracks_each_sources_value_through_the_block() {
+    for pedal in [64, 66, 67, 69] {
+        let mut rig = Rig::new();
+        let (a, b) = (port(1, 0), port(2, 0));
+        let now = rig.mix.next_frame().0;
+        assert_eq!(rig.send(a, now, cc(pedal, 100)), EventOutcome::Queued);
+        assert_eq!(rig.send(b, now, cc(pedal, 80)), EventOutcome::Queued);
+        rig.render(1);
+        let mut seq = soundcraft_midi::Sequence::default();
+        // Reverse storage order: delivery must still be down@88, up@188.
+        for (tick, value) in [(8, 1), (4, 90)] {
+            seq.ctrls.push(soundcraft_midi::CtrlEvent { tick, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(pedal), value });
+        }
+        let start = rig.pos;
+        add_event_clip(&mut rig, start, seq);
+        rig.heard.lock().unwrap().clear();
+        let now = rig.mix.next_frame().0;
+        for (src, at, value) in [(a, 10, 63), (b, 120, 70), (a, 150, 110), (a, 200, 1), (b, 220, 63)] {
+            assert_eq!(rig.send(src, now + at, cc(pedal, value)), EventOutcome::Queued);
+        }
+        rig.render(1);
+        assert_eq!(pedal_values(&rig.heard_by(1), pedal), vec![(now + 10, 80), (now + 88, 90), (now + 150, 110), (now + 200, 70), (now + 220, 63)]);
+        assert!(!rig.mix.has_pending_events());
+    }
+}
+
+#[test]
+fn dense_clip_events_keep_every_release_and_same_sample_order() {
+    let mut rig = Rig::new();
+    let mut seq = soundcraft_midi::Sequence::default();
+    // More events than the scheduler's scratch, including more than a buffer at one sample.
+    for start in [8, 1, 4] {
+        for _ in 0..300 {
+            seq.notes.push(soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 0, channel: 0, start, length: 1 });
+        }
+    }
+    add_event_clip(&mut rig, 0, seq);
+    rig.pos = 0;
+    rig.render(1);
+    assert_eq!(every_on_has_its_off(&rig.heard_by(1)), 900);
+    assert!(!rig.mix.has_pending_events());
+    assert_eq!(rig.mix.event_status().shed.note_on, 0);
+}

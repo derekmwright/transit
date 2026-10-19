@@ -15,9 +15,10 @@
 //! A re-strike (a second note-on for an open note) carries the old voice's off, so it is charged
 //! two of those slots.
 //!
-//! **Delivery**, before the instrument's `process`: controller chase, then the clips (as
-//! [`Source::CLIP`], through the same note and pedal table), then the queue entries due in the
-//! block at `due − block start`. Pedals are tracked per source: values >= 64 hold, values < 64
+//! **Delivery**, before the instrument's `process`: controller chase, then clips (as
+//! [`Source::CLIP`], through the same note and pedal table) merged in time order with queue
+//! entries due in the block at `due − block start`. Clips precede live entries at equal offsets.
+//! Pedals are tracked per source: values >= 64 hold, values < 64
 //! release. The plug-in gets the maximum of the holders' current values, evaluated in due order:
 //! down when the first holder appears, the final holder's exact up value when it leaves, and
 //! every change of the maximum in between. A100/B60/A0/B0 emits 100/0: B's unmatched ups emit

@@ -1912,9 +1912,9 @@ fn process_strip<B: Busses + ?Sized>(
                     if std::mem::take(&mut strip.chase) {
                         chase_controllers(s, t, pos, inst);
                     }
-                    schedule_notes(s, t, pos, frames, inst);
+                    schedule_notes(s, t, pos, frames, live.frame, inst);
                 }
-                // Then the live events due in this block (F10), stopped or not.
+                // Deliver the remaining live events, including when stopped (F10).
                 if let Some(e) = inst.events.as_deref_mut() {
                     e.deliver(&mut *inst.plugin, live.frame, frames);
                 }
@@ -2760,7 +2760,77 @@ fn midi_offset(s: &Session, t: &Track) -> i64 {
 
 /// Send note on/offs and controllers for MIDI clips overlapping the block.
 /// Plan mode routes them through the instrument's note and pedal table as [`Source::CLIP`].
-fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mut PluginSlot) {
+fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, render_frame: u64, inst: &mut PluginSlot) {
+    // Sort before touching the identity/holder tables: sorting only in the plug-in is too late.
+    // Fixed scratch bounds memory, not event count. If a range overflows, split its time span
+    // and rescan; a single sample can stream directly in the visitor's off-before-on order.
+    // Usually the entire block fits and needs just one visit and one allocation-free sort.
+    let mut scratch = [(0usize, 0usize, ClipEvent::Off(0)); 256];
+    let (mut from, mut until) = (0, frames);
+    while from < frames {
+        let mut used = 0usize;
+        let mut overflow = false;
+        let single_sample = until - from == 1;
+        visit_clip_events(s, t, pos, frames, |at, event| {
+            if at < from || at >= until {
+                return;
+            }
+            if single_sample {
+                deliver_clip_event(inst, render_frame, at, event);
+            } else if let Some(slot) = scratch.get_mut(used) {
+                *slot = (at, used, event);
+                used += 1;
+            } else {
+                overflow = true;
+            }
+        });
+        if overflow {
+            until = from + (until - from) / 2;
+            continue;
+        }
+        if let Some(events) = scratch.get_mut(..used) {
+            // The traversal index preserves off-before-on at ties, and on-then-off for a
+            // note whose duration rounds to zero samples. No stable-sort allocation.
+            events.sort_unstable_by_key(|&(at, order, _)| (at, order));
+            for &(at, _, event) in events.iter() {
+                deliver_clip_event(inst, render_frame, at, event);
+            }
+        }
+        from = until;
+        until = frames;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClipEvent {
+    On(u8, u8),
+    Off(u8),
+    Control([u8; 3]),
+}
+
+fn deliver_clip_event(inst: &mut PluginSlot, render_frame: u64, at: usize, event: ClipEvent) {
+    if let Some(e) = inst.events.as_deref_mut() {
+        // Only earlier live events: at a tie, chase and clips precede live events. Applying
+        // a future clip pedal first could otherwise absorb an earlier live pedal release.
+        e.deliver(&mut *inst.plugin, render_frame, at);
+        let offset = u32::try_from(at).unwrap_or(u32::MAX);
+        match event {
+            ClipEvent::On(key, velocity) => e.clip_on(&mut *inst.plugin, offset, key, velocity),
+            ClipEvent::Off(key) => e.clip_off(&mut *inst.plugin, offset, key),
+            ClipEvent::Control(msg) => e.clip_ctrl(&mut *inst.plugin, offset, msg),
+        }
+    } else {
+        match event {
+            ClipEvent::On(key, velocity) => inst.plugin.note_on(at, key, velocity),
+            ClipEvent::Off(key) => inst.plugin.note_off(at, key),
+            ClipEvent::Control(msg) => inst.plugin.midi(at, msg),
+        }
+    }
+}
+
+/// Visit candidates without mutating delivery state. At each offset all nonzero-length offs
+/// precede ons; a note whose on and off round to the same sample keeps on-then-off.
+fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut visit: impl FnMut(usize, ClipEvent)) {
     let sr = s.sample_rate;
     // MIDI Track Offsets: the track's notes sound `offset` samples later (earlier if negative), so
     // the block looks that far back into the clips.
@@ -2808,17 +2878,11 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 }
                 if ons && on >= pos && on < end {
                     let at = usize::try_from(on - pos).unwrap_or(0);
-                    match inst.events.as_deref_mut() {
-                        Some(e) => e.clip_on(&mut *inst.plugin, u32::try_from(at).unwrap_or(u32::MAX), n.pitch, n.velocity),
-                        None => inst.plugin.note_on(at, n.pitch, n.velocity),
-                    }
+                    visit(at, ClipEvent::On(n.pitch, n.velocity));
                 }
                 if off >= pos && off < end && (ons == (off == on)) {
                     let at = usize::try_from(off - pos).unwrap_or(0);
-                    match inst.events.as_deref_mut() {
-                        Some(e) => e.clip_off(&mut *inst.plugin, u32::try_from(at).unwrap_or(u32::MAX), n.pitch),
-                        None => inst.plugin.note_off(at, n.pitch),
-                    }
+                    visit(at, ClipEvent::Off(n.pitch));
                 }
             }
             if !ons {
@@ -2834,7 +2898,7 @@ fn schedule_notes(s: &Session, t: &Track, pos: Samples, frames: usize, inst: &mu
                 }
                 let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
                 if at >= pos && at < end && at < clip.end() {
-                    clip_midi(inst, usize::try_from(at - pos).unwrap_or(0), ctrl_message(c.kind, c.value, dp));
+                    visit(usize::try_from(at - pos).unwrap_or(0), ClipEvent::Control(ctrl_message(c.kind, c.value, dp)));
                 }
             }
         }

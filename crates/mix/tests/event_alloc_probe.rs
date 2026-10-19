@@ -21,6 +21,57 @@ const SR: u32 = 48_000;
 const BLOCK: usize = 256;
 
 #[test]
+fn dense_clip_sorting_and_live_pedal_merge_allocate_nothing() {
+    MixEngine::force_serial(true);
+    mark_audio_thread();
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 };
+    let mut mix = MixEngine::realtime_with_events(target, EngineEpoch::FIRST, EventLimits::default());
+    let mut comp = PlanCompiler::new(target, PlanLimits::default());
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    s.track_mut(t).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    let mut seq = soundcraft_midi::Sequence::default();
+    for start in [8, 1, 4] {
+        seq.notes.push(soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 0, channel: 0, start, length: 1 });
+    }
+    for tick in [5, 2] {
+        for _ in 0..300 {
+            seq.ctrls.push(soundcraft_midi::CtrlEvent { tick, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(1), value: 1 });
+        }
+    }
+    for (tick, value) in [(8, 63), (4, 127)] {
+        seq.ctrls.push(soundcraft_midi::CtrlEvent { tick, channel: 0, kind: soundcraft_midi::CtrlKind::Cc(64), value });
+    }
+    let cid = s.new_clip_id();
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::midi(cid, "dense", 512, 48_000, seq));
+    let mut make = |spec: &InstanceSpec, _: SlotGen| soundcraft_mix::create_instance(&spec.id, None, SR as f32, BLOCK, spec.ch);
+    let mut env = comp.compile(Arc::new(s), PlanGeneration::EMPTY, PlanGeneration::EMPTY.checked_next().unwrap(), &mut make).unwrap();
+    assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+    comp.reclaim(env);
+    let binding = comp.active_bindings().into_iter().find(|b| b.1 == INSTRUMENT_SLOT).unwrap();
+    let event = |at, value| InstrumentEvent {
+        engine: EngineEpoch::FIRST,
+        target: binding,
+        due: Due::Frame(RenderFrame(at)),
+        transport: None,
+        source: Source { port: 1, channel: 0, generation: 1 },
+        message: Message::Control { cc: 64, value },
+        arrival: Arrival { host_ns: 0, sequence: 0 },
+    };
+    let mut out = vec![vec![0.0; BLOCK]; 2];
+    mix.render_active(0, BLOCK, &mut out);
+    assert_eq!(mix.queue_event(&event(256, 127)), EventOutcome::Queued);
+    mix.render_active(256, BLOCK, &mut out);
+    let ((), stats) = measure(|| {
+        assert_eq!(mix.queue_event(&event(522, 63)), EventOutcome::Queued);
+        mix.render_active(512, BLOCK, &mut out);
+        mix.render_active(768, BLOCK, &mut out);
+    });
+    assert_eq!(stats, AllocStats::default(), "dense clip sorting and mixed-source delivery");
+    assert!(!mix.has_pending_events());
+}
+
+#[test]
 fn admission_delivery_revocation_and_panic_allocate_nothing() {
     MixEngine::force_serial(true);
     mark_audio_thread();
