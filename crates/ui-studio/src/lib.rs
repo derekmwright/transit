@@ -8,6 +8,7 @@
 
 pub mod actions;
 pub mod arrange;
+pub mod audio_devices;
 pub mod automation;
 pub mod browser;
 pub mod control;
@@ -262,6 +263,8 @@ pub struct StudioApp {
     pub finish: finish::FinishState,
     /// Slice 7: the automation lanes' gesture, point selection, write pass and last layout.
     pub auto: automation::AutoState,
+    /// Audio › Audio Devices: the window, its draft choices and the device listing.
+    pub audio_devices: audio_devices::AudioDevicesState,
 }
 
 impl StudioApp {
@@ -314,6 +317,7 @@ impl StudioApp {
             telemetry: telemetry::TelemetryState::default(),
             finish: finish::FinishState::default(),
             auto: automation::AutoState::default(),
+            audio_devices: audio_devices::AudioDevicesState::default(),
         }
     }
 
@@ -440,6 +444,10 @@ impl StudioApp {
         if ns.plugin_dirs != self.ui.plugin_dirs {
             return Err("plugin folders can't be changed over the control channel".into());
         }
+        let audio_changed = ns.audio != self.ui.audio;
+        if audio_changed && self.engine.transport.recording {
+            return Err(audio_devices::REFUSED_RECORDING.into());
+        }
         if let Some(pace) = pace {
             self.imports.pace = pace;
         }
@@ -460,6 +468,10 @@ impl StudioApp {
         let wanted: Vec<(TrackId, usize)> = self.ui.plugin_windows.clone();
         for key in wanted {
             self.want_editor(key);
+        }
+        // A new device choice takes effect now, as the window's Apply does.
+        if audio_changed {
+            self.reopen_audio();
         }
         Ok(json!({"ui": self.ui}))
     }
@@ -700,6 +712,7 @@ impl StudioApp {
         menus::recovery(self, &ctx);
         menus::shortcuts_window(self, &ctx);
         telemetry::window(self, &ctx);
+        audio_devices::window(self, &ctx);
         if self.is_playing() || self.engine.transport.recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 30));
         } else if self.main_meter.level[0] > 0.0001 {
@@ -756,11 +769,14 @@ impl StudioApp {
             "telemetry": self.telemetry.layout,
             "finish": self.finish.inspect(),
             "automation": self.auto.layout,
+            "audio_devices": self.audio_devices.layout,
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }
 }
 
+#[cfg(test)]
+mod audio_devices_tests;
 #[cfg(test)]
 mod automation_tests;
 #[cfg(test)]

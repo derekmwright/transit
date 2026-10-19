@@ -10,6 +10,8 @@
 //! - `ui.scroll {x,y,dx?,dy?,unit?,steps?,mods?}`, `ui.zoom {x,y,factor,steps?}`
 //! - `ui.key {key, cmd?, shift?, alt?, ctrl?}`, `ui.text {text}`
 //! - `ui.screenshot {path?}` (PNG; base64 when no path), `app.quit`
+//! - `audio.fake_devices {systems}`: stand-in devices for Audio › Audio Devices (screenshot runs;
+//!   see [`crate::audio_devices::fake_from_json`]). `ui.set {audio}` reopens the devices.
 
 use crate::StudioApp as SoundApp;
 use serde_json::{Value, json};
@@ -192,6 +194,14 @@ fn handle(app: &mut SoundApp, ctx: &egui::Context, req: &ControlRequest) -> Opti
             ctx.request_repaint();
             return None;
         }
+        "audio.fake_devices" => match crate::audio_devices::fake_from_json(p) {
+            Ok(fake) => {
+                app.audio_devices.fake = fake;
+                app.audio_devices.forget_listing();
+                ok(json!({}))
+            }
+            Err(e) => err(e),
+        },
         "app.quit" => {
             app.quit_requested = true;
             ok(json!({}))

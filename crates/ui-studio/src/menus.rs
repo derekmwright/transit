@@ -223,9 +223,16 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     }
                 });
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Transport".into(), String::new(), transport_menu.response.rect));
-                ui.menu_button("Audio", |ui| {
+                let mut audio_items = Vec::new();
+                let audio_menu = ui.menu_button("Audio", |ui| {
                     let name = app.player.as_ref().map_or("No audio device (--no-audio)".to_string(), |p| p.device_name.clone());
                     ui.label(egui::RichText::new(name).color(TOKENS.text_dim));
+                    let b = ui.button("Audio Devices…");
+                    audio_items.push(crate::mixer::MenuItem::at(ui, "Audio Devices…".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.open_audio_devices();
+                        ui.close();
+                    }
                     if ui.add_enabled(app.player.is_some(), egui::Button::new("Reconnect Device")).clicked() {
                         app.reconnect_audio();
                         ui.close();
@@ -235,6 +242,8 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                 });
+                app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Audio".into(), String::new(), audio_menu.response.rect));
+                app.arrange.bar_menu.extend(audio_items);
                 let help = ui.menu_button("Help", |ui| {
                     let b = ui.button("Keyboard Shortcuts");
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Keyboard Shortcuts".into(), String::new(), b.rect));
