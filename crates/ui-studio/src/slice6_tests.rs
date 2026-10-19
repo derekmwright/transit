@@ -353,8 +353,10 @@ fn recording_over_a_clip_makes_a_take_and_the_old_clip_stays_as_take_1() {
     let a = t.track(json!({"kind": "audio", "name": "Audio 1"}));
     t.record(&dir, a, 0, 2.0, 1);
     let first = t.app.engine.session().track(a).unwrap().clips()[0].id;
+    let before = t.undo_len();
     let status = t.record(&dir, a, 24_000, 1.0, 2);
     assert!(status.ends_with("as take 2"), "{status}");
+    assert_eq!((t.undo_len(), t.app.engine.undo_history().pop().as_deref()), (before + 1, Some("Record")), "a take is one undo step");
     let tr = t.app.engine.session().track(a).unwrap().clone();
     assert_eq!((tr.playlists.len(), tr.active_playlist), (2, 1));
     assert!(tr.playlists[0].clips.iter().any(|c| c.id == first && c.length == 96_000), "take 1 keeps the old clip whole");

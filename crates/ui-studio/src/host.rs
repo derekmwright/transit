@@ -440,7 +440,7 @@ impl StudioApp {
     }
 
     /// Slice 6: place finished take files. A take recorded over clips on its track goes on a new
-    /// playlist that copies the old one (`track.playlist_duplicate`), so the old clips stay as the
+    /// playlist that copies the old one (the engine does it inside the one "Record" undo step), so the old clips stay as the
     /// previous take (plan 06, L8: takes are track playlists). The new clips are selected and the
     /// status line says what was recorded where. `end` is where the playhead stopped.
     pub(crate) fn place_takes(
@@ -456,12 +456,12 @@ impl StudioApp {
         if plan.pass.is_none() && to > from {
             for (t, _) in &takes {
                 let over = self.engine.session().track(*t).is_some_and(|tr| tr.clips().iter().any(|c| c.start < to && c.end() > from));
-                if over && self.run("track.playlist_duplicate", json!({"track": t.0})).is_ok() {
+                if over {
                     new_take.push(*t);
                 }
             }
         }
-        let ids = soundcraft_engine::io::place_recording(&mut self.engine, plan, takes);
+        let ids = soundcraft_engine::io::place_recording_take(&mut self.engine, plan, takes, true);
         if plan.pass.is_some() {
             self.status = format!("Loop-recorded {} take(s)", ids.len() / tracks.max(1));
             return;
