@@ -855,3 +855,20 @@ fn a_re_strike_is_charged_two_slots() {
     assert_eq!(every_on_has_its_off(&rig.heard_by(1)), 3);
 }
 
+/// Review F10-4e (deviation 5): CC 121 from one source while another holds the pedal: the plug-in
+/// sees CC 121, then the pedal down again for the holder, at its value.
+#[test]
+fn reset_controllers_re_sends_other_sources_pedals() {
+    let mut rig = Rig::new();
+    let (a, b) = (port(1, 0), port(2, 0));
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(b, now, cc(64, 100)), EventOutcome::Queued);
+    assert_eq!(rig.send(a, now + 10, cc(121, 0)), EventOutcome::Queued);
+    rig.render(1);
+    let ctl: Vec<(u64, u8, u8)> = rig
+        .heard_by(1)
+        .iter()
+        .filter_map(|(f, e)| if let Message::Control { cc, value } = e.message { Some((*f, cc, value)) } else { None })
+        .collect();
+    assert_eq!(ctl, vec![(now, 64, 100), (now + 10, 121, 0), (now + 10, 64, 100)]);
+}
