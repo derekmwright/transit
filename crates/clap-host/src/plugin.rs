@@ -349,7 +349,8 @@ enum Restart {
 
 /// A parameter value the host does not know yet (beyond rounding).
 fn differs(host: f64, plugin: f64) -> bool {
-    !((host - plugin).abs() <= 1e-9 * host.abs().max(plugin.abs()).max(1.0))
+    let d = (host - plugin).abs();
+    d.is_nan() || d > 1e-9 * host.abs().max(plugin.abs()).max(1.0)
 }
 
 /// A hosted CLAP plugin. Parameter ids are the CLAP param ids as decimal strings ("0", "17", …);
