@@ -39,7 +39,11 @@ impl Plugin for Recorder {
     fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
         self.inner.prepare(sr, mb, ch);
     }
-    fn reset(&mut self) {}
+    /// As real hosts do: pending non-releases are dropped, releases (and `all_notes_off`) are
+    /// kept for the next block, so a mix that relies on a reset to drop a release is caught.
+    fn reset(&mut self) {
+        self.pending.retain(|(_, e)| e.is_none_or(|e| e.message.survives_reset()));
+    }
     fn set_param(&mut self, id: &str, v: f32) -> bool {
         self.inner.set_param(id, v)
     }
@@ -382,6 +386,17 @@ fn pedal_edges(heard: &[(u64, PluginEvent)], pedal: u8) -> Vec<(u64, bool)> {
         .collect()
 }
 
+/// The plug-in's view of pedal `cc`: (frame, value).
+fn pedal_values(heard: &[(u64, PluginEvent)], pedal: u8) -> Vec<(u64, u8)> {
+    heard
+        .iter()
+        .filter_map(|(f, e)| match e.message {
+            Message::Control { cc, value } if cc == pedal => Some((*f, value)),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn pedals_from_two_ports_are_ored_and_a_revocation_releases_the_last_holder() {
     let mut rig = Rig::new();
@@ -656,3 +671,25 @@ fn pending_events_keep_a_stopped_engine_awake_until_delivered() {
     rig.render(1);
     assert_eq!(pedal_edges(&rig.heard_by(1), 64).last(), Some(&(now + 3 * BLOCK as u64, false)));
 }
+
+// ---- review fixes (F10 post-review) ----
+
+/// Review F10-1: `MixEngine::reset` (Stop) releases every source and the plug-in, resetting like
+/// a real host, still gets the pedal-up and the note-off on the next block.
+#[test]
+fn a_reset_releases_every_source_and_the_releases_survive_the_host_reset() {
+    let mut rig = Rig::new();
+    let now = rig.mix.next_frame().0;
+    assert_eq!(rig.send(port(1, 0), now, on(72)), EventOutcome::Queued);
+    assert_eq!(rig.send(port(1, 0), now, cc(64, 127)), EventOutcome::Queued);
+    rig.render(1);
+    rig.heard.lock().unwrap().clear();
+    rig.mix.reset();
+    rig.render(1);
+    let heard = rig.heard_by(1);
+    assert!(heard.iter().any(|(_, e)| matches!(e.message, Message::NoteOff { key: 72, .. })), "the note-off: {heard:?}");
+    assert_eq!(pedal_values(&heard, 64), vec![(now + BLOCK as u64, 0)], "the pedal-up");
+    assert!(!rig.mix.has_pending_events());
+    assert_eq!(rig.send(port(1, 0), rig.mix.next_frame().0, off(72)), EventOutcome::Unmatched, "the reset released it");
+}
+
