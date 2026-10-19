@@ -210,13 +210,17 @@ fn unpublished_dependency_slot_returns_empty_before_producer_resumes() {
 #[test]
 fn concurrent_publication_and_reclamation_preserve_credit_fifo_and_drop_affinity() {
     const COUNT: usize = 20_000;
+    const NO_PROGRESS: Duration = Duration::from_secs(30);
     for capacity in [1, 2, 3, 7] {
         let trace = Trace::new();
         let (mut control, mut audio) = channel(NonZeroUsize::new(capacity).unwrap());
         let done = Arc::new(AtomicBool::new(false));
         let done_audio = Arc::clone(&done);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let started_audio = Arc::clone(&started);
         let worker = thread::spawn(move || {
             let mut applied = 0;
+            started_audio.wait();
             let ((), stats) = measure(|| {
                 while !done_audio.load(Ordering::Acquire) {
                     let result = audio.service_one(|p: &mut Payload| {
@@ -236,8 +240,10 @@ fn concurrent_publication_and_reclamation_preserve_credit_fifo_and_drop_affinity
         let (mut submitted, mut reclaimed) = (0, 0);
         let mut random = 0x1234_5678_u64;
         let mut waiting = None;
-        let deadline = std::time::Instant::now() + WATCHDOG;
-        while reclaimed < COUNT && std::time::Instant::now() < deadline {
+        started.wait();
+        let mut last_progress = std::time::Instant::now();
+        while reclaimed < COUNT {
+            let before = (submitted, reclaimed);
             random ^= random << 13;
             random ^= random >> 7;
             random ^= random << 17;
@@ -255,10 +261,18 @@ fn concurrent_publication_and_reclamation_preserve_credit_fifo_and_drop_affinity
                 });
             }
             assert_eq!(control.credits(), capacity - (submitted - reclaimed));
+            if reclaimed != before.1 {
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() >= NO_PROGRESS {
+                break; // Deadlock guard only; a slow but progressing run remains valid.
+            }
+            if before == (submitted, reclaimed) {
+                thread::yield_now();
+            }
         }
         done.store(true, Ordering::Release);
         let (audio, applied, stats) = worker.join().unwrap();
-        assert_eq!(reclaimed, COUNT, "watchdog is failure, never proof of quiescence");
+        assert_eq!(reclaimed, COUNT, "no-progress watchdog is failure, never proof of quiescence");
         assert_eq!(applied, COUNT);
         assert!(stats.is_zero(), "{stats:?}");
         assert_eq!(trace.counts(), (COUNT, 0));

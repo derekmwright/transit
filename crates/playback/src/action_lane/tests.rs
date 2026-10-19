@@ -515,16 +515,27 @@ fn teardown_preserves_finished_receipts_and_cancels_every_waiting_or_queued_acti
 
 #[test]
 fn concurrent_borrowed_audio_endpoint_preserves_all_twenty_thousand_receipts() {
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+    const COUNT: u32 = 20_000;
+    const NO_PROGRESS: Duration = Duration::from_secs(30);
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
     let (mut control, mut audio) = fixture();
     let stop = AtomicBool::new(false);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = Barrier::new(2);
     let (mut sent, mut received, mut ordered) = (0, 0, true);
     let (processed, worker_ordered, heap_free) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
             let (mut count, mut ordered, mut heap_free) = (0, true, true);
-            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            started.wait();
+            while !stop.load(Ordering::Acquire) {
+                let before = count;
                 let (_, stats) = measure(|| {
                     audio.service_generation(&mut super::callback_scope(), generation(1), &mut |event| {
                         if let Event::Action { payload, .. } = event {
@@ -536,24 +547,41 @@ fn concurrent_borrowed_audio_endpoint_preserves_all_twenty_thousand_receipts() {
                     })
                 });
                 heap_free &= stats.is_zero();
-                std::thread::yield_now();
+                if count == before {
+                    std::thread::yield_now();
+                }
             }
             (count, ordered, heap_free)
         });
-        while (sent < 20_000 || received < sent) && Instant::now() < deadline {
-            if sent < 20_000 && control.send(sent, Class::Ordinary, None).is_ok() {
+        let _stop_on_unwind = StopOnDrop(&stop);
+        started.wait();
+        let mut last_progress = Instant::now();
+        while received < COUNT {
+            let before = (sent, received);
+            for _ in 0..CALLBACK_ACTIONS {
+                if sent == COUNT || control.send(sent, Class::Ordinary, None).is_err() {
+                    break;
+                }
                 sent += 1;
             }
-            if let Some(receipt) = control.reclaim() {
+            for _ in 0..CALLBACK_ACTIONS {
+                let Some(receipt) = control.reclaim() else { break };
                 ordered &= receipt.payload == received && receipt.outcome == Outcome::Applied;
                 received += 1;
             }
-            std::thread::yield_now();
+            if received != before.1 {
+                last_progress = Instant::now();
+            } else if last_progress.elapsed() >= NO_PROGRESS {
+                break; // Deadlock guard only: elapsed time never proves completion.
+            }
+            if before == (sent, received) {
+                std::thread::yield_now();
+            }
         }
         stop.store(true, Ordering::Release);
         worker.join().unwrap()
     });
-    assert_eq!((sent, received, processed), (20_000, 20_000, 20_000));
+    assert_eq!((sent, received, processed), (COUNT, COUNT, COUNT), "no-progress watchdog is a failure, not a throughput requirement");
     assert!(ordered && worker_ordered && heap_free);
     assert!(control.retire(audio).is_empty());
 }
