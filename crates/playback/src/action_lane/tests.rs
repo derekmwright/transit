@@ -26,6 +26,126 @@ fn fixture<T: Copy>() -> (action_lane::Control<T>, action_lane::Audio<T>) {
 }
 
 #[test]
+fn typed_receipts_keep_handler_refusal_separate_from_successful_lane_dispatch() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, bool>(&plan_control);
+    let transport = control.send_action(1, None).unwrap();
+    let note = control.send_note(2, super::NoteKind::Off).unwrap();
+    let mut calls = 0;
+    let (result, stats) = measure(|| {
+        audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |event, _| {
+            calls += 1;
+            matches!(event, Event::Action { payload: 1, .. })
+        })
+    });
+    assert!(stats.is_zero());
+    assert_eq!((result.applied, calls), (2, 2));
+    // Cross-class receipt order differs from admission order. Sequence owns the result.
+    let receipt = control.reclaim().unwrap();
+    assert_eq!((receipt.sequence, receipt.payload, receipt.outcome, receipt.handler_result), (note, 2, Outcome::Applied, Some(false)));
+    let receipt = control.reclaim().unwrap();
+    assert_eq!((receipt.sequence, receipt.payload, receipt.outcome, receipt.handler_result), (transport, 1, Outcome::Applied, Some(true)));
+    assert!(control.retire(audio).is_empty());
+    plan_control.retire(plan_audio);
+}
+
+#[test]
+fn typed_receipts_have_no_result_for_actions_that_never_reached_the_handler() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, u64>(&plan_control);
+    let stopped = control.send_action(1, None).unwrap();
+    control.stop().unwrap();
+    let released = control.send_note(2, super::NoteKind::On).unwrap();
+    control.all_notes_off().unwrap();
+    let rejected = control.send_action(3, Some(generation(1))).unwrap();
+    control.reject_plan(generation(1));
+    audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |event, _| {
+        assert!(!matches!(event, Event::Action { .. }), "cancelled work must not reach handler");
+        u64::MAX // Urgent acknowledgments must not leak this result into normal receipts.
+    });
+    let mut receipts = control.retire(audio);
+    receipts.sort_unstable_by_key(|r| r.sequence);
+    assert_eq!(receipts.len(), 3);
+    assert_eq!(
+        receipts.iter().map(|r| (r.sequence, r.outcome)).collect::<Vec<_>>(),
+        [(stopped, Outcome::Stopped), (released, Outcome::NotesReleased), (rejected, Outcome::PlanRejected),]
+    );
+    assert!(receipts.iter().all(|r| r.handler_result.is_none()));
+    let (mut control, audio) = action_lane::pair_with_result::<u8, u64>(&plan_control);
+    let shutdown = control.send_action(4, None).unwrap();
+    let receipts = control.retire(audio);
+    assert_eq!((receipts[0].sequence, receipts[0].outcome, receipts[0].handler_result), (shutdown, Outcome::Shutdown, None));
+    plan_control.retire(plan_audio);
+}
+
+#[test]
+fn typed_result_survives_return_backpressure_and_later_fault_without_replaying() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, u64>(&plan_control);
+    for _ in 0..CAPACITY {
+        audio
+            .actions
+            .returned
+            .push(super::Receipt { sequence: super::Sequence(0), payload: 0, outcome: Outcome::Shutdown, handler_result: None })
+            .unwrap();
+    }
+    let sequence = control.send_action(9, None).unwrap();
+    let mut calls = 0;
+    let mut apply = |_, _: &mut crate::plan_bridge::Processing<'_>| {
+        calls += 1;
+        0xFEDC_BA98_7654_3210
+    };
+    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), &mut plan_audio, &mut apply));
+    assert!(stats.is_zero());
+    assert!(result.return_pending);
+    audio.fault();
+    assert!(audio.service(&mut super::callback_scope(), &mut plan_audio, &mut apply).return_pending);
+    for _ in 0..CAPACITY {
+        control.actions.returned.pop().unwrap();
+    }
+    let (result, stats) = measure(|| audio.service(&mut super::callback_scope(), &mut plan_audio, &mut apply));
+    assert!(stats.is_zero());
+    assert!(result.faulted);
+    assert_eq!(calls, 1);
+    let receipt = control.reclaim().unwrap();
+    assert_eq!((receipt.sequence, receipt.outcome, receipt.handler_result), (sequence, Outcome::Applied, Some(0xFEDC_BA98_7654_3210)));
+    assert_eq!(control.credits(), CAPACITY);
+    assert!(control.retire(audio).is_empty());
+    plan_control.retire(plan_audio);
+}
+
+#[test]
+fn typed_handler_unwind_does_not_publish_an_invented_result() {
+    let (plan_control, mut plan_audio) = bridge();
+    let (mut control, mut audio) = action_lane::pair_with_result::<u8, u64>(&plan_control);
+    control.send_action(1, None).unwrap();
+    control.send_note(2, super::NoteKind::Off).unwrap();
+    let mut calls = 0;
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            audio.service(&mut super::callback_scope(), &mut plan_audio, &mut |_, _| {
+                calls += 1;
+                panic!("typed handler failed before returning");
+            });
+        }))
+        .is_err()
+    );
+    assert!(
+        audio
+            .service(&mut super::callback_scope(), &mut plan_audio, &mut |_, _| {
+                calls += 1;
+                99
+            })
+            .faulted
+    );
+    assert_eq!(calls, 1);
+    let receipts = control.retire(audio);
+    assert_eq!(receipts.len(), 2);
+    assert!(receipts.iter().all(|r| r.outcome == Outcome::Faulted && r.handler_result.is_none()));
+    plan_control.retire(plan_audio);
+}
+
+#[test]
 fn notes_do_not_wait_for_transport_prerequisites_or_consume_transport_credits() {
     use super::NoteKind;
     let (mut control, mut audio) = fixture();
@@ -454,7 +574,11 @@ fn a_defensively_full_return_lane_retains_the_finished_action_without_replaying_
     // Artificially consume the reserved return slots, violating the normal credit invariant.
     // The defensive path must still preserve the real pending receipt.
     for _ in 0..CAPACITY {
-        audio.actions.returned.push(super::Receipt { sequence: super::Sequence(0), payload: 0, outcome: Outcome::Shutdown }).unwrap();
+        audio
+            .actions
+            .returned
+            .push(super::Receipt { sequence: super::Sequence(0), payload: 0, outcome: Outcome::Shutdown, handler_result: None })
+            .unwrap();
     }
     let sequence = control.send(9, Class::Ordinary, None).unwrap();
     let mut calls = 0;

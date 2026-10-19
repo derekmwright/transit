@@ -52,10 +52,13 @@ pub enum SendError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Match this result to the admitted request by `sequence`, never by receipt order.
 /// Independent note/transport lanes can complete in a different order.
-pub struct Receipt<T: Copy> {
+pub struct Receipt<T: Copy, R: Copy = ()> {
     pub sequence: Sequence,
     pub payload: T,
     pub outcome: Outcome,
+    /// Some only after the handler returned. Applied acknowledges dispatch, not the
+    /// handler's semantic success: a mix refusal is still returned here for the caller.
+    pub handler_result: Option<R>,
 }
 
 /// Stop must stop transport AND release notes. A handler unwind permanently faults both lanes.
@@ -74,13 +77,19 @@ struct Entry<T: Copy> {
     plan: Option<PlanGeneration>,
 }
 #[derive(Clone, Copy)]
-struct Pending<T: Copy> {
+struct Pending<T: Copy, R: Copy = ()> {
     entry: Entry<T>,
     finished: Option<Outcome>,
+    handler_result: Option<R>,
 }
-impl<T: Copy> Pending<T> {
-    fn receipt(self) -> Receipt<T> {
-        Receipt { sequence: self.entry.sequence, payload: self.entry.payload, outcome: self.finished.unwrap_or(Outcome::Shutdown) }
+impl<T: Copy, R: Copy> Pending<T, R> {
+    fn receipt(self) -> Receipt<T, R> {
+        Receipt {
+            sequence: self.entry.sequence,
+            payload: self.entry.payload,
+            outcome: self.finished.unwrap_or(Outcome::Shutdown),
+            handler_result: self.handler_result,
+        }
     }
 }
 
@@ -142,39 +151,39 @@ impl Service {
     }
 }
 
-struct ControlLane<T: Copy> {
+struct ControlLane<T: Copy, R: Copy = ()> {
     send: rtrb::Producer<Entry<T>>,
-    returned: rtrb::Consumer<Receipt<T>>,
+    returned: rtrb::Consumer<Receipt<T, R>>,
     credits: usize,
 }
-struct AudioLane<T: Copy> {
+struct AudioLane<T: Copy, R: Copy = ()> {
     receive: rtrb::Consumer<Entry<T>>,
-    returned: rtrb::Producer<Receipt<T>>,
-    pending: Option<Pending<T>>,
+    returned: rtrb::Producer<Receipt<T, R>>,
+    pending: Option<Pending<T, R>>,
 }
-fn lane<T: Copy>(capacity: usize) -> (ControlLane<T>, AudioLane<T>) {
+fn lane<T: Copy, R: Copy>(capacity: usize) -> (ControlLane<T, R>, AudioLane<T, R>) {
     let (send, receive) = rtrb::RingBuffer::new(capacity);
     let (return_send, returned) = rtrb::RingBuffer::new(capacity);
     (ControlLane { send, returned, credits: capacity }, AudioLane { receive, returned: return_send, pending: None })
 }
-impl<T: Copy> ControlLane<T> {
-    fn reclaim(&mut self) -> Option<Receipt<T>> {
+impl<T: Copy, R: Copy> ControlLane<T, R> {
+    fn reclaim(&mut self) -> Option<Receipt<T, R>> {
         let receipt = self.returned.pop().ok()?;
         self.credits += 1;
         Some(receipt)
     }
 }
 
-pub struct Control<T: Copy> {
-    actions: ControlLane<T>,
-    notes: ControlLane<T>,
+pub struct Control<T: Copy, R: Copy = ()> {
+    actions: ControlLane<T, R>,
+    notes: ControlLane<T, R>,
     shared: Arc<Shared>,
     next: u64,
     prefer_notes: bool,
 }
-pub struct Audio<T: Copy> {
-    actions: AudioLane<T>,
-    notes: AudioLane<T>,
+pub struct Audio<T: Copy, R: Copy = ()> {
+    actions: AudioLane<T, R>,
+    notes: AudioLane<T, R>,
     state: State,
     runtime: plan_bridge::RuntimeIdentity,
 }
@@ -187,6 +196,11 @@ struct State {
 
 /// Pair only with this bridge incarnation. A new device/rate bridge needs new action lanes.
 pub fn pair<T: Copy>(bridge: &plan_bridge::Control) -> (Control<T>, Audio<T>) {
+    pair_with_result(bridge)
+}
+
+/// Typed results travel back in the same reserved receipt, without a side channel.
+pub fn pair_with_result<T: Copy, R: Copy>(bridge: &plan_bridge::Control) -> (Control<T, R>, Audio<T, R>) {
     let (actions, audio_actions) = lane(CAPACITY);
     let (notes, audio_notes) = lane(NOTE_CAPACITY);
     let shared = Arc::new(Shared::default());
@@ -201,7 +215,7 @@ pub fn pair<T: Copy>(bridge: &plan_bridge::Control) -> (Control<T>, Audio<T>) {
     )
 }
 
-impl<T: Copy> Control<T> {
+impl<T: Copy, R: Copy> Control<T, R> {
     fn sequence(&mut self) -> Result<Sequence, SendError> {
         self.next = self.next.checked_add(1).ok_or(SendError::SequenceExhausted)?;
         Ok(Sequence(self.next))
@@ -263,7 +277,7 @@ impl<T: Copy> Control<T> {
     }
     /// Each class is FIFO; receipts from independent classes may arrive out of sequence.
     /// Round-robin reclamation prevents a busy transport lane starving note credits.
-    pub fn reclaim(&mut self) -> Option<Receipt<T>> {
+    pub fn reclaim(&mut self) -> Option<Receipt<T, R>> {
         self.prefer_notes = !self.prefer_notes;
         if self.prefer_notes {
             self.notes.reclaim().or_else(|| self.actions.reclaim())
@@ -280,7 +294,7 @@ impl<T: Copy> Control<T> {
     pub fn recovery_progress(&self) -> (Sequence, Sequence) {
         (Sequence(self.shared.applied_stop.load(Ordering::Acquire)), Sequence(self.shared.applied_release.load(Ordering::Acquire)))
     }
-    pub fn retire(mut self, mut audio: Audio<T>) -> Vec<Receipt<T>> {
+    pub fn retire(mut self, mut audio: Audio<T, R>) -> Vec<Receipt<T, R>> {
         let mut receipts = Vec::with_capacity(CAPACITY + NOTE_CAPACITY);
         while let Some(receipt) = self.reclaim() {
             receipts.push(receipt);
@@ -290,7 +304,7 @@ impl<T: Copy> Control<T> {
                 receipts.push(pending.receipt());
             }
             while let Ok(entry) = lane.receive.pop() {
-                receipts.push(Pending { entry, finished: None }.receipt());
+                receipts.push(Pending { entry, finished: None, handler_result: None }.receipt());
             }
         }
         receipts.sort_unstable_by_key(|r| r.sequence);
@@ -299,14 +313,14 @@ impl<T: Copy> Control<T> {
 }
 
 impl State {
-    fn urgent<T: Copy>(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>) -> bool) {
+    fn urgent<T: Copy, R: Copy>(&mut self, stop: bool, sequence: Sequence, apply: &mut impl FnMut(Event<T>) -> Option<R>) {
         if stop {
             self.seen_stop = sequence;
         } else {
             self.seen_release = self.seen_release.max(sequence);
         }
         self.faulted = true;
-        self.faulted = !apply(if stop { Event::Stop { sequence } } else { Event::AllNotesOff { sequence } });
+        self.faulted = apply(if stop { Event::Stop { sequence } } else { Event::AllNotesOff { sequence } }).is_none();
         if self.faulted {
             return;
         }
@@ -315,7 +329,7 @@ impl State {
         }
         self.shared.applied_release.store(self.seen_stop.max(self.seen_release).0, Ordering::Release);
     }
-    fn recover<T: Copy>(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>) -> bool) -> bool {
+    fn recover<T: Copy, R: Copy>(&mut self, budget: &mut Budget, apply: &mut impl FnMut(Event<T>) -> Option<R>) -> bool {
         if self.faulted {
             return true;
         }
@@ -367,13 +381,13 @@ impl State {
             None
         }
     }
-    fn service_lane<T: Copy>(
+    fn service_lane<T: Copy, R: Copy>(
         &mut self,
-        lane: &mut AudioLane<T>,
+        lane: &mut AudioLane<T, R>,
         notes: bool,
         budget: &mut Budget,
         active: PlanGeneration,
-        apply: &mut impl FnMut(Event<T>) -> bool,
+        apply: &mut impl FnMut(Event<T>) -> Option<R>,
     ) -> Service {
         let mut result = Service::default();
         if !self.recover(budget, apply) {
@@ -395,7 +409,7 @@ impl State {
                 let Ok(entry) = lane.receive.pop() else {
                     break;
                 };
-                lane.pending = Some(Pending { entry, finished: None });
+                lane.pending = Some(Pending { entry, finished: None, handler_result: None });
             }
             budget.spend(notes);
             result.examined += 1;
@@ -412,29 +426,32 @@ impl State {
                 break;
             };
             lane.pending = Some(Pending { finished: Some(Outcome::Faulted), ..pending });
-            if outcome == Outcome::Applied {
+            let handler_result = if outcome == Outcome::Applied {
                 self.faulted = true;
-                self.faulted = !apply(Event::Action { sequence: pending.entry.sequence, payload: pending.entry.payload });
-                if self.faulted {
+                let Some(value) = apply(Event::Action { sequence: pending.entry.sequence, payload: pending.entry.payload }) else {
                     continue;
-                }
+                };
+                self.faulted = false;
                 result.applied += 1;
-            }
-            lane.pending = Some(Pending { finished: Some(outcome), ..pending });
+                Some(value)
+            } else {
+                None
+            };
+            lane.pending = Some(Pending { finished: Some(outcome), handler_result, ..pending });
         }
         result.faulted = self.faulted;
         result
     }
 }
 
-impl<T: Copy> Audio<T> {
+impl<T: Copy, R: Copy> Audio<T, R> {
     /// The paired bridge supplies both generation and permanent fault state. A foreign
     /// runtime, even with equal numeric generations, permanently refuses this lane.
     pub fn service(
         &mut self,
         budget: &mut Budget,
         bridge: &mut plan_bridge::Audio,
-        apply: &mut impl FnMut(Event<T>, &mut plan_bridge::Processing<'_>),
+        apply: &mut impl FnMut(Event<T>, &mut plan_bridge::Processing<'_>) -> R,
     ) -> Service {
         if !bridge.matches_runtime(&self.runtime) || bridge.engine().faulted() {
             self.state.faulted = true;
@@ -445,10 +462,9 @@ impl<T: Copy> Audio<T> {
             // The restricted view cannot change these. Recheck at each dispatch so
             // future view extensions cannot silently invalidate prerequisite checks.
             if !bridge.matches_runtime(runtime) || bridge.engine().faulted() || bridge.engine().active().generation != active {
-                return false;
+                return None;
             }
-            apply(event, &mut bridge.processing());
-            true
+            Some(apply(event, &mut bridge.processing()))
         };
         let mut result = state.service_lane(notes, true, budget, active, &mut dispatch);
         if !result.recovery_deferred {
@@ -458,11 +474,8 @@ impl<T: Copy> Audio<T> {
     }
     // Private fixture seam; production callers cannot bypass runtime/fault validation.
     #[cfg(test)]
-    fn service_generation(&mut self, budget: &mut Budget, active: PlanGeneration, apply: &mut impl FnMut(Event<T>)) -> Service {
-        let apply = &mut |event| {
-            apply(event);
-            true
-        };
+    fn service_generation(&mut self, budget: &mut Budget, active: PlanGeneration, apply: &mut impl FnMut(Event<T>) -> R) -> Service {
+        let apply = &mut |event| Some(apply(event));
         let mut result = self.state.service_lane(&mut self.notes, true, budget, active, apply);
         if !result.recovery_deferred {
             result.combine(self.state.service_lane(&mut self.actions, false, budget, active, apply));

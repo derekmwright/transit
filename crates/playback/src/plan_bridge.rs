@@ -430,6 +430,11 @@ impl Control {
 ///     std::mem::swap(view, foreign);
 /// }
 /// ```
+/// ```compile_fail
+/// use soundcraft_playback::plan_bridge::{Audio, Processing};
+/// fn requires_owner_access<T: std::ops::DerefMut<Target = Audio>>() {}
+/// requires_owner_access::<Processing<'static>>();
+/// ```
 pub struct Processing<'a> {
     audio: &'a mut Audio,
 }
