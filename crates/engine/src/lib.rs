@@ -115,6 +115,8 @@ pub struct Engine {
     doc: Arc<Session>,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
+    /// Undo steps pushed since creation; unlike the history length it still counts at `history_limit`.
+    undo_pushes: u64,
     pub history_limit: usize,
     pub clipboard: Clipboard,
     pub transport_requests: Vec<TransportRequest>,
@@ -156,6 +158,7 @@ impl Engine {
             doc,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_pushes: 0,
             history_limit: 200,
             clipboard: Clipboard::default(),
             transport_requests: Vec::new(),
@@ -238,6 +241,10 @@ impl Engine {
     pub fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|h| h.label.as_str())
     }
+    /// How many undo steps have been pushed so far (a counter to diff around a composite edit).
+    pub fn undo_pushes(&self) -> u64 {
+        self.undo_pushes
+    }
     pub fn undo_history(&self) -> Vec<String> {
         self.undo.iter().map(|h| h.label.clone()).collect()
     }
@@ -300,6 +307,7 @@ impl Engine {
             return;
         }
         self.undo.push(HistoryEntry { label: label.to_string(), doc: before });
+        self.undo_pushes += 1;
         self.redo.clear();
         if self.undo.len() > self.history_limit {
             let excess = self.undo.len() - self.history_limit;
