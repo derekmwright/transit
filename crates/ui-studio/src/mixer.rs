@@ -872,7 +872,7 @@ fn strips(app: &mut StudioApp, ui: &mut Ui) {
         let resp = ui.interact(add.intersect(lane), ui.id().with("add_fx"), Sense::click());
         let p = ui.painter().with_clip_rect(lane);
         p.rect_filled(add, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-        p.text(add.center(), Align2::CENTER_CENTER, "+ FX Channel", FontId::proportional(11.5), TOKENS.text);
+        crate::icons::paint_labeled(&p, add, false, crate::icons::Icon::Plus, 12.0, "FX Channel", FontId::proportional(11.5), TOKENS.text);
         if resp.on_hover_text("A return channel with a send from the focused track").clicked() {
             let _ = app.add_fx_channel();
         }
@@ -937,7 +937,7 @@ fn main_out(app: &mut StudioApp, ui: &mut Ui, r: Rect) -> (StripLayout, R4) {
     let add = Rect::from_min_size(pos2(r.min.x + 6.0, r.min.y + 28.0), vec2(r.width() - 12.0, 34.0));
     let resp = ui.interact(add, ui.id().with("add_master"), Sense::click());
     p.rect_filled(add, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-    p.text(add.center(), Align2::CENTER_CENTER, "+ Master\nfader", FontId::proportional(10.5), TOKENS.text);
+    crate::icons::paint_labeled(p, add, false, crate::icons::Icon::Plus, 11.0, "Master\nfader", FontId::proportional(10.5), TOKENS.text);
     if resp.clicked() {
         let _ = app.run("track.new", json!({"kind": "master"}));
     }
@@ -1329,7 +1329,7 @@ pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Tr
     if resp.hovered() {
         p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
-    p.text(pos2(r.min.x + 4.0, r.center().y), Align2::LEFT_CENTER, "+ Send", FontId::proportional(10.5), TOKENS.text_dim);
+    crate::icons::paint_labeled(&p, r, true, crate::icons::Icon::Plus, 11.0, "Send", FontId::proportional(10.5), TOKENS.text_dim);
     let mut choices = send_targets(s, t, None);
     choices.push(("New FX Channel…".into(), NEW_FX.into()));
     push_unused_entry(s, &mut choices);

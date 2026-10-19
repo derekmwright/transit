@@ -151,7 +151,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 let auto_menu = ui.menu_button("Automation", |ui| {
                     // Follow-ups: a preference, not the document.
                     let on = app.ui.thin_after_write;
-                    let b = ui.button(if on { "✓ Thin after write" } else { "   Thin after write" });
+                    let b = check_button(ui, on, "Thin after write".into());
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Thin after write".into(), String::new(), b.rect));
                     if b.clicked() {
                         app.ui.thin_after_write = !on;
@@ -173,8 +173,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ("Devices", A::ToggleDevices, &mut u.show_devices),
                         ("Full Mixer Window", A::FullMixer, &mut u.mixer_full),
                     ] {
-                        let text = if *flag { format!("✓ {name}") } else { format!("   {name}") };
-                        let b = ui.add(egui::Button::new(text).shortcut_text(label(action)));
+                        let b = check_button_with(ui, *flag, name.into(), Some(label(action)));
                         view_items.push(crate::mixer::MenuItem::at(ui, name.into(), String::new(), b.rect));
                         if b.clicked() {
                             *flag = !*flag;
@@ -186,8 +185,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     let sub = ui.menu_button("Appearance", |ui| {
                         for a in crate::theme::Appearance::ALL {
                             let on = app.ui.appearance == a;
-                            let text = if on { format!("✓ {}", a.label()) } else { format!("   {}", a.label()) };
-                            let b = ui.button(text);
+                            let b = check_button(ui, on, a.label().into());
                             view_items.push(crate::mixer::MenuItem::at(ui, a.label().into(), "appearance".into(), b.rect));
                             if b.clicked() {
                                 app.ui.appearance = a;
@@ -217,7 +215,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     ui.separator();
                     // Slice 6: a preference, not the document.
                     let on = app.ui.count_in;
-                    let b = ui.button(if on { "✓ Count-in (1 bar)" } else { "   Count-in (1 bar)" });
+                    let b = check_button(ui, on, "Count-in (1 bar)".into());
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Count-in (1 bar)".into(), String::new(), b.rect));
                     if b.clicked() {
                         app.ui.count_in = !on;
@@ -593,4 +591,23 @@ pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
     }
     layout.open = app.ui.show_shortcuts;
     app.shortcuts_window = layout;
+}
+
+/// A menu entry that is checked when `on`: the label is indented so the check icon (Lucide Check,
+/// not a text glyph) has the gutter, and every entry's text lines up checked or not.
+fn check_button(ui: &mut egui::Ui, on: bool, text: String) -> egui::Response {
+    check_button_with(ui, on, text, None)
+}
+
+fn check_button_with(ui: &mut egui::Ui, on: bool, text: String, shortcut: Option<String>) -> egui::Response {
+    let mut b = egui::Button::new(format!("   {text}"));
+    if let Some(s) = shortcut {
+        b = b.shortcut_text(s);
+    }
+    let resp = ui.add(b);
+    if on {
+        let c = egui::pos2(resp.rect.min.x + 12.0, resp.rect.center().y);
+        crate::icons::paint(ui.painter(), c, crate::icons::Icon::Check, 12.0, ui.visuals().text_color());
+    }
+    resp
 }

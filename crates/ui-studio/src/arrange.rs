@@ -244,10 +244,10 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let add_i = Rect::from_min_size(pos2(add_a.max.x + 8.0, below), add_a.size());
     if add_a.min.y < list.max.y {
         let clip = ui.painter().with_clip_rect(list);
-        for (r, label, kind, salt) in [(add_a, "+ Audio", "audio", "add_audio"), (add_i, "+ Instrument", "instrument", "add_instrument")] {
+        for (r, label, kind, salt) in [(add_a, "Audio", "audio", "add_audio"), (add_i, "Instrument", "instrument", "add_instrument")] {
             let resp = ui.interact(r.intersect(list), ui.id().with(salt), Sense::click());
             clip.rect_filled(r, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-            clip.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), TOKENS.text);
+            crate::icons::paint_labeled(&clip, r, false, crate::icons::Icon::Plus, 12.0, label, FontId::proportional(12.0), TOKENS.text);
             if resp.clicked() {
                 let _ = app.add_track(kind);
             }

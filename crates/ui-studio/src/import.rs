@@ -408,7 +408,7 @@ pub fn paint(app: &mut StudioApp, ctx: &egui::Context) {
                     .show(ctx, |ui| ui.allocate_rect(Rect::from_min_size(x.min, x.size()), Sense::click()));
                 let resp = resp.inner;
                 let ink = if resp.hovered() { TOKENS.text } else { TOKENS.text_dim };
-                painter.text(x.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), ink);
+                crate::icons::paint(&painter, x.center(), crate::icons::Icon::Remove, 12.0, ink);
                 if resp.clicked() {
                     cancel = Some(it.id);
                 }
