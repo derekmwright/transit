@@ -482,6 +482,12 @@ struct Strip {
     layout: u16,
     /// Plan mode: the strip's meter (legacy engines keep theirs in [`MixEngine::meters`]).
     meter: StripMeter,
+    /// A panic out of this strip's processing in phase 1, caught by [`guarded`] on the thread that
+    /// rendered the strip (moving the box allocates nothing). The render re-raises the first one to
+    /// its caller; any other stays here until a later render re-raises it, or leaves with the
+    /// strip for the control side (a plan's returned tables, [`MixEngine::into_retired`]). While
+    /// it holds one the strip does not render, so nothing overwrites (drops) it.
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
@@ -786,6 +792,7 @@ impl Strip {
             id: TrackId(0),
             layout: 0,
             meter: StripMeter::default(),
+            panic: None,
         }
     }
 }
@@ -1430,18 +1437,18 @@ impl MixEngine {
         }
         let busses = std::mem::take(&mut self.busses);
         let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend };
-        // A plug-in that panics unwinds out of here. The strips go back into the engine first, so
-        // their instances can still be drained and torn down off the audio thread, not dropped
-        // by the unwind.
+        // A plug-in that panics unwinds out of here (the first strip's panic, see `guarded`). The
+        // strips go back into the engine first, so their instances (and any other strip's panic)
+        // can still be drained and torn down off the audio thread, not dropped by the unwind.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_strips(&mut work, !self.serial, |(i, st)| {
                 if let Some(t) = s.tracks.get(*i) {
-                    process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo);
+                    guarded(st, |st| process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo));
                 }
             });
         }));
         self.busses = busses;
-        if let Err(panic) = ran {
+        if let Some(panic) = ran.err().or_else(|| work.iter_mut().find_map(|(_, st)| st.panic.take())) {
             self.restore_strips(&mut work, s);
             self.work = work;
             self.order = order;
@@ -2402,6 +2409,21 @@ fn build_render_pool(promote: bool) -> Option<rayon::ThreadPool> {
         .build()
         .map_err(|e| log::warn!("mix: no render pool ({e}); the audio thread renders strips itself"))
         .ok()
+}
+
+/// Runs `f` (one phase-1 strip's processing) unless the strip holds a panic, and keeps a panic
+/// out of it in [`Strip::panic`] instead of letting it unwind. A panic that reached a render pool
+/// worker's frame would end there: Rayon re-raises one panic of a parallel call and drops the
+/// others' payloads, owners plug-ins may have made, on its workers (notes/10: every last-owner
+/// drop on the permitted thread). Caught the same way on every path, serial, pool and offline,
+/// so the render behaves the same whichever way its strips ran: it re-raises the first strip's.
+fn guarded(strip: &mut Strip, f: impl FnOnce(&mut Strip)) {
+    if strip.panic.is_some() {
+        return;
+    }
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *strip))) {
+        strip.panic = Some(panic);
+    }
 }
 
 /// Process strips, in parallel on native targets when there are enough of them.

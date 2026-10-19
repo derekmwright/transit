@@ -382,13 +382,18 @@ impl MixEngine {
         let (p1, rest) = strips.split_at_mut(phase1.min(n_strips));
         let (auxes, others) = rest.split_at_mut(aux_end.saturating_sub(phase1).min(rest.len()));
         // Phase 1: independent strips. They stay in the table; nothing to restore on an unwind.
+        // A strip's panic is kept in the strip (`guarded`); the first one unwinds out of here, the
+        // others stay in the table and go back to the control side with it.
         {
             let busses: &BusTable = busses;
             run_strips(p1, !self.serial, |st| {
                 if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                    process_strip(s, t, st, busses, &live_in, pos, frames, any_solo);
+                    guarded(st, |st| process_strip(s, t, st, busses, &live_in, pos, frames, any_solo));
                 }
             });
+        }
+        if let Some(panic) = p1.iter_mut().find_map(|st| st.panic.take()) {
+            std::panic::resume_unwind(panic);
         }
         let pdc = s.edit.delay_compensation;
         if pdc {
