@@ -12,6 +12,7 @@ const RELEASE_RESERVE: usize = 32;
 struct Pending {
     packet: Packet,
     output: u64,
+    approximate: bool,
 }
 
 pub(super) struct Inbox {
@@ -25,16 +26,36 @@ impl Inbox {
         Self { pending: vec![None; CAPACITY].into_boxed_slice(), count: 0 }
     }
 
-    pub(super) fn admit(&mut self, packet: Packet, output: u64) -> ActionResult {
+    pub(super) fn admit(&mut self, packet: Packet, mut output: u64, mut approximate: bool, sources: &sources::Audio) -> ActionResult {
         if self.count == CAPACITY || (!packet.raw.is_release() && self.count >= CAPACITY - RELEASE_RESERVE) {
             return ActionResult::MidiFull;
+        }
+        // Switching timing modes must not put an off/pedal edge before its
+        // already buffered predecessor. Scan fixed storage, and constrain only
+        // this source generation. Unrelated ports keep their own deadlines.
+        let mut latest = 0;
+        let mut latest_approximate = 0;
+        for previous in self.pending.iter().flatten().filter(|previous| {
+            previous.packet.source.port == packet.source.port
+                && previous.packet.source.generation == packet.source.generation
+                && previous.packet.raw.seq <= packet.raw.seq
+                && sources.permits_sequence(previous.packet.source.port, previous.packet.source.generation, previous.packet.raw.seq)
+        }) {
+            latest = latest.max(previous.output);
+            if previous.approximate {
+                latest_approximate = latest_approximate.max(previous.output);
+            }
+        }
+        if approximate || latest_approximate > output {
+            approximate = true;
+            output = output.max(latest);
         }
         let Some(slot) = self.pending.iter_mut().find(|slot| slot.is_none()) else {
             return ActionResult::MidiFull;
         };
-        *slot = Some(Pending { packet, output });
+        *slot = Some(Pending { packet, output, approximate });
         self.count += 1;
-        ActionResult::MidiBuffered
+        if approximate { ActionResult::MidiBufferedApproximate } else { ActionResult::MidiBuffered }
     }
 
     pub(super) fn dispatch(

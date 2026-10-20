@@ -32,9 +32,23 @@ impl InputView {
                         })
                         .collect();
                     let c = status.counts;
+                    let timing = match status.timing_quality {
+                        Some(soundcraft_playback::device_clock::Quality::Measured) => "device clock",
+                        Some(soundcraft_playback::device_clock::Quality::BackendEstimate) => "estimated device clock",
+                        _ => "approximate (callback scheduling)",
+                    };
                     let mut detail = format!(
-                        "{} open MIDI inputs · {} active routes\nEvents received: {} · queued for audio: {} · filtered: {}\nCanceled: {} · dropped: {} · refused: {} · recovered: {}",
-                        status.open_inputs, status.routes, c.offered, c.admitted, c.filtered, c.cancelled, c.shed, c.refused, c.recovered
+                        "{} open MIDI inputs · {} active routes\nEvents received: {} · queued for audio: {} · filtered: {}\nCanceled: {} · dropped: {} · refused: {} · recovered: {}\nTiming: {timing}\nApproximate events: {}",
+                        status.open_inputs,
+                        status.routes,
+                        c.offered,
+                        c.admitted,
+                        c.filtered,
+                        c.cancelled,
+                        c.shed,
+                        c.refused,
+                        c.recovered,
+                        c.approximate
                     );
                     if let Some(error) = status.error {
                         detail.push_str(&format!("\nLast MIDI error: {error}"));

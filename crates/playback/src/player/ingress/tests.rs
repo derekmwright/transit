@@ -21,6 +21,27 @@ fn input(consumer: InputConsumer, permit: sources::Permit) -> Update {
 }
 
 #[test]
+fn approximate_audio_receipts_are_counted_without_refusing_or_revoking_releases() {
+    let (control, mut plans) = bridge();
+    let (mut registry, sources) = sources::pair(&control).unwrap();
+    let token = registry.register(4).unwrap();
+    let (lane, mut audio) = action_lane::pair_with_result(&control);
+    let (send, mut worker) = pump(lane);
+    let fake = Fake::default();
+    let key = fake.add_input("Unmapped");
+    let (_handle, consumer) = fake.io().open_input(&key, InputConfig::default()).unwrap();
+    send.send(input(consumer, registry.permit(token).unwrap())).ok().unwrap();
+    fake.input_port(&key).unwrap().deliver(0, &[0x90, 60, 100, 0x80, 60, 0]);
+    worker.step();
+    audio.service(&mut action_lane::callback_scope(), &mut plans, &mut |_, _| ActionResult::MidiBufferedApproximate);
+    worker.step();
+    assert_eq!(worker.shared.approximate.load(Ordering::Relaxed), 2);
+    assert_eq!(worker.shared.refused.load(Ordering::Relaxed), 0);
+    assert!(sources.permits(4, token.generation()));
+    assert_eq!(worker.lane.note_credits(), action_lane::NOTE_CAPACITY);
+}
+
+#[test]
 fn channel_messages_decode_without_losing_channel_or_release_semantics() {
     for channel in 0..16 {
         let raw = |status, a, b, len| InputEvent { bytes: [status | channel, a, b], len, ..Default::default() };

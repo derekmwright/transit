@@ -39,6 +39,8 @@ pub struct Counters {
     pub shed: u64,
     pub recovered: u64,
     pub refused: u64,
+    /// Audio-admitted packets using approximate callback-relative timing.
+    pub approximate: u64,
 }
 
 #[derive(Default)]
@@ -52,6 +54,7 @@ struct Shared {
     shed: AtomicU64,
     recovered: AtomicU64,
     refused: AtomicU64,
+    approximate: AtomicU64,
 }
 
 /// Main's per-open cancellation identity. Capture/publish all port cutoffs
@@ -216,6 +219,7 @@ impl Worker {
             shed: s.shed.load(Ordering::Relaxed),
             recovered: s.recovered.load(Ordering::Relaxed),
             refused: s.refused.load(Ordering::Relaxed),
+            approximate: s.approximate.load(Ordering::Relaxed),
         }
     }
 }
@@ -277,6 +281,7 @@ impl Pump {
                 && matches!(
                     receipt.handler_result,
                     Some(ActionResult::MidiBuffered)
+                        | Some(ActionResult::MidiBufferedApproximate)
                         | Some(ActionResult::Event(
                             EventOutcome::Queued
                                 | EventOutcome::QueuedLate { .. }
@@ -285,6 +290,9 @@ impl Pump {
                                 | EventOutcome::Unmatched
                         ))
                 );
+            if accepted && receipt.handler_result == Some(ActionResult::MidiBufferedApproximate) {
+                self.shared.approximate.fetch_add(1, Ordering::Relaxed);
+            }
             if !accepted {
                 self.shared.refused.fetch_add(1, Ordering::Relaxed);
                 if receipt.payload.raw.is_release() {

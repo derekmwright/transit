@@ -64,11 +64,118 @@ impl Rig {
         self.lane.send_note(packet, if release { action_lane::NoteKind::Off } else { action_lane::NoteKind::On }).unwrap();
         packet
     }
-    fn render(&mut self, frames: usize) {
+    fn render(&mut self, frames: usize) -> Vec<f32> {
         let mut output = vec![0.0; frames * 2];
         let (_, heap) = measure(|| fill(&mut self.audio, &mut output));
         assert!(heap.is_zero(), "{heap:?}");
+        output
     }
+}
+
+#[test]
+fn live_notes_sound_without_a_clock_map_and_keep_their_original_arrival() {
+    for device in [44_100, 48_000, 96_000] {
+        let mut rig = Rig::new(device);
+        let mut packet = rig.packet(100, 0, false);
+        packet.lookahead = 37;
+        rig.audio.transport.clock_map = None;
+        rig.lane.send_note(packet, action_lane::NoteKind::On).unwrap();
+        let output = rig.render(256);
+        let tap = rig.audio.plans.engine().event_tap();
+        assert_eq!(tap.len(), 1, "unavailable clock must not silence live playing");
+        assert_eq!(tap[0].due, Some(RenderFrame((37 * 48_000 + u64::from(device) / 2) / u64::from(device))));
+        assert_eq!(tap[0].arrival, Arrival { host_ns: packet.raw.host_arrival_ns, sequence: 0 });
+        assert!(output.iter().any(|sample| sample.abs() > 0.000_001), "the actual instrument must sound");
+        assert_eq!(rig.lane.reclaim().unwrap().handler_result, Some(ActionResult::MidiBufferedApproximate));
+    }
+}
+
+#[test]
+fn clock_expiry_keeps_releases_working_and_recovery_restores_fitted_placement() {
+    let mut rig = Rig::new(48_000);
+    let now = rig.audio.transport.clock_now;
+    let mut off = rig.packet(20, 1, true);
+    off.lookahead = 7;
+    rig.send(10, 0, false);
+    rig.render(32);
+    assert_eq!(rig.lane.reclaim().unwrap().handler_result, Some(ActionResult::MidiBuffered));
+    rig.audio.transport.clock_now = Some(u64::MAX); // Present but expired map.
+    rig.lane.send_note(off, action_lane::NoteKind::Off).unwrap();
+    rig.render(64);
+    let tap = rig.audio.plans.engine().event_tap();
+    assert_eq!(tap.len(), 2);
+    assert_eq!(tap[1].due, Some(RenderFrame(39)));
+    assert_eq!(tap[1].arrival.sequence, 1);
+    assert_eq!(tap[1].outcome, soundcraft_mix::EventOutcome::Queued);
+    assert_eq!(rig.lane.reclaim().unwrap().handler_result, Some(ActionResult::MidiBufferedApproximate));
+    assert!(rig.registry.admits(rig.token));
+    rig.audio.transport.clock_now = now;
+    rig.send(150, 2, false);
+    rig.render(128);
+    assert_eq!(rig.audio.plans.engine().event_tap()[2].due, Some(RenderFrame(150)));
+    assert_eq!(rig.lane.reclaim().unwrap().handler_result, Some(ActionResult::MidiBuffered));
+}
+
+#[test]
+fn switching_timing_modes_cannot_reorder_buffered_note_and_pedal_edges() {
+    let mut rig = Rig::new(48_000);
+    let on = rig.packet(200, 0, false);
+    let mut pedal = rig.packet(210, 1, false);
+    pedal.message = Message::Control { cc: 64, value: 127 };
+    pedal.raw.bytes = [0xb0, 64, 127];
+    let off = rig.packet(220, 2, true);
+    assert_eq!(rig.audio.midi_inbox.admit(on, 200, false, &rig.audio.sources), ActionResult::MidiBuffered);
+    assert_eq!(rig.audio.midi_inbox.admit(pedal, 100, true, &rig.audio.sources), ActionResult::MidiBufferedApproximate);
+    assert_eq!(rig.audio.midi_inbox.admit(off, 50, false, &rig.audio.sources), ActionResult::MidiBufferedApproximate);
+    rig.render(128);
+    assert!(rig.audio.plans.engine().event_tap().is_empty());
+    rig.render(128);
+    let tap = rig.audio.plans.engine().event_tap();
+    assert_eq!(tap.len(), 3);
+    assert_eq!(tap.iter().map(|event| event.arrival.sequence).collect::<Vec<_>>(), [0, 1, 2]);
+    assert!(tap.iter().all(|event| event.due == Some(RenderFrame(200))));
+}
+
+#[test]
+fn stop_and_disconnect_cancel_approximate_events_before_dispatch() {
+    for disconnect in [false, true] {
+        let mut rig = Rig::new(48_000);
+        let mut packet = rig.packet(100, 0, false);
+        packet.lookahead = 200;
+        rig.audio.transport.clock_map = None;
+        rig.lane.send_note(packet, action_lane::NoteKind::On).unwrap();
+        rig.render(32);
+        assert_eq!(rig.audio.midi_inbox.count, 1);
+        if disconnect {
+            rig.registry.permit(rig.token).unwrap().invalidate();
+        } else {
+            rig.registry.cancel_before(rig.token, 1).unwrap();
+            rig.control.stop().unwrap();
+        }
+        rig.render(256);
+        assert!(rig.audio.plans.engine().event_tap().is_empty());
+        assert_eq!(rig.audio.midi_inbox.count, 0);
+    }
+}
+
+#[test]
+fn a_cancelled_approximate_predecessor_cannot_delay_new_input_after_stop() {
+    let mut rig = Rig::new(48_000);
+    let mut old = rig.packet(100, 0, false);
+    old.lookahead = 200;
+    let mut new = rig.packet(110, 1, false);
+    new.lookahead = 0;
+    rig.audio.transport.clock_map = None;
+    rig.lane.send_note(old, action_lane::NoteKind::On).unwrap();
+    rig.render(32);
+    rig.registry.cancel_before(rig.token, 1).unwrap();
+    rig.control.stop().unwrap();
+    rig.lane.send_note(new, action_lane::NoteKind::On).unwrap();
+    rig.render(32);
+    let tap = rig.audio.plans.engine().event_tap();
+    assert_eq!(tap.len(), 1);
+    assert_eq!(tap[0].arrival.sequence, 1);
+    assert_eq!(tap[0].due, Some(RenderFrame(32)));
 }
 
 #[test]
@@ -138,13 +245,16 @@ fn later_arrival_does_not_hide_an_earlier_deadline_on_another_route() {
 fn deferred_capacity_reserves_releases_and_unknown_releases_do_not_revoke_other_notes() {
     let mut rig = Rig::new(48_000);
     for sequence in 0..(CAPACITY - RELEASE_RESERVE) {
-        assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, sequence as u64, false), 400), ActionResult::MidiBuffered);
+        assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, sequence as u64, false), 400, false, &rig.audio.sources), ActionResult::MidiBuffered);
     }
-    assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, 900, false), 400), ActionResult::MidiFull);
+    assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, 900, false), 400, false, &rig.audio.sources), ActionResult::MidiFull);
     for sequence in 0..RELEASE_RESERVE {
-        assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, 1000 + sequence as u64, true), 400), ActionResult::MidiBuffered);
+        assert_eq!(
+            rig.audio.midi_inbox.admit(rig.packet(400, 1000 + sequence as u64, true), 400, false, &rig.audio.sources),
+            ActionResult::MidiBuffered
+        );
     }
-    assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, 1200, true), 400), ActionResult::MidiFull);
+    assert_eq!(rig.audio.midi_inbox.admit(rig.packet(400, 1200, true), 400, false, &rig.audio.sources), ActionResult::MidiFull);
     let mut rig = Rig::new(48_000);
     rig.send(10, 0, true);
     rig.render(64);

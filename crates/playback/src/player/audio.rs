@@ -35,6 +35,8 @@ pub enum ActionResult {
     MidiClock(device_clock::Unavailable),
     MidiTimeline(timeline_map::MapError),
     MidiBuffered,
+    /// Buffered using callback-relative scheduling, without a usable fitted map.
+    MidiBufferedApproximate,
     MidiFull,
     InvalidPosition,
     Timeline(timeline_map::MapError),
@@ -441,20 +443,18 @@ impl Audio {
             if !sources.permits_sequence(packet.source.port, packet.source.generation, packet.raw.seq) {
                 return ActionResult::Event(soundcraft_mix::EventOutcome::RevokedSource);
             }
-            let Some(map) = state.clock_map else {
-                return ActionResult::MidiClock(device_clock::Unavailable::WarmingUp);
-            };
-            let Some(now) = state.clock_now else {
-                return ActionResult::MidiClock(device_clock::Unavailable::Stale);
-            };
-            let output = match map.host_to_frame(state.clock_key, packet.raw.host_arrival_ns, now) {
-                Ok(frame) => frame,
-                Err(error) => return ActionResult::MidiClock(error),
-            };
+            let mapped =
+                state.clock_map.zip(state.clock_now).and_then(|(map, now)| map.host_to_frame(state.clock_key, packet.raw.host_arrival_ns, now).ok());
+            // Live playing remains available during warmup, invalid estimates or
+            // expiry. Use the consumed device ordinal at audio admission, plus
+            // the same explicit frame lookahead. This is approximate monitoring,
+            // not a replacement clock map or a recording-placement calibration.
+            // Original arrival/sequence and every source check remain intact.
+            let output = mapped.unwrap_or_else(|| state.timeline.next_output());
             let Some(output) = output.checked_add(u64::from(packet.lookahead)) else {
                 return ActionResult::MidiTimeline(timeline_map::MapError::Arithmetic);
             };
-            inbox.admit(packet, output)
+            inbox.admit(packet, output, mapped.is_none(), sources)
         });
         self.faulted |= report.faulted;
     }

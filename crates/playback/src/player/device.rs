@@ -485,9 +485,6 @@ impl Player {
         let mut status =
             midi.as_ref().map_or_else(|| super::MidiStatus { error: self.midi_error.clone(), ..Default::default() }, super::native::Native::status);
         status.timing_quality = self.clock_report().and_then(|report| report.map).map(|map| map.quality);
-        if status.routes != 0 && status.timing_quality.is_none() && status.error.is_none() {
-            status.error = Some("MIDI input is waiting for a valid audio clock".into());
-        }
         Ok(status)
     }
     pub fn idle(&self) -> Result<Vec<EditorEdit>, PlayerError> {
