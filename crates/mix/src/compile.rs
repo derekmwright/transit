@@ -3,6 +3,7 @@
 
 use super::plan::{Attach, CellKind, CellLoc, CellMove, PlanTables, PreparedPlan, Shape, SlotBinding, needs_storage};
 use super::*;
+use soundcraft_model::{IoDirection, IoMap, IoPath};
 use std::collections::{BTreeMap, HashMap};
 
 /// Whether compilation edits the active document or restores a document's saved state.
@@ -106,6 +107,10 @@ struct Desc {
     slots: Vec<((TrackId, usize), CellKind, String, usize, u16, usize, usize, u64)>,
     busses: Vec<(BusId, ChannelFormat)>,
     main: Option<ChannelFormat>,
+    /// The output paths the session routes to on this machine.
+    sinks: Vec<SinkSpec>,
+    /// The machine's input paths (monitoring resolves input names through the active plan's copy).
+    inputs: Vec<IoPath>,
 }
 
 /// What the compiler knows of one plan's tables.
@@ -194,6 +199,8 @@ pub struct PlanCompiler {
     faulted: Option<Vec<SlotBinding>>,
     /// Routing loops the last compiled session was loaded with (logged when they change).
     loops: Vec<RouteCycle>,
+    /// This machine's I/O paths: output routes by name become sinks, input names resolve here.
+    io: Arc<IoMap>,
 }
 
 /// The planned content of one slot cell.
@@ -338,7 +345,15 @@ impl PlanCompiler {
             closing: false,
             faulted: None,
             loops: Vec::new(),
+            io: Arc::new(IoMap::default()),
         }
+    }
+
+    /// The path table the next plans are made with. A changed table is a structural change of the
+    /// next plan (when a sink or an input path differs), adopted like any other; the caller
+    /// compiles the session again. Playback's buffers use the same table for the block layout.
+    pub fn set_io(&mut self, io: Arc<IoMap>) {
+        self.io = io;
     }
 
     /// The confirmed active generation.
@@ -648,6 +663,8 @@ impl PlanCompiler {
         for b in &s.busses {
             desc.busses.push((b.id, b.format));
         }
+        desc.sinks = plan_sinks(s, &self.io, self.target.out_channels).sinks;
+        desc.inputs = self.io.paths_of(IoDirection::Input).cloned().collect();
         (desc, rows, phase1, aux_end, specs, loops)
     }
 
@@ -972,6 +989,8 @@ impl PlanCompiler {
         busses.dedup_by_key(|(id, _)| *id);
         tables.busses = BusTable(busses);
         tables.main = vec![vec![0.0; block]; main_ch];
+        tables.sinks = desc.sinks.iter().map(|sp| Sink::new(sp, block)).collect();
+        tables.io = Arc::clone(&self.io);
         tables.main_meter = StripMeter { peaks: vec![0.0; main_ch], ..StripMeter::default() };
         shadow.cells = cells.len();
         tables.cells = cells.into_boxed_slice();

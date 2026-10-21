@@ -1486,13 +1486,17 @@ pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<
         .iter()
         .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
         .map(|t| {
-            let first = match &t.mixer.input {
-                soundcraft_model::Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
-            let inputs = (0..t.channels()).map(|k| first.saturating_add(k) % input_channels.max(1)).collect();
+            // The same resolution as the mix's input monitoring: a path by its name in this
+            // machine's table, else the number in the label.
+            let inputs = (0..t.channels())
+                .map(|k| {
+                    let channel = match &t.mixer.input {
+                        soundcraft_model::Route::Hardware(h) => soundcraft_model::input_channel(Some(e.io_map()), h, k),
+                        _ => k,
+                    };
+                    channel % input_channels.max(1)
+                })
+                .collect();
             let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
             let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
             (t.id, inputs, path)
@@ -1648,6 +1652,27 @@ mod record_tests {
         bytes.extend((0..frames).flat_map(|i| (i as f32 / frames as f32 - 0.5).to_le_bytes()));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn an_input_path_by_name_records_its_channel_and_old_labels_keep_their_meaning() {
+        use soundcraft_model::{ChannelFormat, IoDirection, IoMap, IoPath};
+        let dir = std::env::temp_dir().join(format!("soundcraft-takes-path-{}", std::process::id()));
+        let mut e = Engine::default();
+        let mut io = IoMap::for_device("ASIO", "x", 8, 2);
+        io.add_path(IoPath { name: "Guitar".into(), direction: IoDirection::Input, channels: vec![4], format: ChannelFormat::Mono }).unwrap();
+        io.add_path(IoPath { name: "Drum pair".into(), direction: IoDirection::Input, channels: vec![6, 7], format: ChannelFormat::Stereo }).unwrap();
+        e.set_io_map(io);
+        let gtr = armed(&mut e, "Gtr", "mono", "Guitar");
+        let drums = armed(&mut e, "Drums", "stereo", "Drum pair");
+        let old = armed(&mut e, "Old", "stereo", "In 3-4");
+        let plan = plan_takes(&e, &dir, 8);
+        let channels = |t: TrackId| plan.iter().find(|p| p.0 == t).map(|p| p.1.clone()).unwrap();
+        assert_eq!(channels(gtr), [4], "Guitar is input channel 5");
+        assert_eq!(channels(drums), [6, 7]);
+        assert_eq!(channels(old), [2, 3]);
+        // The same names, resolved by the mix: one function (`soundcraft_model::input_channel`).
+        assert_eq!(soundcraft_model::input_channel(Some(e.io_map()), "Guitar", 0), 4);
     }
 
     #[test]

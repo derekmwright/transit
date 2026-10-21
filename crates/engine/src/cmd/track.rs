@@ -198,7 +198,9 @@ pub fn specs() -> Vec<CommandSpec> {
             }
         ),
         cmd!("track.input", "Track Input", [], None, "{tracks?, input: none|bus name|hardware name}", has_selection, |e, p| route(e, p, true)),
-        cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name}", has_selection, |e, p| route(e, p, false)),
+        cmd!("track.output", "Track Output", [], None, "{tracks?, output: main|none|bus name|output path name}", has_selection, |e, p| route(
+            e, p, false
+        )),
         cmd!("track.timebase", "Track Timebase", [], None, "{tracks?, ticks: bool}", has_selection, |e, p| flag(
             e,
             p,
@@ -815,11 +817,27 @@ fn select_playlist(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({}))
 }
 
-pub(crate) fn parse_route(s: &soundcraft_model::Session, v: &str) -> Route {
+/// What `v` names. Buses and I/O paths share one namespace (ADR 0015): a bus that already exists
+/// keeps its name (a session made before paths could hold one called "Out 3-4"), else an output
+/// path of this machine's table (`io`) is `Route::Hardware(its name)`; Main's own path is Main.
+/// Anything else is left for the caller: `Route::Hardware(v)` here, which `route` turns into a new
+/// bus, or keeps as an input name.
+pub(crate) fn parse_route(s: &soundcraft_model::Session, io: &soundcraft_model::IoMap, v: &str, input: bool) -> Route {
     match v.to_ascii_lowercase().as_str() {
         "" | "none" | "no input" | "no output" => Route::None,
-        "main" | "out 1-2" | "master" => Route::Main,
-        _ => s.bus_by_name(v).map_or_else(|| Route::Hardware(v.to_string()), |b| Route::Bus(b.id)),
+        "main" | "master" => Route::Main,
+        _ => {
+            if let Some(b) = s.bus_by_name(v) {
+                return Route::Bus(b.id);
+            }
+            let want = if input { soundcraft_model::IoDirection::Input } else { soundcraft_model::IoDirection::Output };
+            match io.path(v).filter(|p| p.direction == want) {
+                Some(p) if !input && p.name.eq_ignore_ascii_case(&io.main) => Route::Main,
+                Some(p) => Route::Hardware(p.name.clone()),
+                None if v.eq_ignore_ascii_case("out 1-2") => Route::Main,
+                None => Route::Hardware(v.to_string()),
+            }
+        }
     }
 }
 
@@ -828,10 +846,20 @@ fn route(e: &mut Engine, p: &Value, input: bool) -> Result<Value> {
     let tracks = tracks_required(e, "track.route", p)?;
     let v = str_param(p, key).ok_or_else(|| bad("track.route", format!("`{key}` required")))?.to_string();
     let create_bus = bool_or(p, "create_bus", true);
+    let io = e.io_map().clone();
     let s = e.session_mut();
-    let mut r = parse_route(s, &v);
+    let mut r = parse_route(s, &io, &v, input);
+    let named = |n: &str| io.path(n).map(|p| p.direction);
+    if let Route::Hardware(name) = &r
+        && let Some(found) = named(name)
+        && (found == soundcraft_model::IoDirection::Input) != input
+    {
+        let (is, wants) = if input { ("an output", "input") } else { ("an input", "output") };
+        return Err(bad("track.route", format!("`{name}` is {is} path, not an {wants}")));
+    }
     if let Route::Hardware(name) = &r
         && create_bus
+        && named(name).is_none()
         && !name.to_ascii_lowercase().starts_with("in ")
     {
         let fmt = tracks
@@ -887,6 +915,36 @@ mod tests {
         e.execute("track.playlist_promote", &json!({"track": kick, "playlist": 0, "start": {"seconds": 10.0}, "end": {"seconds": 12.0}})).unwrap();
         assert!(!gap(&e));
         assert!(e.execute("track.playlist_promote", &json!({"track": kick, "playlist": 1, "start": 0, "end": 10})).is_err());
+    }
+
+    #[test]
+    fn output_names_resolve_to_paths_before_any_bus_is_made() {
+        use soundcraft_model::{IoMap, Route};
+        let mut e = crate::demo::demo_engine();
+        e.set_io_map(IoMap::for_device("ASIO", "TASCAM", 12, 10));
+        let kick = e.session().track_by_name("Kick").map(|t| t.id.0).unwrap();
+        let buses = e.session().busses.len();
+        let r = e.execute("track.output", &json!({"tracks": [kick], "output": "out 3-4"})).unwrap();
+        assert_eq!(r["output"], json!({"Hardware": "Out 3-4"}), "the path's own spelling, and no bus of that name");
+        assert_eq!(e.session().busses.len(), buses);
+        assert_eq!(e.session().track_by_name("Kick").unwrap().mixer.output, Route::Hardware("Out 3-4".into()));
+        // Main's own path is Main; a name that is no path still makes a bus, as before.
+        e.execute("track.output", &json!({"tracks": [kick], "output": "Out 1-2"})).unwrap();
+        assert_eq!(e.session().track_by_name("Kick").unwrap().mixer.output, Route::Main);
+        e.execute("track.output", &json!({"tracks": [kick], "output": "Fresh"})).unwrap();
+        assert_eq!(e.session().busses.len(), buses + 1);
+        // An input path is not an output, and an output path is not an input.
+        assert!(e.execute("track.output", &json!({"tracks": [kick], "output": "In 3"})).is_err());
+        assert!(e.execute("track.input", &json!({"tracks": [kick], "input": "Out 3-4"})).is_err());
+        e.execute("track.input", &json!({"tracks": [kick], "input": "in 3"})).unwrap();
+        assert_eq!(e.session().track_by_name("Kick").unwrap().mixer.input, Route::Hardware("In 3".into()));
+        // A send goes to a path too; a bus that exists keeps its name.
+        let r = e.execute("mix.send", &json!({"tracks": [kick], "bus": "Out 5-6"})).unwrap();
+        assert_eq!(r["path"], json!({"Hardware": "Out 5-6"}));
+        assert_eq!(e.session().busses.len(), buses + 1);
+        // Another machine without that path: the route stays, silent and listed.
+        e.set_io_map(IoMap::for_device("WASAPI", "Scarlett", 2, 2));
+        assert_eq!(e.unresolved_routes(), ["Out 5-6"]);
     }
 
     #[test]

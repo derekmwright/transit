@@ -11,8 +11,9 @@
 //!
 //! [`PlanCompiler`]: crate::PlanCompiler
 
-use super::{APPLIED_INLINE, BusTable, ChannelFormat, PluginSlot, SampleSource, Session, SourceAudio, Strip, StripMeter, TrackId};
+use super::{APPLIED_INLINE, BusTable, ChannelFormat, PluginSlot, SampleSource, Session, Sink, SourceAudio, Strip, StripMeter, TrackId};
 use soundcraft_dsp::Plugin;
+use soundcraft_model::IoMap;
 use std::sync::Arc;
 
 /// A plan's place in the sequence of plans an engine adopts. [`PlanGeneration::EMPTY`] is a
@@ -168,6 +169,10 @@ pub(crate) struct PlanTables {
     pub(crate) main: Vec<Vec<f32>>,
     pub(crate) main_fmt: ChannelFormat,
     pub(crate) main_meter: StripMeter,
+    /// The output paths the session routes to, as laid out for this machine (ADR 0015).
+    pub(crate) sinks: Vec<Sink>,
+    /// The machine's I/O paths the plan was made with: input routes resolve their names here.
+    pub(crate) io: Arc<IoMap>,
 }
 
 impl PlanTables {

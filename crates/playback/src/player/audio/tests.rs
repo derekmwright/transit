@@ -942,6 +942,11 @@ fn retained_payload_cleanup_cannot_escape_quiescent_endpoint_return() {
 fn click_on_device(channels: usize, io: Option<soundcraft_model::IoMap>) -> Vec<Vec<f32>> {
     let mut session = Session::default();
     session.edit.click = true;
+    play_on_device(session, channels, io)
+}
+
+/// Four 256-frame callbacks of `session` playing from 0 on a device with `channels` outputs.
+fn play_on_device(session: Session, channels: usize, io: Option<soundcraft_model::IoMap>) -> Vec<Vec<f32>> {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
@@ -1045,4 +1050,69 @@ fn a_path_table_edit_on_an_open_stream_moves_main_through_the_published_plan() {
     assert!(loud(&after, 2) && loud(&after, 3), "Main plays on device channels 2 and 3");
     assert!(!loud(&after, 0) && !loud(&after, 1), "and no longer on 0 and 1");
     control.retire(audio.plans, audio.actions);
+}
+
+/// A mono track playing a constant `level` from 0, panned hard left, to `output`.
+fn tone_track(session: &mut Session, name: &str, level: f32, output: soundcraft_model::Route) {
+    use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
+    let len = 4_096;
+    let src = SourceId(session.next_id + 10_000);
+    let buffer = soundcraft_audio_io::AudioBuffer { sample_rate: 48_000, channels: vec![vec![level; len]] };
+    session.pool.insert(src, Arc::new(SourceAudio::new(buffer)));
+    let t = session.add_track(TrackKind::Audio, ChannelFormat::Mono, Some(name));
+    let cid = session.new_clip_id();
+    let tr = session.track_mut(t).unwrap();
+    tr.playlist_mut().unwrap().clips.push(Clip::audio(cid, "tone", src, 0, 0, len as i64));
+    tr.mixer.output = output;
+}
+
+fn tone_session(tones: &[(f32, soundcraft_model::Route)]) -> Session {
+    let mut s = Session::default();
+    s.edit.click = false;
+    for (i, (level, route)) in tones.iter().enumerate() {
+        tone_track(&mut s, &format!("Tone {i}"), *level, route.clone());
+    }
+    s
+}
+
+#[test]
+fn a_track_routed_to_an_output_path_plays_on_that_paths_device_channels_only() {
+    use soundcraft_model::Route;
+    let main = click_on_device_of(&tone_session(&[(0.5, Route::Main)]), 10, None);
+    let stem = click_on_device_of(&tone_session(&[(0.5, Route::Hardware("Out 5-6".into()))]), 10, None);
+    assert!(main[0].iter().any(|v| v.abs() > 0.05), "Main carries the tone");
+    for c in [0, 1, 2, 3, 6, 7, 8, 9] {
+        assert!(stem[c].iter().all(|v| *v == 0.0), "device channel {c} stays silent");
+    }
+    // The mono tone pans like Main's: the same samples on the path's first pair as on Main's.
+    assert_eq!(stem[4], main[0]);
+    assert_eq!(stem[5], main[1]);
+}
+
+#[test]
+fn paths_that_share_a_device_channel_sum_there_and_clip_once() {
+    use soundcraft_model::{ChannelFormat, IoDirection, IoPath, Route};
+    let mut io = soundcraft_model::IoMap::for_device("test", "test", 0, 10);
+    // "Phones" is device channels 5 and 3: it shares channel 3 with "Out 3-4" (channels 2 and 3).
+    io.add_path(IoPath { name: "Phones".into(), direction: IoDirection::Output, channels: vec![5, 3], format: ChannelFormat::Stereo }).unwrap();
+    let a = tone_session(&[(0.25, Route::Hardware("Out 3-4".into()))]);
+    let b = tone_session(&[(0.125, Route::Hardware("Phones".into()))]);
+    let both = tone_session(&[(0.25, Route::Hardware("Out 3-4".into())), (0.125, Route::Hardware("Phones".into()))]);
+    let (a, b, both) =
+        (click_on_device_of(&a, 10, Some(io.clone())), click_on_device_of(&b, 10, Some(io.clone())), click_on_device_of(&both, 10, Some(io)));
+    // Channel 3 is Out 3-4's right and Phones' right (its second channel); channels 2 and 5 are theirs alone.
+    assert!(a[3].iter().any(|v| v.abs() > 0.01) && b[3].iter().any(|v| v.abs() > 0.01));
+    for i in 0..a[3].len() {
+        assert!((both[3][i] - (a[3][i] + b[3][i])).abs() < 1e-6, "sample {i} sums");
+    }
+    assert_eq!(both[2], a[2]);
+    assert_eq!(both[5], b[5]);
+    // Past full scale the sum is clamped once, per device channel.
+    let loud = tone_session(&[(0.9, Route::Hardware("Out 3-4".into())), (0.9, Route::Hardware("Out 3-4".into())), (0.9, Route::Main)]);
+    let loud = click_on_device_of(&loud, 10, None);
+    assert!(loud.iter().flatten().all(|v| v.abs() <= 1.0));
+}
+
+fn click_on_device_of(session: &Session, channels: usize, io: Option<soundcraft_model::IoMap>) -> Vec<Vec<f32>> {
+    play_on_device(session.clone(), channels, io)
 }

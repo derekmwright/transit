@@ -268,6 +268,8 @@ impl RouteScratch {
                         target = Some(route);
                     }
                 }
+                // A send to an output path (`Route::Hardware`) is a sink: nothing reads it, so it
+                // cannot close a loop and is not an edge (ADR 0015 section 6).
                 let Some(target @ Route::Bus(_)) = target else { continue };
                 let Some(to) = route_node(&self.bus_ids, target) else { continue };
                 let pre_fader = snd.as_ref().is_some_and(|x| x.pre_fader);
@@ -775,6 +777,24 @@ mod tests {
 
     fn names(s: &Session, ts: &[TrackId]) -> Vec<String> {
         ts.iter().map(|t| s.track(*t).map(|t| t.name.clone()).unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn output_paths_are_sinks_and_never_make_a_loop() {
+        let mut s = session();
+        let (a, ab) = aux(&mut s, "A");
+        let src = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Src"));
+        set_output(&mut s, src, Route::Bus(ab));
+        set_output(&mut s, a, Route::Hardware("Out 3-4".into()));
+        if let Some(t) = s.track_mut(a) {
+            t.mixer.sends[0] = Some(SendSlot::new(Route::Hardware("Out 5-6".into())));
+        }
+        // Nothing reads a path, so neither the output nor the send changes the graph or refuses an edit.
+        let routes = RouteGraph::new(&s);
+        let from_a = |e: &&RouteEdge| matches!(e.from, RouteNode::Track(i) if s.tracks.get(i).is_some_and(|t| t.id == a));
+        assert_eq!(routes.edges().iter().filter(from_a).count(), 0);
+        assert!(would_create_cycle(&s, &RouteChange::Output { track: src, route: Route::Hardware("Out 1-2".into()) }).is_none());
+        assert!(would_create_cycle(&s, &RouteChange::Send { track: a, slot: 1, route: Route::Hardware("Out 3-4".into()) }).is_none());
     }
 
     #[test]

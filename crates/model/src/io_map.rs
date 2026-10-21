@@ -86,6 +86,32 @@ fn label(prefix: &str, first: u16, width: u16) -> String {
     if width <= 1 { format!("{prefix} {}", first + 1) } else { format!("{prefix} {}-{}", first + 1, first + width) }
 }
 
+impl IoPath {
+    /// The device channel strip channel `k` of a route through this path uses: the path's own
+    /// channels in order, then (a strip wider than the path) the channels after the last one,
+    /// which is what "In 3" on a stereo track always meant.
+    pub fn source_channel(&self, k: usize) -> usize {
+        match self.channels.get(k) {
+            Some(&c) => usize::from(c),
+            None => self.channels.last().map_or(k, |&l| usize::from(l).saturating_add(k + 1 - self.channels.len())),
+        }
+    }
+}
+
+/// The device input channel (not yet wrapped to the channels the device opened) strip channel `k`
+/// listens to or records for an input route named `name`. One function for the mix's monitoring
+/// and the recorder, so they cannot disagree (ADR 0015 section 1.4). A name in `io`'s table
+/// resolves through it, so a path renamed "Guitar" on channel 5 is channel 5. A name that is not
+/// there (an old session, or one made on another machine) keeps the label meaning it always had:
+/// the number in "In 3" or "In 3-4" is the first channel.
+pub fn input_channel(io: Option<&IoMap>, name: &str, k: usize) -> usize {
+    if let Some(p) = io.and_then(|m| m.path(name)).filter(|p| p.direction == IoDirection::Input) {
+        return p.source_channel(k);
+    }
+    let first = name.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1));
+    first.saturating_add(k)
+}
+
 impl IoMap {
     /// The default table for an opened device (counts capped at [`MAX_DEVICE_CHANNELS`]): outputs
     /// "Out 1-2" (Main) and one stereo path per remaining pair, a lone trailing channel mono;
@@ -166,7 +192,9 @@ impl IoMap {
         Ok(())
     }
 
-    /// Rename a path; a session keeps its old route names (the caller renames them).
+    /// Rename a path. Sessions refer to paths by name and keep the names they have: nothing here or
+    /// in the engine rewrites a `Route::Hardware`, so a route left naming the old name is an
+    /// unresolved route (silent, listed by the engine), not a silent change of destination.
     pub fn rename_path(&mut self, name: &str, to: &str) -> Result<(), IoError> {
         let to = to.trim();
         if to.is_empty() {
@@ -371,6 +399,24 @@ mod tests {
         moved.set_main("Out 3-4").unwrap();
         moved.reconcile(0, 2);
         assert_eq!(moved.main, "Out 1-2");
+    }
+
+    #[test]
+    fn input_names_resolve_through_the_table_and_fall_back_to_the_label() {
+        let mut m = IoMap::for_device("ASIO", "x", 8, 2);
+        m.add_path(IoPath { name: "Guitar".into(), direction: IoDirection::Input, channels: vec![4], format: ChannelFormat::Mono }).unwrap();
+        m.add_path(IoPath { name: "Pair".into(), direction: IoDirection::Input, channels: vec![6, 1], format: ChannelFormat::Stereo }).unwrap();
+        assert_eq!(input_channel(Some(&m), "Guitar", 0), 4);
+        assert_eq!(input_channel(Some(&m), "guitar", 1), 5, "a stereo strip on a mono path continues after it, as In 3 always did");
+        assert_eq!((input_channel(Some(&m), "Pair", 0), input_channel(Some(&m), "Pair", 1)), (6, 1));
+        assert_eq!(input_channel(Some(&m), "In 3", 0), 2);
+        assert_eq!(input_channel(Some(&m), "In 3-4", 1), 3);
+        // Not in the table: the number in the label, as before.
+        assert_eq!(input_channel(Some(&m), "In 12", 0), 11);
+        assert_eq!(input_channel(None, "In 3-4", 1), 3);
+        assert_eq!(input_channel(None, "Guitar", 0), 0);
+        // An output path is not an input.
+        assert_eq!(input_channel(Some(&m), "Out 1-2", 0), 0);
     }
 
     #[test]

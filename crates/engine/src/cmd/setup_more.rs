@@ -233,7 +233,8 @@ fn io_state(s: &Session) -> Value {
 fn io_map_state(e: &Engine) -> Value {
     let io = e.io_map();
     let overlaps: Vec<Value> = io.overlaps().into_iter().map(|(a, b, c)| json!({"a": a, "b": b, "channel": c})).collect();
-    json!({"io": io, "overlaps": overlaps})
+    let unresolved = e.unresolved_routes();
+    json!({"io": io, "overlaps": overlaps, "unresolved": unresolved})
 }
 
 /// `setup.io_map`: the machine's I/O paths. Not a session edit (the table is per machine, kept by
@@ -298,11 +299,16 @@ fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
         Some(f) => ChannelFormat::from_id(f).ok_or_else(|| bad(id, format!("unknown format `{f}`")))?,
         None => ChannelFormat::Stereo,
     };
+    let paths = e.io_map().clone();
     let s = e.session_mut();
     match action {
         "create_bus" => {
             if s.bus_by_name(&name).is_some() {
                 return Err(bad(id, format!("a bus named `{name}` exists")));
+            }
+            // Buses and I/O paths share one namespace, so a route's name means one thing.
+            if paths.path(&name).is_some() {
+                return Err(bad(id, format!("`{name}` is an I/O path of this machine; a bus needs another name")));
             }
             s.add_bus(&name, format);
         }
@@ -310,6 +316,9 @@ fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
             let to = new_name.ok_or_else(|| bad(id, "`new_name` required"))?;
             if s.bus_by_name(&to).is_some() {
                 return Err(bad(id, format!("a bus named `{to}` exists")));
+            }
+            if paths.path(&to).is_some() {
+                return Err(bad(id, format!("`{to}` is an I/O path of this machine; a bus needs another name")));
             }
             let b = s.busses.iter_mut().find(|b| b.name.eq_ignore_ascii_case(&name)).ok_or_else(|| bad(id, format!("no bus `{name}`")))?;
             b.name = to;
@@ -666,6 +675,28 @@ mod tests {
             assert!(matches!(e.execute("setup.io_map", &params), Err(crate::EngineError::BadParams(..))), "{params}");
         }
         assert_eq!((e.io_map().clone(), e.io_revision()), before);
+    }
+
+    #[test]
+    fn a_bus_cannot_take_a_path_name_and_the_list_names_unresolved_routes() {
+        let mut e = Engine::default();
+        e.set_io_map(soundcraft_model::IoMap::for_device("ASIO", "x", 2, 4));
+        assert!(matches!(e.execute("setup.io", &json!({"action": "create_bus", "name": "out 3-4"})), Err(crate::EngineError::BadParams(..))));
+        assert!(matches!(e.execute("setup.io", &json!({"action": "create_bus", "name": "In 1"})), Err(crate::EngineError::BadParams(..))));
+        e.execute("setup.io", &json!({"action": "create_bus", "name": "Drums"})).unwrap();
+        assert!(matches!(
+            e.execute("setup.io", &json!({"action": "rename_bus", "name": "Drums", "new_name": "Out 1-2"})),
+            Err(crate::EngineError::BadParams(..))
+        ));
+        let t = e.execute("track.new", &json!({"name": "Cue"})).unwrap()["tracks"][0].as_u64().unwrap();
+        e.session_mut().track_mut(soundcraft_model::TrackId(t)).unwrap().mixer.output = Route::Hardware("Headphones".into());
+        assert_eq!(e.execute("setup.io_map", &json!({})).unwrap()["unresolved"], json!(["Headphones"]));
+        // Renaming a path leaves the session's routes alone: the old name is then unresolved.
+        e.session_mut().track_mut(soundcraft_model::TrackId(t)).unwrap().mixer.output = Route::Hardware("Out 3-4".into());
+        assert_eq!(e.execute("setup.io_map", &json!({})).unwrap()["unresolved"], json!([]));
+        e.execute("setup.io_map", &json!({"action": "rename_path", "name": "Out 3-4", "new_name": "Wedge"})).unwrap();
+        assert_eq!(e.session().track(soundcraft_model::TrackId(t)).unwrap().mixer.output, Route::Hardware("Out 3-4".into()));
+        assert_eq!(e.execute("setup.io_map", &json!({})).unwrap()["unresolved"], json!(["Out 3-4"]));
     }
 
     #[test]

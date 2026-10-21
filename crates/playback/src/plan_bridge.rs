@@ -122,6 +122,8 @@ struct Buffers {
     /// The device channel each main channel plays on (the `IoMap`'s Main path). Every other
     /// device channel is written as silence by the callback.
     main_dest: Vec<u16>,
+    /// The device channel of each sink channel, which follow Main's in `output` (ADR 0015).
+    sink_dest: Vec<u16>,
     input_storage: Vec<Vec<f32>>,
     input: Option<Arc<InputRing>>,
     meters: Arc<MeterBank>,
@@ -133,10 +135,13 @@ struct Buffers {
 impl Buffers {
     fn prepare(session: &Session, input: Option<Arc<InputRing>>, target: RenderTarget, io: &IoMap, limits: PlanLimits) -> Result<Self, CompileError> {
         let channels = main_channels(session);
+        let sinks = soundcraft_mix::plan_sinks(session, io, target.out_channels);
+        let sink_channels = sinks.channels();
         let input_channels = input.as_ref().map_or(0, |r| r.channels.load(Ordering::Relaxed).clamp(1, u16::MAX as usize));
         let block = target.max_block.clamp(16, 16_384) as usize;
         let bytes = channels
             .checked_add(input_channels)
+            .and_then(|n| n.checked_add(sink_channels))
             .and_then(|n| {
                 block
                     .checked_mul(size_of::<f32>())
@@ -160,8 +165,9 @@ impl Buffers {
             return Err(CompileError::ResourceLimit { what: "playback meter tracks", need: session.tracks.len(), limit: usize::from(limits.tracks) });
         }
         Ok(Self {
-            output: vec![vec![0.0; block]; channels],
+            output: vec![vec![0.0; block]; channels + sink_channels],
             main_dest: main_destination(io, channels, usize::from(target.out_channels)),
+            sink_dest: sinks.destinations(),
             input_storage: vec![vec![0.0; block]; input_channels],
             monitoring: session.tracks.iter().any(|t| {
                 (t.mixer.input_monitor || t.mixer.record_arm) && (input.is_some() || matches!(t.kind, TrackKind::Instrument | TrackKind::Midi))
@@ -300,6 +306,7 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
     let buffers = Buffers {
         output: Vec::new(),
         main_dest: Vec::new(),
+        sink_dest: Vec::new(),
         input_storage: Vec::new(),
         input: None,
         meters: Arc::clone(&meters),
@@ -392,6 +399,8 @@ impl Control {
         }
         let next = self.issued.checked_next().ok_or(CompileError::GenerationExhausted)?;
         let buffers = Buffers::prepare(&request.session, request.input, self.target, &self.io, self.limits)?;
+        // The compiler lays the sinks out from the same table, so the block layout agrees.
+        self.compiler.set_io(Arc::clone(&self.io));
         let plan = self.compiler.compile_with_mode(request.session, self.compiler.active(), next, request.mode, make)?;
         self.issued = next;
         self.pending_meters = Some(Arc::clone(&buffers.meters));
@@ -646,6 +655,10 @@ impl Audio {
     /// The device channel of each main channel; the callback leaves every other channel at zero.
     pub fn main_dest(&self) -> &[u16] {
         &self.buffers.main_dest
+    }
+    /// The device channel of each output-sink channel; they follow Main's in [`Self::output`].
+    pub fn sink_dest(&self) -> &[u16] {
+        &self.buffers.sink_dest
     }
     pub fn fold(&self) -> &[(f32, f32); MAX_CHANNELS] {
         &self.buffers.fold

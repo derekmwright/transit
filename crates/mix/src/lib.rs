@@ -87,6 +87,7 @@ mod events;
 mod plan;
 #[cfg(test)]
 mod plan_tests;
+mod sink;
 
 pub use compile::{CompileError, CompileMode, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
 pub use events::{
@@ -97,6 +98,8 @@ pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
     RenderTarget, Retired, SlotBinding, SlotGen,
 };
+pub use sink::{MAX_SINK_CHANNELS, SinkPlan, SinkSpec, plan_sinks, unresolved_routes};
+use sink::{Sink, sink_index};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -1492,8 +1495,14 @@ impl MixEngine {
             }
         }
         let busses = std::mem::take(&mut self.busses);
-        let live_in =
-            LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame: 0 };
+        let live_in = LiveInput {
+            input: &self.input,
+            monitor_only: self.monitor_only,
+            recording: self.recording,
+            no_suspend: self.no_suspend,
+            frame: 0,
+            io: None,
+        };
         // A plug-in that panics unwinds out of here (the first strip's panic, see `guarded`). The
         // strips go back into the engine first, so their instances (and any other strip's panic)
         // can still be drained and torn down off the audio thread, not dropped by the unwind.
@@ -1537,13 +1546,13 @@ impl MixEngine {
         let mut main_arrival = 0usize;
         for (at, (i, st)) in work.iter_mut().enumerate() {
             if let Some(t) = s.tracks.get(*i) {
-                pdc_visit(t, st, at, true, &mut self.busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, true, &mut self.busses, &mut [], &mut main_arrival, pdc);
             }
         }
         let auxes = order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| is_aux(t));
         for (at, t) in (work.len()..).zip(auxes) {
             if let Some(st) = self.strips.get_mut(&t.id) {
-                pdc_visit(t, st, at, live(t), &mut self.busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, live(t), &mut self.busses, &mut [], &mut main_arrival, pdc);
             }
         }
         self.main_arrival = main_arrival;
@@ -1562,8 +1571,14 @@ impl MixEngine {
             if st.scratch.len() < self.max_block {
                 st.scratch.resize(self.max_block, 0.0);
             }
-            let live_in =
-                LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame: 0 };
+            let live_in = LiveInput {
+                input: &self.input,
+                monitor_only: self.monitor_only,
+                recording: self.recording,
+                no_suspend: self.no_suspend,
+                frame: 0,
+                io: None,
+            };
             // As in phase 1: a panicking plug-in leaves its strip in the engine, not dropped by the unwind.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
@@ -1638,8 +1653,14 @@ impl MixEngine {
         let m = self.meters.entry(t.id).or_default();
         m.measure(&strip.buf, frames, strip.gr);
         m.plugin_failures = strip.failures;
-        let mix =
-            MixOut { busses: &mut self.busses, main: &mut self.main, main_fmt: self.main_fmt, law: self.pan_law, main_arrival: self.main_arrival };
+        let mix = MixOut {
+            busses: &mut self.busses,
+            main: &mut self.main,
+            main_fmt: self.main_fmt,
+            sinks: &mut [],
+            law: self.pan_law,
+            main_arrival: self.main_arrival,
+        };
         let need = route_into(t, strip, pos, frames, mix);
         if need > 0 {
             let st = &mut self.legacy_status;
@@ -1655,6 +1676,9 @@ struct MixOut<'a, B: Busses + ?Sized> {
     busses: &'a mut B,
     main: &'a mut [Vec<f32>],
     main_fmt: ChannelFormat,
+    /// The output paths plan mode renders into; none in a legacy engine, where a route to a path
+    /// is dropped.
+    sinks: &'a mut [Sink],
     law: PanLaw,
     /// The slowest path into the main mix this block ([`pdc_visit`]).
     main_arrival: usize,
@@ -1667,7 +1691,16 @@ struct MixOut<'a, B: Busses + ?Sized> {
 /// feedback, from an older session) does not count: [`route_into`] drops that edge. An inactive
 /// aux (`live` false) still marks the bus it reads, so the edges dropped are exactly the route
 /// graph's [`RouteScratch::dropped`] (render order is the graph's, inactive tracks included).
-fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut B, main_arrival: &mut usize, pdc: bool) {
+fn pdc_visit<B: Busses + ?Sized>(
+    t: &Track,
+    st: &mut Strip,
+    at: usize,
+    live: bool,
+    busses: &mut B,
+    sinks: &mut [Sink],
+    main_arrival: &mut usize,
+    pdc: bool,
+) {
     let mut arrive = 0usize;
     if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
         && let Route::Bus(b) = &t.mixer.input
@@ -1689,11 +1722,17 @@ fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, live: boo
                 x.arrival = x.arrival.max(out);
             }
         }
+        // An output path is a sink with no readers: it waits for its slowest source too.
+        Route::Hardware(h) => {
+            if let Some(x) = sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
+                x.arrival = x.arrival.max(out);
+            }
+        }
         _ => {}
     };
     feed(&t.mixer.output);
     for snd in t.mixer.sends.iter().flatten() {
-        if matches!(snd.target, Route::Bus(_)) {
+        if matches!(snd.target, Route::Bus(_) | Route::Hardware(_)) {
             feed(&snd.target);
         }
     }
@@ -1706,13 +1745,14 @@ fn pdc_visit<B: Busses + ?Sized>(t: &Track, st: &mut Strip, at: usize, live: boo
 /// this block is a routing loop's feedback and is dropped. Returns the longest delay a plan-mode
 /// line had to clamp (0: none).
 fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) -> usize {
-    let MixOut { busses, main, main_fmt, law, main_arrival } = out;
+    let MixOut { busses, main, main_fmt, sinks, law, main_arrival } = out;
     let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, .. } = strip;
     let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
     // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
-    let delay_of = |busses: &B, r: &Route| match r {
+    let delay_of = |busses: &B, sinks: &[Sink], r: &Route| match r {
         Route::Main => Some(main_arrival.saturating_sub(o)),
         Route::Bus(b) => busses.bus(*b).filter(|x| at < x.reader).map(|x| x.arrival.saturating_sub(o)),
+        Route::Hardware(h) => sink_index(sinks, h).and_then(|k| sinks.get(k)).map(|x| x.arrival.saturating_sub(o)),
         _ => None,
     };
     // Edge 0 is the output, edge 1 + i send i. Each line is written when any edge asks it for a
@@ -1721,7 +1761,7 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
     let (mut post, mut pre_max, mut held_post, mut held_pre) = (0usize, 0usize, held(0), 0usize);
     for (i, snd) in t.mixer.sends.iter().enumerate() {
         let Some(snd) = snd else { continue };
-        if let (Route::Bus(_), Some(d)) = (&snd.target, delay_of(busses, &snd.target)) {
+        if let (Route::Bus(_) | Route::Hardware(_), Some(d)) = (&snd.target, delay_of(busses, sinks, &snd.target)) {
             if snd.pre_fader {
                 pre_max = pre_max.max(d);
                 held_pre = held_pre.max(held(i + 1));
@@ -1731,7 +1771,7 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
             }
         }
     }
-    if let Some(d) = delay_of(busses, &t.mixer.output) {
+    if let Some(d) = delay_of(busses, sinks, &t.mixer.output) {
         post = post.max(d);
     }
     let clamped = tap.fit(post).max(tap_pre.fit(pre_max));
@@ -1759,8 +1799,10 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
     let src_fmt = strip_format(t, buf.len());
     for (i, snd) in t.mixer.sends.iter().enumerate() {
         let Some(snd) = snd else { continue };
-        let Route::Bus(b) = &snd.target else { continue };
-        let Some(d) = delay_of(busses, &snd.target) else { continue };
+        if !matches!(snd.target, Route::Bus(_) | Route::Hardware(_)) {
+            continue;
+        }
+        let Some(d) = delay_of(busses, sinks, &snd.target) else { continue };
         let read = plan(i + 1, d, snd.pre_fader);
         if snd.mute || muted {
             continue;
@@ -1782,14 +1824,24 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
                 outbuf
             }
         };
-        let Some(dst) = busses.bus_mut(*b) else { continue };
+        let (dst_buf, dst_fmt): (&mut Vec<Vec<f32>>, ChannelFormat) = match &snd.target {
+            Route::Bus(b) => match busses.bus_mut(*b) {
+                Some(d) => (&mut d.buf, d.fmt),
+                None => continue,
+            },
+            Route::Hardware(h) => match sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
+                Some(d) => (&mut d.buf, d.fmt),
+                None => continue,
+            },
+            _ => continue,
+        };
         // Mono sends use the send's own pan; stereo sends go straight to L/R.
         let stereo = if src.len() == 1 { [snd.pan, 0.0] } else { [-1.0, 1.0] };
         let surround = snd.surround.as_ref().or(if snd.follow_main_pan { t.mixer.surround.as_ref() } else { None });
-        let m = build_matrix(src_fmt, src.len(), dst.fmt, dst.buf.len(), &PanSpec { stereo, surround }, law);
-        apply_matrix(src, frames, &mut dst.buf, &m, gain);
+        let m = build_matrix(src_fmt, src.len(), dst_fmt, dst_buf.len(), &PanSpec { stereo, surround }, law);
+        apply_matrix(src, frames, dst_buf, &m, gain);
     }
-    let Some(d) = delay_of(busses, &t.mixer.output) else { return clamped };
+    let Some(d) = delay_of(busses, sinks, &t.mixer.output) else { return clamped };
     let src: &[Vec<f32>] = match plan(0, d, false) {
         None => buf,
         Some((from, to, done)) => {
@@ -1800,6 +1852,10 @@ fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, fr
     let (dst, dst_fmt): (&mut [Vec<f32>], ChannelFormat) = match &t.mixer.output {
         Route::Main => (main, main_fmt),
         Route::Bus(b) => match busses.bus_mut(*b) {
+            Some(d) => (&mut d.buf, d.fmt),
+            None => return clamped,
+        },
+        Route::Hardware(h) => match sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
             Some(d) => (&mut d.buf, d.fmt),
             None => return clamped,
         },
@@ -1827,6 +1883,9 @@ struct LiveInput<'a> {
     no_suspend: bool,
     /// The block's first render frame (plan mode: instrument events are due against it).
     frame: u64,
+    /// The machine's I/O paths, which resolve an input route's name (plan mode; a legacy engine
+    /// has none and reads the number out of the label).
+    io: Option<&'a soundcraft_model::IoMap>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1847,15 +1906,13 @@ fn process_strip<B: Busses + ?Sized>(
     match t.kind {
         TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
             // Input monitoring: the track hears its hardware input instead of its clips.
-            let first = match &t.mixer.input {
-                Route::Hardware(h) => {
-                    h.trim_start_matches("In ").split(['-', ' ']).next().and_then(|n| n.parse::<usize>().ok()).map_or(0, |n| n.saturating_sub(1))
-                }
-                _ => 0,
-            };
             let n_in = live.input.len().max(1);
             for (k, dst) in strip.buf.iter_mut().enumerate() {
-                if let Some(src) = live.input.get((first + k) % n_in) {
+                let channel = match &t.mixer.input {
+                    Route::Hardware(h) => soundcraft_model::input_channel(live.io, h, k),
+                    _ => k,
+                };
+                if let Some(src) = live.input.get(channel % n_in) {
                     for (d, x) in dst.iter_mut().zip(src.iter()).take(frames) {
                         *d = *x;
                     }
@@ -2622,6 +2679,9 @@ fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)
     bus.clear();
     bus.resize(s.busses.len(), (0, false));
     let mut need = 0usize;
+    // Every output path is padded to the one device latency Main has, master inserts included
+    // (ADR 0015 section 6), so a path's delay can exceed any source's own by that much.
+    let mut to_sink = false;
     for &i in route.order() {
         let Some(t) = s.tracks.get(i).filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) else { continue };
         let mut arrive = 0;
@@ -2642,7 +2702,12 @@ fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)
             {
                 x.0 = x.0.max(out);
             }
+            to_sink |= matches!(r, Route::Hardware(_));
         }
+    }
+    if to_sink {
+        let masters = s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive);
+        need = need.saturating_add(masters.fold(0usize, |a, t| a.saturating_add(latency(t))));
     }
     need.min(MAX_LATENCY)
 }

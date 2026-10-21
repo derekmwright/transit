@@ -297,6 +297,40 @@ fn bus_add_and_delete_and_a_main_format_change_allocate_nothing() {
 }
 
 #[test]
+fn output_path_routes_allocate_nothing_when_added_moved_and_removed() {
+    use soundcraft_model::{IoMap, SendSlot};
+    let (mut s, t, _) = session_with_clip();
+    let mut rig = Rig::new(&s);
+    rig.compiler.set_io(Arc::new(IoMap::for_device("test", "test", 2, 10)));
+    rig.out = vec![vec![0.0; BLOCK]; 6];
+    s.track_mut(t).unwrap().mixer.output = Route::Hardware("Out 3-4".into());
+    no_cost("output to a path", &rig.edit(&s));
+    assert!(rig.out[2].iter().any(|x| *x != 0.0), "the path carries the track");
+    assert!(rig.out[0].iter().all(|x| *x == 0.0), "and Main does not");
+    s.track_mut(t).unwrap().mixer.sends[0] = Some(SendSlot {
+        target: Route::Hardware("Out 5-6".into()),
+        level_db: 0.0,
+        pan: 0.0,
+        mute: false,
+        pre_fader: true,
+        follow_main_pan: true,
+        surround: None,
+    });
+    no_cost("a pre-fader send to a second path", &rig.edit(&s));
+    assert!(rig.out[4].iter().any(|x| *x != 0.0));
+    s.track_mut(t).unwrap().mixer.output = Route::Hardware("Missing".into());
+    no_cost("output to a name the table lacks", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.output = Route::Main;
+    s.track_mut(t).unwrap().mixer.sends[0] = None;
+    no_cost("back to Main", &rig.edit(&s));
+    // The table itself changing is a plan like any other.
+    s.track_mut(t).unwrap().mixer.output = Route::Hardware("Out 3-4".into());
+    no_cost("path again", &rig.edit(&s));
+    rig.compiler.set_io(Arc::new(IoMap::for_device("test", "test", 2, 2)));
+    no_cost("the path vanishes with the table", &rig.edit(&s));
+}
+
+#[test]
 fn clip_effects_on_and_off_and_forty_chains_allocate_nothing() {
     let (mut s, t, first) = session_with_clip();
     let mut rig = Rig::new(&s);

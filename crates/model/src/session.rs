@@ -824,4 +824,28 @@ mod tests {
         let text: serde_json::Value = serde_json::from_str(&saved).unwrap();
         assert_eq!(text["outputs"], stored["outputs"], "the file keeps the field in its current shape");
     }
+
+    /// ADR 0015 slice (b) adds no field to the session: a route to an output path is the
+    /// `Hardware(name)` variant the file always had, so a session this build saves reads in the
+    /// previous format, and a file with such a route loads and saves unchanged.
+    #[test]
+    fn routes_to_output_paths_keep_the_previous_file_shape() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("Cue"));
+        let tr = s.track_mut(t).unwrap();
+        tr.mixer.output = crate::Route::Hardware("Out 3-4".into());
+        tr.mixer.sends[0] = Some(crate::SendSlot::new(crate::Route::Hardware("Headphones".into())));
+        let saved = s.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        let mixer = &value["tracks"][0]["mixer"];
+        assert_eq!(mixer["output"], serde_json::json!({"Hardware": "Out 3-4"}));
+        assert_eq!(mixer["sends"][0]["target"], serde_json::json!({"Hardware": "Headphones"}));
+        assert!(value.get("outputs").is_some(), "Session::outputs stays in the file");
+        let again = Session::from_json(&saved).unwrap();
+        assert_eq!(again.track(t).unwrap().mixer.output, crate::Route::Hardware("Out 3-4".into()));
+        assert_eq!(again.to_json().unwrap(), saved);
+        // A file from before paths, with the same variant in an output, loads as it always did.
+        let old = saved.replace("Out 3-4", "Out 7-8");
+        assert_eq!(Session::from_json(&old).unwrap().track(t).unwrap().mixer.output, crate::Route::Hardware("Out 7-8".into()));
+    }
 }

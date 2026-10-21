@@ -21,7 +21,7 @@ mod track;
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
-pub use io_map::{IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH};
+pub use io_map::{IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH, input_channel};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use midi_input::{MidiInput, MidiPort};
 pub use mixer::{

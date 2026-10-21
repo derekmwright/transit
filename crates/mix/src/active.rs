@@ -378,7 +378,7 @@ impl MixEngine {
         };
         let ActivePlan { session, tables, status, .. } = plan;
         let s: &Session = session;
-        let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, .. } = tables;
+        let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, sinks, io, .. } = tables;
         let (phase1, aux_end) = (*phase1, *aux_end);
         let main_fmt = *main_fmt;
         // A seek or loop wrap releases what the clips play; live sources keep sounding (F10).
@@ -402,12 +402,21 @@ impl MixEngine {
         for c in main.iter_mut() {
             c.iter_mut().take(frames).for_each(|x| *x = 0.0);
         }
+        for k in sinks.iter_mut() {
+            k.clear(frames);
+        }
         let any_solo = s.tracks.iter().any(|t| t.mixer.solo && !t.inactive);
         let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
         let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
         let track = |st: &Strip| s.tracks.get(usize::from(st.track));
-        let live_in =
-            LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording, no_suspend: self.no_suspend, frame };
+        let live_in = LiveInput {
+            input: &self.input,
+            monitor_only: self.monitor_only,
+            recording: self.recording,
+            no_suspend: self.no_suspend,
+            frame,
+            io: Some(&**io),
+        };
         let n_strips = strips.len();
         let (p1, rest) = strips.split_at_mut(phase1.min(n_strips));
         let (auxes, others) = rest.split_at_mut(aux_end.saturating_sub(phase1).min(rest.len()));
@@ -446,17 +455,26 @@ impl MixEngine {
         let mut main_arrival = 0usize;
         for (at, st) in p1.iter_mut().enumerate() {
             if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                pdc_visit(t, st, at, true, busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, at, true, busses, sinks, &mut main_arrival, pdc);
             }
         }
         // Inactive auxes still mark the bus they read (see `pdc_visit`).
         for (k, st) in auxes.iter_mut().enumerate() {
             if let Some(t) = track(st) {
-                pdc_visit(t, st, phase1.saturating_add(k), live(t), busses, &mut main_arrival, pdc);
+                pdc_visit(t, st, phase1.saturating_add(k), live(t), busses, sinks, &mut main_arrival, pdc);
             }
         }
+        // One device latency for every sink (ADR 0015 section 6): Main's (its sources' arrival plus
+        // the master inserts') or the slowest path's, whichever is longer. Each sink is padded to
+        // it, Main to it less its inserts, so stems and cue mixes leave the device with Main. With
+        // no sinks this is Main's own arrival, as before.
+        let device = sinks.iter().fold(main_arrival.saturating_add(lmax_m), |l, k| l.max(k.arrival));
+        main_arrival = device.saturating_sub(lmax_m);
+        for k in sinks.iter_mut() {
+            k.arrival = device;
+        }
         self.main_arrival = main_arrival;
-        self.latency = main_arrival.saturating_add(lmax_m);
+        self.latency = device;
         let law = self.pan_law;
         let mut exceeded = |need: usize, st: &Strip| {
             if need > 0 {
@@ -469,7 +487,7 @@ impl MixEngine {
             let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) else { continue };
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
-            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law, main_arrival });
+            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, sinks, law, main_arrival });
             exceeded(need, st);
         }
         // Phase 2: auxes in dependency order (they read busses).
@@ -478,7 +496,7 @@ impl MixEngine {
             process_strip(s, t, st, &*busses, &live_in, pos, frames, any_solo);
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
-            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, law, main_arrival });
+            let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, sinks, law, main_arrival });
             exceeded(need, st);
         }
         // Master faders process the main mix, in track order.
@@ -499,6 +517,19 @@ impl MixEngine {
                 if let Some(d) = o.get_mut(i) {
                     *d = if v.is_finite() { v } else { 0.0 };
                 }
+            }
+        }
+        // The sinks' channels follow Main's, in table order: the device callback plays each on its
+        // path's device channels (`plan_sinks` gives the layout both sides share).
+        let mut at = main.len();
+        for k in sinks.iter() {
+            for src in &k.buf {
+                if let Some(o) = out.get_mut(at) {
+                    for (d, v) in o.iter_mut().zip(src.iter()).take(frames) {
+                        *d = if v.is_finite() { *v } else { 0.0 };
+                    }
+                }
+                at += 1;
             }
         }
         main_meter.measure(main, frames, 0.0);

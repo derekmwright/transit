@@ -622,25 +622,40 @@ impl Audio {
                 a + (b - a) * fraction
             };
             {
-                if output.len() > 2 && channels < output.len() {
+                // The block holds Main's channels, then the output sinks' (ADR 0015). With sinks,
+                // everything is summed per device channel first and clamped once after.
+                let main_len = self.plans.main_dest().len();
+                let sinks = self.plans.sink_dest();
+                let limit = |v: f32| if sinks.is_empty() { v.clamp(-1.0, 1.0) } else { v };
+                if main_len > 2 && channels < main_len {
                     let (mut left, mut right) = (0.0f32, 0.0f32);
-                    for (channel, &(l, r)) in self.plans.fold().iter().enumerate().take(output.len()) {
+                    for (channel, &(l, r)) in self.plans.fold().iter().enumerate().take(main_len) {
                         let value = sample(channel);
                         left += value * l;
                         right += value * r;
                     }
                     if let Some(out) = frame.first_mut() {
-                        *out = left.clamp(-1.0, 1.0);
+                        *out = limit(left);
                     }
                     if let Some(out) = frame.get_mut(1) {
-                        *out = right.clamp(-1.0, 1.0);
+                        *out = limit(right);
                     }
                 } else {
                     // The frame was zeroed above: device channels outside Main's path stay silent.
-                    for (channel, &dest) in self.plans.main_dest().iter().enumerate().take(output.len()) {
+                    for (channel, &dest) in self.plans.main_dest().iter().enumerate() {
                         if let Some(out) = frame.get_mut(usize::from(dest)) {
-                            *out = sample(channel).clamp(-1.0, 1.0);
+                            *out = limit(sample(channel));
                         }
+                    }
+                }
+                if !sinks.is_empty() {
+                    for (k, &dest) in sinks.iter().enumerate() {
+                        if let Some(out) = frame.get_mut(usize::from(dest)) {
+                            *out += sample(main_len + k);
+                        }
+                    }
+                    for out in frame.iter_mut() {
+                        *out = out.clamp(-1.0, 1.0);
                     }
                 }
             }

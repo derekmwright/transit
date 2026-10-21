@@ -221,6 +221,14 @@ impl Engine {
         &self.io
     }
 
+    /// Output route names (tracks, buses' tracks and sends) that name no output path this machine
+    /// has, each once, in track order. They render as silent sinks and the session keeps the
+    /// names, so the machine they came from restores them; renaming a path leaves routes alone, so
+    /// they show up here until the route or the path is changed back. For the UI and status.
+    pub fn unresolved_routes(&self) -> Vec<String> {
+        soundcraft_mix::unresolved_routes(&self.doc, &self.io, self.io.outputs)
+    }
+
     /// Counts every change to the I/O map, so a host can pass it on to the audio device.
     pub fn io_revision(&self) -> u64 {
         self.io_revision
