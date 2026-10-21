@@ -279,7 +279,13 @@ pub(crate) fn strip_bytes(ch: usize, block: usize, cap: usize, inserts: usize, c
 
 /// Checks every limit and the prepared bytes, with each strip's delay capacity from `cap_of`
 /// (0: the strip keeps its live lines). Allocates nothing.
-fn measure(s: &Session, l: &PlanLimits, block: usize, cap_of: &dyn Fn(&Track, usize) -> usize) -> Result<(), CompileError> {
+fn measure(
+    s: &Session,
+    l: &PlanLimits,
+    block: usize,
+    cap_of: &dyn Fn(&Track, usize) -> usize,
+    key_cap_of: &dyn Fn(&Track, usize) -> usize,
+) -> Result<(), CompileError> {
     over("tracks", s.tracks.len(), l.tracks.into())?;
     over("buses", s.busses.len(), l.buses.into())?;
     let main_ch = main_channels(s);
@@ -297,6 +303,12 @@ fn measure(s: &Session, l: &PlanLimits, block: usize, cap_of: &dyn Fn(&Track, us
         let slots = add(add(t.mixer.inserts.iter().flatten().count(), usize::from(t.instrument.is_some()))?, mul(clips, 2)?)?;
         cells = add(add(cells, 1)?, slots)?;
         bytes = add(bytes, strip_bytes(ch, block, cap_of(t, ch), t.mixer.inserts.len(), clips)?)?;
+        // Each keyed insert holds two delay lines (its signal's and the key's), as wide as the strip.
+        let keyed = t.mixer.inserts.iter().flatten().filter(|i| i.key.is_some()).count();
+        if keyed > 0 {
+            let line = mul(mul(ch, add(key_cap_of(t, ch), block)?)?, size_of::<f32>())?;
+            bytes = add(bytes, mul(mul(keyed, 2)?, line)?)?;
+        }
         for ins in t.mixer.inserts.iter().flatten().chain(t.instrument.iter()) {
             if needs_storage(ins.params.len()) {
                 bytes = add(bytes, mul(ins.params.len(), size_of::<f32>())?)?;
@@ -578,7 +590,7 @@ impl PlanCompiler {
             (_, true) => 0,
             (cap, false) => cap,
         };
-        measure(&session, &self.limits, block, &least)?;
+        measure(&session, &self.limits, block, &least, &|_, _| 0)?;
         // Path-based (F05): the slowest path into any summing point bounds every edge's delay.
         let need = path_need(&session, &|t: &Track| if mode == CompileMode::Update { self.active.track_latency(t.id) } else { 0 });
         let sized = |me: &Self, hints: bool| {
@@ -586,7 +598,8 @@ impl PlanCompiler {
                 (_, true) => 0,
                 (cap, false) => cap,
             };
-            measure(&session, &me.limits, block, &cap_of)
+            let key_cap = |t: &Track, ch: usize| me.strip_cap(t, ch, need, hints, mode).0;
+            measure(&session, &me.limits, block, &cap_of, &key_cap)
         };
         if let Err(e) = sized(self, true) {
             // A hinted delay that does not fit is dropped: the strip stays clamped and reported.
@@ -921,26 +934,22 @@ impl PlanCompiler {
                 (_, true) => 0,
                 (cap, false) => cap,
             };
-            if let Err(e) = measure(s, &self.limits, block, &cap_of) {
+            let key_cap = |t: &Track, ch: usize| self.strip_cap(t, ch, need, true, mode).0;
+            if let Err(e) = measure(s, &self.limits, block, &cap_of, &key_cap) {
                 self.release_planned(per_strip);
                 return Err(e);
             }
         }
 
         // Strips and cells.
-        let mut tables = PlanTables {
-            phase1,
-            aux_end,
-            main_fmt: s.main_format(),
-            layers: desc.layers.clone().into_boxed_slice(),
-            keys: KeyBank::new(&desc.keys, block),
-            ..PlanTables::default()
-        };
+        let mut tables =
+            PlanTables { phase1, aux_end, main_fmt: s.main_format(), layers: desc.layers.clone().into_boxed_slice(), ..PlanTables::default() };
         let mut cells: Vec<CellLoc> = Vec::new();
         let mut moves = Vec::new();
         let mut attach = Vec::new();
         let mut shadow = Shadow { desc: None, ..Shadow::default() };
         let mut strip_moves = Vec::new();
+        let mut key_caps: Vec<usize> = Vec::new();
         desc.strips.clear();
         for (si, (ti, layout, _, clips)) in per_strip.iter().enumerate() {
             let Some(t) = s.tracks.get(*ti) else { continue };
@@ -955,6 +964,9 @@ impl PlanCompiler {
             st.clipbuf = vec![vec![0.0; block]; ch];
             st.external = true;
             st.key_pre = desc.keys.iter().any(|k| k.pre && k.from == KeyEnd::Strip(si as u16));
+            // A line for the strip's own signal before each keyed insert, in case its key arrives late.
+            st.key_in = desc.keys.iter().filter(|k| usize::from(k.keyed) == si).map(|k| KeyIn::new(k.slot, ch, cap, block)).collect();
+            key_caps.push(cap);
             // A strip that keeps its live lines gets placeholders: the move brings the lines.
             let line = || if keep { DelayLine::placeholder() } else { DelayLine::with_capacity(ch, cap, block) };
             st.tap = line();
@@ -1002,6 +1014,7 @@ impl PlanCompiler {
             shadow.strips.push(ShadowStrip { track: t.id, generation, ch: ch16, layout: *layout, cap });
             tables.strips.push(st);
         }
+        tables.keys = KeyBank::new(&desc.keys, block, |keyed| key_caps.get(usize::from(keyed)).copied().unwrap_or(0));
         moves.extend(strip_moves);
         for (si, (_, layout, planned, _)) in per_strip.into_iter().enumerate() {
             for p in planned {

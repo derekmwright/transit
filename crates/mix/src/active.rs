@@ -67,6 +67,12 @@ fn move_strip(old: &mut Strip, new: &mut Strip) {
         }
     }
     new.edges = old.edges;
+    // The delays before keyed inserts continue from the old lines' history, insert by insert.
+    for k in new.key_in.iter_mut() {
+        if let Some(o) = old.key_in.iter().find(|o| o.slot == k.slot) {
+            k.line.take_history(&o.line);
+        }
+    }
     if old.meter.peaks.len() == new.meter.peaks.len() {
         std::mem::swap(&mut old.meter, &mut new.meter);
     }
@@ -409,6 +415,55 @@ impl MixEngine {
         let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
         let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
         let track = |st: &Strip| s.tracks.get(usize::from(st.track));
+        // Sidechain keys (ADR 0015 section 4): a key and the signal it meets must come from the
+        // same source sample time, but a strip's output latency is known only after phase 1. So
+        // with keys in the plan, the latencies of this block (each strip's inserts, as the
+        // forward pass below counts them) are walked once before it, in render order, to give
+        // every key edge its delay (`KeyBank::align`). The busses' marks are cleared after.
+        if !keys.is_empty() {
+            let pdc = s.edit.delay_compensation;
+            let mut walked = 0usize;
+            for at in 0..aux_end.min(strips.len()) {
+                let (before, rest) = strips.split_at_mut(at);
+                let Some(st) = rest.first_mut() else { continue };
+                let Some(t) = track(st) else { continue };
+                let aux = is_aux(t);
+                let alive = live(t);
+                if at < phase1 && (!alive || aux) {
+                    continue;
+                }
+                let mut arrive = 0usize;
+                if aux && let Route::Bus(b) = &t.mixer.input {
+                    arrive = busses.bus(*b).map_or(0, |x| x.arrival);
+                }
+                if alive {
+                    let from = |sp: &KeySpec| match sp.from {
+                        KeyEnd::Strip(j) => before.get(usize::from(j)).filter(|b| track(b).is_some_and(live)).map_or(0, |b| b.pdc_out),
+                        KeyEnd::Bus(b) => {
+                            if aux {
+                                busses.bus(b).map_or(0, |x| x.arrival)
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    let short = keys.align(at, t, st, arrive, pos, pdc, &from);
+                    if short > 0 {
+                        status.capacity_exceeded = status.capacity_exceeded.saturating_add(1);
+                        status.required_latency = status.required_latency.max(u32::try_from(short).unwrap_or(u32::MAX));
+                        status.affected = Some((st.id, st.generation));
+                    }
+                }
+                pdc_visit(t, st, at, alive, busses, sinks, &mut walked, pdc);
+            }
+            for (_, b) in busses.0.iter_mut() {
+                b.arrival = 0;
+                b.reader = usize::MAX;
+            }
+            for k in sinks.iter_mut() {
+                k.arrival = 0;
+            }
+        }
         let live_in = LiveInput {
             input: &self.input,
             monitor_only: self.monitor_only,

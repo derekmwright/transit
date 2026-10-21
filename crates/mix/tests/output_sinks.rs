@@ -11,7 +11,8 @@ use soundcraft_mix::{
     render_range, unresolved_routes,
 };
 use soundcraft_model::{
-    Bus, BusId, ChannelFormat, Clip, Insert, IoDirection, IoMap, IoPath, Route, SendSlot, Session, SourceAudio, SourceId, TrackId, TrackKind,
+    Bus, BusId, ChannelFormat, Clip, Insert, IoDirection, IoMap, IoPath, KeyFrom, KeySource, Route, SendSlot, Session, SourceAudio, SourceId, Tap,
+    TrackId, TrackKind,
 };
 use soundcraft_time::Range;
 use std::sync::Arc;
@@ -71,7 +72,10 @@ fn delay(n: usize) -> Insert {
 fn make(s: &Session, spec: &InstanceSpec) -> Option<NewInstance> {
     let t = s.track(spec.track)?;
     let ins = t.mixer.inserts.get(spec.slot)?.as_ref()?;
-    let n: usize = ins.preset.strip_prefix("delay:")?.parse().ok()?;
+    let Some(n) = ins.preset.strip_prefix("delay:").and_then(|n| n.parse::<usize>().ok()) else {
+        return soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), SR as f32, BLOCK, spec.ch)
+            .map(|n| NewInstance { plugin: n.plugin, refused_state: false });
+    };
     let mut d = Delay { n, ring: Vec::new(), w: 0 };
     d.prepare(SR as f32, BLOCK, spec.ch);
     Some(NewInstance { plugin: Box::new(d), refused_state: false })
@@ -313,4 +317,33 @@ fn an_input_path_by_name_monitors_its_channel() {
     // Names the table knows by label, and names it does not (an old session): the number in the label.
     assert!((heard("In 3") / ch(2) - pan).abs() < 1e-5);
     assert!((heard("In 7") / ch(6) - pan).abs() < 1e-5);
+}
+
+#[test]
+fn a_key_edge_keeps_main_and_a_stem_aligned() {
+    // A latent kick (outside the mix) keys the bass's compressor, so the bass waits for the key;
+    // the device latency covers that wait, and Main and Out 3-4 still leave together.
+    let keyed = |kick: usize, bass: usize| {
+        let mut s = session();
+        let k = impulse_track(&mut s, "Kick", Route::None);
+        s.track_mut(k).unwrap().mixer.inserts[0] = Some(delay(kick));
+        let b = impulse_track(&mut s, "Bass", Route::Main);
+        let mut comp = Insert::new("compressor");
+        comp.key = Some(KeySource { from: KeyFrom::Track(k), tap: Tap::Post });
+        let bt = s.track_mut(b).unwrap();
+        bt.mixer.inserts[0] = Some(delay(bass));
+        bt.mixer.inserts[1] = Some(comp);
+        impulse_track(&mut s, "Stem", Route::Hardware("Out 3-4".into()));
+        s
+    };
+    // The key is late: the kick's 128 against the bass's 16 ahead of the compressor.
+    let r = render(&keyed(128, 16), &wide_io(), None);
+    assert_eq!(r.latency, 128);
+    assert_eq!(hits(&r.channels[0]), [AT + 128], "the bass is on the device with the key's latency");
+    assert_eq!(hits(&r.channels[r.main]), [AT + 128], "the stem leaves with Main");
+    // The key is early: the bass's 200 against the kick's 32.
+    let r = render(&keyed(32, 200), &wide_io(), None);
+    assert_eq!(r.latency, 200);
+    assert_eq!(hits(&r.channels[0]), [AT + 200]);
+    assert_eq!(hits(&r.channels[r.main]), [AT + 200]);
 }

@@ -512,3 +512,45 @@ fn path_based_delay_compensation_allocates_nothing() {
     assert_eq!(e.status.capacity_exceeded, 0, "the prepared lines hold every path's delay");
     assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the session plays");
 }
+
+#[test]
+fn key_alignment_allocates_nothing_when_a_key_or_a_latency_changes() {
+    use soundcraft_model::{KeyFrom, KeySource, Tap};
+    let (mut s, bass, _) = session_with_clip();
+    s.edit.delay_compensation = true;
+    // The kick is declared after the bass: the bass renders in a later layer.
+    let kick = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    let mut rig = Rig::new(&s);
+    let latent = |ms: f32| {
+        let mut c = builtin("compressor");
+        c.params.insert("lookahead".into(), ms);
+        c
+    };
+    let keyed = |from: TrackId, tap| {
+        let mut c = builtin("compressor");
+        c.key = Some(KeySource { from: KeyFrom::Track(from), tap });
+        c
+    };
+    s.track_mut(kick).unwrap().mixer.inserts[0] = Some(latent(5.0));
+    s.track_mut(bass).unwrap().mixer.inserts[0] = Some(keyed(kick, Tap::Post));
+    let e = rig.edit(&s);
+    no_cost("a key from a latent source: the keyed strip waits", &e);
+    assert_eq!(e.status.capacity_exceeded, 0);
+    assert!(rig.mix.latency > 0, "the late key delays the bass");
+    let late = rig.mix.latency;
+    s.track_mut(kick).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("lookahead".into(), 10.0);
+    no_cost("a longer source latency", &rig.edit(&s));
+    assert!(rig.mix.latency > late);
+    // The bass is the slow one now: ahead of the keyed compressor, so the key waits instead.
+    s.track_mut(bass).unwrap().mixer.inserts[0] = Some(latent(10.0));
+    s.track_mut(bass).unwrap().mixer.inserts[1] = Some(keyed(kick, Tap::Pre));
+    s.track_mut(kick).unwrap().mixer.inserts[0] = None;
+    let e = rig.edit(&s);
+    no_cost("the key arrives early", &e);
+    assert_eq!(e.status.capacity_exceeded, 0);
+    s.track_mut(bass).unwrap().mixer.inserts[1].as_mut().unwrap().key = Some(KeySource { from: KeyFrom::Track(kick), tap: Tap::Post });
+    no_cost("changing the tap", &rig.edit(&s));
+    s.track_mut(bass).unwrap().mixer.inserts[1].as_mut().unwrap().key = None;
+    no_cost("removing the key", &rig.edit(&s));
+    assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the session plays");
+}

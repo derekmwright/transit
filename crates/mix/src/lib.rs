@@ -95,7 +95,7 @@ pub use events::{
     Arrival, Due, EngineEpoch, EventLimits, EventOutcome, EventStatus, InstrumentEvent, MAX_OPEN, MAX_PEDALS, MAX_PORTS, Message, NoteId,
     PluginEvent, QUEUE_CAP, RenderFrame, Shed, ShedCounts, Source, TapRecord, TransportEpoch,
 };
-use key::{KeyBank, KeyEnd, KeySpec};
+use key::{KeyBank, KeyEnd, KeyIn, KeySpec};
 pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
     RenderTarget, Retired, SlotBinding, SlotGen,
@@ -486,8 +486,12 @@ struct Strip {
     /// The engine takes its instances from the host ([`MixEngine::set_external_instances`]):
     /// clip-effect modules come from `sync`, never from the render.
     external: bool,
-    /// Total latency of the instrument and the active inserts (samples).
+    /// Total latency of the instrument, the active inserts and the delays before keyed inserts
+    /// (samples).
     latency: usize,
+    /// Plan mode: the delay of this strip's own signal before each keyed insert (a key that
+    /// arrives late, [`KeyBank::align`]).
+    key_in: Vec<key::KeyIn>,
     /// Delay compensation (F05): the post-fader and the pre-fader signal, read back by each edge
     /// the strip feeds at that edge's own delay, so every path into a summing point arrives with
     /// the slowest one.
@@ -811,6 +815,7 @@ impl Strip {
             clipbuf: Vec::new(),
             external: false,
             latency: 0,
+            key_in: Vec::new(),
             tap: DelayLine::default(),
             tap_pre: DelayLine::default(),
             outbuf: Vec::new(),
@@ -1422,7 +1427,7 @@ impl MixEngine {
         } else {
             let strips = &self.strips;
             let latency = |t: &Track| strips.get(&t.id).map_or(0, |st| strip_latency(t, st));
-            path_need_with(s, &self.route, &mut self.bus_need, &latency).max(self.legacy_status.required_latency as usize)
+            path_need_with(s, &self.route, &mut self.bus_need, &latency, false).max(self.legacy_status.required_latency as usize)
         };
         let mb = self.max_block;
         for t in &s.tracks {
@@ -2051,6 +2056,7 @@ fn process_strip<B: Busses + ?Sized>(
     let mut gr = 0.0f32;
     // A latent instrument delays its track like an insert does (G8).
     let mut latency = strip.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
+    strip.key_in.iter_mut().for_each(|k| k.ran = false);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
@@ -2059,6 +2065,14 @@ fn process_strip<B: Busses + ?Sized>(
         apply_params(slot, ins, t, i, pos);
         // An insert with a key detects on it when the plan made one for the slot (else on its own input).
         let key = ins.key.and_then(|_| keys.get(t.id, i));
+        // A key that arrives late holds the strip's signal back to meet it (`KeyBank::align`).
+        if key.is_some()
+            && let Some(k) = strip.key_in.iter_mut().find(|k| usize::from(k.slot) == i)
+        {
+            k.ran = true;
+            k.line.apply(k.want, &mut strip.buf, &mut strip.outbuf, frames);
+            latency = latency.saturating_add(k.want.min(k.line.cap()));
+        }
         if run_insert(slot, &mut strip.buf, key, frames, &transport, live.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
             strip.failures.record(i);
             continue;
@@ -2068,6 +2082,7 @@ fn process_strip<B: Busses + ?Sized>(
             gr = slot.plugin.gain_reduction_db();
         }
     }
+    strip.key_in.iter_mut().filter(|k| !k.ran).for_each(|k| k.line.idle());
     strip.gr = gr;
     strip.latency = latency.min(MAX_LATENCY);
     let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
@@ -2689,15 +2704,17 @@ fn path_need(s: &Session, latency: &dyn Fn(&Track) -> usize) -> usize {
     let mut route = RouteScratch::new();
     route.reserve(s);
     route.layer(s);
-    path_need_with(s, &route, &mut Vec::new(), latency)
+    path_need_with(s, &route, &mut Vec::new(), latency, true)
 }
 
 /// [`path_need`] over a solved route graph of `s`, with `bus` as per-bus scratch: allocates
 /// nothing once `bus` holds the bus count. Same rule as the render: tracks in the graph's order,
 /// a write into a bus already read does not count.
-fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)>, latency: &dyn Fn(&Track) -> usize) -> usize {
+fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)>, latency: &dyn Fn(&Track) -> usize, keys: bool) -> usize {
     bus.clear();
-    bus.resize(s.busses.len(), (0, false));
+    // With `keys` (plan mode), the output latency of each track follows the busses' entries.
+    bus.resize(s.busses.len() + if keys { s.tracks.len() } else { 0 }, (0, false));
+    let nbus = s.busses.len();
     let mut need = 0usize;
     // Every output path is padded to the one device latency Main has, master inserts included
     // (ADR 0015 section 6), so a path's delay can exceed any source's own by that much.
@@ -2712,8 +2729,28 @@ fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)
             x.1 = true;
             arrive = x.0;
         }
+        // A key that arrives later than the strip's own signal holds it back (`KeyBank::align`):
+        // at worst the strip's input waits for the slowest of its keys, whatever sits before the
+        // keyed insert.
+        if keys {
+            for e in route.edges() {
+                let (soundcraft_model::EdgeKind::Key { .. }, soundcraft_model::RouteNode::Track(to)) = (e.kind, e.to) else { continue };
+                if to != i {
+                    continue;
+                }
+                let from = match e.from {
+                    soundcraft_model::RouteNode::Track(j) => bus.get(nbus + j).map_or(0, |x| x.0),
+                    soundcraft_model::RouteNode::Bus(b) => bus.get(b).map_or(0, |x| x.0),
+                    soundcraft_model::RouteNode::Main => 0,
+                };
+                arrive = arrive.max(from);
+            }
+        }
         let out = arrive.saturating_add(latency(t));
         need = need.max(out);
+        if keys && let Some(x) = bus.get_mut(nbus + i) {
+            x.0 = out;
+        }
         let targets = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target));
         for r in targets {
             if let Route::Bus(b) = r
@@ -3141,6 +3178,12 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
             continue;
         }
         apply_params(slot, ins, t, i, pos);
+        // The delay `KeyBank::align` gave the signal before a keyed insert (0 without one).
+        if ins.key.is_some()
+            && let Some(k) = strip.key_in.iter().find(|k| usize::from(k.slot) == i)
+        {
+            latency = latency.saturating_add(k.want.min(k.line.cap()));
+        }
         latency = latency.saturating_add(slot.plugin.latency());
     }
     strip.latency = latency.min(MAX_LATENCY);
