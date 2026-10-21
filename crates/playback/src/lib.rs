@@ -28,7 +28,7 @@ pub mod telemetry;
 pub mod timeline_map;
 
 pub use devices::AudioConfig;
-pub use player::{ActionResult, Player, PlayerCommand, PlayerError, PlayerNotice};
+pub use player::{ActionResult, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};

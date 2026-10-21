@@ -22,6 +22,8 @@ pub enum Scope {
     Arrangement,
     /// The piano roll, while it is open and active.
     PianoRoll,
+    /// The piano roll while Step entry is on (its keys shadow the notes' Delete and the digits).
+    Step,
     /// The browser (its drag, its Add Folder field).
     Browser,
     /// Mixer strips and the device chain (the control under the pointer, a readout being typed).
@@ -35,14 +37,24 @@ pub enum Scope {
 }
 
 impl Scope {
-    pub const ALL: [Scope; 8] =
-        [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Automation, Scope::Browser, Scope::Mixer, Scope::Dialog, Scope::Rename];
+    pub const ALL: [Scope; 9] = [
+        Scope::Global,
+        Scope::Arrangement,
+        Scope::PianoRoll,
+        Scope::Step,
+        Scope::Automation,
+        Scope::Browser,
+        Scope::Mixer,
+        Scope::Dialog,
+        Scope::Rename,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Scope::Global => "Global",
             Scope::Arrangement => "Arrangement",
             Scope::PianoRoll => "Piano roll",
+            Scope::Step => "Step entry",
             Scope::Browser => "Browser",
             Scope::Mixer => "Mixer",
             Scope::Dialog => "Dialogs",
@@ -108,6 +120,15 @@ pub enum Action {
     NotesEarlier,
     NotesLater,
     NotesDelete,
+    StepToggle,
+    StepRest,
+    StepBack,
+    StepWhole,
+    StepHalf,
+    StepQuarter,
+    StepEighth,
+    StepSixteenth,
+    StepThirtySecond,
     BrowserCancel,
     BrowserAddFolder,
     DialogConfirm,
@@ -272,6 +293,29 @@ pub const TABLE: &[Shortcut] = &[
     row(A::NotesLater, "Move Later by the Grid", NONE, Key::ArrowRight, S::PianoRoll, "All DAWs."),
     row(A::NotesDelete, "Delete Notes", NONE, Key::Delete, S::PianoRoll, "All DAWs."),
     row(A::NotesDelete, "Delete Notes", NONE, Key::Backspace, S::PianoRoll, "Same as Delete."),
+    row(
+        A::StepToggle,
+        "Step Entry",
+        NONE,
+        Key::S,
+        S::PianoRoll,
+        "Ours (Logic's step input is a bar button; Ableton has none). MIDI notes then enter at the cursor.",
+    ),
+    row(
+        A::StepRest,
+        "Step Rest",
+        NONE,
+        Key::Period,
+        S::Step,
+        "Ours; Space stays Play/Stop, and Tab moves egui's focus (it then blocks every shortcut), so it cannot be the rest key.",
+    ),
+    row(A::StepBack, "Step Back (Delete the Last Step)", NONE, Key::Backspace, S::Step, "Ours; wins over Delete Notes while Step is on."),
+    row(A::StepWhole, "Step Length: Whole", NONE, Key::Num1, S::Step, "Ours."),
+    row(A::StepHalf, "Step Length: Half", NONE, Key::Num2, S::Step, "Ours."),
+    row(A::StepQuarter, "Step Length: Quarter", NONE, Key::Num3, S::Step, "Ours."),
+    row(A::StepEighth, "Step Length: Eighth", NONE, Key::Num4, S::Step, "Ours."),
+    row(A::StepSixteenth, "Step Length: Sixteenth", NONE, Key::Num5, S::Step, "Ours."),
+    row(A::StepThirtySecond, "Step Length: Thirty-Second", NONE, Key::Num6, S::Step, "Ours."),
     // Automation lanes (slice 7): only while points are selected, before the arrangement's Delete.
     row(A::DeletePoints, "Delete Selected Points", NONE, Key::Delete, S::Automation, "All DAWs. Without selected points Delete takes clips."),
     row(A::DeletePoints, "Delete Selected Points", NONE, Key::Backspace, S::Automation, "Same as Delete."),

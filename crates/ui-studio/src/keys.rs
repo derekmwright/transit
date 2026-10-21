@@ -11,6 +11,9 @@
 //! Zoom, scroll, snap, pane height, new-note velocity and the audition switch are view state: [`KeysPrefs`] in
 //! [`crate::UiState`] and [`KeysState`] here, never the document.
 
+mod step;
+pub use step::StepState;
+
 use crate::StudioApp;
 use crate::arrange::R4;
 use crate::mixer::MenuItem;
@@ -194,6 +197,11 @@ pub struct KeysLayout {
     pub snap_menu: Vec<MenuItem>,
     pub quantize: R4,
     pub audition: R4,
+    /// The Step toggle, whether Step entry is on, and its cursor and step length in ticks.
+    pub step: R4,
+    pub step_on: bool,
+    pub step_cursor: i64,
+    pub step_ticks: i64,
     pub new_note_velocity: R4,
     pub use_selected_velocity: R4,
     pub ruler: R4,
@@ -241,6 +249,8 @@ pub struct KeysState {
     held: Vec<(TrackId, u8, f64)>,
     pub auditions: u64,
     pub last_audition: Option<(u8, u8)>,
+    /// Step entry (session state, never saved).
+    pub step: StepState,
     serial: u64,
     /// The last click on the grid (time, position), for double-clicks.
     last_click: Option<(f64, Pos2)>,
@@ -601,6 +611,30 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         }
         return;
     }
+    if pressed(ctx, A::StepToggle) {
+        app.step_toggle();
+    }
+    if app.step_active() {
+        if pressed(ctx, A::StepBack) {
+            app.step_back();
+            return;
+        }
+        if pressed(ctx, A::StepRest) {
+            app.step_rest();
+        }
+        for (action, ticks) in [
+            (A::StepWhole, PPQ * 4),
+            (A::StepHalf, PPQ * 2),
+            (A::StepQuarter, PPQ),
+            (A::StepEighth, PPQ / 2),
+            (A::StepSixteenth, PPQ / 4),
+            (A::StepThirtySecond, PPQ / 8),
+        ] {
+            if pressed(ctx, action) {
+                app.step_set_len(ticks);
+            }
+        }
+    }
     if pressed(ctx, A::NotesSelectAll) {
         app.keys.selection = app.keys_notes();
     }
@@ -707,6 +741,7 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     }
     app.keys.top = app.keys.top.clamp((rows - 1.0).min(127.0), 127.0);
     app.keys.scroll = app.keys.scroll.max(-(cv.c0 as f64));
+    let step_cur = app.step_cursor(ppt, grid.width());
     let map = Map { gx0: grid.min.x, gy0: grid.min.y, ppt, scroll: app.keys.scroll, top: app.keys.top, kh, c0: cv.c0, grid: prefs.snap.ticks() };
     // Drop selected notes that no longer exist (undo, another view).
     let present = resolve(&cv.notes, &app.keys.selection);
@@ -738,6 +773,21 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     let to_rel = |at: Samples| s.tempo.samples_to_ticks(at, s.sample_rate) - cv.c0;
     let cx = map.x(to_rel(app.cursor()));
     p.line_segment([pos2(cx, ruler.min.y), pos2(cx, vel.max.y)], Stroke::new(1.0, TOKENS.cursor.gamma_multiply(0.6)));
+    if let Some((at, len)) = step_cur {
+        let (x0, x1) = (map.x(at), map.x(at + len));
+        let band = Rect::from_min_max(pos2(x0, ruler.min.y), pos2(x1.max(x0 + 2.0), vel.max.y));
+        p.rect_filled(band, 0.0, TOKENS.accent.gamma_multiply(0.18));
+        p.line_segment([pos2(x0, ruler.min.y), pos2(x0, vel.max.y)], Stroke::new(2.0, TOKENS.accent));
+        p.add(egui::Shape::convex_polygon(
+            vec![pos2(x0 - 5.0, ruler.min.y), pos2(x0 + 5.0, ruler.min.y), pos2(x0, ruler.min.y + 8.0)],
+            TOKENS.accent,
+            Stroke::NONE,
+        ));
+        layout.step_cursor = at;
+        layout.step_ticks = len;
+        ui.ctx().request_repaint();
+    }
+    layout.step_on = step_cur.is_some();
     if app.is_playing() {
         let rel = to_rel(app.engine.transport.position);
         let px = map.x(rel);
@@ -821,6 +871,34 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
         (b, ui.interact(b, ui.id().with(("keys_btn", salt)), Sense::click()))
     };
     let small = FontId::proportional(11.5);
+    let (b, resp) = button(ui, 96.0, "step");
+    let on = app.keys.step.on;
+    let p = ui.painter();
+    p.rect_filled(
+        b,
+        crate::theme::RADIUS_SM,
+        if on {
+            TOKENS.accent
+        } else if resp.hovered() {
+            TOKENS.button_hover
+        } else {
+            TOKENS.button
+        },
+    );
+    let label = if on { format!("Step {}", step::length_label(app.step_len())) } else { "Step".into() };
+    p.text(b.center(), Align2::CENTER_CENTER, label, small.clone(), if on { theme::text_on(TOKENS.accent) } else { TOKENS.text_dim });
+    layout.step = r4(b);
+    if resp
+        .on_hover_text(format!(
+            "Step entry: notes played on the MIDI keyboard go in at the cursor ({}; rest {}, back {}, length 1-6)",
+            crate::shortcuts::label(crate::shortcuts::Action::StepToggle),
+            crate::shortcuts::label(crate::shortcuts::Action::StepRest),
+            crate::shortcuts::label(crate::shortcuts::Action::StepBack)
+        ))
+        .clicked()
+    {
+        app.step_toggle();
+    }
     let (b, resp) = button(ui, 72.0, "audition");
     let on = app.ui.keys.audition;
     let p = ui.painter();

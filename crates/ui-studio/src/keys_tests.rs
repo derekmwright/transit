@@ -762,3 +762,167 @@ fn the_plain_wheel_still_scrolls_rows_and_pitches_and_never_time() {
     t.notch(at, json!({"dy": -1}));
     assert_eq!(t.app.arrange.layout.scroll, sc, "plain wheel does not pan the arrangement");
 }
+
+// Step entry. There is no MIDI device in the harness: `StudioApp::step_midi` is the entry point
+// `step_poll` feeds from `Player::take_played_notes` (the ingress tap), so these tests call it.
+
+impl T {
+    fn step_on(&mut self) {
+        self.key("S", json!({}));
+        assert!(self.app.keys.layout.step_on, "Step is on");
+    }
+
+    fn played(&mut self, pitch: u8, velocity: u8, on: bool) {
+        self.app.step_midi(soundcraft_playback::PlayedNote { pitch, velocity, on });
+        self.frames(2);
+    }
+
+    /// A note played and released.
+    fn tap(&mut self, pitch: u8, velocity: u8) {
+        self.played(pitch, velocity, true);
+        self.played(pitch, 0, false);
+    }
+
+    fn clip_ticks(&self) -> i64 {
+        self.app.keys.layout.clip_ticks
+    }
+}
+
+const SIXTEENTH: i64 = soundcraft_time::TICKS_PER_QUARTER / 4;
+
+#[test]
+fn step_toggles_from_the_toolbar_and_the_key_and_shows_a_cursor() {
+    let mut t = T::open();
+    assert!(!t.app.keys.layout.step_on);
+    t.click(mid(t.app.keys.layout.step));
+    assert!(t.app.keys.layout.step_on && t.app.keys.layout.step_cursor == 0 && t.app.keys.layout.step_ticks == SIXTEENTH);
+    t.key("S", json!({}));
+    assert!(!t.app.keys.layout.step_on, "S toggles it off");
+    t.key("S", json!({}));
+    assert!(t.app.keys.layout.step_on);
+}
+
+#[test]
+fn a_played_note_enters_at_the_cursor_with_the_step_length_as_one_undo_step() {
+    let mut t = T::open();
+    t.step_on();
+    let undo = t.undo_len();
+    t.played(60, 90, true);
+    assert!(t.notes().is_empty(), "entered when the key is released");
+    t.played(60, 0, false);
+    let n = t.notes();
+    assert_eq!((n.len(), n[0].pitch, n[0].start, n[0].length, n[0].velocity), (1, 60, 0, SIXTEENTH, 90));
+    assert_eq!(t.app.keys.layout.step_cursor, SIXTEENTH);
+    assert_eq!(t.undo_len(), undo + 1);
+    t.tap(62, 70);
+    assert_eq!(t.notes().iter().map(|n| (n.pitch, n.start)).collect::<Vec<_>>(), vec![(60, 0), (62, SIXTEENTH)]);
+    assert_eq!(t.undo_len(), undo + 2);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.notes().len(), 1, "one step undone");
+}
+
+#[test]
+fn keys_held_together_enter_one_chord_step() {
+    let mut t = T::open();
+    t.step_on();
+    let undo = t.undo_len();
+    t.played(60, 80, true);
+    t.played(64, 100, true);
+    t.played(67, 90, true);
+    t.played(60, 0, false);
+    t.played(64, 0, false);
+    t.played(67, 0, false);
+    let n = t.notes();
+    assert_eq!(n.len(), 3);
+    assert!(n.iter().all(|x| x.start == 0 && x.length == SIXTEENTH));
+    assert_eq!(n.iter().map(|x| (x.pitch, x.velocity)).collect::<Vec<_>>(), vec![(60, 80), (64, 100), (67, 90)]);
+    assert_eq!((t.app.keys.layout.step_cursor, t.undo_len()), (SIXTEENTH, undo + 1));
+}
+
+#[test]
+fn rest_advances_and_backspace_takes_the_last_step_back() {
+    let mut t = T::open();
+    t.step_on();
+    t.tap(60, 100);
+    t.key("Period", json!({}));
+    assert_eq!((t.app.keys.layout.step_cursor, t.notes().len()), (2 * SIXTEENTH, 1), "rest: cursor moves, no note");
+    t.tap(62, 100);
+    assert_eq!(t.notes().iter().map(|n| n.start).collect::<Vec<_>>(), vec![0, 2 * SIXTEENTH]);
+    let undo = t.undo_len();
+    t.key("Backspace", json!({}));
+    assert_eq!(
+        t.notes().iter().map(|n| n.pitch).collect::<Vec<_>>(),
+        vec![60],
+        "the last step's note is gone: {} {:?}",
+        t.app.status,
+        t.app.keys.step
+    );
+    assert_eq!(t.app.keys.layout.step_cursor, 2 * SIXTEENTH);
+    assert_eq!(t.undo_len(), undo + 1, "undoable");
+    t.key("Backspace", json!({}));
+    assert_eq!((t.app.keys.layout.step_cursor, t.notes().len()), (SIXTEENTH, 1), "the rest is taken back, no note lost");
+    t.key("Backspace", json!({}));
+    assert!(t.notes().is_empty());
+    assert_eq!(t.app.keys.layout.step_cursor, 0);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.notes().len(), 1, "Backspace undone");
+}
+
+#[test]
+fn number_keys_set_the_step_length() {
+    let mut t = T::open();
+    t.step_on();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    for (key, ticks) in [("1", q * 4), ("2", q * 2), ("3", q), ("4", q / 2), ("5", q / 4), ("6", q / 8)] {
+        t.key(key, json!({}));
+        assert_eq!(t.app.keys.layout.step_ticks, ticks, "key {key}");
+    }
+    t.key("3", json!({}));
+    t.tap(60, 100);
+    assert_eq!((t.notes()[0].length, t.app.keys.layout.step_cursor), (q, q));
+}
+
+#[test]
+fn entering_past_the_clip_end_extends_the_clip() {
+    let mut t = T::open();
+    t.step_on();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    t.key("1", json!({}));
+    assert_eq!(t.clip_ticks(), 4 * q);
+    t.tap(60, 100);
+    t.tap(62, 100);
+    assert_eq!(t.clip_ticks(), 8 * q, "a whole-note step past the bar grows the clip to the step boundary");
+    assert_eq!(t.notes().iter().map(|n| n.start).collect::<Vec<_>>(), vec![0, 4 * q]);
+}
+
+#[test]
+fn entering_stops_at_the_next_clip_and_says_so() {
+    let mut t = T::open();
+    let (end, _) = {
+        let s = t.app.engine.session();
+        let c = s.find_clip(t.clip).unwrap().1;
+        (c.end(), c.start)
+    };
+    t.app.run("midi.new_clip", json!({"tracks": [t.track.0], "start": end, "end": end + 48_000})).unwrap();
+    t.frames(2);
+    t.step_on();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    t.key("1", json!({}));
+    t.tap(60, 100);
+    assert_eq!(t.notes().len(), 1);
+    let undo = t.undo_len();
+    t.tap(62, 100);
+    assert_eq!((t.notes().len(), t.undo_len(), t.clip_ticks()), (1, undo, 4 * q), "nothing entered, clip not overlapped");
+    assert!(t.app.status.contains("next clip"), "{}", t.app.status);
+}
+
+#[test]
+fn midi_enters_nothing_while_step_is_off() {
+    let mut t = T::open();
+    t.tap(60, 100);
+    assert!(t.notes().is_empty());
+    t.step_on();
+    t.key("S", json!({}));
+    t.tap(60, 100);
+    assert!(t.notes().is_empty(), "off again");
+}

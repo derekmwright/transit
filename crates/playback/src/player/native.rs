@@ -190,6 +190,10 @@ impl Native {
         }
     }
 
+    pub(super) fn take_notes(&self) -> Vec<super::PlayedNote> {
+        self.worker.take_notes()
+    }
+
     pub(super) fn status(&self) -> Status {
         let mut status = self.status.clone();
         status.counts = self.worker.counters();

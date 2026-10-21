@@ -90,7 +90,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Step Input...",
             ["Event", "MIDI Operations"],
             None,
-            "{track?, pitch?: 60 | pitches?: [..], duration?: '1/8'|ticks, velocity?: 100, rest?: bool, advance?: true}",
+            "{track?, pitch?: 60 | pitches?: [..], velocities?: [..] (one per pitch), duration?: '1/8'|ticks, velocity?: 100, rest?: bool, advance?: true, at?: absolute ticks (default: the selection start), clip?: the clip to continue}",
             has_tracks,
             step_input
         ),
@@ -406,12 +406,28 @@ fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
     };
     let s = e.session_mut();
     let sr = s.sample_rate;
-    let at = s.edit.selection.start.max(0);
-    let tick = s.tempo.samples_to_ticks(at, sr);
+    let (at, tick) = match p.get("at").and_then(Value::as_i64) {
+        Some(t) => (s.tempo.tick_to_samples(t.max(0), sr), t.max(0)),
+        None => {
+            let at = s.edit.selection.start.max(0);
+            (at, s.tempo.samples_to_ticks(at, sr))
+        }
+    };
+    let velocities: Vec<u8> = p
+        .get("velocities")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_i64).map(|x| x.clamp(1, 127) as u8).collect())
+        .unwrap_or_default();
     let end_tick = tick.saturating_add(dur);
     let end = s.tempo.tick_to_samples(end_tick, sr);
     // Continue the clip under (or ending at) the insertion point, else start a new one.
+    let wanted = p.get("clip").and_then(Value::as_u64).map(soundcraft_model::ClipId);
     let host = s.track(t).and_then(|tr| {
+        if let Some(w) = wanted
+            && tr.clips().iter().any(|c| c.id == w && matches!(c.content, ClipContent::Midi { .. }))
+        {
+            return Some(w);
+        }
         tr.clips().iter().filter(|c| matches!(c.content, ClipContent::Midi { .. })).find(|c| c.range().contains(at) || c.end() == at).map(|c| c.id)
     });
     let host = match host {
@@ -430,8 +446,9 @@ fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
         let base = tempo.samples_to_ticks(c.start, sr);
         if let ClipContent::Midi { sequence } = &mut c.content {
             if !rest {
-                for pitch in &pitches {
-                    sequence.notes.push(Note { pitch: *pitch, velocity: vel, release_velocity: 64, channel: 0, start: tick - base, length: dur });
+                for (i, pitch) in pitches.iter().enumerate() {
+                    let velocity = velocities.get(i).copied().unwrap_or(vel);
+                    sequence.notes.push(Note { pitch: *pitch, velocity, release_velocity: 64, channel: 0, start: tick - base, length: dur });
                     added += 1;
                 }
             }
@@ -861,6 +878,29 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(e.session().edit.selection.start, 3 * 24_000);
+    }
+
+    #[test]
+    fn step_input_at_a_tick_in_a_named_clip_keeps_the_selection_and_takes_per_note_velocities() {
+        let (mut e, t) = midi_engine();
+        e.execute("edit.select", &json!({"tracks": [t.0], "start": 0})).unwrap();
+        let r = e.execute("event.step_input", &json!({"pitch": 60, "duration": "1/4"})).unwrap();
+        let cid = r["clip"].as_u64().unwrap();
+        let sel = e.session().edit.selection.start;
+        e.execute(
+            "event.step_input",
+            &json!({"track": t.0, "clip": cid, "at": 960, "pitches": [64, 67], "velocities": [50, 90], "duration": 480, "advance": false}),
+        )
+        .unwrap();
+        assert_eq!(e.session().edit.selection.start, sel, "advance false leaves the selection");
+        match &e.session().find_clip(ClipId(cid)).unwrap().1.content {
+            ClipContent::Midi { sequence } => {
+                let got: Vec<_> = sequence.notes.iter().map(|n| (n.pitch, n.start, n.length, n.velocity)).collect();
+                assert_eq!(got, vec![(60, 0, 960, 100), (64, 960, 480, 50), (67, 960, 480, 90)]);
+            }
+            _ => panic!(),
+        }
+        assert_eq!(e.session().find_clip(ClipId(cid)).unwrap().1.length, 36_000, "the clip grew to the step's end");
     }
 
     #[test]

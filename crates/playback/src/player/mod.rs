@@ -17,6 +17,14 @@ mod handles;
 pub use handles::Handles;
 mod runtime;
 pub use runtime::{AudioPorts, Retirement, RuntimeControl, ServiceReport};
+/// A played note as the UI sees it (step entry): note-on with its velocity, or a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayedNote {
+    pub pitch: u8,
+    pub velocity: u8,
+    pub on: bool,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ingress;
 #[cfg(not(target_arch = "wasm32"))]

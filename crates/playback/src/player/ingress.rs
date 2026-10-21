@@ -1,13 +1,14 @@
 //! Native MIDI ingestion, independent of the UI pump. The worker owns only raw
 //! consumers and a bounded action producer, never devices, plug-ins or editors.
 //! Main retains the input handles; closing one invalidates its source first.
-use super::{ActionResult, RuntimeControl, sources};
+use super::{ActionResult, PlayedNote, RuntimeControl, sources};
 use crate::action_lane::{self, NoteKind, Outcome};
 use soundcraft_midi_io::{InputBoundary, InputConsumer, InputEvent};
 use soundcraft_mix::{EngineEpoch, EventOutcome, Message, NoteId, SlotBinding, Source};
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BATCH: usize = 256;
@@ -43,8 +44,13 @@ pub struct Counters {
     pub approximate: u64,
 }
 
+/// The most notes held for the UI between its polls; the oldest are dropped past this.
+const TAP_CAPACITY: usize = 256;
+
 #[derive(Default)]
 struct Shared {
+    /// Notes admitted to any route, for the UI's step entry. Filled by the ingress thread, never by audio.
+    tap: Mutex<VecDeque<PlayedNote>>,
     stop: AtomicBool,
     finished: AtomicBool,
     offered: AtomicU64,
@@ -208,6 +214,11 @@ impl Worker {
         Ok(applied)
     }
 
+    /// The notes played since the last call, oldest first.
+    pub fn take_notes(&self) -> Vec<PlayedNote> {
+        self.shared.tap.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+    }
+
     /// Independent diagnostic counters, not a coherent cancellation frontier.
     pub fn counters(&self) -> Counters {
         let s = &self.shared;
@@ -239,6 +250,21 @@ struct Pump {
     inputs: Vec<Input>,
     cursor: usize,
     shared: Arc<Shared>,
+}
+impl Shared {
+    fn tap(&self, message: Message) {
+        let note = match message {
+            Message::NoteOn { key, velocity, .. } => PlayedNote { pitch: key, velocity, on: true },
+            Message::NoteOff { key, .. } => PlayedNote { pitch: key, velocity: 0, on: false },
+            _ => return,
+        };
+        if let Ok(mut q) = self.tap.lock() {
+            if q.len() >= TAP_CAPACITY {
+                q.pop_front();
+            }
+            q.push_back(note);
+        }
+    }
 }
 impl Pump {
     fn step(&mut self) {
@@ -336,6 +362,7 @@ impl Pump {
                 self.shared.filtered.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            let mut tapped = false;
             for (permit, route) in &input.routes {
                 if !permit.admits_sequence(raw.seq) {
                     self.shared.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -365,6 +392,10 @@ impl Pump {
                 };
                 if self.lane.send_note(packet, if release { NoteKind::Off } else { NoteKind::On }).is_ok() {
                     self.shared.admitted.fetch_add(1, Ordering::Relaxed);
+                    if !tapped {
+                        tapped = true;
+                        self.shared.tap(message);
+                    }
                 } else {
                     self.shared.shed.fetch_add(1, Ordering::Relaxed);
                     permit.invalidate();

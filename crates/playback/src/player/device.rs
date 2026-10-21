@@ -516,6 +516,16 @@ impl Player {
         }
         Ok(report)
     }
+    /// Notes played on armed MIDI inputs since the last call (the UI's step entry); empty without MIDI.
+    pub fn take_played_notes(&self) -> Vec<super::PlayedNote> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(midi) = self.midi.try_borrow()
+            && let Some(m) = midi.as_ref()
+        {
+            return m.take_notes();
+        }
+        Vec::new()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn midi_status(&self) -> Result<super::MidiStatus, PlayerError> {
         let midi = self.midi.try_borrow().map_err(|_| PlayerError::Busy)?;

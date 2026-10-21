@@ -295,7 +295,7 @@ fn help_keyboard_shortcuts_opens_groups_by_scope_and_filters() {
     let w = t.inspect()["shortcuts"].clone();
     assert_eq!(w["open"], true);
     let scopes: Vec<String> = serde_json::from_value(w["scopes"].clone()).unwrap();
-    assert_eq!(scopes, ["Global", "Arrangement", "Piano roll", "Automation", "Browser", "Mixer", "Dialogs", "Name field"]);
+    assert_eq!(scopes, ["Global", "Arrangement", "Piano roll", "Step entry", "Automation", "Browser", "Mixer", "Dialogs", "Name field"]);
     let all = w["rows"].as_array().unwrap().len();
     assert_eq!(all, crate::shortcuts::TABLE.len(), "every row shown");
     // Filter by typing in its box.
@@ -418,7 +418,7 @@ fn the_radius_scan_catches_multi_line_literals() {
 #[test]
 fn every_table_row_is_reachable_and_no_looser_row_shadows_it() {
     use crate::shortcuts::{Action, Scope, TABLE, pressed, text};
-    let live = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Mixer];
+    let live = [Scope::Global, Scope::Arrangement, Scope::PianoRoll, Scope::Step, Scope::Mixer];
     // Does `action` consume a press of `key` with exactly `mods` held? (A fresh frame each time,
     // so one action cannot eat the press another is asked about.)
     let fires = |key: egui::Key, mods: egui::Modifiers, action: Action| {

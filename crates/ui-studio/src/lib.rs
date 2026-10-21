@@ -644,6 +644,7 @@ impl StudioApp {
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
         self.poll_player();
+        self.step_poll();
         self.drive_editors();
         theme::probe_fonts(ctx);
         let wheeling = self.drive_wheel(ctx, now) | self.drive_tempo_wheel(ctx, now);
