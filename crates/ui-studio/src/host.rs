@@ -115,7 +115,7 @@ impl StudioApp {
             return;
         }
         let e = self.engine.session().edit.clone();
-        let sel = e.selection;
+        let sel = e.cycle_range();
         let cycle = e.loop_playback && !sel.is_empty();
         if cycle && e.loop_record {
             self.record_start = sel.start;
@@ -714,7 +714,7 @@ impl StudioApp {
     /// selection, loop the selection (the engine's loop range is the selection, plan 06 L6).
     pub fn play_from_cursor(&mut self) {
         let s = self.engine.session();
-        let sel = s.edit.selection;
+        let sel = s.edit.cycle_range();
         if s.edit.loop_playback && !sel.is_empty() {
             self.start_play(sel.start, None, Some(sel));
         } else {

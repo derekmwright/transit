@@ -77,6 +77,8 @@ pub struct ClipRect {
 pub struct Layout {
     pub track_list: R4,
     pub ruler: R4,
+    /// The loop strip along the top of the ruler.
+    pub loop_strip: R4,
     pub timeline: R4,
     pub samples_per_px: f64,
     pub scroll: Samples,
@@ -95,6 +97,8 @@ pub struct Layout {
 #[derive(Debug, Default)]
 pub struct ArrangeState {
     pub gesture: Option<Gesture>,
+    /// The loop strip gesture in progress (the loop region itself lives in the session).
+    pub loop_drag: Option<crate::loopbar::LoopDrag>,
     /// Vertical scroll of the track rows (points).
     pub vscroll: f32,
     pub layout: Layout,
@@ -287,7 +291,10 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     takes(app, ui, &s, map, tl, list, &rows, &geo, &layout);
     let vscroll = app.arrange.vscroll;
     crate::automation::lanes(app, ui, &s, map, tl, list, &rows, &geo, vscroll);
-    ruler_input(app, ui, map, ruler);
+    let strip = Rect::from_min_max(ruler.min, pos2(ruler.max.x, ruler.min.y + crate::loopbar::STRIP_H));
+    crate::loopbar::strip(app, ui, &s, map, strip);
+    layout.loop_strip = r4(strip);
+    ruler_input(app, ui, map, Rect::from_min_max(pos2(ruler.min.x, strip.max.y), ruler.max));
     overlays(app, ui, &s, map, ruler, tl, &rows, &geo);
     scroll_and_zoom(app, ui, map, full, tl, content_h);
     follow_playhead(app, map, tl);
@@ -639,8 +646,14 @@ fn grid_and_ruler(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, 
         }
         if (bar - 1) % every == 0 {
             gp.line_segment([pos2(x, tl.min.y), pos2(x, tl.max.y)], Stroke::new(1.0, TOKENS.grid_bar));
-            rp.line_segment([pos2(x, ruler.min.y + 10.0), pos2(x, ruler.max.y)], Stroke::new(1.0, TOKENS.text_dim));
-            rp.text(pos2(x + 4.0, ruler.min.y + 9.0), Align2::LEFT_CENTER, bar.to_string(), FontId::proportional(11.0), TOKENS.text);
+            rp.line_segment([pos2(x, ruler.min.y + crate::loopbar::STRIP_H + 10.0), pos2(x, ruler.max.y)], Stroke::new(1.0, TOKENS.text_dim));
+            rp.text(
+                pos2(x + 4.0, ruler.min.y + crate::loopbar::STRIP_H + 9.0),
+                Align2::LEFT_CENTER,
+                bar.to_string(),
+                FontId::proportional(11.0),
+                TOKENS.text,
+            );
         } else if bar_px >= 6.0 {
             gp.line_segment([pos2(x, tl.min.y), pos2(x, tl.max.y)], Stroke::new(1.0, TOKENS.grid_beat));
         }
@@ -919,9 +932,10 @@ fn ruler_input(app: &mut StudioApp, ui: &mut Ui, map: Map, ruler: Rect) {
 #[allow(clippy::too_many_arguments)]
 fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Rect, rows: &[&Track], geo: &RowGeo) {
     let p = ui.painter();
-    let sel = s.edit.selection;
+    let sel = s.edit.cycle_range();
     if s.edit.loop_playback && !sel.is_empty() {
-        let r = Rect::from_min_max(pos2(map.x(sel.start), ruler.min.y + 14.0), pos2(map.x(sel.end), ruler.max.y - 1.0)).intersect(ruler);
+        let r = Rect::from_min_max(pos2(map.x(sel.start), ruler.min.y + crate::loopbar::STRIP_H + 14.0), pos2(map.x(sel.end), ruler.max.y - 1.0))
+            .intersect(ruler);
         p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.55));
     }
     // The take being recorded grows on each armed track where it will land (slice 6: inside the

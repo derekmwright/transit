@@ -180,7 +180,7 @@ pub fn top_corners() -> egui::CornerRadius {
 }
 
 /// Track list row metrics (Cubase-like density).
-pub const RULER_H: f32 = 26.0;
+pub const RULER_H: f32 = 34.0;
 pub const TRANSPORT_H: f32 = 40.0;
 pub const STATUS_H: f32 = 22.0;
 pub const CLIP_NAME_H: f32 = 14.0;

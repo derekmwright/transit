@@ -192,6 +192,10 @@ pub struct EditState {
     pub link_track_edit: bool,
     pub insertion_follows_playback: bool,
     pub loop_playback: bool,
+    /// The loop region the arrangement's loop strip edits; empty = none (the cycle then follows
+    /// the edit selection, as before). `loop_playback` is the on/off switch for both.
+    #[serde(default)]
+    pub loop_range: Range,
     pub pre_post_roll: bool,
     pub pre_roll: Samples,
     pub post_roll: Samples,
@@ -224,6 +228,10 @@ pub struct EditState {
 }
 
 impl EditState {
+    /// The range Cycle plays and records: the loop region when one is set, else the selection.
+    pub fn cycle_range(&self) -> Range {
+        if self.loop_range.is_empty() { self.selection } else { self.loop_range }
+    }
     pub fn flag(&self, id: &str) -> bool {
         self.flags.contains(id)
     }
@@ -265,6 +273,7 @@ impl Default for EditState {
             link_track_edit: false,
             insertion_follows_playback: false,
             loop_playback: false,
+            loop_range: Range::default(),
             pre_post_roll: false,
             pre_roll: 96_000,
             post_roll: 96_000,
@@ -681,6 +690,19 @@ pub fn truncate_chars(s: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cycle_range_prefers_the_loop_region_over_the_selection() {
+        let mut e = EditState { selection: Range::new(10, 20), ..EditState::default() };
+        assert_eq!(e.cycle_range(), Range::new(10, 20), "no loop region: the selection");
+        e.loop_range = Range::new(100, 200);
+        assert_eq!(e.cycle_range(), Range::new(100, 200));
+        // A session saved before the loop region existed loads with none.
+        let mut v = serde_json::to_value(&e).unwrap();
+        v.as_object_mut().unwrap().remove("loop_range");
+        let old: EditState = serde_json::from_value(v).unwrap();
+        assert!(old.loop_range.is_empty());
+    }
 
     #[test]
     fn add_tracks_names_and_order() {

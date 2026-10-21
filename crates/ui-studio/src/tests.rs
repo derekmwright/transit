@@ -2503,4 +2503,131 @@ mod output_paths {
         app.engine.set_io_map(io);
         assert_eq!(app.io_warning().as_deref(), Some("Output paths overlap: Headphones, Out 5-6"));
     }
+// ---- loop strip (backlog #9) ----
+
+/// An app after a few frames, so the arrangement layout is known.
+fn loop_app() -> (StudioApp, egui::Context, f64) {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    (app, ctx, time)
+}
+
+/// The loop strip's point for the sample position `at` (plus `dx` points), at its middle height.
+fn strip_at(app: &StudioApp, at: i64, dx: f32) -> (f32, f32) {
+    let l = &app.arrange.layout;
+    let x = l.timeline[0] + ((at - l.scroll) as f64 / l.samples_per_px) as f32 + dx;
+    (x, (l.loop_strip[1] + l.loop_strip[3]) / 2.0)
+}
+
+fn strip_drag(app: &mut StudioApp, from: (i64, f32), to: (i64, f32), mods: Value) {
+    let (a, b) = (strip_at(app, from.0, from.1), strip_at(app, to.0, to.1));
+    drag(app, a, b, mods);
+}
+
+fn loop_range(app: &StudioApp) -> (i64, i64) {
+    let r = app.engine.session().edit.loop_range;
+    (r.start, r.end)
+}
+
+/// One beat at the default tempo and rate; the grid at the default zoom is a beat.
+fn beat(app: &StudioApp) -> i64 {
+    let s = app.engine.session();
+    s.tempo.tick_to_samples(soundcraft_time::TICKS_PER_QUARTER, s.sample_rate)
+}
+
+#[test]
+fn dragging_the_empty_loop_strip_creates_a_snapped_region_in_one_undo_step() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    let steps = undo_len(&mut app);
+    // Press a little off the 2nd beat and release a little off the 6th: both snap.
+    strip_drag(&mut app, (2 * b, 3.0), (6 * b, -4.0), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(loop_range(&app), (2 * b, 6 * b));
+    assert!(app.engine.session().edit.loop_playback, "a new region turns looping on");
+    assert_eq!(undo_len(&mut app), steps + 1, "one undo step for the whole gesture");
+    assert!(app.arrange.loop_drag.is_none());
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(loop_range(&app), (0, 0), "undo removes the region");
+    assert!(!app.engine.session().edit.loop_playback);
+}
+
+#[test]
+fn dragging_the_right_edge_extends_the_region_and_the_body_moves_it() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    app.run("transport.loop", json!({"start": 4 * b, "end": 8 * b, "enabled": true})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let steps = undo_len(&mut app);
+    strip_drag(&mut app, (8 * b, -2.0), (12 * b, 0.0), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(loop_range(&app), (4 * b, 12 * b), "the right edge moved, the left stayed");
+    assert_eq!(undo_len(&mut app), steps + 1);
+    // The body: press in the middle, drag two beats left; the length stays.
+    strip_drag(&mut app, (8 * b, 0.0), (6 * b, 0.0), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(loop_range(&app), (2 * b, 10 * b), "moved, same length");
+    assert_eq!(undo_len(&mut app), steps + 2);
+    // Dragged far left, the body stops at zero and keeps its length.
+    strip_drag(&mut app, (6 * b, 0.0), (0, 0.0), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(loop_range(&app), (0, 8 * b));
+    // Undo goes back one gesture at a time.
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(loop_range(&app), (2 * b, 10 * b));
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(loop_range(&app), (4 * b, 12 * b));
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(loop_range(&app), (4 * b, 8 * b), "undo restores the previous region");
+}
+
+#[test]
+fn dragging_the_left_edge_past_the_right_one_swaps_them() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    app.run("transport.loop", json!({"start": 4 * b, "end": 8 * b})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    strip_drag(&mut app, (4 * b, 2.0), (10 * b, 0.0), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(loop_range(&app), (8 * b, 10 * b));
+}
+
+#[test]
+fn double_clicking_the_strip_toggles_looping_and_the_cycle_button_follows() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    app.run("transport.loop", json!({"start": 4 * b, "end": 8 * b, "enabled": false})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let at = strip_at(&app, 6 * b, 0.0);
+    click_with(&mut app, at, json!({"count": 2}));
+    frames(&mut app, &ctx, 12, &mut time);
+    assert!(app.engine.session().edit.loop_playback, "enabled");
+    assert_eq!(loop_range(&app), (4 * b, 8 * b), "the region stays");
+    frames(&mut app, &ctx, 60, &mut time); // past egui's multi-click window
+    let at = strip_at(&app, 6 * b, 0.0);
+    click_with(&mut app, at, json!({"count": 2}));
+    frames(&mut app, &ctx, 12, &mut time);
+    assert!(!app.engine.session().edit.loop_playback, "disabled");
+    // The transport's cycle command and the strip share the one flag.
+    app.run("options.loop_playback", json!({})).unwrap();
+    assert!(app.engine.session().edit.loop_playback);
+    // A plain click on the strip leaves the region and the cursor alone.
+    let cursor = app.cursor();
+    let at = strip_at(&app, 20 * b, 0.0);
+    click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!((loop_range(&app), app.cursor()), ((4 * b, 8 * b), cursor));
+}
+
+#[test]
+fn shift_dragging_the_loop_strip_does_not_snap() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    strip_drag(&mut app, (2 * b, 0.0), (6 * b, 20.0), json!({"shift": true}));
+    frames(&mut app, &ctx, 20, &mut time);
+    let (s, e) = loop_range(&app);
+    assert!((s - 2 * b).abs() < 1100 && (e - (6 * b + 20 * 1024)).abs() < 1100, "{s} {e}");
+    assert_ne!(e % b, 0, "off the grid");
 }

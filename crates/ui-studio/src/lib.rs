@@ -23,6 +23,7 @@ pub mod icons;
 pub mod import;
 mod io_settings;
 pub mod keys;
+mod loopbar;
 pub mod menus;
 mod midi_input;
 pub mod mixer;
