@@ -14,9 +14,11 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 - Adaptive grid down to 1/128, with Ctrl+1-4 for narrower, wider, triplet and snap on/off.
 - Clips snap to the grid as you drag; Ctrl-drag or Alt-drag copies; Shift bypasses snap.
-- Loop strip on the ruler: drag to make a loop, drag its edges to resize it, double-click to toggle it. The loop follows tempo changes.
+- Loop strip on the ruler, in amber: drag to make a loop, drag its edges to resize it, double-click to toggle it. The loop follows tempo changes.
 - Automation lanes under any track for volume, pan, mute, sends and every device parameter; Read, Touch, Latch and Write modes.
 - Tempo and meter changes along the timeline, edited by dragging or typing in the transport.
+- Transport metronome button: right-click for click level and count-in bars. Count-in works at bar 1, and recording starts sample-exact at the end of it.
+- Transport load readout (for example "30%  128 @ 48 kHz  ASIO") with an overload warning.
 - Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor (no MIDI recording yet; it is next).
 
 ### Mixer and routing
@@ -31,6 +33,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 ### Instruments and effects
 
 - Hosts CLAP and VST3 plug-ins, with their own editor windows, saved state, and reported latency.
+- The device card shows Loading while a heavy plug-in instantiates.
 - Plug-in browser with a background scan and your own search folders.
 - Built-in instruments: Subtractive Synth, Drum Synth, Sampler.
 - Built-in dynamics and EQ: Compressor/Limiter, Expander/Gate, De-Esser, Maximizer, Channel Strip, EQ 7-Band, EQ 1-Band.
@@ -59,7 +62,8 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 ### Under the hood
 
 - Pure Rust: egui UI on the SoundCraft engine.
-- Offline render runs on the same plan renderer as playback, and golden tests check that the two agree.
+- One renderer: playback and offline render both use the plan renderer; the legacy renderer is gone.
+- Offline render and playback are checked against each other by golden tests.
 - Every edit is a named command, which is what makes undo and the command catalog uniform.
 
 ## Status
@@ -105,7 +109,7 @@ disables saving settings.
 ## Status and known issues
 
 - Pre-alpha; the session format and UI change freely.
-- Loading a plug-in can block the UI while it initializes.
+- A heavy plug-in can still block the UI for the duration of its single create call.
 - Windows releases are unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft
@@ -123,3 +127,10 @@ and [NOTICE](NOTICE).
 ## Contributing
 
 Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Background on past decisions is in the [ADR index](docs/adr/README.md).
+
+## For contributors and their agents
+
+- [AGENTS.md](AGENTS.md): read this first.
+- [docs/adr/](docs/adr/README.md): architecture decisions.
+- [docs/contributing/](docs/contributing/README.md): evidence and knowledge notes.
+- [docs/known-issues/](docs/known-issues/README.md): accepted, tracked limitations.
