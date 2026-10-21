@@ -1523,3 +1523,34 @@ fn a_moved_insert_keeps_its_instance_and_the_order_changes_the_sound() {
     assert_eq!(orig.publish(&s), Adoption::Adopted);
     assert_ne!(moved_out, orig.render(4), "gain then saturator is not saturator then gain");
 }
+
+/// How many plug-ins a compile of `s` asks the factory for.
+fn instances_made(mut comp: PlanCompiler, s: &Session) -> usize {
+    let made = std::cell::Cell::new(0usize);
+    let mut make = |spec: &InstanceSpec, _: SlotGen| {
+        made.set(made.get() + 1);
+        create_instance(&spec.id, spec.state.as_deref(), SR as f32, BLOCK, spec.ch)
+    };
+    let next = comp.active().checked_next().unwrap();
+    let env = comp.compile(Arc::new(s.clone()), comp.active(), next, &mut make).unwrap();
+    comp.reclaim(env);
+    made.get()
+}
+
+#[test]
+fn an_inactive_tracks_plugins_are_made_by_a_live_compile_but_not_an_offline_one() {
+    let (mut s, a, b) = audio_session();
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(builtin("maximizer"));
+    s.track_mut(b).unwrap().mixer.inserts[0] = Some(builtin("maximizer"));
+    s.track_mut(b).unwrap().mixer.inserts[1] = Some(builtin("maximizer"));
+    let live = || PlanCompiler::new(target(), PlanLimits::default());
+    assert_eq!(instances_made(live(), &s), 3);
+    assert_eq!(instances_made(live().skipping_inactive_instances(), &s), 3, "active tracks keep every instance");
+    s.track_mut(b).unwrap().inactive = true;
+    assert_eq!(instances_made(live(), &s), 3, "the live engine keeps an inactive track warm");
+    assert_eq!(instances_made(live().skipping_inactive_instances(), &s), 1, "an offline compile skips it");
+    // A muted track can be unmuted by automation: it stays.
+    s.track_mut(b).unwrap().inactive = false;
+    s.track_mut(b).unwrap().mixer.mute = true;
+    assert_eq!(instances_made(live().skipping_inactive_instances(), &s), 3);
+}

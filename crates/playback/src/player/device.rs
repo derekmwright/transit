@@ -398,6 +398,10 @@ impl Player {
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) -> Result<action_lane::Sequence, PlayerError> {
         self.owner()?.send_action(Command::Play { from, end, looped }, true)
     }
+    /// Retarget (or clear) the loop of a running transport without moving the playhead.
+    pub fn set_loop(&self, looped: Option<Range>) -> Result<action_lane::Sequence, PlayerError> {
+        self.owner()?.send_action(Command::SetLoop(looped), true)
+    }
     pub fn locate(&self, at: Samples) -> Result<action_lane::Sequence, PlayerError> {
         self.cancel_record_start()?;
         self.owner()?.send_action(Command::Locate(at), true)

@@ -948,6 +948,21 @@ mod tests {
     }
 
     #[test]
+    fn a_send_reaches_a_bus_named_like_an_input_path() {
+        use soundcraft_model::{IoMap, Route};
+        let mut e = crate::demo::demo_engine();
+        e.set_io_map(IoMap::for_device("ASIO", "TASCAM", 12, 10));
+        let kick = e.session().track_by_name("Kick").map(|t| t.id.0).unwrap();
+        // With no such bus, an input path name is still refused.
+        assert!(e.execute("mix.send", &json!({"tracks": [kick], "bus": "In 1"})).is_err());
+        let bus = e.session_mut().add_bus("In 1", soundcraft_model::ChannelFormat::Stereo);
+        let r = e.execute("mix.send", &json!({"tracks": [kick], "bus": "In 1"})).unwrap();
+        assert_eq!(r["bus"], json!(bus));
+        let sends = &e.session().track_by_name("Kick").unwrap().mixer.sends;
+        assert!(sends.iter().flatten().any(|s| s.target == Route::Bus(bus)));
+    }
+
+    #[test]
     fn folder_routes_members_through_its_bus() {
         let mut e = crate::demo::demo_engine();
         let r = e.execute("track.move_to_new_folder", &json!({"tracks": ["Kick", "Snare"], "name": "Drums"})).unwrap();

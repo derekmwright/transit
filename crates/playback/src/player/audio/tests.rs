@@ -362,6 +362,63 @@ fn seek_past_loop_end_continues_linearly_and_a_seek_back_engages_the_loop() {
     control.retire(audio.plans, audio.actions);
 }
 
+fn positions(audio: &mut Audio, shared: &Shared, fills: usize) -> Vec<i64> {
+    let mut out = [0.0; 128];
+    (0..fills)
+        .map(|_| {
+            let ((), heap) = measure(|| fill(audio, &mut out));
+            assert!(heap.is_zero(), "{heap:?}");
+            shared.position.load(Ordering::Relaxed)
+        })
+        .collect()
+}
+
+#[test]
+fn a_loop_set_while_playing_wraps_at_its_new_end_without_reseeking() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    assert_eq!(positions(&mut audio, &shared, 1), [64]);
+    control.send_action(Command::SetLoop(Some(Range { start: 64, end: 512 })), true).unwrap();
+    let seen = positions(&mut audio, &shared, 12);
+    assert_eq!(seen[0], 128, "the playhead did not move: {seen:?}");
+    assert!(seen.iter().all(|p| (64..512).contains(p)), "wrapped inside the new region: {seen:?}");
+    assert!(seen.windows(2).any(|w| w[1] < w[0]), "wrapped at the new end: {seen:?}");
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_loop_set_before_the_playhead_waits_for_it_a_loop_set_behind_it_never_jumps() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 1000, end: None, looped: None }, true).unwrap();
+    positions(&mut audio, &shared, 1);
+    control.send_action(Command::SetLoop(Some(Range { start: 0, end: 256 })), true).unwrap();
+    let seen = positions(&mut audio, &shared, 5);
+    assert!(seen.windows(2).all(|w| w[1] == w[0] + 64), "linear past the new end: {seen:?}");
+    assert!(!audio.transport.loop_engaged);
+    // Ahead of a region the playhead plays through, then wraps at its end (the Ableton rule).
+    control.send_action(Command::Locate(0), true).unwrap();
+    control.send_action(Command::SetLoop(Some(Range { start: 256, end: 512 })), true).unwrap();
+    let seen = positions(&mut audio, &shared, 12);
+    assert!(seen.iter().all(|p| *p < 512), "wrapped at the region end: {seen:?}");
+    assert!(seen.windows(2).any(|w| w[1] < w[0]), "{seen:?}");
+    assert!(seen.iter().filter(|p| **p >= 256).count() > 1, "{seen:?}");
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn turning_the_loop_off_mid_loop_continues_linearly() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 0, end: None, looped: Some(Range { start: 0, end: 256 }) }, true).unwrap();
+    positions(&mut audio, &shared, 1);
+    control.send_action(Command::SetLoop(None), true).unwrap();
+    let seen = positions(&mut audio, &shared, 10);
+    assert!(seen.windows(2).all(|w| w[1] == w[0] + 64), "linear after loop off: {seen:?}");
+    assert!(seen.last().unwrap() > &512);
+    control.send_action(Command::SetLoop(Some(Range { start: 5, end: 5 })), true).unwrap();
+    positions(&mut audio, &shared, 1);
+    control.retire(audio.plans, audio.actions);
+}
+
 #[test]
 fn conversion_chunks_share_the_actual_device_callback_action_budget() {
     let (mut control, mut audio, _) = fixture(48_000);

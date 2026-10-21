@@ -3597,7 +3597,7 @@ impl RangeRender {
     pub fn try_new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Result<Self, CompileError> {
         let target = Self::target(s, block);
         let mut eng = MixEngine::realtime(target);
-        let mut compiler = PlanCompiler::new(target, Self::limits());
+        let mut compiler = PlanCompiler::new(target, Self::limits()).skipping_inactive_instances();
         let (sr, max_block) = (target.sample_rate as f32, target.block());
         let mut make = |spec: &InstanceSpec, _: SlotGen| create_instance(&spec.id, spec.state.as_deref(), sr, max_block, spec.ch);
         let next = compiler.active().checked_next().ok_or(CompileError::GenerationExhausted)?;

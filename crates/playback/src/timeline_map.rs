@@ -177,6 +177,24 @@ impl Timeline {
         }
         Ok(())
     }
+    /// Retarget the loop without moving the position or changing the rate. `engaged`
+    /// is the renderer's view (its position is ahead of this one, never behind), so
+    /// both sides keep wrapping at the same boundary: a position already at or past
+    /// the new end plays on linearly, one before it wraps at the new end.
+    pub fn set_loop(&mut self, transport: u64, loop_range: Option<(i64, i64)>, engaged: bool) -> Result<(), MapError> {
+        if transport <= self.transport {
+            return Err(MapError::WrongGeneration);
+        }
+        if let Some((start, end)) = loop_range
+            && (start >= end || start < -MAX_POSITION || end > MAX_POSITION)
+        {
+            return Err(MapError::Invalid);
+        }
+        self.transport = transport;
+        self.loop_range = loop_range;
+        self.loop_active = engaged && loop_range.is_some_and(|(_, end)| self.position < i128::from(end) * i128::from(self.rate.denominator));
+        Ok(())
+    }
     pub fn next_output(&self) -> u64 {
         self.next_output
     }

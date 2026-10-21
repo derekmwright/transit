@@ -742,6 +742,25 @@ impl StudioApp {
         }
     }
 
+    /// The loop region reaches a running player the moment it changes (or Cycle goes off), like
+    /// Ableton: the playhead is not moved. Not while recording, where the loop shapes the take passes.
+    fn retarget_loop(&mut self) {
+        let edit = &self.engine.session().edit;
+        let want = (edit.loop_playback && !edit.loop_range.is_empty()).then_some(edit.loop_range);
+        if want == self.loop_seen {
+            return;
+        }
+        self.loop_seen = want;
+        if self.recording_active() || !self.is_playing() {
+            return;
+        }
+        if let Some(p) = &self.player {
+            let _ = self.player_requests.result(&mut self.status, p.set_loop(want));
+        } else if let Some(sim) = &mut self.sim {
+            sim.2 = want;
+        }
+    }
+
     pub(crate) fn handle_transport(&mut self, dt: f32) {
         let mut reqs: std::collections::VecDeque<TransportRequest> = std::mem::take(&mut self.engine.transport_requests).into();
         while let Some(r) = reqs.pop_front() {
@@ -843,6 +862,7 @@ impl StudioApp {
                 }
             }
         }
+        self.retarget_loop();
         // Read back the position.
         if let Some(p) = &self.player {
             let playing = p.is_playing();

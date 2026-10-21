@@ -99,3 +99,25 @@ fn a_streamed_bounce_is_exactly_the_range_long() {
     }
     assert_eq!(total, 30_000);
 }
+
+/// An inactive track with an instrument and an insert is never processed: the bounce equals the
+/// legacy one, and equals the bounce of the session without that track.
+#[test]
+fn an_inactive_hosted_track_changes_nothing_in_the_bounce() {
+    let base = session(true);
+    let mut s = base.clone();
+    let idle = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+    let mut seq = Sequence::default();
+    seq.notes.push(Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 4_000 });
+    let cid = s.new_clip_id();
+    let tr = s.track_mut(idle).unwrap();
+    tr.playlist_mut().unwrap().clips.push(Clip::midi(cid, "n", 0, 48_000, seq));
+    tr.instrument = Some(builtin("subtractive_synth"));
+    tr.mixer.inserts[0] = Some(builtin("maximizer"));
+    tr.inactive = true;
+    let range = Range::new(0, 30_000);
+    let plan = render_range(&s, range, 512);
+    assert!(plan.iter().flatten().any(|v| v.abs() > 1e-3));
+    assert_same("inactive, plan against legacy", &plan, &render_legacy(&s, None, range, 512));
+    assert_same("inactive, against the session without the track", &plan, &render_range(&base, range, 512));
+}

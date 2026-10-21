@@ -481,7 +481,7 @@ fn send(e: &mut Engine, p: &Value) -> Result<Value> {
     // exists keeps its name; a name that is only an output path is that path; else a new bus.
     let path =
         io.path(&bus).filter(|x| x.direction == soundcraft_model::IoDirection::Output && s.bus_by_name(&bus).is_none()).map(|x| x.name.clone());
-    if io.path(&bus).is_some_and(|x| x.direction == soundcraft_model::IoDirection::Input) {
+    if s.bus_by_name(&bus).is_none() && io.path(&bus).is_some_and(|x| x.direction == soundcraft_model::IoDirection::Input) {
         return Err(bad("mix.send", format!("`{bus}` is an input path, not an output")));
     }
     let target = match &path {

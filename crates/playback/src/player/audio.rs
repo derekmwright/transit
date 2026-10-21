@@ -18,9 +18,20 @@ mod midi;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
-    Play { from: Samples, end: Option<Samples>, looped: Option<Range> },
-    Record { ticket: start::Ticket, from: Option<Samples>, end: Option<Samples>, looped: Option<Range> },
+    Play {
+        from: Samples,
+        end: Option<Samples>,
+        looped: Option<Range>,
+    },
+    Record {
+        ticket: start::Ticket,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+    },
     Locate(Samples),
+    /// Retarget (or clear) the loop while running, without reseeking.
+    SetLoop(Option<Range>),
     Recording(bool),
     Note(soundcraft_mix::InstrumentEvent),
 }
@@ -167,6 +178,20 @@ impl Transport {
                     self.loop_engaged = self.looped.is_some_and(|r| at < r.end);
                     self.discard_pending = true;
                     live.set_transport_epoch(soundcraft_mix::TransportEpoch(self.epoch));
+                })
+            }
+            action_lane::Event::Action { payload: Command::SetLoop(looped), .. } => {
+                if looped.is_some_and(|r| r.start >= r.end || r.start < -MAX_POSITION || r.end > MAX_POSITION) {
+                    return ActionResult::InvalidPosition;
+                }
+                let engaged = looped.is_some_and(|r| self.render_position < r.end);
+                self.epoch.checked_add(1).ok_or(timeline_map::MapError::Arithmetic).and_then(|epoch| {
+                    self.timeline.set_loop(epoch, looped.map(|r| (r.start, r.end)), engaged)?;
+                    self.epoch = epoch;
+                    self.looped = looped;
+                    self.loop_engaged = engaged;
+                    live.set_transport_epoch(soundcraft_mix::TransportEpoch(epoch));
+                    Ok(())
                 })
             }
             action_lane::Event::Action { payload: Command::Recording(on), .. } => {

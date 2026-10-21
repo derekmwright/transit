@@ -239,6 +239,8 @@ pub struct StudioApp {
     last_meter_poll: f64,
     /// Transport simulation when there is no player (tests, `--no-audio`).
     sim: Option<(Samples, Option<Samples>, Option<Range>)>,
+    /// The loop the session asked for at the last frame, so a change while playing retargets the running loop.
+    loop_seen: Option<Range>,
     record_hint: Option<(f64, &'static str)>,
     pub quit_requested: bool,
     pub frame_ms: f32,
@@ -318,6 +320,7 @@ impl StudioApp {
             meter_snapshot: soundcraft_playback::MeterSnapshot::default(),
             last_meter_poll: f64::NEG_INFINITY,
             sim: None,
+            loop_seen: None,
             record_hint: None,
             quit_requested: false,
             frame_ms: 0.0,

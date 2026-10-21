@@ -183,6 +183,9 @@ impl Drop for ReleaseOnUnwind<'_> {
 pub struct PlanCompiler {
     target: RenderTarget,
     limits: PlanLimits,
+    /// Headless compile (an offline render): tracks the render never processes get no plug-in
+    /// instances. A live compile keeps them warm so an inactive track can come back instantly.
+    skip_inactive: bool,
     active: Shadow,
     pending: Option<Pending>,
     last: PlanGeneration,
@@ -335,6 +338,7 @@ impl PlanCompiler {
         PlanCompiler {
             target: target.normalized(),
             limits,
+            skip_inactive: false,
             active: Shadow::default(),
             pending: None,
             last: PlanGeneration::EMPTY,
@@ -347,6 +351,14 @@ impl PlanCompiler {
             loops: Vec::new(),
             io: Arc::new(IoMap::default()),
         }
+    }
+
+    /// Compile for a headless render: an inactive track is never processed, so it gets no plug-in
+    /// instances (a bounce of a session with large hosted instruments no longer loads the idle ones).
+    #[must_use]
+    pub fn skipping_inactive_instances(mut self) -> Self {
+        self.skip_inactive = true;
+        self
     }
 
     /// The path table the next plans are made with. A changed table is a structural change of the
@@ -626,7 +638,18 @@ impl PlanCompiler {
         mode: CompileMode,
     ) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>, Vec<RouteCycle>) {
         let main_ch = main_channels(s);
-        let specs: HashMap<(TrackId, usize), InstanceSpec> = realtime_instance_specs(s).into_iter().map(|x| ((x.track, x.slot), x)).collect();
+        // The tracks `render_rows` never processes: inactive, and not an aux, folder or master.
+        let idle: Vec<TrackId> = if self.skip_inactive {
+            s.tracks
+                .iter()
+                .filter(|t| t.inactive && !matches!(t.kind, TrackKind::Aux | TrackKind::Folder | TrackKind::Master))
+                .map(|t| t.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let specs: HashMap<(TrackId, usize), InstanceSpec> =
+            realtime_instance_specs(s).into_iter().filter(|x| !idle.contains(&x.track)).map(|x| ((x.track, x.slot), x)).collect();
         let (rows, phase1, aux_end, loops) = render_rows(s);
         let mut desc = Desc { main: Some(s.main_format()), ..Desc::default() };
         for (r, &ti) in rows.iter().enumerate() {
