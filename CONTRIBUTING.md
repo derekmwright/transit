@@ -5,13 +5,19 @@ ideas and questions.
 
 Pull requests should be small, focused and written in the style of the code around them.
 
-Before you open one, run:
+Before you open one, read the contributor docs and run the gates:
+
+- Start at [`docs/contributing/README.md`](docs/contributing/README.md).
+- How the engine and UI are built: [`docs/contributing/knowledge/README.md`](docs/contributing/knowledge/README.md).
+- What counts as evidence, and the gate commands: [`docs/contributing/evidence/README.md`](docs/contributing/evidence/README.md).
+- Known issues: [`docs/known-issues/README.md`](docs/known-issues/README.md). Build notes: [`docs/building.md`](docs/building.md).
 
 ```sh
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo xtask layers
+cargo xtask assets
 ```
 
 Rules:

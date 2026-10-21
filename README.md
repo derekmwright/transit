@@ -122,4 +122,4 @@ and [NOTICE](NOTICE).
 
 ## Contributing
 
-Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Background on past decisions is in the [ADR index](docs/adr/README.md).
