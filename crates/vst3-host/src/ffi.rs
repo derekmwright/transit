@@ -2016,7 +2016,8 @@ impl Instance {
         for (dir, n) in [(din, nin), (dout, nout)] {
             for i in 0..n {
                 let on = i == 0 || (dir == din && layout.key_bus == usize::try_from(i).ok());
-                // SAFETY: valid component; index below the bus count.
+                // SAFETY: valid component; index below the bus count; the component is inactive here
+                // (`shutdown` above, `setActive(1)` below), as the SDK requires for bus activation.
                 unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(on)) };
             }
         }

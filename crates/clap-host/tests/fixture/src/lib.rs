@@ -650,10 +650,14 @@ static PARAMS: clap_plugin_params = clap_plugin_params {
 const KEY_MARK: f32 = 0.125;
 
 unsafe extern "C" fn ports_count(p: *const clap_plugin, is_input: bool) -> u32 {
-    // SAFETY (both `fx` calls): the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
-    if is_input && unsafe { fx(p) }.synth {
+    // SAFETY: the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
+    let (synth, keyed) = unsafe {
+        let f = fx(p);
+        (f.synth, f.keyed)
+    };
+    if is_input && synth {
         0
-    } else if is_input && unsafe { fx(p) }.keyed {
+    } else if is_input && keyed {
         2
     } else {
         1
@@ -661,8 +665,9 @@ unsafe extern "C" fn ports_count(p: *const clap_plugin, is_input: bool) -> u32 {
 }
 
 unsafe extern "C" fn ports_get(p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_audio_port_info) -> bool {
-    // SAFETY (the `fx` calls): the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
-    if index == 1 && is_input && unsafe { fx(p) }.keyed {
+    // SAFETY: the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
+    let keyed = unsafe { fx(p) }.keyed;
+    if index == 1 && is_input && keyed {
         // SAFETY: the host passes a writable clap_audio_port_info.
         let info = unsafe { &mut *info };
         info.id = 2;
