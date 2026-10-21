@@ -77,6 +77,7 @@ fn rig(payload_panics: bool, plugin_panics: bool) -> (LegacyPlayer, Log, Arc<Ato
         speed: AtomicU32::new(1000),
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
+        metro: crate::Metro::default(),
     });
     let (tx, rx) = channel();
     let (gtx, grx) = channel();

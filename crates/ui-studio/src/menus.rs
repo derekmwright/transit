@@ -226,8 +226,8 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                     ui.separator();
                     // Slice 6: a preference, not the document.
                     let on = app.ui.count_in;
-                    let b = check_button(ui, on, "Count-in (1 bar)");
-                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Count-in (1 bar)".into(), String::new(), b.rect));
+                    let b = check_button(ui, on, "Count-in");
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Count-in".into(), String::new(), b.rect));
                     if b.clicked() {
                         app.ui.count_in = !on;
                         ui.close();

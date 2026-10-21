@@ -155,7 +155,7 @@ fn atomic_record_start_receipt_updates_transport_and_clock_refusal_collects_the_
         let mut control = control();
         let (mut starts, _) = start::pair(soundcraft_mix::EngineEpoch(1));
         let reader = starts.prepare().unwrap();
-        let command = PlayerCommand::Record { ticket: reader.ticket(), from: Some(500), end: None, looped: None };
+        let command = PlayerCommand::Record { ticket: reader.ticket(), from: Some(500), end: None, looped: None, count_in: None };
         let sequence = control.send_action(command, false).unwrap();
         let mut requests = PlayerRequests { play: Some(sequence), recording: Some(sequence), ..Default::default() };
         let mut status = "Record pending".to_owned();

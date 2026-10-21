@@ -458,19 +458,102 @@ fn delete_take_keeps_the_other_and_is_refused_with_three() {
 }
 
 #[test]
-fn count_in_is_a_preference_from_the_transport_menu_and_plays_one_bar_first() {
+fn count_in_is_a_preference_from_the_transport_menu_and_measures_bars_from_the_tempo_map() {
     let mut t = T::new();
     t.menu("Transport");
-    t.menu("Count-in (1 bar)");
+    t.menu("Count-in");
     assert!(t.app.ui.count_in);
     assert!(!t.app.engine.is_dirty(), "a preference, not the document");
-    let bar = t.app.lead_in(10 * 48_000);
-    // 120 BPM in 4/4: a bar is two seconds.
-    assert_eq!(bar, 96_000);
+    // 120 BPM in 4/4: a beat is half a second, a bar two seconds.
+    let one = t.app.count_in_for(10 * 48_000).unwrap();
+    assert_eq!((one.frames, one.beat, one.per_bar), (96_000, 24_000, 4));
+    t.app.ui.count_in_bars = 2;
+    assert_eq!(t.app.count_in_for(0).unwrap().frames, 192_000, "bar 1 needs no room before it");
+    assert_eq!(t.app.lead_in(10 * 48_000), 0, "the count-in is not a pre-roll");
     t.menu("Transport");
-    t.menu("Count-in (1 bar)");
+    t.menu("Count-in");
     assert!(!t.app.ui.count_in);
-    assert_eq!(t.app.lead_in(10 * 48_000), 0, "off, and no pre-roll");
+    assert!(t.app.count_in_for(0).is_none());
+}
+
+#[test]
+fn record_with_a_count_in_at_bar_one_counts_in_then_plays_from_the_start() {
+    let mut t = T::new();
+    t.app.ui.count_in = true;
+    t.app.ui.count_in_bars = 2;
+    t.app.set_cursor(0, None);
+    t.app.begin_pass(Vec::new());
+    assert_eq!(t.app.status, "Count-in");
+    let (left, total) = t.app.count_in_state().expect("counting in");
+    assert_eq!((left, total), (192_000, 192_000));
+    assert_eq!(t.app.count_in_label().as_deref(), Some("-2| 1"));
+    assert!(!t.app.is_playing(), "the playhead waits at the start");
+    assert_eq!(t.app.position(), 0);
+    // One second in (two beats): still bar -2, beat 3.
+    t.app.handle_transport(1.0);
+    assert_eq!(t.app.count_in_label().as_deref(), Some("-2| 3"));
+    assert!(t.app.beat_phase().is_some(), "the metronome button has a beat to flash");
+    t.app.handle_transport(1.0);
+    assert_eq!(t.app.count_in_label().as_deref(), Some("-1| 1"));
+    // The rest of the two bars, and the transport plays from the cursor.
+    t.app.handle_transport(2.1);
+    assert!(t.app.count_in_state().is_none());
+    assert!(t.app.is_playing());
+    assert_eq!(t.app.record_start, 0);
+    t.app.handle_transport(0.0);
+    assert_ne!(t.app.status, "Count-in", "the status line moves on once the count-in ends");
+    t.app.stop_play();
+}
+
+#[test]
+fn stop_during_the_count_in_cancels_it_without_playing() {
+    let mut t = T::new();
+    t.app.ui.count_in = true;
+    t.app.set_cursor(10 * 48_000, None);
+    t.app.begin_pass(Vec::new());
+    assert!(t.app.count_in_state().is_some());
+    t.app.handle_transport(0.5);
+    t.app.stop_play();
+    assert!(t.app.count_in_state().is_none());
+    t.app.handle_transport(5.0);
+    assert!(!t.app.is_playing(), "a cancelled count-in never starts playing");
+    assert_eq!(t.app.cursor(), 10 * 48_000);
+}
+
+#[test]
+fn the_metronome_button_toggles_the_click_and_its_popup_sets_preferences_without_undo() {
+    let mut t = T::new();
+    let undo = t.undo_len();
+    let button = t.app.arrange.layout.transport["metronome"];
+    t.click(mid(button));
+    assert!(t.app.engine.session().edit.click, "one click turns the click on");
+    t.click(mid(button));
+    assert!(!t.app.engine.session().edit.click);
+    assert_eq!(t.undo_len(), undo, "options.click is not an undo step");
+    // Right-click: the popup.
+    t.input("ui.click", json!({"x": mid(button).0, "y": mid(button).1, "button": "right"}));
+    assert!(t.app.metro_popup);
+    let at = |t: &T, name: &str| mid(t.app.arrange.layout.transport[name]);
+    let bars = at(&t, "metro_bars_4");
+    t.click(bars);
+    assert!(t.app.ui.count_in);
+    assert_eq!(t.app.ui.count_in_bars, 4);
+    for _ in 0..3 {
+        let up = at(&t, "metro_level_inc");
+        t.click(up);
+    }
+    assert_eq!(t.app.ui.metronome_db, 3.0);
+    let down = at(&t, "metro_level_dec");
+    t.click(down);
+    assert_eq!(t.app.ui.metronome_db, 2.0);
+    let off = at(&t, "metro_bars_off");
+    t.click(off);
+    assert!(!t.app.ui.count_in);
+    assert_eq!(t.undo_len(), undo, "the popup edits preferences, not the document");
+    assert!(!t.app.engine.is_dirty());
+    // Both persist with the other UI settings.
+    let saved = serde_json::to_value(&t.app.ui).unwrap();
+    assert_eq!((saved["count_in_bars"].as_u64(), saved["metronome_db"].as_f64()), (Some(4), Some(2.0)));
 }
 
 // ---- Piano roll clip-end handle ----
@@ -760,23 +843,6 @@ fn the_take_glyph_keeps_the_lanes_reachable_at_a_narrow_zoom() {
     t.click(mid(chip.rect));
     assert_eq!(t.app.ui.takes_open, vec![a], "the glyph opens the lanes");
     assert_eq!(t.app.finish.layout.takes.len(), 2);
-}
-
-#[test]
-fn count_in_at_bar_one_says_it_was_skipped() {
-    let mut t = T::new();
-    t.app.ui.count_in = true;
-    t.app.set_cursor(0, None);
-    t.app.begin_pass(Vec::new());
-    assert_eq!(t.app.status, "Count-in skipped: no room before bar 1");
-    t.app.stop_play();
-    // With room before the cursor the count-in plays and nothing is said.
-    t.app.status.clear();
-    t.app.set_cursor(10 * 48_000, None);
-    t.app.engine.transport.playing = false;
-    t.app.begin_pass(Vec::new());
-    assert!(t.app.status.is_empty(), "{}", t.app.status);
-    assert_eq!(t.app.engine.transport.position, 10 * 48_000 - 96_000);
 }
 
 #[test]

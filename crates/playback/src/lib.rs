@@ -28,7 +28,7 @@ pub mod telemetry;
 pub mod timeline_map;
 
 pub use devices::AudioConfig;
-pub use player::{ActionResult, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice};
+pub use player::{ActionResult, CountIn, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
@@ -94,6 +94,24 @@ struct Shared {
     /// A hosted plug-in's editor is open (set by the UI thread each frame): the engine keeps
     /// running while stopped, because such GUIs initialise and sync through `process` calls.
     editors_open: AtomicBool,
+    metro: Metro,
+}
+
+/// The click's level and the record count-in, shared between Main and the audio thread. Plain
+/// atomics: neither side allocates or waits.
+struct Metro {
+    /// Linear click trim, as `f32` bits.
+    gain: AtomicU32,
+    /// Project samples of the count-in still to play; 0 when none is running.
+    count_in_left: AtomicI64,
+    /// Length of the running count-in, in project samples.
+    count_in_total: AtomicI64,
+}
+
+impl Default for Metro {
+    fn default() -> Self {
+        Self { gain: AtomicU32::new(1.0f32.to_bits()), count_in_left: AtomicI64::new(0), count_in_total: AtomicI64::new(0) }
+    }
 }
 
 /// What stopped the audio output.
@@ -769,6 +787,7 @@ impl LegacyPlayer {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let want = session.sample_rate.hz();
         let side_rate = session.sample_rate.as_f64() as f32;
@@ -1523,6 +1542,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         };
         let fault = Fault::default();
         let mut out = [0.5f32; 8];
@@ -1545,6 +1565,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let holder: Holder =
             Arc::new(Mutex::new(Some(AudioState::new(channel().1, Arc::clone(&shared), Arc::new(Session::default()), 48_000.0, channel().0))));
@@ -1631,6 +1652,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1694,6 +1716,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, channel().0);
@@ -1726,6 +1749,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -1752,6 +1776,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
@@ -1786,6 +1811,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1875,6 +1901,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -1985,6 +2012,7 @@ mod tests {
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
                 editors_open: AtomicBool::new(false),
+                metro: Metro::default(),
             });
             let (tx, rx) = channel();
             let (gtx, _grx) = channel();
@@ -2054,6 +2082,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, _grx) = channel();
@@ -2092,6 +2121,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -2195,6 +2225,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -2288,6 +2319,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -2330,6 +2362,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -2430,6 +2463,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, channel().0);
@@ -2516,6 +2550,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();
@@ -2546,6 +2581,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
@@ -2582,6 +2618,7 @@ mod tests {
                 speed: AtomicU32::new(1000),
                 meters: Mutex::new(MeterSnapshot::default()),
                 editors_open: AtomicBool::new(false),
+                metro: Metro::default(),
             });
             let (tx, rx) = channel();
             let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -2613,6 +2650,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
@@ -2653,6 +2691,7 @@ mod tests {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: Metro::default(),
         });
         let (tx, rx) = channel();
         let (gtx, grx) = channel();

@@ -70,15 +70,22 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 if button(app, ui, "play", Icon::Play, playing && !recording, TOKENS.accent).clicked() {
                     let _ = app.run("transport.play", json!({}));
                 }
-                if button(app, ui, "record", Icon::Record, recording, TOKENS.record).clicked() {
+                // A record count-in pulses the button on each beat instead of lighting it.
+                let counting = app.count_in_label();
+                let pulse = counting.is_some() && app.beat_phase().is_some_and(|(phase, _)| phase < 0.5);
+                if button(app, ui, "record", Icon::Record, (recording && counting.is_none()) || pulse, TOKENS.record).clicked() {
                     let _ = app.run("transport.record", json!({}));
                 }
                 if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.loop_region).clicked() {
                     let _ = app.run("options.loop_playback", json!({"value": !cycle}));
                 }
+                crate::metronome::button(app, ui);
                 ui.add_space(2.0 * crate::theme::SPACE);
                 let at = app.position();
-                readout(ui, &bars_beats(app, at), 128.0, TOKENS.text);
+                match &counting {
+                    Some(label) => readout(ui, &format!("Count-in {label}"), 128.0, TOKENS.record),
+                    None => readout(ui, &bars_beats(app, at), 128.0, TOKENS.text),
+                }
                 readout(ui, &min_sec(app, at), 92.0, TOKENS.text_dim);
                 ui.add_space(2.0 * crate::theme::SPACE);
                 crate::tempo_edit::tempo_field(app, ui);

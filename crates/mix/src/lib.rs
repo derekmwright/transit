@@ -904,6 +904,18 @@ impl PreparedLines {
     }
 }
 
+/// The click of a record count-in. The transport is parked at the record start while it runs, so
+/// the beats come from this grid (project samples), not from the tempo map at the playhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountInClick {
+    /// Project samples of count-in already rendered before the block.
+    pub elapsed: Samples,
+    /// Samples per beat.
+    pub beat: Samples,
+    /// Beats per bar; the first beat of each bar is accented.
+    pub per_bar: u32,
+}
+
 /// Renders sessions. Keep one per playback stream; plugin state persists across blocks.
 pub struct MixEngine {
     sample_rate: f32,
@@ -947,6 +959,11 @@ pub struct MixEngine {
     /// Mix the metronome (Options > Click) into the output. Playback turns this on; offline renders
     /// (bounces, stems, exports) leave it off so the click is never printed into a file.
     pub metronome: bool,
+    /// Linear trim on the click level (the transport's metronome control). Not part of the session.
+    pub metronome_gain: f32,
+    /// A record count-in in progress: the click sounds while the transport is parked (see
+    /// [`CountInClick`]), whatever Options > Click says.
+    pub count_in: Option<CountInClick>,
     /// Every plugin instance comes from [`MixEngine::adopt`] instead of being created in `sync`.
     external: bool,
     /// Instances handed over by the host, waiting for `sync` to place them (at most one per
@@ -1070,6 +1087,8 @@ impl MixEngine {
             recording: false,
             no_suspend: false,
             metronome: false,
+            metronome_gain: 1.0,
+            count_in: None,
             external: false,
             adopt: Vec::new(),
             retired: Vec::new(),
@@ -1646,7 +1665,10 @@ impl MixEngine {
         // Not while monitoring only (transport stopped): the position does not advance there, so the
         // start of the same beat would repeat every block as a buzz.
         if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
-            click::render(s, pos, frames, &mut self.main);
+            click::render(s, pos, frames, &mut self.main, self.metronome_gain);
+        }
+        if let Some(c) = self.count_in {
+            click::render_count_in(s, c, frames, &mut self.main, self.metronome_gain);
         }
         // Output: min(out.len(), main channels) channels; any further output channels are silent.
         for (c, o) in out.iter_mut().enumerate() {
@@ -2812,14 +2834,41 @@ mod click {
     /// Blip length in seconds.
     const LEN_S: f64 = 0.03;
 
-    pub fn render(s: &Session, pos: Samples, frames: usize, main: &mut [Vec<f32>]) {
+    /// Sound settings: gain (session level times the transport trim), then the accent and normal
+    /// (hz, velocity) pairs.
+    fn sound(s: &Session, trim: f32) -> (f64, (f64, f64), (f64, f64)) {
+        let gain = f64::from(db_to_gain(s.edit.value("click.volume_db", -6.0).clamp(-60.0, 12.0) as f32)) * f64::from(trim);
+        let accent = (note_hz(s.edit.value("click.accent_note", 84.0)), s.edit.value("click.accent_velocity", 127.0));
+        let normal = (note_hz(s.edit.value("click.normal_note", 72.0)), s.edit.value("click.normal_velocity", 100.0));
+        (gain, accent, normal)
+    }
+
+    /// The count-in's beats: `elapsed` samples of the count-in precede this block. Allocation-free.
+    pub fn render_count_in(s: &Session, c: CountInClick, frames: usize, main: &mut [Vec<f32>], trim: f32) {
+        let len = (LEN_S * s.sample_rate.as_f64()) as i64;
+        let (gain, accent, normal) = sound(s, trim);
+        let beat = c.beat.max(1);
+        let end = c.elapsed.saturating_add(frames as i64);
+        // A blip that began in an earlier block still rings into this one.
+        let mut k = (c.elapsed.saturating_sub(len)).max(0) / beat;
+        while k.saturating_mul(beat) < end {
+            let at = k * beat;
+            if at.saturating_add(len) > c.elapsed {
+                let first = k % i64::from(c.per_bar.max(1)) == 0;
+                let (hz, vel) = if first { accent } else { normal };
+                let amp = gain * (vel.clamp(1.0, 127.0) / 127.0);
+                blip(main, at - c.elapsed, frames, hz, amp as f32, s.sample_rate.as_f64());
+            }
+            k += 1;
+        }
+    }
+
+    pub fn render(s: &Session, pos: Samples, frames: usize, main: &mut [Vec<f32>], trim: f32) {
         let sr = s.sample_rate;
         let rate = sr.as_f64();
         let len = (LEN_S * rate) as i64;
         let end = pos.saturating_add(frames as i64);
-        let gain = f64::from(db_to_gain(s.edit.value("click.volume_db", -6.0).clamp(-60.0, 12.0) as f32));
-        let accent = (note_hz(s.edit.value("click.accent_note", 84.0)), s.edit.value("click.accent_velocity", 127.0));
-        let normal = (note_hz(s.edit.value("click.normal_note", 72.0)), s.edit.value("click.normal_velocity", 100.0));
+        let (gain, accent, normal) = sound(s, trim);
         // Start one blip length early so a click that began in an earlier block still rings into this one.
         let t0 = s.tempo.samples_to_ticks(pos.saturating_sub(len), sr).max(0).saturating_sub(1);
         let mut tick = t0.saturating_sub(s.tempo.bar_beat_at_tick(t0).tick);

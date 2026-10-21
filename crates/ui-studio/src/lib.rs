@@ -26,6 +26,7 @@ mod io_settings;
 pub mod keys;
 mod loopbar;
 pub mod menus;
+pub mod metronome;
 mod midi_input;
 pub mod mixer;
 pub mod plugin_scan;
@@ -105,9 +106,15 @@ pub struct UiState {
     pub show_shortcuts: bool,
     #[serde(skip)]
     pub shortcuts_filter: String,
-    /// Transport > Count-in (slice 6): Record plays one bar before the cursor (or the cycle
-    /// range) and records from there. A preference, not part of the document.
+    /// Transport > Count-in: Record clicks `count_in_bars` bars before it starts recording, with
+    /// the playhead parked at the start (no room before bar 1 needed). A preference, not part of
+    /// the document.
     pub count_in: bool,
+    /// How many bars the count-in lasts when it is on: 1, 2 or 4 (the metronome popup).
+    pub count_in_bars: u8,
+    /// The click's level in dB on top of Setup > Click/Countoff, from the metronome popup. A
+    /// preference: it reaches the mixer without touching the document or its undo history.
+    pub metronome_db: f32,
     /// Automation > Thin after write (follow-ups): when a write pass ends, `automation.thin`
     /// runs on the tracks it wrote, as part of the pass's undo step. A preference.
     pub thin_after_write: bool,
@@ -152,6 +159,8 @@ impl Default for UiState {
             show_shortcuts: false,
             shortcuts_filter: String::new(),
             count_in: false,
+            count_in_bars: 1,
+            metronome_db: 0.0,
             thin_after_write: true,
             takes_open: Vec::new(),
             show_history: false,
@@ -239,6 +248,12 @@ pub struct StudioApp {
     last_meter_poll: f64,
     /// Transport simulation when there is no player (tests, `--no-audio`).
     sim: Option<(Samples, Option<Samples>, Option<Range>)>,
+    /// The same for a record count-in: samples left, then what to play when it ends.
+    sim_count_in: Option<(Samples, (Samples, Option<Samples>, Option<Range>))>,
+    /// The running count-in's grid, for the transport's beat counter.
+    count_in_plan: Option<soundcraft_playback::CountIn>,
+    /// The metronome popup is open.
+    pub(crate) metro_popup: bool,
     /// The loop the session asked for at the last frame, so a change while playing retargets the running loop.
     loop_seen: Option<Range>,
     record_hint: Option<(f64, &'static str)>,
@@ -320,6 +335,9 @@ impl StudioApp {
             meter_snapshot: soundcraft_playback::MeterSnapshot::default(),
             last_meter_poll: f64::NEG_INFINITY,
             sim: None,
+            sim_count_in: None,
+            count_in_plan: None,
+            metro_popup: false,
             loop_seen: None,
             record_hint: None,
             quit_requested: false,

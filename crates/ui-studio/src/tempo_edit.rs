@@ -186,7 +186,7 @@ pub fn keys(app: &mut StudioApp, ctx: &egui::Context) {
     }
 }
 
-fn register(app: &mut StudioApp, name: &str, r: Rect) {
+pub(crate) fn register(app: &mut StudioApp, name: &str, r: Rect) {
     app.arrange.layout.transport.insert(name.to_string(), [r.min.x, r.min.y, r.max.x, r.max.y]);
 }
 
@@ -326,7 +326,7 @@ pub fn meter_field(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 /// A popup button: its label as text, or an icon when `icon` is given.
-fn small_button(ui: &mut Ui, label: &str, icon: Option<Icon>, w: f32, on: bool) -> (Rect, bool) {
+pub(crate) fn small_button(ui: &mut Ui, label: &str, icon: Option<Icon>, w: f32, on: bool) -> (Rect, bool) {
     let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
     let bg = if on {
         TOKENS.accent.gamma_multiply(0.35)

@@ -23,6 +23,7 @@ pub(super) fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Contr
         speed: AtomicU32::new(1000),
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
+        metro: crate::Metro::default(),
     });
     let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let key = ClockKey { generation: 1, domain: 1, direction: Direction::Output };
@@ -72,7 +73,8 @@ fn recording_waits_for_its_plan_and_publishes_the_actual_consumed_output_boundar
     recording_clock(&mut audio, 48_000);
     let reader = start.prepare().unwrap();
     control.request(Arc::new(Session::default()), None).unwrap();
-    let sequence = control.send_action(Command::Record { ticket: reader.ticket(), from: Some(700), end: None, looped: None }, true).unwrap();
+    let sequence =
+        control.send_action(Command::Record { ticket: reader.ticket(), from: Some(700), end: None, looped: None, count_in: None }, true).unwrap();
     for _ in 0..3 {
         fill(&mut audio, &mut [0.0; 8]);
         assert_eq!(reader.status(), start::Status::Pending);
@@ -114,7 +116,8 @@ fn cancelled_or_unclocked_recording_cannot_apply_play_or_start_a_newer_take() {
             start.cancel();
             Some(start.prepare().unwrap())
         };
-        let sequence = control.send_action(Command::Record { ticket: reader.ticket(), from: Some(800), end: None, looped: None }, true).unwrap();
+        let sequence =
+            control.send_action(Command::Record { ticket: reader.ticket(), from: Some(800), end: None, looped: None, count_in: None }, true).unwrap();
         let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 8]));
         assert!(heap.is_zero());
         assert!(!audio.transport.playing && !audio.transport.recording);
@@ -151,7 +154,7 @@ fn punch_in_retains_fractional_playhead_and_pending_dsp_output() {
     let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
     audio.transport.record_start = publisher;
     let reader = start.prepare().unwrap();
-    control.send_action(Command::Record { ticket: reader.ticket(), from: None, end: None, looped: None }, true).unwrap();
+    control.send_action(Command::Record { ticket: reader.ticket(), from: None, end: None, looped: None, count_in: None }, true).unwrap();
     let ((), heap) = measure(|| fill(&mut audio, &mut []));
     assert!(heap.is_zero());
     let start::Status::Started(point) = reader.status() else { panic!("punch did not apply") };
@@ -173,6 +176,7 @@ fn owner_fixture() -> (crate::player::RuntimeControl<Command, ActionResult>, Aud
         speed: AtomicU32::new(1000),
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
+        metro: crate::Metro::default(),
     });
     let (mut owner, ports) = crate::player::RuntimeControl::new(Arc::new(session), None, target, PlanLimits::default()).unwrap();
     owner.service();
@@ -311,6 +315,7 @@ fn invalid_audio_initialization_returns_every_endpoint_for_main_thread_retiremen
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: crate::Metro::default(),
         });
         let (mut owner, ports) = crate::player::RuntimeControl::new(session, None, target, PlanLimits::default()).unwrap();
         owner.service();
@@ -1010,6 +1015,7 @@ fn play_on_device(session: Session, channels: usize, io: Option<soundcraft_model
         speed: AtomicU32::new(1000),
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
+        metro: crate::Metro::default(),
     });
     let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: channels as u16, in_channels: 0 };
     let key = ClockKey { generation: 1, domain: 1, direction: Direction::Output };
@@ -1070,6 +1076,7 @@ fn a_path_table_edit_on_an_open_stream_moves_main_through_the_published_plan() {
         speed: AtomicU32::new(1000),
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
+        metro: crate::Metro::default(),
     });
     let channels = 10;
     let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: channels as u16, in_channels: 0 };
@@ -1202,4 +1209,187 @@ fn a_loop_ending_exactly_at_the_playhead_when_none_was_engaged_plays_on_linearly
     let seen = positions(&mut audio, &shared, 6);
     assert!(seen.windows(2).all(|w| w[1] == w[0] + 64), "no wrap to a region behind the playhead: {seen:?}");
     control.retire(audio.plans, audio.actions);
+}
+
+/// The clock service keeps the map current as callbacks run; a test that runs thousands of frames
+/// refits one that covers the frames around `frame`.
+fn track_clock(audio: &mut Audio, rate: u32, frame: u64) {
+    use crate::device_clock::{ClockFitter, Observation, Quality, Stamp};
+    let key = audio.transport.clock_key;
+    let mut fitter = ClockFitter::new(key);
+    let step = u64::from(rate / 250);
+    let n = (frame / step).max(30);
+    for i in n - 30..=n {
+        let ns = i * 4_000_000;
+        let _ = fitter.observe(Observation {
+            key,
+            first_frame: i * step,
+            frames: rate / 250,
+            nominal_rate: rate,
+            stamp: Stamp {
+                host_callback_ns: 1_000_000_000 + ns,
+                backend_callback_ns: ns as i64,
+                backend_frame_ns: ns as i64,
+                quality: Quality::BackendEstimate,
+                offset_uncertainty_ns: None,
+            },
+        });
+    }
+    audio.transport.clock_map = fitter.map();
+    audio.transport.clock_now = Some(1_000_000_000 + n * 4_000_000);
+}
+
+/// A count-in fixture: a clocked recorder waiting for a ticket, the default session (120 bpm, 4/4).
+fn counting(from: Samples, bars: i64) -> (Control<Command, ActionResult>, Audio, Arc<Shared>, start::Control, start::Reader) {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 8]);
+    control.service(&mut make);
+    let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    audio.transport.record_start = publisher;
+    recording_clock(&mut audio, 48_000);
+    let reader = start.prepare().unwrap();
+    let count_in = CountIn { frames: bars * 4 * 24_000, beat: 24_000, per_bar: 4 };
+    let command = Command::Record { ticket: reader.ticket(), from: Some(from), end: None, looped: None, count_in: Some(count_in) };
+    control.send_action(command, true).unwrap();
+    (control, audio, shared, start, reader)
+}
+
+/// Audible frames (either channel) in a stereo callback buffer.
+fn loud(out: &[f32]) -> usize {
+    out.as_chunks::<2>().0.iter().filter(|f| f[0].abs() > 1e-6 || f[1].abs() > 1e-6).count()
+}
+
+#[test]
+fn count_in_clicks_for_exactly_the_bar_then_play_and_the_recording_latch_start_on_that_sample() {
+    // 700 frames per callback does not divide 96,000: the hand-over happens inside a callback.
+    for (from, callback) in [(0, 480usize), (0, 700), (96_000, 700)] {
+        let (mut control, mut audio, shared, _start, reader) = counting(from, 1);
+        let first = audio.transport.timeline.next_output();
+        let mut out = vec![0.0f32; callback * 2];
+        let mut frames = 0usize;
+        let mut clicked = 0usize;
+        let mut after = 0usize;
+        while reader.status() == start::Status::Pending && frames < 200_000 {
+            let now = audio.transport.timeline.next_output();
+            track_clock(&mut audio, 48_000, now);
+            fill(&mut audio, &mut out);
+            control.service(&mut make);
+            if reader.status() == start::Status::Pending {
+                // Parked at the start: the position does not move and nothing is playing.
+                assert!(!audio.transport.playing && !audio.transport.recording);
+                assert_eq!(shared.position.load(Ordering::Relaxed), from);
+                let (left, total) = (shared.metro.count_in_left.load(Ordering::Relaxed), shared.metro.count_in_total.load(Ordering::Relaxed));
+                assert_eq!(total, 96_000);
+                // Rendered block by block, so it runs ahead of the callbacks by at most one block.
+                assert!((0..=96_000).contains(&left), "{left}");
+                clicked += loud(&out);
+            } else {
+                after = loud(&out);
+            }
+            frames += callback;
+        }
+        let start::Status::Started(point) = reader.status() else {
+            panic!(
+                "never latched: {:?} frames={frames} from={from} cb={callback} left={}",
+                reader.status(),
+                shared.metro.count_in_left.load(Ordering::Relaxed)
+            )
+        };
+        // The latch is the output frame 96,000 samples after the command was applied, at the start.
+        assert_eq!(point.output_frame, first + 96_000);
+        assert_eq!(point.position, timeline_map::Position { sample: from, fraction: 0, denominator: 1 });
+        assert!(audio.transport.playing && audio.transport.recording);
+        assert!(clicked > 4 * 100, "four beats of click, got {clicked} audible frames");
+        assert!(clicked <= 4 * 1_440 + 8, "click blips only, got {clicked}");
+        // Material from the start sample: the default session has none and the click option is off.
+        assert_eq!(after, 0);
+        assert_eq!(shared.metro.count_in_left.load(Ordering::Relaxed), 0);
+        control.retire(audio.plans, audio.actions);
+    }
+}
+
+#[test]
+fn count_in_click_is_four_beats_of_one_bar_with_the_accent_first() {
+    let (mut control, mut audio, _, _start, reader) = counting(0, 1);
+    let mut out = vec![0.0f32; 480 * 2];
+    let mut blips = Vec::new();
+    for call in 0..200 {
+        fill(&mut audio, &mut out);
+        control.service(&mut make);
+        let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        if peak > 0.0 && call % 50 == 0 {
+            blips.push(peak);
+        }
+    }
+    assert_eq!(blips.len(), 4, "a click on each beat");
+    assert!(blips[0] > blips[1] && (blips[1] - blips[2]).abs() < 1e-3, "beat 1 is accented: {blips:?}");
+    assert!(matches!(reader.status(), start::Status::Pending | start::Status::Started(_)));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn stopping_during_the_count_in_leaves_no_take_and_no_sounding_click() {
+    let (mut control, mut audio, shared, start, reader) = counting(0, 2);
+    let mut out = vec![0.0f32; 480 * 2];
+    for _ in 0..60 {
+        fill(&mut audio, &mut out);
+        control.service(&mut make);
+    }
+    assert!(shared.metro.count_in_left.load(Ordering::Relaxed) > 0);
+    // Main: cancel the start, then Stop.
+    start.cancel();
+    control.stop().unwrap();
+    fill(&mut audio, &mut out);
+    assert_eq!(reader.status(), start::Status::Cancelled);
+    assert!(audio.transport.count_in.is_none() && !audio.transport.playing && !audio.transport.recording);
+    assert_eq!(shared.metro.count_in_left.load(Ordering::Relaxed), 0);
+    // Well past where the count-in would have ended: still silent, still cancelled, still stopped.
+    for _ in 0..400 {
+        fill(&mut audio, &mut out);
+        assert_eq!(loud(&out), 0, "no click after Stop");
+    }
+    assert_eq!(reader.status(), start::Status::Cancelled);
+    assert!(!audio.transport.playing && !audio.transport.recording);
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_cancelled_ticket_stops_the_count_in_from_starting_play() {
+    let (control, mut audio, _shared, start, reader) = counting(0, 1);
+    let mut out = vec![0.0f32; 480 * 2];
+    for _ in 0..10 {
+        fill(&mut audio, &mut out);
+    }
+    start.cancel();
+    for _ in 0..300 {
+        fill(&mut audio, &mut out);
+    }
+    assert_eq!(reader.status(), start::Status::Cancelled);
+    assert!(!audio.transport.playing && !audio.transport.recording);
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn metronome_gain_scales_the_click_and_changing_it_allocates_nothing() {
+    let peak_of_beat_two = |gain: f32| {
+        let (control, mut audio, shared, _start, _reader) = counting(0, 1);
+        let mut out = vec![0.0f32; 480 * 2];
+        let mut peak = 0.0f32;
+        for call in 0..60 {
+            if call == 49 {
+                // Between callbacks, as Main would: one atomic store.
+                let ((), heap) = measure(|| shared.metro.gain.store(gain.to_bits(), Ordering::Relaxed));
+                assert!(heap.is_zero());
+            }
+            let ((), heap) = measure(|| fill(&mut audio, &mut out));
+            assert!(heap.is_zero(), "{heap:?}");
+            if call >= 50 {
+                peak = peak.max(out.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+            }
+        }
+        control.retire(audio.plans, audio.actions);
+        peak
+    };
+    let (full, quarter) = (peak_of_beat_two(1.0), peak_of_beat_two(0.25));
+    assert!(full > 0.0 && (quarter / full - 0.25).abs() < 0.02, "{full} {quarter}");
 }

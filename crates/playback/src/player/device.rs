@@ -1,6 +1,6 @@
 //! Device facade for the prepared runtime. All factories, editors and reclamation
 //! belong to this creating-thread owner; the device borrows its anchored audio state.
-use super::audio::{ActionResult, Audio, Command};
+use super::audio::{ActionResult, Audio, Command, CountIn};
 use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputCallback, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
@@ -102,6 +102,7 @@ impl Player {
             speed: AtomicU32::new(1000),
             meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
+            metro: crate::Metro::default(),
         })
     }
 
@@ -430,8 +431,20 @@ impl Player {
         end: Option<Samples>,
         looped: Option<Range>,
     ) -> Result<action_lane::Sequence, PlayerError> {
+        self.record_with_count_in(recorder, from, end, looped, None)
+    }
+    /// As [`Player::record`], but with `count_in` the click plays first while the transport waits at
+    /// `from`, and Play with the recording latch starts at the sample the count-in ends.
+    pub fn record_with_count_in(
+        &self,
+        recorder: &record::Recorder,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        count_in: Option<CountIn>,
+    ) -> Result<action_lane::Sequence, PlayerError> {
         let ticket = recorder.prepared_start().ok_or(PlayerError::NoPreparedRecording)?;
-        let result = self.owner()?.send_action(Command::Record { ticket, from, end, looped }, true);
+        let result = self.owner()?.send_action(Command::Record { ticket, from, end, looped, count_in }, true);
         if result.is_err() {
             self.cancel_record_start()?;
         }
@@ -597,6 +610,17 @@ impl Player {
     }
     pub fn speed(&self) -> f32 {
         self.shared.speed.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+    /// The click's level in dB, on top of Setup > Click/Countoff. Reaches the audio thread with
+    /// one atomic store; no session change, no undo.
+    pub fn set_metronome_db(&self, db: f32) {
+        let gain = if db.is_finite() { 10f32.powf(db.clamp(-60.0, 12.0) / 20.0) } else { 1.0 };
+        self.shared.metro.gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+    /// A record count-in under way: (samples left, whole length) in project samples.
+    pub fn count_in(&self) -> Option<(Samples, Samples)> {
+        let left = self.shared.metro.count_in_left.load(Ordering::Relaxed);
+        (left > 0).then(|| (left, self.shared.metro.count_in_total.load(Ordering::Relaxed)))
     }
     pub fn position(&self) -> Samples {
         self.shared.position.load(Ordering::Relaxed)

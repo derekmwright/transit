@@ -20,11 +20,8 @@ use serde_json::json;
 use soundcraft_engine::TransportRequest;
 use soundcraft_model::TrackId;
 use soundcraft_playback::record::Trouble;
-use soundcraft_playback::{OutputTrouble, Player};
+use soundcraft_playback::{CountIn, OutputTrouble, Player};
 use soundcraft_time::{Range, Samples};
-
-/// Said when Record is asked with the count-in on and the cursor sits at the start of the session.
-const COUNT_IN_SKIPPED: &str = "Count-in skipped: no room before bar 1";
 
 impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
@@ -67,6 +64,8 @@ impl StudioApp {
             self.finish_recording();
         }
         self.sim = None;
+        self.sim_count_in = None;
+        self.count_in_plan = None;
         self.engine.transport.playing = false;
         self.engine.transport.recording = false;
         // Adapted: the cursor stays where it was (Ableton), so Stop then Play starts the same
@@ -111,7 +110,7 @@ impl StudioApp {
             // Punch in on the fly at the current playhead.
             self.record_start = self.position();
             self.punch = None;
-            self.plan_recording(takes, None, None);
+            self.plan_recording(takes, None, None, None);
             return;
         }
         let e = self.engine.session().edit.clone();
@@ -120,40 +119,32 @@ impl StudioApp {
         if cycle && e.loop_record {
             self.record_start = sel.start;
             self.punch = None;
-            self.plan_recording(takes, Some(sel.len()), Some((sel.start, None, Some(sel))));
+            let count_in = self.count_in_for(sel.start);
+            self.plan_recording(takes, Some(sel.len()), Some((sel.start, None, Some(sel))), count_in);
         } else if cycle {
             // Slice 6: punch. With Cycle on (and Loop Record off), record just the cycle range:
-            // play from a count-in or pre-roll before it and stop at its end.
+            // play from the pre-roll before it and stop at its end; a count-in clicks first.
             let lead = self.lead_in(sel.start);
             self.record_start = (sel.start - lead).max(0);
             self.punch = Some(sel);
-            self.plan_recording(takes, None, Some((self.record_start, Some(sel.end), None)));
-            if self.ui.count_in && self.record_start >= sel.start {
-                self.status = COUNT_IN_SKIPPED.into();
-            }
+            let count_in = self.count_in_for(self.record_start);
+            self.plan_recording(takes, None, Some((self.record_start, Some(sel.end), None)), count_in);
         } else {
             let at = self.cursor();
             let from = (at - self.lead_in(at)).max(0);
             self.record_start = from;
-            // A count-in is heard, not kept: the take starts at the cursor. (A pre-roll is kept,
-            // as in SoundCraft.)
-            self.punch = (self.ui.count_in && from < at).then(|| Range::new(at, at.saturating_add(i64::MAX / 4)));
-            self.plan_recording(takes, None, Some((from, None, None)));
-            if self.ui.count_in && from >= at {
-                self.status = COUNT_IN_SKIPPED.into();
-            }
+            self.punch = None;
+            // The count-in clicks with the transport parked at `from`, needing no room before it.
+            let count_in = self.count_in_for(from);
+            self.plan_recording(takes, None, Some((from, None, None)), count_in);
         }
     }
 
-    /// How long Record plays before `at`: one bar with the count-in on, else the pre-roll when
-    /// it is on. Never before the session start, so a count-in at bar 1 is cut short.
+    /// How long Record plays before `at`: the pre-roll when it is on. (The count-in is separate:
+    /// [`StudioApp::count_in_for`].) Never before the session start.
     pub(crate) fn lead_in(&self, at: Samples) -> Samples {
         let s = self.engine.session();
-        if self.ui.count_in {
-            let bar = s.tempo.bar_beat_at(at.max(0), s.sample_rate).bar;
-            let start = |b: i64| s.tempo.samples_at_bar_beat(soundcraft_time::BarBeat { bar: b, beat: 1, tick: 0 }, s.sample_rate);
-            return (start(bar + 1) - start(bar)).max(1);
-        }
+        let _ = at;
         if s.edit.pre_post_roll { s.edit.pre_roll } else { 0 }
     }
 
@@ -164,6 +155,7 @@ impl StudioApp {
         takes: Vec<soundcraft_engine::io::Take>,
         pass: Option<Samples>,
         play: Option<(Samples, Option<Samples>, Option<Range>)>,
+        count_in: Option<CountIn>,
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
         self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
@@ -177,7 +169,7 @@ impl StudioApp {
                 return;
             };
             let (from, end, looped) = play.map_or((None, None, None), |(from, end, looped)| (Some(from), end, looped));
-            let Some(sequence) = self.player_requests.result(&mut self.status, p.record(recorder, from, end, looped)) else {
+            let Some(sequence) = self.player_requests.result(&mut self.status, p.record_with_count_in(recorder, from, end, looped, count_in)) else {
                 self.finish_recording();
                 return;
             };
@@ -185,9 +177,18 @@ impl StudioApp {
             if play.is_some() {
                 self.player_requests.play = Some(sequence);
             }
-            self.status = "Record pending".into();
+            self.status = if count_in.is_some() && from.is_some() { "Count-in".into() } else { "Record pending".into() };
+            self.count_in_plan = count_in.filter(|_| from.is_some());
         } else if let Some((from, end, looped)) = play {
-            self.start_play(from, end, looped);
+            match count_in {
+                // No audio device: the same count-in, timed by the frame clock and silent.
+                Some(plan) => {
+                    self.sim_count_in = Some((plan.frames, (from, end, looped)));
+                    self.count_in_plan = Some(plan);
+                    self.status = "Count-in".into();
+                }
+                None => self.start_play(from, end, looped),
+            }
         }
         if let Some(root) = self.autosave_dir.clone() {
             self.queue_autosave(root);
@@ -762,6 +763,11 @@ impl StudioApp {
     }
 
     pub(crate) fn handle_transport(&mut self, dt: f32) {
+        self.push_metronome_level();
+        // The count-in is over (or was cancelled): the status line says what happens next.
+        if self.status == "Count-in" && self.count_in_state().is_none() && self.sim_count_in.is_none() {
+            self.status = if self.recording_active() { "Recording".into() } else { String::new() };
+        }
         let mut reqs: std::collections::VecDeque<TransportRequest> = std::mem::take(&mut self.engine.transport_requests).into();
         while let Some(r) = reqs.pop_front() {
             match r {
@@ -801,7 +807,10 @@ impl StudioApp {
                     }
                 }
                 TransportRequest::Play => {
-                    if !self.is_playing() && self.player_requests.play.is_none() {
+                    if self.count_in_state().is_some() {
+                        // Play during a record count-in cancels it: no half-armed take.
+                        self.stop_play();
+                    } else if !self.is_playing() && self.player_requests.play.is_none() {
                         self.play_from_cursor();
                     }
                 }
@@ -892,6 +901,13 @@ impl StudioApp {
             feed_meter(&mut self.main_meter, main, 0.0, dt);
             if ended && self.player_requests.stop.is_none() {
                 self.complete_stop();
+            }
+        } else if let Some((left, play)) = &mut self.sim_count_in {
+            *left -= (f64::from(dt) * self.engine.session().sample_rate.as_f64()) as i64;
+            if *left <= 0 {
+                let (from, end, looped) = *play;
+                self.sim_count_in = None;
+                self.start_play(from, end, looped);
             }
         } else if let Some((pos, end, looped)) = &mut self.sim {
             let sr = self.engine.session().sample_rate.as_f64();

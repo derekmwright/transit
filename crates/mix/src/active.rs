@@ -584,7 +584,10 @@ impl MixEngine {
             st.meter.plugin_failures = st.failures;
         }
         if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
-            click::render(s, pos, frames, main);
+            click::render(s, pos, frames, main, self.metronome_gain);
+        }
+        if let Some(c) = self.count_in {
+            click::render_count_in(s, c, frames, main, self.metronome_gain);
         }
         for (c, o) in out.iter_mut().enumerate() {
             let src = main.get(c);

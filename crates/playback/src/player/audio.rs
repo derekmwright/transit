@@ -28,12 +28,39 @@ pub enum Command {
         from: Option<Samples>,
         end: Option<Samples>,
         looped: Option<Range>,
+        /// Click for this long first, with the transport parked at `from` (ignored when `from` is
+        /// `None`, a punch in on the fly).
+        count_in: Option<CountIn>,
     },
     Locate(Samples),
     /// Retarget (or clear) the loop while running, without reseeking.
     SetLoop(Option<Range>),
     Recording(bool),
     Note(soundcraft_mix::InstrumentEvent),
+}
+
+/// A record count-in, measured on Main from the tempo map at the record start. The audio thread
+/// only counts samples: the click phase ends, and Play with the recording latch begins, at exactly
+/// `frames` project samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountIn {
+    /// Length of the whole count-in in project samples.
+    pub frames: Samples,
+    /// Samples per beat.
+    pub beat: Samples,
+    /// Beats per bar (the first beat of each bar is accented).
+    pub per_bar: u32,
+}
+
+/// A count-in under way: what to start when it ends.
+#[derive(Debug, Clone, Copy)]
+struct Counting {
+    ticket: start::Ticket,
+    from: Samples,
+    end: Option<Samples>,
+    looped: Option<Range>,
+    plan: CountIn,
+    left: Samples,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +100,7 @@ struct Transport {
     looped: Option<Range>,
     loop_engaged: bool,
     discard_pending: bool,
+    count_in: Option<Counting>,
     timeline_fault: Option<timeline_map::MapError>,
     record_start: start::Publisher,
     clock_key: ClockKey,
@@ -140,6 +168,55 @@ impl Transport {
         ActionResult::RecordingStarted(point)
     }
 
+    /// Park the transport at `from` and click for `plan.frames` samples; `render_next` then starts
+    /// Play and the recording latch at that sample. The ticket stays pending meanwhile, so Main's
+    /// cancel (Stop, Locate) makes the start a no-op even if this thread has not seen it yet.
+    fn count_in(
+        &mut self,
+        ticket: start::Ticket,
+        from: Samples,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        plan: CountIn,
+        live: &mut plan_bridge::Processing<'_>,
+    ) -> ActionResult {
+        if !(-MAX_POSITION..=MAX_POSITION).contains(&from)
+            || end.is_some_and(|end| !(-MAX_POSITION..=MAX_POSITION).contains(&end) || end < from)
+            || plan.frames <= 0
+            || plan.beat <= 0
+        {
+            self.record_start.cancel(ticket);
+            return ActionResult::InvalidPosition;
+        }
+        // Same preconditions as the start itself, so a missing clock fails now, not after the bars.
+        if self.clock_map.is_none() || self.clock_now.is_none() {
+            self.record_start.cancel(ticket);
+            return ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp);
+        }
+        self.end_count_in();
+        if let Err(error) = self.change(Some(from), false, None) {
+            self.record_start.cancel(ticket);
+            self.timeline_fault = Some(error);
+            live.fault();
+            return ActionResult::Timeline(error);
+        }
+        self.render_position = from;
+        self.end = None;
+        self.recording = false;
+        self.loop_engaged = false;
+        self.discard_pending = true;
+        self.count_in = Some(Counting { ticket, from, end, looped, plan, left: plan.frames });
+        live.set_transport_epoch(soundcraft_mix::TransportEpoch(self.epoch));
+        ActionResult::Applied
+    }
+
+    /// Drop a count-in under way, withdrawing its recording start.
+    fn end_count_in(&mut self) {
+        if let Some(counting) = self.count_in.take() {
+            self.record_start.cancel(counting.ticket);
+        }
+    }
+
     fn change(&mut self, seek: Option<Samples>, playing: bool, looped: Option<Range>) -> Result<(), timeline_map::MapError> {
         let epoch = self.epoch.checked_add(1).ok_or(timeline_map::MapError::Arithmetic)?;
         self.timeline.change(epoch, seek, self.rate, playing, looped.map(|r| (r.start, r.end)))?;
@@ -151,8 +228,14 @@ impl Transport {
 
     fn command(&mut self, event: action_lane::Event<Command>, live: &mut plan_bridge::Processing<'_>) -> ActionResult {
         let result = match event {
-            action_lane::Event::Action { payload: Command::Record { ticket, from, end, looped }, .. } => {
-                return self.record(ticket, from, end, looped, live);
+            action_lane::Event::Action { payload: Command::Record { ticket, from, end, looped, count_in }, .. } => {
+                return match (from, count_in) {
+                    (Some(from), Some(plan)) => self.count_in(ticket, from, end, looped, plan, live),
+                    _ => {
+                        self.end_count_in();
+                        self.record(ticket, from, end, looped, live)
+                    }
+                };
             }
             action_lane::Event::Action { payload: Command::Play { from, end, looped }, .. } => {
                 if !(-MAX_POSITION..=MAX_POSITION).contains(&from)
@@ -161,6 +244,7 @@ impl Transport {
                 {
                     return ActionResult::InvalidPosition;
                 }
+                self.end_count_in();
                 self.change(Some(from), true, looped).map(|()| {
                     self.render_position = from;
                     self.end = end;
@@ -173,6 +257,7 @@ impl Transport {
                 if !(-MAX_POSITION..=MAX_POSITION).contains(&at) {
                     return ActionResult::InvalidPosition;
                 }
+                self.end_count_in();
                 self.change(Some(at), self.playing, self.looped).map(|()| {
                     self.render_position = at;
                     self.loop_engaged = self.looped.is_some_and(|r| at < r.end);
@@ -206,6 +291,7 @@ impl Transport {
                 return ActionResult::Event(live.queue_event(&event));
             }
             action_lane::Event::Stop { .. } => {
+                self.end_count_in();
                 let result = self.change(None, false, None);
                 self.playing = false;
                 self.recording = false;
@@ -324,6 +410,7 @@ impl Audio {
             midi.fault();
         }
         self.shared.playing.store(false, Ordering::Relaxed);
+        self.publish_count_in();
     }
     /// Construct on main from the owner's exact endpoint bundle, before starting
     /// a callback. No second compiler, action lane or source registry is created.
@@ -380,6 +467,7 @@ impl Audio {
                     looped: None,
                     loop_engaged: false,
                     discard_pending: false,
+                    count_in: None,
                     timeline_fault: None,
                     record_start,
                     clock_key: key,
@@ -454,6 +542,14 @@ impl Audio {
         #[cfg(not(target_arch = "wasm32"))]
         self.service_midi(budget);
         self.shared.playing.store(self.transport.playing && !self.faulted, Ordering::Relaxed);
+        self.publish_count_in();
+    }
+
+    /// What the UI reads of the count-in: samples left, and the whole length.
+    fn publish_count_in(&self) {
+        let (left, total) = self.transport.count_in.filter(|_| !self.faulted).map_or((0, 0), |c| (c.left, c.plan.frames));
+        self.shared.metro.count_in_total.store(total, Ordering::Relaxed);
+        self.shared.metro.count_in_left.store(left, Ordering::Relaxed);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -489,6 +585,18 @@ impl Audio {
     }
 
     fn render_next(&mut self, quantum: usize, actions: &mut action_lane::Budget) -> Result<(), timeline_map::MapError> {
+        if let Some(counting) = self.transport.count_in.filter(|c| c.left <= 0) {
+            // The count-in ended exactly at the previous block's last sample: start Play and the
+            // recording latch now, for the block about to render. Nothing is pending, so the reset
+            // `record` asks for would only discard the block rendered below.
+            self.transport.count_in = None;
+            let mut live = self.plans.processing();
+            let _ = self.transport.record(counting.ticket, Some(counting.from), counting.end, counting.looped, &mut live);
+            self.transport.discard_pending = false;
+            self.publish_count_in();
+        }
+        let gain = f32::from_bits(self.shared.metro.gain.load(Ordering::Relaxed));
+        let gain = if gain.is_finite() { gain.clamp(0.0, 8.0) } else { 1.0 };
         let state = &mut self.transport;
         if state.playing
             && state.loop_engaged
@@ -520,7 +628,13 @@ impl Audio {
                 frames = frames.min(usize::try_from(end - state.render_position).map_err(|_| timeline_map::MapError::Arithmetic)?);
             }
         }
+        let counting = state.count_in;
+        if let Some(c) = counting {
+            frames = frames.min(usize::try_from(c.left).unwrap_or(usize::MAX));
+        }
         self.plans.set_processing(!state.playing, state.recording, self.shared.editors_open.load(Ordering::Relaxed));
+        let click = counting.map(|c| soundcraft_mix::CountInClick { elapsed: c.plan.frames - c.left, beat: c.plan.beat, per_bar: c.plan.per_bar });
+        self.plans.set_metronome(gain, click);
         #[cfg(not(target_arch = "wasm32"))]
         self.midi_inbox.dispatch(
             self.read,
@@ -537,6 +651,11 @@ impl Audio {
         // release does not prove that its envelope or any downstream tail ended.
         self.plans.render(state.render_position, frames);
         self.pending = frames;
+        if let Some(c) = &mut state.count_in {
+            c.left -= frames as i64;
+            self.publish_count_in();
+        }
+        let state = &mut self.transport;
         if state.playing {
             state.render_position =
                 state.render_position.checked_add(frames as i64).filter(|p| *p <= MAX_POSITION).ok_or(timeline_map::MapError::Arithmetic)?;

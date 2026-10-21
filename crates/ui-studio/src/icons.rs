@@ -19,6 +19,8 @@ pub enum Icon {
     Play,
     Record,
     Loop,
+    /// Lucide metronome: the click toggle and its count-in/level popup.
+    Metronome,
     ChevronRight,
     ChevronDown,
     Plus,
@@ -40,12 +42,13 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 21] = [
+    pub const ALL: [Icon; 22] = [
         Icon::Rewind,
         Icon::Stop,
         Icon::Play,
         Icon::Record,
         Icon::Loop,
+        Icon::Metronome,
         Icon::ChevronRight,
         Icon::ChevronDown,
         Icon::Plus,
@@ -72,6 +75,7 @@ impl Icon {
             Icon::Play => "play",
             Icon::Record => "circle",
             Icon::Loop => "repeat",
+            Icon::Metronome => "metronome",
             Icon::ChevronRight => "chevron-right",
             Icon::ChevronDown => "chevron-down",
             Icon::Plus => "plus",
@@ -98,6 +102,7 @@ impl Icon {
             Icon::Play => include_bytes!("../assets/icons/play.svg"),
             Icon::Record => include_bytes!("../assets/icons/circle.svg"),
             Icon::Loop => include_bytes!("../assets/icons/repeat.svg"),
+            Icon::Metronome => include_bytes!("../assets/icons/metronome.svg"),
             Icon::ChevronRight => include_bytes!("../assets/icons/chevron-right.svg"),
             Icon::ChevronDown => include_bytes!("../assets/icons/chevron-down.svg"),
             Icon::Plus => include_bytes!("../assets/icons/plus.svg"),

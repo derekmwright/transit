@@ -633,6 +633,11 @@ impl Audio {
         self.mix.recording = recording;
         self.mix.no_suspend = editors_open;
     }
+    /// The click's trim and the record count-in, for the next block. Plain stores: no allocation.
+    pub fn set_metronome(&mut self, gain: f32, count_in: Option<soundcraft_mix::CountInClick>) {
+        self.mix.metronome_gain = gain;
+        self.mix.count_in = count_in;
+    }
     pub fn reset(&mut self) {
         if !self.faulted() {
             self.mix.reset();

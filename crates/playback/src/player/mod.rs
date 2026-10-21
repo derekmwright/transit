@@ -34,7 +34,7 @@ pub use native::Status as MidiStatus;
 pub mod sources;
 
 mod audio;
-pub use audio::{ActionResult, Command as PlayerCommand};
+pub use audio::{ActionResult, Command as PlayerCommand, CountIn};
 mod device;
 pub use device::{Player, PlayerNotice};
 

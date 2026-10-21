@@ -61,7 +61,7 @@ impl T {
 fn transport_buttons_show_lucide_icons_and_still_work() {
     let mut t = T::new();
     let icons = t.inspect()["layout"]["transport_icons"].clone();
-    assert_eq!(icons, json!({"rtz": "skip-back", "stop": "square", "play": "play", "record": "circle", "cycle": "repeat"}));
+    assert_eq!(icons, json!({"rtz": "skip-back", "stop": "square", "play": "play", "record": "circle", "cycle": "repeat", "metronome": "metronome"}));
     let play = t.app.arrange.layout.transport["play"];
     t.click(mid(play));
     assert!(t.app.is_playing(), "the Play icon button plays");
