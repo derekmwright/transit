@@ -39,6 +39,8 @@ It needs LLVM (for bindgen; set `LIBCLANG_PATH` to LLVM's `bin`, and put LLVM be
 the first build unless `CPAL_ASIO_DIR` points at a copy). Steinberg's licensing terms apply to
 anyone who redistributes ASIO-enabled binaries, so the published releases are WASAPI-only.
 
+Full steps, the MinGW/libclang pitfall, and licensing: [docs/building.md](docs/building.md#building-with-asio-windows); scripted build: `tools/build-asio.ps1`.
+
 ## Run
 
 ```sh
