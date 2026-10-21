@@ -73,12 +73,37 @@ impl StudioApp {
         self.keys.step = StepState { on: true, cursor, follow: true, ..StepState::default() };
     }
 
-    /// Notes played on the armed MIDI inputs since the last frame.
+    /// Notes played on the armed MIDI inputs since the last frame. One drain feeds both the
+    /// piano roll's held keys and Step entry (each event reaches each exactly once).
     pub(crate) fn step_poll(&mut self) {
+        let inputs: Vec<_> = self.engine.session().tracks.iter().map(|t| t.midi_input.clone()).collect();
+        if inputs != self.keys.live_inputs {
+            // A device was closed or reselected: its note-offs may never come.
+            self.keys.live_inputs = inputs;
+            self.live_clear();
+        }
         let Some(p) = &self.player else { return };
         for n in p.take_played_notes() {
-            self.step_midi(n);
+            self.live_midi(n);
         }
+    }
+
+    /// One played note: update the held keys, then Step entry.
+    pub fn live_midi(&mut self, n: PlayedNote) {
+        if let Some(v) = self.keys.live.get_mut(usize::from(n.pitch)) {
+            *v = if n.on { n.velocity.clamp(1, 127) } else { 0 };
+        }
+        self.step_midi(n);
+    }
+
+    /// Let go of every live key (Stop, all notes off, input change).
+    pub fn live_clear(&mut self) {
+        self.keys.live = [0; 128];
+    }
+
+    /// The keys held on the MIDI keyboard as (pitch, velocity), lowest first.
+    pub fn live_keys(&self) -> Vec<(u8, u8)> {
+        (0u8..128).zip(self.keys.live).filter(|(_, v)| *v > 0).collect()
     }
 
     /// One played note (the live MIDI path and the test hook): note-ons gather into a chord that

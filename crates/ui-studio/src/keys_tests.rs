@@ -763,7 +763,7 @@ fn the_plain_wheel_still_scrolls_rows_and_pitches_and_never_time() {
     assert_eq!(t.app.arrange.layout.scroll, sc, "plain wheel does not pan the arrangement");
 }
 
-// Step entry. There is no MIDI device in the harness: `StudioApp::step_midi` is the entry point
+// Step entry. There is no MIDI device in the harness: `StudioApp::live_midi` is the entry point
 // `step_poll` feeds from `Player::take_played_notes` (the ingress tap), so these tests call it.
 
 impl T {
@@ -773,7 +773,7 @@ impl T {
     }
 
     fn played(&mut self, pitch: u8, velocity: u8, on: bool) {
-        self.app.step_midi(soundcraft_playback::PlayedNote { pitch, velocity, on });
+        self.app.live_midi(soundcraft_playback::PlayedNote { pitch, velocity, on });
         self.frames(2);
     }
 
@@ -925,4 +925,51 @@ fn midi_enters_nothing_while_step_is_off() {
     t.key("S", json!({}));
     t.tap(60, 100);
     assert!(t.notes().is_empty(), "off again");
+}
+
+// Live MIDI keys: the keyboard column accents the keys being played.
+
+#[test]
+fn a_note_on_holds_the_key_and_the_note_off_lets_go() {
+    let mut t = T::open();
+    assert!(t.app.keys.layout.live.is_empty());
+    t.played(64, 100, true);
+    assert_eq!(t.app.keys.layout.live, vec![(64, 100)]);
+    t.played(64, 0, false);
+    assert!(t.app.keys.layout.live.is_empty());
+}
+
+#[test]
+fn a_chord_holds_every_key_and_a_stop_lets_go_of_all() {
+    let mut t = T::open();
+    for p in [60, 64, 67] {
+        t.played(p, 90, true);
+    }
+    assert_eq!(t.app.keys.layout.live.iter().map(|k| k.0).collect::<Vec<_>>(), vec![60, 64, 67]);
+    t.played(64, 0, false);
+    assert_eq!(t.app.keys.layout.live.iter().map(|k| k.0).collect::<Vec<_>>(), vec![60, 67]);
+    t.app.stop_play();
+    t.frames(2);
+    assert!(t.app.keys.layout.live.is_empty(), "Stop clears them");
+}
+
+#[test]
+fn step_mode_still_enters_the_note_and_highlights_the_key() {
+    let mut t = T::open();
+    t.step_on();
+    t.played(60, 90, true);
+    assert_eq!(t.app.keys.layout.live, vec![(60, 90)]);
+    t.played(60, 0, false);
+    assert!(t.app.keys.layout.live.is_empty());
+    let n = t.notes();
+    assert_eq!((n.len(), n[0].pitch), (1, 60), "the step was entered");
+}
+
+#[test]
+fn reselecting_a_midi_input_lets_go_of_held_keys() {
+    let mut t = T::open();
+    t.played(60, 90, true);
+    t.app.run("midi.input", json!({"track": t.track.0, "channel": 3})).unwrap();
+    t.frames(2);
+    assert!(t.app.keys.layout.live.is_empty());
 }

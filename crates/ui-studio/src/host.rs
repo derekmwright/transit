@@ -41,6 +41,7 @@ impl StudioApp {
     }
 
     pub(crate) fn stop_play(&mut self) {
+        self.live_clear();
         if let Some(p) = &self.player {
             // Half-speed is a separate command. Stop must not leave that rate for the next Play.
             p.set_speed(1.0);
@@ -882,6 +883,7 @@ impl StudioApp {
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {
+                    self.live_clear();
                     if let Some(p) = &self.player {
                         if let Some(sequence) = self.player_requests.result(&mut self.status, p.all_notes_off()) {
                             self.player_requests.release = Some(sequence);

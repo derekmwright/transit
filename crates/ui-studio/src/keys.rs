@@ -229,9 +229,11 @@ pub struct KeysLayout {
     pub last_audition: Option<(u8, u8)>,
     /// Auditioned pitches still sounding.
     pub sounding: Vec<u8>,
+    /// Keys held on an armed MIDI input, as (pitch, velocity), lowest first.
+    pub live: Vec<(u8, u8)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct KeysState {
     /// The clip being edited.
     pub clip: Option<ClipId>,
@@ -251,10 +253,37 @@ pub struct KeysState {
     pub last_audition: Option<(u8, u8)>,
     /// Step entry (session state, never saved).
     pub step: StepState,
+    /// Velocity per pitch of the keys held on an armed MIDI input (0 = up). Session state.
+    pub live: [u8; 128],
+    /// The tracks' MIDI inputs as last seen: a change lets go of every live key.
+    live_inputs: Vec<soundcraft_model::MidiInput>,
     serial: u64,
     /// The last click on the grid (time, position), for double-clicks.
     last_click: Option<(f64, Pos2)>,
     pub layout: KeysLayout,
+}
+
+impl Default for KeysState {
+    fn default() -> Self {
+        KeysState {
+            clip: None,
+            selection: Vec::new(),
+            gesture: None,
+            scroll: 0.0,
+            top: 0.0,
+            fit: false,
+            active: false,
+            held: Vec::new(),
+            auditions: 0,
+            last_audition: None,
+            step: StepState::default(),
+            live: [0; 128],
+            live_inputs: Vec::new(),
+            serial: 0,
+            last_click: None,
+            layout: KeysLayout::default(),
+        }
+    }
 }
 
 fn r4(r: Rect) -> R4 {
@@ -696,9 +725,12 @@ pub fn pane(app: &mut StudioApp, ui: &mut Ui) -> bool {
     let max_h = (ui.ctx().content_rect().height() - 200.0).max(MIN_H);
     let h = app.ui.keys.height.clamp(MIN_H, max_h);
     egui::Panel::bottom("keys").exact_size(h).frame(egui::Frame::NONE.fill(TOKENS.panel)).show(ui, |ui| editor(app, ui));
-    // A pending note-off needs a frame to happen on, even with the mouse still.
+    // A pending note-off needs a frame to happen on, even with the mouse still; held MIDI keys repaint at ~60 Hz.
     if !app.keys.held.is_empty() {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    if !app.live_keys().is_empty() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
     }
     true
 }
@@ -801,6 +833,9 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     }
     let lp = ui.painter();
     lp.rect_filled(corner, 0.0, TOKENS.ruler);
+    if let Some((pitch, _)) = layout.live.last() {
+        lp.text(corner.center(), Align2::CENTER_CENTER, soundcraft_midi::note_name(*pitch), FontId::proportional(12.0), TOKENS.accent);
+    }
     lp.rect_filled(vel_label, 0.0, TOKENS.panel);
     lp.text(pos2(vel_label.min.x + 8.0, vel_label.min.y + 10.0), Align2::LEFT_CENTER, "Velocity", FontId::proportional(10.5), TOKENS.text_dim);
     lp.line_segment([pos2(area.min.x, vel.min.y - 0.5), pos2(area.max.x, vel.min.y - 0.5)], Stroke::new(1.0, TOKENS.line));
@@ -821,6 +856,7 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     layout.auditions = app.keys.auditions;
     layout.last_audition = app.keys.last_audition;
     layout.sounding = app.keys.held.iter().map(|h| h.1).collect();
+    layout.live = app.live_keys();
     app.keys.layout = layout;
 }
 
@@ -1449,6 +1485,11 @@ fn paint_keyboard(app: &StudioApp, ui: &Ui, map: &Map, kb: Rect) {
             TOKENS.panel_raised
         };
         p.rect_filled(row, 0.0, fill);
+        // A key held on the MIDI keyboard: the accent, a little stronger the harder it is played.
+        let v = app.keys.live[usize::from(pitch)];
+        if v > 0 {
+            p.rect_filled(row, 0.0, TOKENS.accent.gamma_multiply(0.6 + 0.4 * f32::from(v) / 127.0));
+        }
         p.line_segment(
             [pos2(kb.min.x, row.max.y), pos2(kb.max.x, row.max.y)],
             Stroke::new(1.0, TOKENS.line.gamma_multiply(if pitch.is_multiple_of(12) { 1.0 } else { 0.5 })),
