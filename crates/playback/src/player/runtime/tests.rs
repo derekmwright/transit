@@ -745,7 +745,16 @@ fn render_while_an_instance_is_made() -> (u32, std::time::Duration) {
     runtime.update_session(Arc::new(edited)).unwrap();
 
     let made = Arc::new(AtomicUsize::new(0));
-    let mut create = slow_factory(std::time::Duration::from_millis(500), &made);
+    let mut slow = slow_factory(std::time::Duration::from_millis(500), &made);
+    // True for the whole factory call, so blocks are counted across the sleep as well as the load.
+    let in_factory = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&in_factory);
+    let mut create = move |spec: &soundcraft_mix::InstanceSpec| {
+        flag.store(true, Ordering::Release);
+        let made = slow(spec);
+        flag.store(false, Ordering::Release);
+        made
+    };
     let third_party = |id: &str| id == "subtractive_synth";
     runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
 
@@ -754,16 +763,17 @@ fn render_while_an_instance_is_made() -> (u32, std::time::Duration) {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let audio = {
         let stop = Arc::clone(&stop);
+        let in_factory = Arc::clone(&in_factory);
         let mut plans = ports.plans;
         std::thread::spawn(move || {
             let (mut during, mut worst) = (0u32, std::time::Duration::ZERO);
             while !stop.load(Ordering::Acquire) {
-                let creating_before = soundcraft_mix::creating_instance();
+                let creating_before = in_factory.load(Ordering::Acquire);
                 let t = std::time::Instant::now();
                 plans.service(&mut plan_bridge::callback_scope(), true);
                 plans.render(0, 512);
                 worst = worst.max(t.elapsed());
-                during += u32::from(creating_before && soundcraft_mix::creating_instance());
+                during += u32::from(creating_before && in_factory.load(Ordering::Acquire));
                 std::thread::sleep(std::time::Duration::from_micros(2_000));
             }
             (during, worst, plans)
