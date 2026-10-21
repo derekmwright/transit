@@ -245,6 +245,8 @@ pub struct StudioApp {
     /// The opened device still needs its saved I/O table; the engine's table revision last passed on.
     io_adopt: bool,
     io_pushed: u64,
+    /// The status-bar path warning, with the (document, I/O map) revisions it was computed for.
+    io_warning_cache: Option<((u64, u64), Option<String>)>,
     /// A ResetSession boundary awaiting successful admission or device reopen.
     restore_pending: bool,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -321,6 +323,7 @@ impl StudioApp {
             last_rev: 0,
             io_adopt: true,
             io_pushed: 0,
+            io_warning_cache: None,
             restore_pending: false,
             control_rx: None,
             pending_shots: Vec::new(),

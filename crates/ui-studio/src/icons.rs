@@ -249,9 +249,9 @@ mod tests {
     /// a key, not a button.
     #[test]
     fn symbols_are_icons_not_text_glyphs() {
-        const GLYPHS: [&str; 16] = [
+        const GLYPHS: [&str; 17] = [
             "+", "\u{d7}", "\u{2715}", "\u{2713}", "\u{2714}", "\u{25be}", "\u{25b8}", "\u{25bc}", "\u{25b6}", "\u{25b2}", "\u{22ef}", "\u{22ee}",
-            "\u{2212}", "\u{2304}", "\u{203a}", "\u{2039}",
+            "\u{2212}", "\u{2304}", "\u{203a}", "\u{2039}", "\u{26a0}",
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found = Vec::new();
@@ -267,7 +267,10 @@ mod tests {
                     continue;
                 }
                 for g in GLYPHS {
-                    if line.contains(&format!("\"{g}\"")) || line.contains(&format!("\"{g} ")) {
+                    // The glyph typed in, or spelled as a `\u{..}` escape.
+                    let escaped: String = g.chars().map(|c| format!("{}u{{{:x}}}", '\\', c as u32)).collect();
+                    let spellings = [g.to_string(), escaped];
+                    if spellings.iter().any(|g| line.contains(&format!("\"{g}\"")) || line.contains(&format!("\"{g} "))) {
                         found.push(format!("{name}:{}: {}", n + 1, code));
                     }
                 }

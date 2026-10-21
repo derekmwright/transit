@@ -2491,7 +2491,7 @@ mod output_paths {
         app.engine.set_io_map(IoMap::default());
         frames(&mut app, &ctx, 3, &mut time);
         assert_eq!(app.io_warning().as_deref(), Some("1 route not on this device"));
-        assert_eq!(strip(&app, t).output_label, "\u{26a0} Headphones");
+        assert_eq!(strip(&app, t).output_label, "Headphones");
         assert_eq!(app.engine.session().track(t).unwrap().mixer.output, Route::Hardware("Headphones".into()));
     }
 

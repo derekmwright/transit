@@ -280,7 +280,9 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                 ui.label(egui::RichText::new(&app.status).color(TOKENS.text_dim).size(11.5));
                 if let Some(w) = app.io_warning() {
                     ui.add_space(crate::theme::SPACE);
-                    let text = egui::RichText::new(format!("\u{26a0} {w}")).color(TOKENS.record).size(11.5);
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(crate::icons::ICON, crate::icons::ICON), egui::Sense::hover());
+                    crate::icons::paint(ui.painter(), r.center(), crate::icons::Icon::Warning, 14.0, TOKENS.record);
+                    let text = egui::RichText::new(w).color(TOKENS.record).size(11.5);
                     if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("Open Audio Devices").clicked() {
                         app.open_audio_devices();
                     }

@@ -275,8 +275,16 @@ pub fn fallback_notes(cfg: &AudioConfig, systems: Option<&[AudioSystem]>, opened
 
 impl StudioApp {
     /// The one-line warning about the path table (`audio_devices_io::warning_text`).
-    pub fn io_warning(&self) -> Option<String> {
-        crate::audio_devices_io::warning_text(&self.engine.unresolved_routes(), &self.engine.io_map().overlaps())
+    ///
+    /// Cached by (document revision, I/O map revision): the status bar asks every frame, and
+    /// finding the unresolved routes plans the sinks.
+    pub fn io_warning(&mut self) -> Option<String> {
+        let key = (self.engine.revision, self.engine.io_revision());
+        if self.io_warning_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            let text = crate::audio_devices_io::warning_text(&self.engine.unresolved_routes(), &self.engine.io_map().overlaps());
+            self.io_warning_cache = Some((key, text));
+        }
+        self.io_warning_cache.as_ref().and_then(|(_, t)| t.clone())
     }
 
     /// Audio › Audio Devices: open the window with the saved choices.

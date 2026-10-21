@@ -445,13 +445,6 @@ fn unresolved_output(io: &IoMap, r: &Route) -> bool {
 
 const NOT_HERE: &str = "not on this device";
 
-/// How an output route reads in a dropdown or a send row: its label, with a warning marker when
-/// the path is not on this machine.
-fn output_text(s: &Session, io: &IoMap, r: &Route, channels: usize) -> String {
-    let label = route_label(s, r, false, channels);
-    if unresolved_output(io, r) { format!("\u{26a0} {label}") } else { label }
-}
-
 /// Whether picking `value` from a route dropdown would leave the route as it is: the same route,
 /// or the label the current one already reads as (an audio track's default input, L15).
 fn same_route(s: &Session, cur: &Route, cur_label: &str, value: &str, label: &str) -> bool {
@@ -1167,7 +1160,12 @@ fn dropdown(
     }
     let p = ui.painter().with_clip_rect(clip);
     p.rect_filled(r, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
-    let text_r = r.shrink2(vec2(4.0, 0.0));
+    let mut text_r = r.shrink2(vec2(4.0, 0.0));
+    if tip.is_some() {
+        // A tip marks a route that is not on this device: the warning icon leads the text.
+        crate::icons::paint(&p, pos2(text_r.min.x + 5.0, r.center().y), crate::icons::Icon::Warning, 10.0, TOKENS.record);
+        text_r.min.x += 12.0;
+    }
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, current, FontId::proportional(10.5), TOKENS.text);
     crate::icons::paint(&p, pos2(r.max.x - 7.0, r.center().y), crate::icons::Icon::ChevronDown, 10.0, TOKENS.text_dim);
     choice_menu(&resp, current, choices, menu)
@@ -1259,7 +1257,7 @@ pub(crate) fn send_row(
     let p = ui.painter().with_clip_rect(clip);
     let target = match &snd.target {
         Route::Bus(b) => bus_label(s, *b),
-        other => output_text(s, app.engine.io_map(), other, 0),
+        other => route_label(s, other, false, 0),
     };
     let not_here = unresolved_output(app.engine.io_map(), &snd.target);
     let mut row = SendRow { slot, target: target.clone(), level_db: snd.level_db, pre_fader: snd.pre_fader, rect: r4(r), ..SendRow::default() };
@@ -1296,7 +1294,11 @@ pub(crate) fn send_row(
     if resp.hovered() {
         p.rect_filled(th, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
-    let text_r = tr.shrink2(vec2(4.0, 0.0));
+    let mut text_r = tr.shrink2(vec2(4.0, 0.0));
+    if not_here {
+        crate::icons::paint(&p, pos2(text_r.min.x + 5.0, tr.center().y), crate::icons::Icon::Warning, 10.0, TOKENS.record);
+        text_r.min.x += 12.0;
+    }
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
     row.target_rect = r4(th);
     let mut choices = send_targets(s, t, Some(slot), app.engine.io_map());
@@ -1727,7 +1729,7 @@ fn strip(
     y += rows as f32 * SEND_ROW_H;
     // Output.
     let out_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
-    let cur = output_text(s, app.engine.io_map(), &m.output, t.channels());
+    let cur = route_label(s, &m.output, false, t.channels());
     let mut choices = output_choices(s, t, app.engine.io_map());
     push_unused_entry(s, &mut choices);
     let tip = unresolved_output(app.engine.io_map(), &m.output).then_some(NOT_HERE);
