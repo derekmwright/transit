@@ -196,14 +196,159 @@ fn dragging_a_clip_in_the_window_moves_copies_and_constrains_it() {
     frames(&mut app, &ctx, 20, &mut time);
     assert_eq!(clips_on(&app, t2).len(), 1);
     assert_eq!(clips_on(&app, t).len(), 1, "the Alt-drag copied");
-    // Ctrl-drag toward the first track: stays on its own track, moves in time.
+    // Ctrl-drag (Cmd on a Mac) copies too: one bar later onto the first track, the original stays.
     let start = clips_on(&app, t2)[0].1;
-    drag(&mut app, grab, (grab.0 + px_per_bar as f32, (lane1[1] + lane1[3]) / 2.0), json!({"ctrl": true}));
+    drag(&mut app, grab, (grab.0 + px_per_bar as f32, (lane1[1] + lane1[3]) / 2.0), json!({"cmd": true}));
     frames(&mut app, &ctx, 20, &mut time);
-    let after = clips_on(&app, t2);
-    assert_eq!(after.len(), 1, "constrained to its track: {after:?}");
-    assert!(after[0].1 > start);
-    assert_eq!(clips_on(&app, t).len(), 1);
+    assert_eq!(clips_on(&app, t2).len(), 1, "the original stays");
+    assert_eq!(clips_on(&app, t2)[0].1, start);
+    assert_eq!(clips_on(&app, t).len(), 2, "the Ctrl-drag copied onto the first track");
+}
+
+#[test]
+fn drag_modifiers_choose_copy_and_the_snap_bypass() {
+    use crate::arrange::{drag_copies, drop_start};
+    use egui::Modifiers;
+    assert!(!drag_copies(Modifiers::NONE));
+    assert!(!drag_copies(Modifiers::SHIFT));
+    assert!(drag_copies(Modifiers::ALT));
+    assert!(drag_copies(Modifiers::COMMAND));
+    let beat = |d: i64| (d as f64 / 1000.0).round() as i64 * 1000;
+    assert_eq!(drop_start(0, 1500, false, beat), 2000, "snapped");
+    assert_eq!(drop_start(0, 1400, false, beat), 1000);
+    assert_eq!(drop_start(500, 1500, true, beat), 2000, "Shift keeps the raw delta");
+    assert_eq!(drop_start(500, 1400, true, beat), 1900);
+    assert_eq!(drop_start(500, -3000, false, beat), 0, "never before zero");
+}
+
+/// A bar-long clip with a second track (at the default zoom the visible grid is a beat); returns what a drag needs.
+struct CopyRig {
+    app: StudioApp,
+    ctx: egui::Context,
+    time: f64,
+    t: TrackId,
+    t2: TrackId,
+    grab: (f32, f32),
+    lane2_y: f32,
+    px_per_beat: f32,
+    beat: i64,
+}
+
+fn copy_rig() -> CopyRig {
+    let mut app = app();
+    let (t, clip, bar) = track_with_clip(&mut app);
+    let r = app.run("track.new", json!({"kind": "instrument"})).unwrap();
+    let t2 = TrackId(r["tracks"][0].as_u64().unwrap());
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 3, &mut time);
+    let layout = app.arrange.layout.clone();
+    let rect = layout.clips.iter().find(|c| c.id == clip.0).unwrap().rect;
+    let lane2 = layout.tracks.iter().find(|r| r.id == t2.0).unwrap().lane;
+    let beat = bar / 4;
+    let s = app.engine.session();
+    assert_eq!(crate::automation::grid_ticks(s, layout.samples_per_px), soundcraft_time::TICKS_PER_QUARTER, "the visible grid is a beat");
+    CopyRig {
+        app,
+        ctx,
+        time,
+        t,
+        t2,
+        grab: (rect[0] + 20.0, (rect[1] + rect[3]) / 2.0),
+        lane2_y: (lane2[1] + lane2[3]) / 2.0,
+        px_per_beat: (beat as f64 / layout.samples_per_px) as f32,
+        beat,
+    }
+}
+
+#[test]
+fn ctrl_drag_copies_a_clip_snapped_in_one_undo_step() {
+    let mut r = copy_rig();
+    let before = undo_len(&mut r.app);
+    let to = (r.grab.0 + 1.5 * r.px_per_beat, r.lane2_y);
+    drag(&mut r.app, r.grab, to, json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t).len(), 1, "the original stays");
+    let copy = clips_on(&r.app, r.t2);
+    assert_eq!(copy.len(), 1, "the copy lands on the other track: {copy:?}");
+    assert!(copy[0].1 == r.beat || copy[0].1 == 2 * r.beat, "a half-beat drag snaps to a beat: {copy:?}");
+    assert_eq!(undo_len(&mut r.app), before + 1, "one undo step");
+    r.app.run("edit.undo", json!({})).unwrap();
+    assert!(clips_on(&r.app, r.t2).is_empty(), "undo removes the copy");
+    assert_eq!(clips_on(&r.app, r.t).len(), 1);
+}
+
+#[test]
+fn ctrl_drag_snaps_to_the_nearest_beat_and_shift_bypasses_the_snap() {
+    let mut r = copy_rig();
+    let to = (r.grab.0 + 1.4 * r.px_per_beat, r.lane2_y);
+    drag(&mut r.app, r.grab, to, json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t2)[0].1, r.beat, "1.4 beats snaps to 1");
+    r.app.run("edit.undo", json!({})).unwrap();
+    drag(&mut r.app, r.grab, to, json!({"cmd": true, "shift": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let at = clips_on(&r.app, r.t2)[0].1;
+    assert!((at - (1.4 * r.beat as f64) as i64).abs() < 2 * r.beat / 20, "Shift leaves it unsnapped: {at}");
+}
+
+#[test]
+fn ctrl_drag_that_lands_where_it_started_does_nothing() {
+    let mut r = copy_rig();
+    let before = undo_len(&mut r.app);
+    let to = (r.grab.0 + 0.2 * r.px_per_beat, r.grab.1);
+    drag(&mut r.app, r.grab, to, json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t).len(), 1, "no copy");
+    assert_eq!(undo_len(&mut r.app), before, "no undo entry");
+    drag(&mut r.app, r.grab, r.grab, json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t).len(), 1);
+    assert_eq!(undo_len(&mut r.app), before);
+}
+
+#[test]
+fn the_drag_snap_uses_the_same_grid_as_the_automation_snap() {
+    let r = copy_rig();
+    let s = r.app.engine.session();
+    let spp = r.app.arrange.layout.samples_per_px;
+    for start in [0, 700] {
+        for dx in [r.beat / 3, r.beat * 14 / 10, r.beat * 16 / 10, r.beat * 5] {
+            let landed = start + crate::automation::snap_delta(s, spp, start, dx);
+            if start == 0 {
+                assert_eq!(landed, crate::automation::snap(s, spp, dx), "start {start} dx {dx}");
+            } else {
+                assert_eq!((landed - start) % r.beat, 0, "an off-grid start keeps its offset");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_plain_drag_still_moves_and_snaps() {
+    let mut r = copy_rig();
+    let to = (r.grab.0 + 2.2 * r.px_per_beat, r.grab.1);
+    drag(&mut r.app, r.grab, to, json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let c = clips_on(&r.app, r.t);
+    assert_eq!(c.len(), 1, "moved, not copied: {c:?}");
+    assert_eq!(c[0].1, 2 * r.beat);
+    r.app.run("edit.undo", json!({})).unwrap();
+    let to = (r.grab.0 + 1.4 * r.px_per_beat, r.grab.1);
+    drag(&mut r.app, r.grab, to, json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t)[0].1, r.beat, "1.4 beats moves 1");
+    r.app.run("edit.undo", json!({})).unwrap();
+    let to = (r.grab.0 + 1.6 * r.px_per_beat, r.grab.1);
+    drag(&mut r.app, r.grab, to, json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t)[0].1, 2 * r.beat, "1.6 beats moves 2");
+    r.app.run("edit.undo", json!({})).unwrap();
+    let to = (r.grab.0 + 1.4 * r.px_per_beat, r.grab.1);
+    drag(&mut r.app, r.grab, to, json!({"shift": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let at = clips_on(&r.app, r.t)[0].1;
+    assert!((at - r.beat * 14 / 10).abs() < r.beat / 10, "Shift bypasses the snap: {at}");
 }
 
 #[test]

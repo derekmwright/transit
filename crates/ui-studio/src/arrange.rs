@@ -1,6 +1,6 @@
 //! The arrangement window: a track list on the left, a bar/beat ruler, and the timeline with
-//! clips as colored regions. Clicking a clip selects it; dragging moves it (Alt-drag copies,
-//! Ctrl-drag keeps it on its track); dragging an edge trims it; clicking empty timeline sets the
+//! clips as colored regions. Clicking a clip selects it; dragging moves it (Ctrl-drag, Cmd on a
+//! Mac, or Alt-drag copies; clip drags snap to the visible grid, Shift bypasses it); dragging an edge trims it; clicking empty timeline sets the
 //! cursor. Every edit goes through engine commands (see `actions`).
 
 use crate::StudioApp;
@@ -648,6 +648,18 @@ fn grid_and_ruler(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, 
     let _ = app;
 }
 
+/// Does a clip drag with these modifiers copy instead of move? Ctrl (Cmd on a Mac; egui's
+/// `command`) is Ableton's copy-drag; Alt is Logic's. The shortcut table binds neither to a drag.
+pub fn drag_copies(m: egui::Modifiers) -> bool {
+    m.command || m.alt
+}
+
+/// Where a dragged clip's start lands: `start` moved by `dx` (through `snap`, the session grid's
+/// snapped delta, unless Shift is held), never before zero. Moves and copies share this.
+pub fn drop_start(start: Samples, dx: Samples, shift: bool, snap: impl Fn(Samples) -> Samples) -> Samples {
+    start.saturating_add(if shift { dx } else { snap(dx) }).max(0)
+}
+
 /// The clip being dragged, as it would land: (track, start, end).
 fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, geo: &RowGeo) -> Option<(ClipId, TrackId, Samples, Samples, bool)> {
     let Some(Gesture::Clip { clip, track, kind, press, start, end }) = app.arrange.gesture.clone() else { return None };
@@ -657,14 +669,11 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, g
     let dx = dx.round() as Samples;
     Some(match kind {
         DragKind::Move => {
-            let new_start = (start + dx).max(0);
+            let s = app.engine.session();
+            let new_start = drop_start(start, dx, m.shift, |d| crate::automation::snap_delta(s, map.spp, start, d));
             let row = geo.index_at(pos.y - tl.min.y + app.arrange.vscroll);
-            let dest = if m.command || m.ctrl {
-                track
-            } else {
-                row.and_then(|i| rows.get(i)).map(|t| t.id).filter(|t| app.holds_clips(*t)).unwrap_or(track)
-            };
-            (clip, dest, new_start, new_start + (end - start), m.alt)
+            let dest = row.and_then(|i| rows.get(i)).map(|t| t.id).filter(|t| app.holds_clips(*t)).unwrap_or(track);
+            (clip, dest, new_start, new_start + (end - start), drag_copies(m))
         }
         DragKind::TrimStart => (clip, track, (start + dx).clamp(0, end - 1), end, false),
         DragKind::TrimEnd => (clip, track, start, (end + dx).max(start + 1), false),
@@ -785,7 +794,7 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         app.arrange.gesture = Some(Gesture::Clip { clip, track, kind, press, start, end });
     }
     if resp.dragged() && matches!(app.arrange.gesture, Some(Gesture::Clip { kind: DragKind::Move, .. })) {
-        let copy = ui.input(|i| i.modifiers.alt);
+        let copy = ui.input(|i| drag_copies(i.modifiers));
         ui.ctx().set_cursor_icon(if copy { CursorIcon::Copy } else { CursorIcon::Grabbing });
     }
     if resp.drag_stopped() {
@@ -873,7 +882,7 @@ fn commit_drag(
             let by = a - start;
             if by == 0 && dest == from {
                 if copy {
-                    app.status = "Alt-drag the clip somewhere else to copy it.".into();
+                    app.status = "Ctrl-drag (Alt-drag) the clip somewhere else to copy it.".into();
                 }
                 return;
             }

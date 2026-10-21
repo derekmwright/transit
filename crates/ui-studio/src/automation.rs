@@ -649,7 +649,7 @@ fn follow_touch(app: &mut StudioApp, ui: &Ui) {
 
 /// The visible grid step at this zoom, in ticks: the finest of 1/16, 1/8, 1/4 and a bar that is
 /// at least 12 points wide.
-fn grid_ticks(s: &Session, spp: f64) -> i64 {
+pub fn grid_ticks(s: &Session, spp: f64) -> i64 {
     let q = (s.tempo.tick_to_samples(PPQ, s.sample_rate) - s.tempo.tick_to_samples(0, s.sample_rate)) as f64;
     let px_per_tick = q / PPQ as f64 / spp.max(1e-6);
     [PPQ / 4, PPQ / 2, PPQ, PPQ * 4].into_iter().find(|g| *g as f64 * px_per_tick >= 12.0).unwrap_or(PPQ * 4)
@@ -661,6 +661,17 @@ pub fn snap(s: &Session, spp: f64, at: Samples) -> Samples {
     let tick = s.tempo.samples_to_ticks(at.max(0), s.sample_rate);
     let snapped = ((tick as f64 / g as f64).round() as i64).saturating_mul(g);
     s.tempo.tick_to_samples(snapped.max(0), s.sample_rate)
+}
+
+/// A drag of `dx` samples from `start`, quantized to the visible grid as a delta (Logic's relative
+/// snap): a start on the grid lands on it, an off-grid start keeps its offset. Same grid as [`snap`].
+pub fn snap_delta(s: &Session, spp: f64, start: Samples, dx: Samples) -> Samples {
+    let g = grid_ticks(s, spp).max(1);
+    let t0 = s.tempo.samples_to_ticks(start.max(0), s.sample_rate);
+    let t1 = s.tempo.samples_to_ticks(start.saturating_add(dx).max(0), s.sample_rate);
+    let q = ((t1 - t0) as f64 / g as f64).round() as i64;
+    let to = s.tempo.tick_to_samples(t0.saturating_add(q.saturating_mul(g)).max(0), s.sample_rate);
+    to - s.tempo.tick_to_samples(t0, s.sample_rate)
 }
 
 /// Total height of a track's open lanes.
