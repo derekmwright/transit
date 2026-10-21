@@ -184,7 +184,11 @@ impl Transport {
                 if looped.is_some_and(|r| r.start >= r.end || r.start < -MAX_POSITION || r.end > MAX_POSITION) {
                     return ActionResult::InvalidPosition;
                 }
-                let engaged = looped.is_some_and(|r| self.render_position < r.end);
+                // After the last block of a pass the renderer sits exactly at the loop end until
+                // the next render wraps it. An engaged loop there is pre-wrap, so retargeting it
+                // (a start-only edit keeps the end) must stay engaged; a loop that was not engaged
+                // never wraps to a region behind the playhead.
+                let engaged = looped.is_some_and(|r| self.render_position < r.end || (self.render_position == r.end && self.loop_engaged));
                 self.epoch.checked_add(1).ok_or(timeline_map::MapError::Arithmetic).and_then(|epoch| {
                     self.timeline.set_loop(epoch, looped.map(|r| (r.start, r.end)), engaged)?;
                     self.epoch = epoch;

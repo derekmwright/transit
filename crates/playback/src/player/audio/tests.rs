@@ -1173,3 +1173,33 @@ fn paths_that_share_a_device_channel_sum_there_and_clip_once() {
 fn click_on_device_of(session: &Session, channels: usize, io: Option<soundcraft_model::IoMap>) -> Vec<Vec<f32>> {
     play_on_device(session.clone(), channels, io)
 }
+
+#[test]
+fn a_start_only_loop_edit_at_the_pass_boundary_keeps_the_loop_wrapping() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 0, end: None, looped: Some(Range { start: 0, end: 256 }) }, true).unwrap();
+    let mut all = Vec::new();
+    for k in 0..60i64 {
+        // The host sends one SetLoop per frame while the start edge is dragged; some land
+        // when the renderer sits exactly at the loop end, before it wraps.
+        control.send_action(Command::SetLoop(Some(Range { start: k % 3, end: 256 })), true).unwrap();
+        all.extend(positions(&mut audio, &shared, 1));
+    }
+    assert!(all.iter().all(|p| *p < 256), "loop lost: {all:?}");
+    assert!(all.windows(2).any(|w| w[1] < w[0]), "never wrapped: {all:?}");
+    assert!(audio.transport.loop_engaged);
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_loop_ending_exactly_at_the_playhead_when_none_was_engaged_plays_on_linearly() {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    assert_eq!(positions(&mut audio, &shared, 1), [64]);
+    assert_eq!(audio.transport.render_position, 64);
+    control.send_action(Command::SetLoop(Some(Range { start: 0, end: 64 })), true).unwrap();
+    assert!(!audio.transport.loop_engaged);
+    let seen = positions(&mut audio, &shared, 6);
+    assert!(seen.windows(2).all(|w| w[1] == w[0] + 64), "no wrap to a region behind the playhead: {seen:?}");
+    control.retire(audio.plans, audio.actions);
+}
