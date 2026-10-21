@@ -298,6 +298,26 @@ impl MixEngine {
         self.plan.as_deref().map_or(&NO_PLAN, |p| &p.id)
     }
 
+    /// Delay compensation of `bus` in the active plan, as of the last block (0 for an unknown bus).
+    #[must_use]
+    pub fn bus_latency_active(&self, bus: BusId) -> usize {
+        self.plan.as_deref().and_then(|p| p.tables.busses.bus(bus)).map_or(0, |b| b.arrival)
+    }
+
+    /// Copies the first `frames` of `bus` as the active plan rendered them into `out` (non-finite
+    /// samples become silence; an unknown bus stays silent). No allocation.
+    pub fn copy_bus_active(&self, bus: BusId, frames: usize, out: &mut [Vec<f32>]) {
+        for o in out.iter_mut() {
+            o.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
+        let Some(src) = self.plan.as_deref().and_then(|p| p.tables.busses.bus(bus)) else { return };
+        for (o, c) in out.iter_mut().zip(src.buf.iter()) {
+            for (d, v) in o.iter_mut().zip(c.iter()).take(frames) {
+                *d = if v.is_finite() { *v } else { 0.0 };
+            }
+        }
+    }
+
     /// The active plan's Session.
     #[must_use]
     pub fn session(&self) -> &Arc<Session> {

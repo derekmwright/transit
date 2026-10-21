@@ -1,17 +1,23 @@
 //! Parity (F01b): for representative sessions and edit sequences, a realtime engine fed through
-//! `PlanCompiler::compile` + `MixEngine::adopt_plan` + `render_active` puts out exactly what
-//! today's realtime path (`MixEngine::adopt` + `render`, instances from
-//! `realtime_instance_specs`) puts out, sample for sample, on every channel.
+//! `PlanCompiler::compile` + `MixEngine::adopt_plan` + `render_active` puts out what the golden
+//! outputs in `tests/golden/plan_parity` hold (generated from the legacy renderer, which these
+//! sessions matched bit for bit: `UPDATE_GOLDEN=1` rewrites them from the plan path).
+//!
+//! While the `legacy-render` feature exists the same sessions are also compared against today's
+//! realtime path (`MixEngine::adopt` + `render`, instances from `realtime_instance_specs`) sample
+//! for sample on every channel. Everything behind `cfg(feature = "legacy-render")` goes away with
+//! the legacy renderer (ADR 0015, slice 0 part 2); the golden checks stay.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
 use soundcraft_midi::{Note, Sequence};
-use soundcraft_mix::{
-    Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, PreparedInstance, RenderTarget, create_instance,
-};
+#[cfg(feature = "legacy-render")]
+use soundcraft_mix::PreparedInstance;
+use soundcraft_mix::{Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, create_instance};
 use soundcraft_model::{
     Bus, BusId, ChannelFormat, Clip, Insert, OutputPath, Route, SendSlot, Session, SourceAudio, SourceId, SurroundPan, TrackId, TrackKind,
 };
+#[cfg(feature = "legacy-render")]
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,11 +29,13 @@ fn target() -> RenderTarget {
 }
 
 /// Today's realtime path, as `playback` drives it.
+#[cfg(feature = "legacy-render")]
 struct Legacy {
     mix: MixEngine,
     shadow: HashMap<(TrackId, usize), (String, usize)>,
 }
 
+#[cfg(feature = "legacy-render")]
 impl Legacy {
     fn new() -> Self {
         let mut mix = MixEngine::new(SR as f32, BLOCK);
@@ -80,38 +88,92 @@ impl Planned {
     }
 }
 
+/// Absolute tolerance of a golden comparison (the goldens were made on another machine's libm).
+const GOLDEN_TOLERANCE: f32 = 5e-5;
+
+/// What a plan render put out, thinned to every eighth frame (a different phase each block) so the
+/// fixtures stay small, plus each step's delay compensation; compared with a checked-in file.
+struct Golden {
+    name: String,
+    values: Vec<f32>,
+}
+
+impl Golden {
+    fn new(name: &str) -> Self {
+        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
+        Golden { name: slug, values: Vec::new() }
+    }
+
+    fn block(&mut self, k: usize, block: &[Vec<f32>]) {
+        for ch in block {
+            self.values.extend(ch.iter().skip(k % 8).step_by(8).copied());
+        }
+    }
+
+    fn value(&mut self, v: usize) {
+        self.values.push(v as f32);
+    }
+
+    fn check(self) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/plan_parity").join(format!("{}.f32", self.name));
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes: Vec<u8> = self.values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).unwrap();
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (UPDATE_GOLDEN=1 writes it)", path.display()));
+        let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        assert_eq!(want.len(), self.values.len(), "{}: golden length", self.name);
+        let bad = want.iter().zip(&self.values).position(|(w, g)| (w - g).abs().partial_cmp(&GOLDEN_TOLERANCE).is_none_or(|o| o.is_gt()));
+        assert!(bad.is_none(), "{}: value {bad:?}: golden {:?}, plan {:?}", self.name, bad.map(|i| want[i]), bad.map(|i| self.values[i]));
+    }
+}
+
 /// Renders `sessions` one after the other (each one an edit of the one before), `blocks` blocks
-/// each, through both paths, and compares every channel of every block.
+/// each, through the plan path and checks the golden output; with the legacy renderer present it
+/// also renders the legacy path and compares every channel of every block bit for bit.
 fn assert_parity(name: &str, sessions: &[Session], blocks: usize) {
     MixEngine::force_serial(true);
+    #[cfg(feature = "legacy-render")]
     let mut legacy = Legacy::new();
     let mut planned = Planned::new();
+    let mut golden = Golden::new(name);
     let mut pos = 0i64;
     let mut heard = false;
+    #[cfg_attr(not(feature = "legacy-render"), allow(unused_variables))]
     for (step, s) in sessions.iter().enumerate() {
+        #[cfg(feature = "legacy-render")]
         legacy.update(s);
         planned.update(s);
         let ch = soundcraft_mix::main_channels(s);
-        let mut a = vec![vec![0.0f32; BLOCK]; ch];
         let mut b = vec![vec![0.0f32; BLOCK]; ch];
         for k in 0..blocks {
-            legacy.mix.render(s, pos, BLOCK, &mut a);
             planned.mix.render_active(pos, BLOCK, &mut b);
-            for c in 0..ch {
-                let diff = a[c].iter().zip(&b[c]).position(|(x, y)| x.to_bits() != y.to_bits());
-                assert!(
-                    diff.is_none(),
-                    "{name}: step {step}, block {k}, channel {c}, frame {diff:?}: {:?} vs {:?}",
-                    a[c][diff.unwrap()],
-                    b[c][diff.unwrap()]
-                );
+            #[cfg(feature = "legacy-render")]
+            {
+                let mut a = vec![vec![0.0f32; BLOCK]; ch];
+                legacy.mix.render(s, pos, BLOCK, &mut a);
+                for c in 0..ch {
+                    let diff = a[c].iter().zip(&b[c]).position(|(x, y)| x.to_bits() != y.to_bits());
+                    assert!(
+                        diff.is_none(),
+                        "{name}: step {step}, block {k}, channel {c}, frame {diff:?}: {:?} vs {:?}",
+                        a[c][diff.unwrap()],
+                        b[c][diff.unwrap()]
+                    );
+                }
             }
-            heard |= a.iter().flatten().any(|x| *x != 0.0);
+            golden.block(k, &b);
+            heard |= b.iter().flatten().any(|x| *x != 0.0);
             pos += BLOCK as i64;
         }
+        #[cfg(feature = "legacy-render")]
         assert_eq!(legacy.mix.latency, planned.mix.latency, "{name}: step {step}: delay compensation");
+        golden.value(planned.mix.latency);
     }
     assert!(heard, "{name}: the sessions make sound");
+    golden.check();
 }
 
 fn add_audio(s: &mut Session, fmt: ChannelFormat, src: u64, freq: f32) -> TrackId {
@@ -278,22 +340,31 @@ fn seeks_with_held_notes_match_todays_path() {
     let tr = s.track_mut(t).unwrap();
     tr.playlist_mut().unwrap().clips.push(Clip::midi(cid, "n", 0, 96_000, seq));
     tr.instrument = Some(builtin("subtractive_synth"));
+    #[cfg(feature = "legacy-render")]
     let mut legacy = Legacy::new();
     let mut planned = Planned::new();
+    #[cfg(feature = "legacy-render")]
     legacy.update(&s);
     planned.update(&s);
-    let mut a = vec![vec![0.0f32; BLOCK]; 2];
+    let mut golden = Golden::new("seeks with held notes");
     let mut b = vec![vec![0.0f32; BLOCK]; 2];
     for (k, pos) in [0i64, 256, 512, 768, 20_000, 20_256, 0, 256, 512].into_iter().enumerate() {
         if k == 5 {
             s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("chorus"));
+            #[cfg(feature = "legacy-render")]
             legacy.update(&s);
             planned.update(&s);
         }
-        legacy.mix.render(&s, pos, BLOCK, &mut a);
         planned.mix.render_active(pos, BLOCK, &mut b);
-        assert_eq!(a, b, "block {k} at {pos}");
+        #[cfg(feature = "legacy-render")]
+        {
+            let mut a = vec![vec![0.0f32; BLOCK]; 2];
+            legacy.mix.render(&s, pos, BLOCK, &mut a);
+            assert_eq!(a, b, "block {k} at {pos}");
+        }
+        golden.block(k, &b);
     }
+    golden.check();
 }
 
 #[test]

@@ -1609,11 +1609,13 @@ impl MixEngine {
 
     /// The delay-compensation latency of what was summed onto `bus` in the last block: the
     /// slowest path into it.
+    #[cfg(feature = "legacy-render")]
     fn bus_latency(&self, bus: BusId) -> usize {
         self.busses.get(&bus).map_or(0, |b| b.arrival)
     }
 
     /// Copy one rendered block of `bus` into `out`. A missing bus stays silent.
+    #[cfg(feature = "legacy-render")]
     fn copy_bus(&self, bus: BusId, frames: usize, out: &mut [Vec<f32>]) {
         for o in out.iter_mut() {
             for x in o.iter_mut().take(frames) {
@@ -3464,7 +3466,7 @@ fn render_in_memory(s: &Session, bus: Option<BusId>, range: Range, block: usize)
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
     let mut out: Vec<Vec<f32>> = (0..nch).map(|_| Vec::with_capacity(len)).collect();
     let mut render = RangeRender::new(s, bus, Range::new(range.start, range.start + len as i64), block);
-    while let Some((chunk, n)) = render.next_block(s) {
+    while let Some((chunk, n)) = render.next_block() {
         for (o, c) in out.iter_mut().zip(chunk) {
             o.extend_from_slice(c.get(..n).unwrap_or_default());
         }
@@ -3481,6 +3483,12 @@ pub fn source_channels(s: &Session, bus: Option<BusId>) -> usize {
 }
 
 /// [`render_range`] or [`render_bus`] of any length, a block at a time.
+///
+/// It renders through the plan renderer, the one the live player uses: the session is compiled
+/// once by a [`PlanCompiler`] for a headless [`RenderTarget`] (device generation 0), adopted by a
+/// [`MixEngine::realtime`] engine and driven with [`MixEngine::render_active`], so tempo and meter
+/// maps, automation, delay compensation and plug-in state behave exactly as they do live. The
+/// engine works on a snapshot of the session taken in [`RangeRender::try_new`].
 pub struct RangeRender {
     eng: MixEngine,
     bus: Option<BusId>,
@@ -3492,13 +3500,107 @@ pub struct RangeRender {
 }
 
 impl RangeRender {
-    /// Renders the main mix over `range`, or `bus` when one is named.
+    /// Renders the main mix over `range`, or `bus` when one is named. A session the plan compiler
+    /// refuses (over its limits) renders nothing; use [`RangeRender::try_new`] to learn why.
+    pub fn new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Self {
+        Self::try_new(s, bus, range, block).unwrap_or_else(|err| {
+            log::error!("offline render: the session could not be compiled: {err:?}");
+            let target = Self::target(s, block);
+            RangeRender { eng: MixEngine::realtime(target), bus, tmp: Vec::new(), start: range.start, done: 0, total: 0, latency: 0 }
+        })
+    }
+
+    /// The headless target an offline render compiles for: the session's rate, no device.
+    fn target(s: &Session, block: usize) -> RenderTarget {
+        RenderTarget { device: DeviceGeneration(0), sample_rate: s.sample_rate.hz(), max_block: u32::try_from(block).unwrap_or(u32::MAX) }
+            .normalized()
+    }
+
+    /// Plan limits for an offline render: the live defaults, with track and bus counts raised to
+    /// the largest the plan tables index (a bounce has no realtime budget to protect).
+    fn limits() -> PlanLimits {
+        PlanLimits { tracks: u16::MAX, buses: u16::MAX, ..PlanLimits::default() }
+    }
+
+    /// [`RangeRender::new`], or why the session could not be compiled into a plan.
+    pub fn try_new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Result<Self, CompileError> {
+        let target = Self::target(s, block);
+        let mut eng = MixEngine::realtime(target);
+        let mut compiler = PlanCompiler::new(target, Self::limits());
+        let (sr, max_block) = (target.sample_rate as f32, target.block());
+        let mut make = |spec: &InstanceSpec, _: SlotGen| create_instance(&spec.id, spec.state.as_deref(), sr, max_block, spec.ch);
+        let next = compiler.active().checked_next().ok_or(CompileError::GenerationExhausted)?;
+        let mut env = compiler.compile(Arc::new(s.clone()), compiler.active(), next, &mut make)?;
+        let adoption = eng.adopt_plan(&mut env);
+        compiler.reclaim(env);
+        if adoption != Adoption::Adopted {
+            log::error!("offline render: the engine refused its first plan: {adoption:?}");
+        }
+        let nch = source_channels(s, bus);
+        let tmp = vec![vec![0.0f32; eng.max_block()]; nch];
+        let len = if nch == 0 || adoption != Adoption::Adopted { 0 } else { usize::try_from(range.len().max(0)).unwrap_or(0) };
+        Ok(RangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 })
+    }
+
+    fn render(&mut self, pos: Samples, n: usize) {
+        match self.bus {
+            Some(id) => {
+                self.eng.render_active(pos, n, &mut []);
+                self.eng.copy_bus_active(id, n, &mut self.tmp);
+            }
+            None => self.eng.render_active(pos, n, &mut self.tmp),
+        }
+    }
+
+    /// Renders one more block of the mix and returns it as `(channels, n)`: the next `n` samples
+    /// of the range lead each channel (none while the mix's latency is still being skipped).
+    /// `None` once the range is done. The per-block work allocates nothing.
+    pub fn next_block(&mut self) -> Option<(&[Vec<f32>], usize)> {
+        if self.done >= self.total {
+            return None;
+        }
+        let n = (self.total - self.done).min(self.eng.max_block());
+        self.render(self.start + self.done as i64, n);
+        if self.done == 0 {
+            // The first block tells the mix's latency: render that much more and drop the head.
+            self.latency = match self.bus {
+                Some(b) => self.eng.bus_latency_active(b),
+                None => self.eng.latency,
+            };
+            self.total = self.total.saturating_add(self.latency);
+        }
+        let skip = self.latency.saturating_sub(self.done).min(n);
+        self.done += n;
+        if skip > 0 && skip < n {
+            for c in &mut self.tmp {
+                c.copy_within(skip..n, 0);
+            }
+        }
+        Some((&self.tmp, n - skip))
+    }
+}
+
+/// The offline renderer that predates the plan renderer: [`RangeRender`] on [`MixEngine::render`].
+/// Kept only as the oracle of the parity tests until it is deleted (ADR 0015, slice 0 part 2).
+#[cfg(feature = "legacy-render")]
+pub struct LegacyRangeRender {
+    eng: MixEngine,
+    bus: Option<BusId>,
+    tmp: Vec<Vec<f32>>,
+    start: Samples,
+    done: usize,
+    total: usize,
+    latency: usize,
+}
+
+#[cfg(feature = "legacy-render")]
+impl LegacyRangeRender {
     pub fn new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Self {
         let nch = source_channels(s, bus);
         let eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
         let tmp = vec![vec![0.0f32; eng.max_block()]; nch];
         let len = if nch == 0 { 0 } else { usize::try_from(range.len().max(0)).unwrap_or(0) };
-        RangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 }
+        LegacyRangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 }
     }
 
     fn render(&mut self, s: &Session, pos: Samples, n: usize) {
@@ -3511,9 +3613,7 @@ impl RangeRender {
         }
     }
 
-    /// Renders one more block of the mix of `s` (the session given to [`RangeRender::new`]) and
-    /// returns it as `(channels, n)`: the next `n` samples of the range lead each channel (none
-    /// while the mix's latency is still being skipped). `None` once the range is done.
+    /// As [`RangeRender::next_block`], rendering `s` (the session given to [`LegacyRangeRender::new`]).
     pub fn next_block(&mut self, s: &Session) -> Option<(&[Vec<f32>], usize)> {
         if self.done >= self.total {
             return None;
@@ -3521,7 +3621,6 @@ impl RangeRender {
         let n = (self.total - self.done).min(self.eng.max_block());
         self.render(s, self.start + self.done as i64, n);
         if self.done == 0 {
-            // The first block tells the mix's latency: render that much more and drop the head.
             self.latency = match self.bus {
                 Some(b) => self.eng.bus_latency(b),
                 None => self.eng.latency,
@@ -3537,6 +3636,21 @@ impl RangeRender {
         }
         Some((&self.tmp, n - skip))
     }
+}
+
+/// [`render_range`] or [`render_bus`] on the legacy renderer (the parity oracle).
+#[cfg(feature = "legacy-render")]
+pub fn render_legacy(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Vec<Vec<f32>> {
+    let nch = source_channels(s, bus);
+    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
+    let mut out: Vec<Vec<f32>> = (0..nch).map(|_| Vec::with_capacity(len)).collect();
+    let mut render = LegacyRangeRender::new(s, bus, Range::new(range.start, range.start + len as i64), block);
+    while let Some((chunk, n)) = render.next_block(s) {
+        for (o, c) in out.iter_mut().zip(chunk) {
+            o.extend_from_slice(c.get(..n).unwrap_or_default());
+        }
+    }
+    out
 }
 
 /// ITU-R BS.775 stereo fold-down of planar audio in `fmt` (C and surrounds at -3 dB, LFE dropped;
@@ -5190,7 +5304,7 @@ mod tests {
                 let mut got = Vec::new();
                 let mut skipped = 0;
                 let mut render = RangeRender::new(&s, source, Range::new(900, 2900), block);
-                while let Some((chunk, n)) = render.next_block(&s) {
+                while let Some((chunk, n)) = render.next_block() {
                     assert!(n <= block);
                     skipped += usize::from(n == 0);
                     got.extend_from_slice(&chunk[0][..n]);

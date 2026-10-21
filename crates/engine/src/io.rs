@@ -548,10 +548,13 @@ impl Bounce {
             let _ = std::fs::remove_file(&part);
             EngineError::Io(format!("{}: {err}", path.display()))
         })?;
-        let render = soundcraft_mix::RangeRender::new(&s, bus, r, 1024);
+        // Hosted plug-ins are created while the render is compiled: offline mode must already be on.
+        let offline = soundcraft_vst3_host::offline_scope();
+        let render = soundcraft_mix::RangeRender::try_new(&s, bus, r, 1024)
+            .map_err(|err| EngineError::Io(format!("{}: the session could not be prepared for rendering: {err:?}", path.display())))?;
         let meter = soundcraft_dsp::meter::LoudnessMeter::new(s.sample_rate.as_f64() as f32, channels);
         Ok(Bounce {
-            _offline: soundcraft_vst3_host::offline_scope(),
+            _offline: offline,
             session: s,
             path: path.to_path_buf(),
             part,
@@ -592,7 +595,7 @@ impl Bounce {
     /// bounce once its file is complete.
     pub fn step(&mut self, mut more: impl FnMut() -> bool) -> Result<Option<Bounced>> {
         loop {
-            match self.render.next_block(&self.session) {
+            match self.render.next_block() {
                 Some((chunk, n)) => {
                     fill(&mut self.block, chunk, n, self.fold, self.gain);
                     self.done += n;
@@ -609,7 +612,9 @@ impl Bounce {
                     self.peak = 0.0;
                     self.done = 0;
                     self.measuring = false;
-                    self.render = soundcraft_mix::RangeRender::new(&self.session, self.bus, self.range, 1024);
+                    self.render = soundcraft_mix::RangeRender::try_new(&self.session, self.bus, self.range, 1024).map_err(|err| {
+                        EngineError::Io(format!("{}: the session could not be prepared for rendering: {err:?}", self.path.display()))
+                    })?;
                 }
                 None => return self.finish().map(Some),
             }
