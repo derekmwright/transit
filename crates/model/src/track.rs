@@ -306,6 +306,45 @@ impl Track {
         self.playlist().map_or(&[], |p| p.clips.as_slice())
     }
 
+    /// Moves the insert in slot `from` to slot `to`; the slots between shift by one toward the
+    /// vacated place (empty slots shift too). Each insert keeps its settings, state and
+    /// [`InsertUid`](crate::InsertUid), and every plug-in automation lane follows its insert to the
+    /// new slot. Returns false, changing nothing, when a slot is out of range, `from == to`, or
+    /// `from` is empty.
+    pub fn move_insert(&mut self, from: usize, to: usize) -> bool {
+        let n = self.mixer.inserts.len();
+        if from == to || from >= n || to >= n || self.mixer.inserts.get(from).is_none_or(Option::is_none) {
+            return false;
+        }
+        if from < to {
+            if let Some(r) = self.mixer.inserts.get_mut(from..=to) {
+                r.rotate_left(1);
+            }
+        } else if let Some(r) = self.mixer.inserts.get_mut(to..=from) {
+            r.rotate_right(1);
+        }
+        let new_slot = |s: usize| {
+            if s == from {
+                to
+            } else if from < to && s > from && s <= to {
+                s - 1
+            } else if to < from && s >= to && s < from {
+                s + 1
+            } else {
+                s
+            }
+        };
+        for l in &mut self.automation {
+            // `u8::MAX` is the track trim lane, not an insert.
+            if let AutoParam::Plugin { slot, .. } = &mut l.param
+                && let Some(new) = u8::try_from(new_slot(usize::from(*slot))).ok().filter(|_| usize::from(*slot) < n)
+            {
+                *slot = new;
+            }
+        }
+        true
+    }
+
     pub fn lane(&self, p: &AutoParam) -> Option<&AutomationLane> {
         self.automation.iter().find(|l| &l.param == p)
     }
@@ -350,6 +389,76 @@ mod tests {
         t.lane_mut(&AutoParam::Volume).set_point(10, -6.0);
         assert_eq!(t.automation.len(), 1);
         assert_eq!(t.lane(&AutoParam::Volume).map(|l| l.points.len()), Some(2));
+    }
+
+    fn chain4() -> Track {
+        let mut t = Track::new(TrackId(1), "Gtr", TrackKind::Audio, ChannelFormat::Mono, TRACK_COLORS[0]);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            t.mixer.inserts[i] = Some(crate::Insert::new(*id));
+        }
+        t
+    }
+
+    fn order(t: &Track) -> String {
+        t.mixer.inserts.iter().map(|i| i.as_ref().map_or("_", |i| i.plugin.as_str())).collect()
+    }
+
+    #[test]
+    fn move_insert_forward_and_backward() {
+        let mut t = chain4();
+        let uids: Vec<_> = t.mixer.inserts.iter().flatten().map(|i| i.uid.get()).collect();
+        assert!(t.move_insert(0, 2));
+        assert_eq!(order(&t), "bcad______");
+        assert!(t.move_insert(3, 0));
+        assert_eq!(order(&t), "dbca______");
+        // A move into an empty slot shifts the empties too.
+        assert!(t.move_insert(1, 5));
+        assert_eq!(order(&t), "dca__b____");
+        // Identity travels with the insert.
+        let a = t.mixer.inserts.iter().flatten().find(|i| i.plugin == "a").map(|i| i.uid.get());
+        assert_eq!(a, Some(uids[0]));
+    }
+
+    #[test]
+    fn move_insert_rejects_noops_and_out_of_range() {
+        let mut t = chain4();
+        let before = order(&t);
+        assert!(!t.move_insert(1, 1));
+        assert!(!t.move_insert(0, 10));
+        assert!(!t.move_insert(10, 0));
+        assert!(!t.move_insert(usize::MAX, 0));
+        assert!(!t.move_insert(5, 0), "an empty slot has nothing to move");
+        assert_eq!(order(&t), before);
+    }
+
+    #[test]
+    fn move_insert_carries_flags_and_automation() {
+        let mut t = chain4();
+        {
+            let b = t.mixer.inserts[1].as_mut().unwrap();
+            b.bypass = true;
+            b.active = false;
+            b.params.insert("x".into(), 0.25);
+            b.preset = "P".into();
+        }
+        let lane = |slot| AutoParam::Plugin { slot, param: "x".into() };
+        for slot in [0u8, 1, 2, 3] {
+            t.lane_mut(&lane(slot)).set_point(0, f32::from(slot));
+        }
+        let trim = AutoParam::Plugin { slot: u8::MAX, param: "trim".into() };
+        t.lane_mut(&trim).set_point(0, -3.0);
+        assert!(t.move_insert(1, 3));
+        assert_eq!(order(&t), "acdb______");
+        let b = t.mixer.inserts[3].as_ref().unwrap();
+        assert!(b.bypass && !b.active && b.preset == "P" && b.params.get("x") == Some(&0.25));
+        // The lane that targeted b (value 1.0) now targets slot 3; the others followed their inserts.
+        let at = |t: &Track, slot| t.lane(&lane(slot)).map(|l| l.points[0].value);
+        assert_eq!([at(&t, 0), at(&t, 1), at(&t, 2), at(&t, 3)], [Some(0.0), Some(2.0), Some(3.0), Some(1.0)]);
+        assert_eq!(t.lane(&trim).map(|l| l.points[0].value), Some(-3.0), "the trim lane is not an insert");
+        // And back.
+        assert!(t.move_insert(3, 1));
+        assert_eq!(order(&t), "abcd______");
+        assert_eq!([at(&t, 0), at(&t, 1), at(&t, 2), at(&t, 3)], [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]);
     }
 
     #[test]

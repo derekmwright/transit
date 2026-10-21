@@ -23,7 +23,8 @@ pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use midi_input::{MidiInput, MidiPort};
 pub use mixer::{
-    Bus, ChannelFormat, INSERT_SLOTS, Insert, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos, fader_pos_to_db,
+    Bus, ChannelFormat, INSERT_SLOTS, Insert, InsertUid, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan, fader_db_to_pos,
+    fader_pos_to_db,
 };
 pub use route_graph::{
     EdgeKind, Layering, RouteChange, RouteCycle, RouteEdge, RouteGraph, RouteNode, RouteScratch, describe_cycle, new_cycle, would_create_cycle,

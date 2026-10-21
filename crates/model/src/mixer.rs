@@ -420,9 +420,40 @@ pub enum Route {
     Hardware(String),
 }
 
+/// A process-unique identity for an [`Insert`] that survives moving it between slots, so the
+/// mix engine can keep its plug-in instance (and state) through a reorder. Not saved: every
+/// loaded or newly made insert gets a fresh one, and clones (undo snapshots) keep theirs. It
+/// never takes part in equality.
+#[derive(Debug, Clone, Copy)]
+pub struct InsertUid(u64);
+
+impl InsertUid {
+    /// The identity as a number (never 0).
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for InsertUid {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        InsertUid(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl PartialEq for InsertUid {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// A plugin instance on an insert slot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Insert {
+    /// Stable identity while the insert lives (see [`InsertUid`]).
+    #[serde(skip)]
+    pub uid: InsertUid,
     /// Registry id from `soundcraft-dsp` (e.g. `eq7`, `comp`).
     pub plugin: String,
     #[serde(default, deserialize_with = "finite_params")]
@@ -457,6 +488,7 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            uid: InsertUid::default(),
         }
     }
 

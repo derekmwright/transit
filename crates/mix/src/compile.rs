@@ -101,8 +101,9 @@ type StripDesc = (TrackId, u16, u8, u16, u16, usize, usize, Vec<(u64, bool, bool
 #[derive(Clone, Default, PartialEq)]
 struct Desc {
     strips: Vec<StripDesc>,
-    /// Per slot: key, kind, plugin id, channels, layout, long map length (0 inline), sample.
-    slots: Vec<((TrackId, usize), CellKind, String, usize, u16, usize, usize)>,
+    /// Per slot: key, kind, plugin id, channels, layout, long map length (0 inline), sample, insert
+    /// identity (a reordered chain is a new structure).
+    slots: Vec<((TrackId, usize), CellKind, String, usize, u16, usize, usize, u64)>,
     busses: Vec<(BusId, ChannelFormat)>,
     main: Option<ChannelFormat>,
 }
@@ -197,7 +198,14 @@ pub struct PlanCompiler {
 
 /// The planned content of one slot cell.
 enum SlotPlan {
-    Move { from: u16, generation: SlotGen, applied: Option<usize>, sample: Option<Option<Arc<SourceAudio>>> },
+    /// `old` is the key the instance has in the active plan (not `key` when its insert moved).
+    Move {
+        old: (TrackId, usize),
+        from: u16,
+        generation: SlotGen,
+        applied: Option<usize>,
+        sample: Option<Option<Arc<SourceAudio>>>,
+    },
     Fresh(Box<PluginSlot>),
     Absent,
 }
@@ -634,7 +642,7 @@ impl PlanCompiler {
                 let Some(spec) = specs.get(&key) else { continue };
                 let params = ins.map_or(0, |i| i.params.len());
                 let sample = if kind == CellKind::Instrument { sample_id(instrument_sample(s, t).as_ref()) } else { 0 };
-                desc.slots.push((key, kind, spec.id.clone(), spec.ch, layout, if needs_storage(params) { params } else { 0 }, sample));
+                desc.slots.push((key, kind, spec.id.clone(), spec.ch, layout, if needs_storage(params) { params } else { 0 }, sample, spec.uid));
             }
         }
         for b in &s.busses {
@@ -653,10 +661,22 @@ impl PlanCompiler {
     ) -> Result<(), CompileError> {
         let sample = sample_id(p.sample.as_ref());
         let long = if needs_storage(p.params) { p.params } else { 0 };
-        if let Some(old) = self.active.slots.get(&p.key)
+        // The instance of an insert follows it to another slot of its track (a reorder).
+        let old_key = match self.active.slots.get(&p.key) {
+            Some(o) if o.spec.uid == p.spec.uid => p.key,
+            _ if p.kind == CellKind::Insert && p.spec.uid != 0 => self
+                .active
+                .slots
+                .iter()
+                .find(|(k, o)| k.0 == p.key.0 && o.kind == CellKind::Insert && o.spec.uid == p.spec.uid)
+                .map_or(p.key, |(k, _)| *k),
+            _ => p.key,
+        };
+        if let Some(old) = self.active.slots.get(&old_key)
             && mode == CompileMode::Update
             && old.kind == p.kind
             && old.spec.id == p.spec.id
+            && old.spec.uid == p.spec.uid
             && old.spec.ch == p.spec.ch
             && old.layout == layout
         {
@@ -668,7 +688,7 @@ impl PlanCompiler {
             if old.sample == sample || sampler {
                 let applied = (long > 0 && long != old.heap).then_some(long);
                 let sample = (old.sample != sample).then(|| p.sample.clone());
-                p.plan = SlotPlan::Move { from: old.cell, generation: old.generation, applied, sample };
+                p.plan = SlotPlan::Move { old: old_key, from: old.cell, generation: old.generation, applied, sample };
                 return Ok(());
             }
         }
@@ -795,7 +815,7 @@ impl PlanCompiler {
             }
         }
         let latency_of = |p: &PlannedSlot, me: &Self| match &p.plan {
-            SlotPlan::Move { .. } => me.active.slots.get(&p.key).map_or(0, |o| o.latency),
+            SlotPlan::Move { old, .. } => me.active.slots.get(old).map_or(0, |o| o.latency),
             SlotPlan::Fresh(_) => p.latency,
             SlotPlan::Absent => 0,
         };
@@ -914,8 +934,8 @@ impl PlanCompiler {
                     latency: 0,
                 };
                 match p.plan {
-                    SlotPlan::Move { from, generation, applied, sample } => {
-                        let old = self.active.slots.get(&p.key);
+                    SlotPlan::Move { old, from, generation, applied, sample } => {
+                        let old = self.active.slots.get(&old);
                         sh.generation = generation;
                         sh.latency = old.map_or(0, |o| o.latency);
                         sh.heap = old.map_or(0, |o| o.heap);

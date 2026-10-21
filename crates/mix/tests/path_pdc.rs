@@ -794,3 +794,22 @@ fn a_plan_with_longer_lines_takes_over_seamlessly() {
     assert!(longest < 16, "a gap of {longest} samples");
     assert_eq!(mix.status().capacity_exceeded, 0, "realigned with nothing clamped");
 }
+
+#[test]
+fn moving_an_insert_keeps_the_chain_latency() {
+    let mut s = session();
+    let t = impulse_track(&mut s, "T");
+    {
+        let ins = &mut s.track_mut(t).unwrap().mixer.inserts;
+        ins[0] = Some(delay(100));
+        ins[1] = Some(delay(300));
+        ins[2] = Some(delay(50));
+    }
+    assert_aligned("before the move", &s);
+    let (_, latency) = render_planned(&s);
+    let mut moved = s.clone();
+    assert!(moved.track_mut(t).unwrap().move_insert(0, 2));
+    assert_aligned("after the move", &moved);
+    assert_eq!(render_planned(&moved).1, latency, "the chain's latency does not depend on its order");
+    assert_eq!(render_legacy(&moved).1, latency);
+}

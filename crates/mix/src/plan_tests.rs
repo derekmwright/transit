@@ -1471,3 +1471,55 @@ fn a_session_only_compile_after_a_torn_reclaim_lists_no_released_binding_as_pend
     let pend = rig.comp.pending_bindings().unwrap_or_default();
     assert!(pend.iter().all(|b| !released.contains(b)), "pending {pend:?} includes released {released:?}");
 }
+
+/// Track `a` with a gain (+12 dB), a saturator and a compressor in slots 0..3.
+fn chain_session() -> (Session, TrackId) {
+    let (mut s, a, _) = audio_session();
+    let mut gain = builtin("gain");
+    gain.params.insert("gain".into(), 12.0);
+    let ins = &mut s.track_mut(a).unwrap().mixer.inserts;
+    ins[0] = Some(gain);
+    ins[1] = Some(builtin("saturator"));
+    ins[2] = Some(builtin("compressor"));
+    (s, a)
+}
+
+#[test]
+fn a_moved_insert_keeps_its_instance_and_the_order_changes_the_sound() {
+    let (s, a) = chain_session();
+    let mut rig = Rig::new();
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    let before = rig.comp.active_bindings();
+    assert_eq!(before.len(), 3);
+    let gen_at = |b: &[SlotBinding], slot| b.iter().find(|x| x.0 == a && x.1 == slot).map(|x| x.2);
+    let made = rig.log.made.load(Ordering::Relaxed);
+    // Gain to the end: [saturator, compressor, gain].
+    let mut s2 = s.clone();
+    assert!(s2.track_mut(a).unwrap().move_insert(0, 2));
+    let mut env = rig.compile(&s2);
+    assert_eq!(slot_moves(&env).len(), 3, "all three instances move");
+    assert_eq!(adopt_measured(&mut rig.eng, &mut env), Adoption::Adopted);
+    assert_eq!(holdings(&env).1, 0, "nothing was replaced");
+    rig.comp.reclaim(env);
+    let after = rig.comp.active_bindings();
+    assert_eq!(gen_at(&after, 2), gen_at(&before, 0), "the gain's instance is now in slot 2");
+    assert_eq!(gen_at(&after, 0), gen_at(&before, 1));
+    assert_eq!(gen_at(&after, 1), gen_at(&before, 2));
+    assert_eq!(rig.log.made.load(Ordering::Relaxed), made, "no instance was made");
+    assert_eq!(rig.drops(), 0, "none was dropped");
+    // Undo (the original session again) puts every instance back.
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    assert_eq!(rig.comp.active_bindings(), before);
+    assert_eq!(rig.drops(), 0);
+    // A move before any audio rendered sounds like a fresh plan of the new order; the order matters.
+    let mut moved = Rig::new();
+    assert_eq!(moved.publish(&s), Adoption::Adopted);
+    assert_eq!(moved.publish(&s2), Adoption::Adopted);
+    let moved_out = moved.render(4);
+    let mut fresh = Rig::new();
+    assert_eq!(fresh.publish(&s2), Adoption::Adopted);
+    assert_eq!(moved_out, fresh.render(4), "the moved chain renders as a fresh chain in the new order");
+    let mut orig = Rig::new();
+    assert_eq!(orig.publish(&s), Adoption::Adopted);
+    assert_ne!(moved_out, orig.render(4), "gain then saturator is not saturator then gain");
+}

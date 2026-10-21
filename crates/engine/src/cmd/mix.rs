@@ -446,10 +446,14 @@ fn insert_move(e: &mut Engine, p: &Value) -> Result<Value> {
     let t = tracks_required(e, "mix.insert_move", p)?.first().copied().ok_or_else(|| bad("mix.insert_move", "no track"))?;
     let from = slot_of(p, "from", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_move", "`from` slot"))?;
     let to = slot_of(p, "to", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_move", "`to` slot"))?;
-    if let Some(tr) = e.session_mut().track_mut(t) {
-        tr.mixer.inserts.swap(from, to);
+    if from == to {
+        return Err(bad("mix.insert_move", "`from` and `to` are the same slot"));
     }
-    Ok(json!({}))
+    let tr = e.session_mut().track_mut(t).ok_or_else(|| bad("mix.insert_move", "no track"))?;
+    if !tr.move_insert(from, to) {
+        return Err(bad("mix.insert_move", "empty slot"));
+    }
+    Ok(json!({"track": t, "from": from, "to": to}))
 }
 
 fn send(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -949,6 +953,56 @@ mod tests {
         // Empty params with a preset name still recall (the rename path).
         e.execute("mix.insert_params", &json!({"track": t, "slot": 0, "params": {}, "preset": "Saved"})).unwrap();
         assert_eq!(e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().preset, "Saved");
+    }
+
+    #[test]
+    fn insert_move_reorders_in_one_undo_step_and_validates() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({})).unwrap();
+        let t = e.session().tracks[0].id;
+        for (slot, plugin) in ["gain", "saturator", "compressor", "room_reverb"].iter().enumerate() {
+            e.execute("mix.insert", &json!({"track": t, "slot": slot, "plugin": plugin})).unwrap();
+        }
+        e.execute("mix.insert_bypass", &json!({"track": t, "slot": 1, "value": true})).unwrap();
+        let lane = AutoParam::Plugin { slot: 1, param: "drive".into() };
+        e.session_mut().track_mut(t).unwrap().lane_mut(&lane).set_point(0, 0.5);
+        let order = |e: &Engine| -> Vec<String> {
+            e.session().tracks[0].mixer.inserts.iter().take(4).map(|i| i.as_ref().map_or(String::new(), |i| i.plugin.clone())).collect()
+        };
+        let original = order(&e);
+        let uid = |e: &Engine, plugin: &str| e.session().tracks[0].mixer.inserts.iter().flatten().find(|i| i.plugin == plugin).map(|i| i.uid.get());
+        let sat = uid(&e, "saturator");
+        let steps = e.undo_history().len();
+
+        e.execute("mix.insert_move", &json!({"track": t, "from": 1, "to": 3})).unwrap();
+        assert_eq!(order(&e), ["gain", "compressor", "room_reverb", "saturator"]);
+        assert_eq!(uid(&e, "saturator"), sat);
+        assert!(e.session().tracks[0].mixer.inserts[3].as_ref().unwrap().bypass, "bypass moved with it");
+        let moved = AutoParam::Plugin { slot: 3, param: "drive".into() };
+        assert!(e.session().tracks[0].lane(&moved).is_some(), "the lane follows its insert");
+        assert_eq!(e.undo_history().len(), steps + 1, "one undo step");
+
+        assert!(e.undo());
+        assert_eq!(order(&e), original);
+        assert_eq!(uid(&e, "saturator"), sat);
+        assert!(e.session().tracks[0].lane(&lane).is_some());
+        assert_eq!(e.undo_history().len(), steps);
+
+        // Letters work; from == to, out of range and an empty source are errors that change nothing.
+        e.execute("mix.insert_move", &json!({"track": t, "from": "d", "to": "a"})).unwrap();
+        assert_eq!(order(&e), ["room_reverb", "gain", "saturator", "compressor"]);
+        assert!(e.undo());
+        for p in [
+            json!({"track": t, "from": 2, "to": 2}),
+            json!({"track": t, "from": 0, "to": 10}),
+            json!({"track": t, "from": 10, "to": 0}),
+            json!({"track": t, "from": 7, "to": 0}),
+            json!({"track": t, "from": 0}),
+        ] {
+            assert!(e.execute("mix.insert_move", &p).is_err(), "{p}");
+        }
+        assert_eq!(order(&e), original);
+        assert_eq!(e.undo_history().len(), steps);
     }
 
     #[test]

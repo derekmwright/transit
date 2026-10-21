@@ -161,6 +161,9 @@ pub struct InstanceSpec {
     pub ch: usize,
     /// Decoded [`Insert::state`](soundcraft_model::Insert::state).
     pub state: Option<Vec<u8>>,
+    /// The insert's [`InsertUid`](soundcraft_model::InsertUid): the instance follows it when the
+    /// insert moves to another slot (0 for an instrument or a clip effect).
+    pub uid: u64,
 }
 
 /// A plugin instance created and prepared off the audio thread, handed to [`MixEngine::adopt`].
@@ -191,20 +194,25 @@ pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
     let mut out = Vec::new();
     for t in &s.tracks {
         let ch = strip_channels(t, main_ch);
+        let mut seen: Vec<u64> = Vec::new();
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
             if let Some(ins) = ins {
-                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: state(ins) });
+                // A copied insert on the same strip keeps no identity (0): its instance stays by slot.
+                let uid = ins.uid.get();
+                let uid = if seen.contains(&uid) { 0 } else { uid };
+                seen.push(uid);
+                out.push(InstanceSpec { track: t.id, slot: i, id: ins.plugin.clone(), ch, state: state(ins), uid });
             }
         }
         if let Some(ins) = &t.instrument {
-            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: state(ins) });
+            out.push(InstanceSpec { track: t.id, slot: INSTRUMENT_SLOT, id: ins.plugin.clone(), ch: ch.max(2), state: state(ins), uid: 0 });
         }
         if t.kind == TrackKind::Audio {
             for clip in t.clips().iter().filter(|c| c.is_audio()) {
                 let (eq, comp) = clip_fx_modules(s, clip.id.0);
                 for (want, is_comp, id) in [(eq, false, CLIP_EQ), (comp, true, CLIP_COMP)] {
                     if let Some(slot) = clip_fx_slot(clip.id.0, is_comp).filter(|_| want) {
-                        out.push(InstanceSpec { track: t.id, slot, id: id.to_string(), ch, state: None });
+                        out.push(InstanceSpec { track: t.id, slot, id: id.to_string(), ch, state: None, uid: 0 });
                     }
                 }
             }
@@ -390,6 +398,9 @@ impl Applied {
 
 struct PluginSlot {
     id: String,
+    /// The [`InsertUid`](soundcraft_model::InsertUid) of the insert it serves (legacy engines; 0
+    /// otherwise), so a reordered chain keeps each instance with its insert.
+    uid: u64,
     /// Channel count the plugin was prepared for.
     ch: usize,
     plugin: Box<dyn Plugin>,
@@ -430,6 +441,7 @@ impl PluginSlot {
         let third = is_third_party(&id);
         PluginSlot {
             id,
+            uid: 0,
             ch,
             plugin,
             applied: Applied::new(),
@@ -968,7 +980,9 @@ impl SlotCtx<'_> {
             let state = if third { ins.state_bytes() } else { None };
             (create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)?.plugin, ins.plugin.clone())
         };
-        Some(PluginSlot::new(plugin, id, ch, idx))
+        let mut slot = PluginSlot::new(plugin, id, ch, idx);
+        slot.uid = ins.uid.get();
+        Some(slot)
     }
 }
 
@@ -1261,6 +1275,17 @@ impl MixEngine {
                 cx.retire(p);
             }
             strip.plugins.resize_with(t.mixer.inserts.len(), || None);
+            // A reordered chain: each instance follows its insert to the new slot (swaps only).
+            for (idx, ins) in t.mixer.inserts.iter().enumerate() {
+                let Some(ins) = ins else { continue };
+                let uid = ins.uid.get();
+                if strip.plugins.get(idx).and_then(Option::as_ref).is_some_and(|p| p.uid == uid) {
+                    continue;
+                }
+                if let Some(j) = strip.plugins.iter().position(|p| p.as_ref().is_some_and(|p| p.uid == uid)) {
+                    strip.plugins.swap(idx, j);
+                }
+            }
             for (idx, (slot, ins)) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()).enumerate() {
                 match ins {
                     Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch) || cx.waiting(t.id, idx) => {
@@ -2286,7 +2311,7 @@ fn structure_fingerprint(s: &Session) -> usize {
         t.mixer.input.hash(&mut h);
         t.mixer.output.hash(&mut h);
         for i in &t.mixer.inserts {
-            i.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
+            i.as_ref().map(|x| (x.plugin.as_str(), x.uid.get())).hash(&mut h);
         }
         for snd in t.mixer.sends.iter().flatten() {
             snd.target.hash(&mut h);
@@ -4090,6 +4115,28 @@ mod tests {
     }
 
     #[test]
+    fn a_moved_insert_keeps_its_instance_in_a_legacy_engine() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        {
+            let ins = &mut s.track_mut(t).unwrap().mixer.inserts;
+            ins[0] = Some(Insert::new("gain"));
+            ins[1] = Some(Insert::new("gain"));
+            ins[2] = Some(Insert::new("compressor"));
+        }
+        let mut eng = MixEngine::new(48_000.0, 512);
+        eng.ensure_synced(&s);
+        let ptr = |eng: &MixEngine, i: usize| eng.strips[&t].plugins[i].as_ref().map(|p| &*p.plugin as *const dyn Plugin as *const () as usize);
+        let before: Vec<_> = (0..3).map(|i| ptr(&eng, i)).collect();
+        assert!(before.iter().all(Option::is_some));
+        let mut moved = s.clone();
+        assert!(moved.track_mut(t).unwrap().move_insert(0, 2));
+        eng.ensure_synced(&moved);
+        assert_eq!([ptr(&eng, 0), ptr(&eng, 1), ptr(&eng, 2)], [before[1], before[2], before[0]], "each instance followed its insert");
+        eng.ensure_synced(&s);
+        assert_eq!((0..3).map(|i| ptr(&eng, i)).collect::<Vec<_>>(), before, "and back");
+    }
+
+    #[test]
     fn inserts_process_and_survive_unknown_plugins() {
         let (mut s, t) = session_with_dc(0.5, 4800);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("does-not-exist"));
@@ -4781,7 +4828,7 @@ mod tests {
         ins.params.insert("gain".into(), -6.0);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
         let specs = instance_specs(&s);
-        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None }]);
+        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None, uid: specs[0].uid }]);
         let mut eng = MixEngine::new(48_000.0, 512);
         eng.set_external_instances(true);
         // Nothing to adopt yet: the slot passes audio through (and sync never tried to load a
