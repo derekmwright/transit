@@ -9,8 +9,8 @@ use soundcraft_model::{IoMap, Session, TrackId};
 use soundcraft_rt::handoff::{Anchor, AudioAccess};
 use soundcraft_time::{Range, Samples};
 use std::cell::{Cell, RefCell, RefMut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 type Owner = RuntimeControl<Command, ActionResult>;
 pub type PlayerNotice = Notice<Command, ActionResult>;
@@ -79,7 +79,7 @@ impl Player {
     pub fn prepare_device_free(session: Arc<Session>) -> Result<Self, String> {
         let rate = session.sample_rate.hz();
         Self::prepare(session, rate, IoMap::default()).map(|(mut player, access, _clock)| {
-            let output = DeviceOutput::new(access, &player, 2, rate);
+            let output = DeviceOutput::new(access, &player, 2);
             *player.test_output.get_mut() = Some(output);
             player
         })
@@ -102,7 +102,6 @@ impl Player {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
-            meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
             metro: crate::Metro::default(),
         })
@@ -315,7 +314,7 @@ impl Player {
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
     ) {
         let rate = self.device_rate;
-        let mut callback = DeviceOutput::new(access, self, 2, rate);
+        let mut callback = DeviceOutput::new(access, self, 2);
         let (shared, fault, stop) = (Arc::clone(&self.shared), Arc::clone(&self.fault), Arc::clone(&self.silent_stop));
         let failure_signal = self.failure_signal.clone();
         let spawn = spawn(Box::new(move || {
@@ -789,8 +788,8 @@ struct DeviceOutput {
 }
 
 impl DeviceOutput {
-    fn new(access: AudioAccess<Audio>, player: &Player, channels: usize, rate: u32) -> Self {
-        Self { access, output: OutputCallback::new(channels, rate), shared: Arc::clone(&player.shared), fault: Arc::clone(&player.fault) }
+    fn new(access: AudioAccess<Audio>, player: &Player, channels: usize) -> Self {
+        Self { access, output: OutputCallback::new(channels), shared: Arc::clone(&player.shared), fault: Arc::clone(&player.fault) }
     }
 
     fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T]) {
@@ -814,7 +813,7 @@ where
     use cpal::traits::DeviceTrait;
     let channels = usize::from(config.channels).max(1);
     let rate = config.sample_rate.0;
-    let mut output = DeviceOutput::new(access, player, channels, rate);
+    let mut output = DeviceOutput::new(access, player, channels);
     let fault = Arc::clone(&player.fault);
     let error = error_callback(Arc::clone(&player.fault), Arc::clone(&player.shared), player.failure_signal.clone());
     device.build_output_stream(

@@ -1,7 +1,7 @@
 //! The SoundCraft mix engine.
 //!
-//! [`MixEngine::render`] produces one block of the main output for a session at a timeline
-//! position: clips (with clip gain and fades) → trim/phase → inserts → pre-fader sends → fader and
+//! [`MixEngine::render_active`] produces one block of the main output for a compiled session at a
+//! timeline position: clips (with clip gain and fades) → trim/phase → inserts → pre-fader sends → fader and
 //! mute (with automation) → pan → post-fader sends → busses → aux inputs → main → master faders.
 //! The same code drives realtime playback and offline bounces, so what you hear is what you get.
 //! Steady-state rendering does not allocate.
@@ -21,24 +21,13 @@
 //!   -3 dB, LFE dropped), or map speaker by speaker into other multichannel layouts.
 //!
 //! ## Plugin instances and threads
-//! [`MixEngine::sync`] brings plugin instances in line with the session. Hosted third-party
-//! plugins (`clap:` / `vst3:` ids, see [`is_third_party`]) are expensive and have main-thread
-//! rules; built-in plugins only allocate, but allocating is not allowed on the audio thread
-//! either. So a realtime host makes every instance off the audio thread:
-//! - with [`MixEngine::set_external_instances`]`(true)` (realtime playback), `sync` never creates a
-//!   plugin, built-in or hosted, insert, instrument or clip effect. The host's control (UI) thread
-//!   creates them with [`create_instance`] from [`realtime_instance_specs`] (restoring each hosted
-//!   insert's stored [`Insert::state`] and calling `prepare` there), and hands them over with
-//!   [`MixEngine::adopt`]; `sync` then moves the matching one into its slot. A slot whose
-//!   instance has not arrived yet passes audio through. ([`instance_specs`] lists the hosted
-//!   instances only.)
-//! - every instance `sync` replaces or removes (built-in or not) goes to a retired list instead of
-//!   being dropped; the host takes it with [`MixEngine::take_retired`] and drops it on the control
-//!   thread, so plugin destruction never runs on the audio thread either.
-//! - without external instances (the default: offline [`render_range`], bounces, tests) `sync`
-//!   creates every plugin itself, synchronously (a clip effect when its clip first plays),
-//!   restores stored state before the first `process`, and drops retired instances at the end of
-//!   `sync`.
+//! Hosted third-party plugins (`clap:` / `vst3:` ids, see [`is_third_party`]) are expensive and
+//! have main-thread rules; built-in plugins only allocate, but allocating is not allowed on the
+//! audio thread either. So every instance is made off the audio thread, by the control thread
+//! with [`create_instance`] from [`realtime_instance_specs`] (restoring each hosted insert's
+//! stored [`Insert::state`] and calling `prepare` there), or by the [`PlanCompiler`]. Every
+//! instance a plan replaces or removes goes back to the control thread in the envelope
+//! ([`Retired`]), so plugin destruction never runs on the audio thread either.
 //!
 //! An instance starts from its stored state; the insert's parameter values are then applied on
 //! top before the first block (the session's values are kept in step with the plugin, including
@@ -49,7 +38,7 @@
 //! instrument (the Sampler) is handed the decoded audio of its insert's
 //! [`Insert::sample`] source straight from the session's pool, shared and never copied.
 //!
-//! ## Prepared plans (realtime, F01b)
+//! ## Prepared plans
 //! An engine made with [`MixEngine::realtime`] never discovers structure on the audio thread.
 //! A [`PlanCompiler`] on the control thread turns each Session into a [`PlanEnvelope`] whose
 //! tables (strips, plug-in slots, clip effects, busses, main mix, delay lines, parameter
@@ -62,8 +51,8 @@
 //! [`PlanCompiler::compile_with_mode`] with [`CompileMode::NewDocument`]: every slot is prepared
 //! afresh with the incoming state and a new [`SlotGen`]. The render target stays unchanged;
 //! playback must preserve this restore intent through coalescing until adoption is confirmed.
-//! [`MixEngine::render_active`] renders the active plan. The `adopt`/`sync`/`render` path
-//! described above is unchanged and still drives offline renders and today's playback.
+//! [`MixEngine::render_active`] renders the active plan, for realtime playback and for offline
+//! renders ([`render_range`], [`RangeRender`]) alike.
 //!
 //! [`Insert::state`]: soundcraft_model::Insert::state
 //! [`Insert::sample`]: soundcraft_model::Insert::sample
@@ -77,7 +66,6 @@ use soundcraft_model::{
     Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
-use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -114,7 +102,7 @@ pub fn main_channels(s: &Session) -> usize {
     s.main_format().channels().clamp(MAIN_CHANNELS, MAX_CHANNELS)
 }
 
-/// Slot index used for a track's instrument plugin in [`InstanceSpec`] and [`PreparedInstance`]
+/// Slot index used for a track's instrument plugin in [`InstanceSpec`]
 /// (insert slots use their index).
 pub const INSTRUMENT_SLOT: usize = usize::MAX;
 
@@ -132,7 +120,7 @@ const CLIP_FX_BIT: usize = 1 << (usize::BITS - 1);
 const CLIP_EQ: &str = "eq_7band";
 const CLIP_COMP: &str = "compressor";
 
-/// Slot index of a clip's effect module in [`InstanceSpec`] and [`PreparedInstance`]: its EQ
+/// Slot index of a clip's effect module in [`InstanceSpec`]: its EQ
 /// (`comp` false) or its compressor. `None` for a clip id too large to encode (not made by
 /// [`Session::new_clip_id`] in practice); such a clip plays without its effects in realtime.
 #[must_use]
@@ -171,27 +159,17 @@ pub struct InstanceSpec {
     pub uid: u64,
 }
 
-/// A plugin instance created and prepared off the audio thread, handed to [`MixEngine::adopt`].
-pub struct PreparedInstance {
-    pub track: TrackId,
-    pub slot: usize,
-    pub id: String,
-    pub ch: usize,
-    pub plugin: Box<dyn Plugin>,
-}
-
 /// Every third-party plugin slot (inserts and instruments) of a session, with the channel count
-/// [`MixEngine::sync`] prepares it for. Inactive and master tracks are included (they have strips).
+/// a plan prepares it for. Inactive and master tracks are included (they have strips).
 pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
     let mut out = realtime_instance_specs(s);
     out.retain(|x| is_third_party(&x.id));
     out
 }
 
-/// Every plugin instance a realtime engine ([`MixEngine::set_external_instances`]) takes from
-/// its host: each insert and instrument, built-in or third-party, and each clip-effect module
+/// Every plugin instance a realtime engine takes from its host: each insert and instrument, built-in or third-party, and each clip-effect module
 /// (an EQ or compressor per clip, [`clip_fx_slot`]) of an audio track, with the channel count
-/// [`MixEngine::sync`] prepares it for. Only third-party plugins carry a state to restore.
+/// a plan prepares it for. Only third-party plugins carry a state to restore.
 /// Inactive and master tracks are included (they have strips).
 pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
     let main_ch = main_channels(s);
@@ -350,27 +328,11 @@ impl BusBuf {
     }
 }
 
-/// Where strips find the busses they read and write: a map in legacy engines, a table sorted
-/// by id in plan mode.
-trait Busses {
-    fn bus(&self, id: BusId) -> Option<&BusBuf>;
-    fn bus_mut(&mut self, id: BusId) -> Option<&mut BusBuf>;
-}
-
-impl Busses for HashMap<BusId, BusBuf> {
-    fn bus(&self, id: BusId) -> Option<&BusBuf> {
-        self.get(&id)
-    }
-    fn bus_mut(&mut self, id: BusId) -> Option<&mut BusBuf> {
-        self.get_mut(&id)
-    }
-}
-
-/// Plan-mode busses, sorted by id.
+/// The plan's busses, sorted by id.
 #[derive(Default)]
 struct BusTable(Vec<(BusId, BusBuf)>);
 
-impl Busses for BusTable {
+impl BusTable {
     fn bus(&self, id: BusId) -> Option<&BusBuf> {
         let i = self.0.binary_search_by_key(&id, |(b, _)| *b).ok()?;
         self.0.get(i).map(|(_, b)| b)
@@ -430,9 +392,6 @@ impl Applied {
 
 struct PluginSlot {
     id: String,
-    /// The [`InsertUid`](soundcraft_model::InsertUid) of the insert it serves (legacy engines; 0
-    /// otherwise), so a reordered chain keeps each instance with its insert.
-    uid: u64,
     /// Channel count the plugin was prepared for.
     ch: usize,
     plugin: Box<dyn Plugin>,
@@ -453,7 +412,7 @@ struct PluginSlot {
     /// A parameter was sent to the plugin since it last processed a block. Its next block is
     /// processed even while suspended, so the queued change reaches it.
     woken: bool,
-    /// Plan mode: the slot's identity across plans ([`SlotGen::VACANT`] in legacy engines).
+    /// The slot's identity across plans.
     generation: SlotGen,
     /// Plan mode: channel-format code of the strip it was prepared for.
     layout: u16,
@@ -473,7 +432,6 @@ impl PluginSlot {
         let third = is_third_party(&id);
         PluginSlot {
             id,
-            uid: 0,
             ch,
             plugin,
             applied: Applied::new(),
@@ -501,8 +459,6 @@ struct Strip {
     scratch: Vec<f32>,
     plugins: Vec<Option<PluginSlot>>,
     instrument: Option<PluginSlot>,
-    /// The pool audio handed to the instrument with `set_sample` (sample-playing instruments).
-    sample: Option<Arc<SourceAudio>>,
     /// The instrument's next block starts somewhere new: send it the controllers in effect there.
     chase: bool,
     muted: bool,
@@ -510,9 +466,6 @@ struct Strip {
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     clip_fx: ClipFxTable,
     clipbuf: Vec<Vec<f32>>,
-    /// The engine takes its instances from the host ([`MixEngine::set_external_instances`]):
-    /// clip-effect modules come from `sync`, never from the render.
-    external: bool,
     /// Total latency of the instrument, the active inserts and the delays before keyed inserts
     /// (samples).
     latency: usize,
@@ -533,8 +486,8 @@ struct Strip {
     /// Each edge's read of the delay lines: 0 the output, 1 + i send i.
     edges: [EdgeTap; SEND_SLOTS + 1],
     failures: PluginFailures,
-    /// Plan mode: the strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that
-    /// waits for a move, in a strip whose state moved out, and in legacy engines.
+    /// The strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that waits for a
+    /// move and in a strip whose state moved out.
     generation: SlotGen,
     /// Plan mode: index of the strip's track in the plan's session.
     track: u16,
@@ -542,7 +495,7 @@ struct Strip {
     id: TrackId,
     /// Plan mode: channel-format code of `buf`.
     layout: u16,
-    /// Plan mode: the strip's meter (legacy engines keep theirs in [`MixEngine::meters`]).
+    /// The strip's meter.
     meter: StripMeter,
     /// A panic out of this strip's processing in phase 1, caught by [`guarded`] on the thread that
     /// rendered the strip (moving the box allocates nothing). The render re-raises the first one to
@@ -566,9 +519,8 @@ struct DelayLine {
     idx: usize,
     /// Longest delay a tap can read.
     len: usize,
-    /// Plan mode: `bufs` were sized off the audio thread for this longest delay and are never
-    /// resized; a longer delay is clamped to it.
-    cap: Option<usize>,
+    /// A stand-in in a strip shell, whose live line moves in with the strip state.
+    placeholder: bool,
     /// The ring holds the strip's recent blocks: it was written every block since it was zeroed.
     live: bool,
     /// Samples of continuous history the ring holds (at most its length).
@@ -581,24 +533,19 @@ struct DelayLine {
 const XFADE: usize = 256;
 
 impl DelayLine {
-    /// A plan-mode stand-in in a strip shell whose live lines move in with the strip state.
+    /// A stand-in in a strip shell whose live lines move in with the strip state.
     fn placeholder() -> Self {
-        DelayLine { cap: Some(0), ..DelayLine::default() }
+        DelayLine { placeholder: true, ..DelayLine::default() }
     }
 
     fn is_placeholder(&self) -> bool {
-        self.cap == Some(0) && self.bufs.is_empty()
+        self.placeholder && self.bufs.is_empty()
     }
 
-    /// A delay line serving delays up to `cap` samples, in blocks up to `block`: plan mode
-    /// (`fixed`) never resizes it, a legacy engine's may be replaced by a longer one.
-    fn sized(ch: usize, cap: usize, block: usize, fixed: bool) -> Self {
-        DelayLine { bufs: vec![vec![0.0; cap.saturating_add(block)]; ch], len: cap, cap: fixed.then_some(cap), ..DelayLine::default() }
-    }
-
-    /// A plan-mode delay line serving delays up to `cap` samples, in blocks up to `block`.
+    /// A delay line serving delays up to `cap` samples, in blocks up to `block`. Its storage is
+    /// sized off the audio thread and never resized; a longer delay is clamped to `cap`.
     fn with_capacity(ch: usize, cap: usize, block: usize) -> Self {
-        Self::sized(ch, cap, block, true)
+        DelayLine { bufs: vec![vec![0.0; cap.saturating_add(block)]; ch], len: cap, ..DelayLine::default() }
     }
 
     fn ring(&self) -> usize {
@@ -607,7 +554,7 @@ impl DelayLine {
 
     /// Audio side: whether the line holds a delay of `need`. Never allocates: a longer delay is
     /// read clamped to the line's capacity, and the delay asked for is returned (else 0) so the
-    /// shortfall can be reported and the line grown off the audio thread.
+    /// shortfall can be reported and the line grown by the next plan.
     fn fit(&self, need: usize) -> usize {
         let need = need.min(MAX_LATENCY);
         if need > self.len { need } else { 0 }
@@ -631,25 +578,6 @@ impl DelayLine {
         self.written = n;
         self.live = old.live && n > 0;
         self.fresh = false;
-    }
-
-    /// Control side (legacy engines; a plan-mode line keeps the storage its plan prepared): makes
-    /// the line hold delays up to `need` for `ch` channels in blocks up to `block`, sized as a
-    /// plan sizes its lines. It grows (never shrinks) keeping the history it holds.
-    fn grow(&mut self, need: usize, ch: usize, block: usize) {
-        if self.cap.is_some() {
-            return;
-        }
-        if self.bufs.len() != ch || self.ring() < self.len.saturating_add(block) {
-            *self = DelayLine::default();
-        }
-        let need = need.min(MAX_LATENCY);
-        if need > self.len || self.bufs.is_empty() {
-            let len = line_capacity(need).max(self.len);
-            let mut grown = DelayLine::sized(ch, len, block, false);
-            grown.take_history(self);
-            *self = grown;
-        }
     }
 
     /// Appends one block. A line that was idle is zeroed first, so no stale audio comes back.
@@ -687,15 +615,9 @@ impl DelayLine {
         self.live = false;
     }
 
-    /// The block just written, `delay` samples late (clamped to the line's longest delay), into
-    /// `dst` (each channel resized to `frames`, within its capacity in plan mode).
-    #[cfg(test)]
-    fn read(&self, delay: usize, dst: &mut [Vec<f32>], frames: usize) {
-        self.read_x(delay, delay, 0, dst, frames);
-    }
-
-    /// As [`DelayLine::read`], crossfading from delay `from` to delay `to`, `done` samples into the
-    /// crossfade (`from == to`: a plain read).
+    /// The block just written, `from` samples late and crossfading to `to` samples late (each
+    /// clamped to the line's longest delay), `done` samples into the crossfade (`from == to`: a
+    /// plain read), into `dst` (each channel resized to `frames`, within its capacity).
     fn read_x(&self, from: usize, to: usize, done: usize, dst: &mut [Vec<f32>], frames: usize) {
         let size = self.ring();
         let (a, b) = (from.min(self.len), to.min(self.len));
@@ -722,12 +644,6 @@ impl DelayLine {
         self.bufs.iter_mut().for_each(|b| b.fill(0.0));
         self.written = 0;
     }
-}
-
-/// Capacity of a delay line holding `need` samples: a power of two, at least
-/// [`MIN_DELAY_CAPACITY`], at most [`MAX_LATENCY`] (as plans size theirs).
-fn line_capacity(need: usize) -> usize {
-    need.checked_next_power_of_two().unwrap_or(MAX_LATENCY).clamp(compile::MIN_DELAY_CAPACITY, MAX_LATENCY)
 }
 
 /// One edge's read of its strip's delay line (F05): the delay it plays now and, while it moves to
@@ -773,15 +689,15 @@ impl EdgeTap {
 struct ClipFx {
     eq: Option<ClipModule>,
     comp: Option<ClipModule>,
-    /// The clip's parameters use the module this block. A realtime engine keeps a module whose
-    /// parameters went away (it is not dropped on the audio thread) until `sync` retires it.
+    /// The clip's parameters use the module this block. A plan keeps a module whose parameters
+    /// went away (it is not dropped on the audio thread) until the next plan retires it.
     eq_on: bool,
     comp_on: bool,
     gain_db: f32,
     sr: f32,
     ch: usize,
-    /// Offline engines: modules are made when a clip's parameters first need them and dropped
-    /// when they no longer do. Realtime engines get them from the host through `sync`.
+    /// Consolidation: modules are made when a clip's parameters first need them and dropped when
+    /// they no longer do. A plan's chains get their modules from the compiler.
     lazy: bool,
 }
 
@@ -798,32 +714,7 @@ impl ClipFxTable {
         let i = self.0.binary_search_by_key(&clip, |(c, _)| *c).ok()?;
         self.0.get_mut(i).map(|(_, fx)| fx)
     }
-
-    /// The chain of `clip`, made with `make` when there is none (may allocate: not in plan mode).
-    fn get_or_insert_with(&mut self, clip: u64, make: impl FnOnce() -> ClipFx) -> &mut ClipFx {
-        let i = match self.0.binary_search_by_key(&clip, |(c, _)| *c) {
-            Ok(i) => i,
-            Err(i) => {
-                self.0.insert(i, (clip, make()));
-                i
-            }
-        };
-        let (_, fx) = &mut self.0[i];
-        fx
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(u64, &mut ClipFx) -> bool) {
-        self.0.retain_mut(|(c, fx)| keep(*c, fx));
-    }
-
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut ClipFx> {
-        self.0.iter_mut().map(|(_, fx)| fx)
-    }
 }
-
-/// Room for this many clip-effect chains per audio strip is reserved when the strip is made, so
-/// the first ones added during playback do not grow the table on the audio thread.
-const CLIP_FX_RESERVE: usize = 16;
 
 impl Strip {
     fn new() -> Self {
@@ -834,13 +725,11 @@ impl Strip {
             scratch: Vec::new(),
             plugins: Vec::new(),
             instrument: None,
-            sample: None,
             chase: true,
             muted: false,
             gr: 0.0,
             clip_fx: ClipFxTable::default(),
             clipbuf: Vec::new(),
-            external: false,
             latency: 0,
             key_in: Vec::new(),
             tap: DelayLine::default(),
@@ -860,50 +749,6 @@ impl Strip {
     }
 }
 
-/// Delay lines for a legacy engine, prepared off the audio thread ([`PreparedLines::new`]) and
-/// taken in on it by [`MixEngine::adopt_lines`], which hands the lines it replaced back in here:
-/// drop it on the control side.
-///
-/// Playback (legacy path) prepares them when [`MixEngine::status`] reports `capacity_exceeded > 0`
-/// (with `required_latency` as the need), and with the session that adds tracks (with the last
-/// need), and sends them with that session to the callback, which calls `adopt_lines` after
-/// `ensure_synced`.
-#[derive(Default)]
-pub struct PreparedLines {
-    lines: Vec<(TrackId, DelayLine, DelayLine)>,
-}
-
-impl PreparedLines {
-    /// Control side: lines holding delays up to `need` samples (rounded up as plans size theirs)
-    /// for every strip of `s`, in blocks up to `max_block`, and a pre-fader line only for a strip
-    /// with a pre-fader send. `max_block` must be the block size of the engine that adopts them
-    /// ([`MixEngine::max_block`]): [`MixEngine::adopt_lines`] refuses lines whose ring cannot hold
-    /// a full block of that engine at their longest delay.
-    #[must_use]
-    pub fn new(s: &Session, max_block: usize, need: usize) -> Self {
-        let cap = line_capacity(need.min(MAX_LATENCY));
-        let main_ch = main_channels(s);
-        let block = max_block.clamp(16, 16_384);
-        let lines = s
-            .tracks
-            .iter()
-            .map(|t| {
-                let ch = strip_channels(t, main_ch);
-                let pre =
-                    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) { DelayLine::sized(ch, cap, block, false) } else { DelayLine::default() };
-                (t.id, DelayLine::sized(ch, cap, block, false), pre)
-            })
-            .collect();
-        PreparedLines { lines }
-    }
-
-    /// Bytes of sample storage held (what was prepared, or what came back).
-    #[must_use]
-    pub fn bytes(&self) -> usize {
-        self.lines.iter().flat_map(|(_, a, b)| a.bufs.iter().chain(b.bufs.iter())).map(|c| c.len() * size_of::<f32>()).sum()
-    }
-}
-
 /// The click of a record count-in. The transport is parked at the record start while it runs, so
 /// the beats come from this grid (project samples), not from the tempo map at the playhead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -918,35 +763,15 @@ pub struct CountInClick {
 
 /// Renders sessions. Keep one per playback stream; plugin state persists across blocks.
 pub struct MixEngine {
-    sample_rate: f32,
     max_block: usize,
-    strips: HashMap<TrackId, Strip>,
-    busses: HashMap<BusId, BusBuf>,
-    main: Vec<Vec<f32>>,
-    main_fmt: ChannelFormat,
-    pub meters: HashMap<TrackId, StripMeter>,
-    pub main_meter: StripMeter,
     pub pan_law: PanLaw,
     /// Last rendered position end (to detect seeks).
     last_end: Samples,
-    /// Snapshot key of the session the strips/order were synced to.
-    synced: (usize, usize, usize),
-    order: Vec<usize>,
     /// Current total compensation delay (samples) of the main mix: the slowest path into it
     /// (instruments, inserts, auxes and busses along the way), plus the master faders' inserts.
     pub latency: usize,
     /// The slowest path into the main mix (before the master faders), this block.
     main_arrival: usize,
-    /// Fingerprint of the routing the order was computed for.
-    route_key: Option<usize>,
-    /// The route graph's working storage, reserved at sync: a routing change re-orders the
-    /// strips and finds a loop's dropped edges without allocating.
-    route: RouteScratch,
-    /// Per bus (route-graph index): arrival and read flag, for sizing delay lines at sync.
-    bus_need: Vec<(usize, bool)>,
-    /// Legacy engines: delay lines that had to clamp since they were last grown (the plan path
-    /// keeps this in its plan). [`MixEngine::ensure_synced`] grows them.
-    legacy_status: PlanStatus,
     /// Live input for the next block (planar), set by the audio host for input monitoring.
     pub input: Vec<Vec<f32>>,
     /// Transport stopped: only monitored inputs sound (no clips).
@@ -965,82 +790,12 @@ pub struct MixEngine {
     /// [`CountInClick`]), whatever Options > Click says.
     pub count_in: Option<CountInClick>,
     /// Every plugin instance comes from [`MixEngine::adopt`] instead of being created in `sync`.
-    external: bool,
-    /// Instances handed over by the host, waiting for `sync` to place them (at most one per
-    /// slot). The buffer is the one the host sent; `adopt` hands the previous one back.
-    adopt: Vec<PreparedInstance>,
-    /// Instances `sync` took out of service, for the host to drop (see [`MixEngine::take_retired`]).
-    retired: Vec<Box<dyn Plugin>>,
-    /// Ownership workspace reused for parallel strip processing.
-    work: Vec<(usize, Strip)>,
     /// Render every strip on the calling thread (tests compare it with the parallel render).
     serial: bool,
-    /// Plan mode ([`MixEngine::realtime`]): the active plan [`MixEngine::render_active`] renders.
+    /// The active plan [`MixEngine::render_active`] renders.
     plan: Option<Box<plan::ActivePlan>>,
     /// Instrument events (F10): the epoch, the render clock and the counters.
     events: events::EngineEvents,
-}
-
-/// What `sync` needs to fill a slot.
-struct SlotCtx<'a> {
-    sr: f32,
-    mb: usize,
-    external: bool,
-    adopt: &'a mut Vec<PreparedInstance>,
-    retired: &'a mut Vec<Box<dyn Plugin>>,
-}
-
-impl SlotCtx<'_> {
-    fn retire(&mut self, slot: Option<PluginSlot>) {
-        if let Some(s) = slot {
-            self.retired.push(s.plugin);
-        }
-    }
-
-    fn retire_module(&mut self, module: Option<ClipModule>) {
-        self.retire(module);
-    }
-
-    fn waiting_at(&self, t: TrackId, idx: usize) -> Option<usize> {
-        self.adopt.iter().position(|p| p.track == t && p.slot == idx)
-    }
-
-    /// True when the host handed over an instance for this slot. It replaces whatever the slot
-    /// holds, even an instance of the same plugin: the host made it because it no longer tracks
-    /// the old one (it was removed and re-added between two renders), and drives its editor.
-    fn waiting(&self, t: TrackId, idx: usize) -> bool {
-        self.external && self.waiting_at(t, idx).is_some()
-    }
-
-    /// The next clip-effect module the host handed over for track `t`: its clip, whether it is
-    /// the compressor (else the EQ), and the instance.
-    fn take_clip_module(&mut self, t: TrackId) -> Option<(u64, bool, PreparedInstance)> {
-        let i = self.adopt.iter().position(|p| p.track == t && clip_fx_of_slot(p.slot).is_some())?;
-        let p = self.adopt.swap_remove(i);
-        let (clip, comp) = clip_fx_of_slot(p.slot)?;
-        Some((clip, comp, p))
-    }
-
-    /// A new instance for `ins` on track `t`, slot `idx`, prepared for `ch` channels: the one
-    /// the host handed over (realtime), or one made here (offline).
-    fn make(&mut self, t: TrackId, idx: usize, ins: &soundcraft_model::Insert, ch: usize) -> Option<PluginSlot> {
-        let third = is_third_party(&ins.plugin);
-        let (plugin, id) = if self.external {
-            let p = self.waiting_at(t, idx).map(|i| self.adopt.swap_remove(i))?;
-            if p.id != ins.plugin || p.ch != ch {
-                self.retired.push(p.plugin);
-                return None;
-            }
-            // The host's id string moves into the slot: nothing is copied or freed here.
-            (p.plugin, p.id)
-        } else {
-            let state = if third { ins.state_bytes() } else { None };
-            (create_instance(&ins.plugin, state.as_deref(), self.sr, self.mb, ch)?.plugin, ins.plugin.clone())
-        };
-        let mut slot = PluginSlot::new(plugin, id, ch, idx);
-        slot.uid = ins.uid.get();
-        Some(slot)
-    }
 }
 
 impl MixEngine {
@@ -1060,28 +815,14 @@ impl MixEngine {
     }
 
     /// Also spawns the process's render pool on first use (never from the audio thread).
-    pub fn new(sample_rate: f32, max_block: usize) -> Self {
+    fn new(max_block: usize) -> Self {
         init_render_pool();
-        let max_block = max_block.clamp(16, 16_384);
         MixEngine {
-            sample_rate: if sample_rate.is_finite() && sample_rate > 0.0 { sample_rate } else { 48_000.0 },
-            max_block,
-            strips: HashMap::new(),
-            busses: HashMap::new(),
-            main: vec![vec![0.0; max_block]; MAIN_CHANNELS],
-            main_fmt: ChannelFormat::Stereo,
-            meters: HashMap::new(),
-            main_meter: StripMeter::default(),
+            max_block: max_block.clamp(16, 16_384),
             pan_law: PanLaw::Minus3,
             last_end: 0,
-            synced: (0, 0, 0),
-            order: Vec::new(),
             latency: 0,
             main_arrival: 0,
-            route_key: None,
-            route: RouteScratch::new(),
-            bus_need: Vec::new(),
-            legacy_status: PlanStatus::default(),
             input: Vec::new(),
             monitor_only: false,
             recording: false,
@@ -1089,124 +830,40 @@ impl MixEngine {
             metronome: false,
             metronome_gain: 1.0,
             count_in: None,
-            external: false,
-            adopt: Vec::new(),
-            retired: Vec::new(),
-            work: Vec::new(),
             serial: false,
             plan: None,
             events: events::EngineEvents::new(None, EventLimits::default()),
         }
     }
 
-    /// Every strip: a legacy engine's, and the active plan's.
-    fn all_strips(&mut self) -> impl Iterator<Item = &mut Strip> {
-        self.strips.values_mut().chain(self.plan.iter_mut().flat_map(|p| p.tables.strips.iter_mut()))
-    }
-
-    /// Realtime mode: every plugin (built-in or third-party, inserts, instruments and clip
-    /// effects) is created by the host and handed over with [`MixEngine::adopt`] instead of being
-    /// created in `sync` (see the crate docs and [`realtime_instance_specs`]).
-    pub fn set_external_instances(&mut self, on: bool) {
-        self.external = on;
-    }
-
-    /// Takes instances created off the audio thread; the next render's `sync` places them.
-    /// An earlier instance waiting for the same slot is retired.
-    ///
-    /// When everything sent before has been placed (the usual case), the engine keeps the
-    /// host's vector as its waiting list and hands the previous, emptied one back through
-    /// [`MixEngine::take_retired`], so a realtime caller neither allocates nor frees here.
-    pub fn adopt(&mut self, mut instances: Vec<PreparedInstance>) {
-        // Force a re-sync so waiting slots pick their instance up.
-        self.synced = (usize::MAX, usize::MAX, usize::MAX);
-        if self.adopt.is_empty() {
-            std::mem::swap(&mut self.adopt, &mut instances);
-        } else {
-            // Two hand-overs before a sync: merge (this may allocate; F01b's plan protocol
-            // coalesces on the control side instead).
-            for p in instances.drain(..) {
-                match self.adopt.iter_mut().find(|q| q.track == p.track && q.slot == p.slot) {
-                    Some(q) => {
-                        let old = std::mem::replace(q, p);
-                        self.retired.push(old.plugin);
-                    }
-                    None => self.adopt.push(p),
-                }
-            }
-        }
-        self.hand_back(instances);
-    }
-
-    /// Returns an emptied hand-over vector to the host inside the retired list, so its memory is
-    /// freed on the host's thread. The vector is converted in place (a `PreparedInstance` is a
-    /// whole multiple of a `Box<dyn Plugin>` in size and alignment): nothing is allocated.
-    fn hand_back(&mut self, spent: Vec<PreparedInstance>) {
-        const {
-            assert!(size_of::<PreparedInstance>().is_multiple_of(size_of::<Box<dyn Plugin>>()));
-            assert!(align_of::<PreparedInstance>() == align_of::<Box<dyn Plugin>>());
-        }
-        if spent.capacity() == 0 {
-            return;
-        }
-        let buf: Vec<Box<dyn Plugin>> = spent.into_iter().map(|p| p.plugin).collect();
-        if self.retired.capacity() == 0 {
-            self.retired = buf;
-        }
-        // Else the host has not taken the previous list yet (two hand-overs in one callback):
-        // `buf` is freed here. The plan protocol (F01b) returns every buffer instead.
-    }
-
-    /// Instances taken out of service since the last call (drop them off the audio thread).
-    /// Does not allocate. The vector can be empty and still hold memory (a hand-over vector
-    /// [`MixEngine::adopt`] gives back): a realtime host sends it off the audio thread whenever
-    /// its capacity is not zero, not only when it has elements.
-    pub fn take_retired(&mut self) -> Vec<Box<dyn Plugin>> {
-        std::mem::take(&mut self.retired)
-    }
-
-    /// Every instance this engine holds (strips, instruments, clip effects) plus the retired and
-    /// waiting ones, leaving the engine empty: hand them to another thread to drop before
-    /// replacing the engine.
-    pub fn drain_plugins(&mut self) -> Vec<Box<dyn Plugin>> {
-        let mut out = std::mem::take(&mut self.retired);
-        for st in self.strips.values_mut() {
-            out.extend(st.plugins.iter_mut().filter_map(Option::take).map(|s| s.plugin));
-            out.extend(st.instrument.take().map(|s| s.plugin));
-            for fx in st.clip_fx.values_mut() {
-                out.extend(fx.eq.take().into_iter().chain(fx.comp.take()).map(|m| m.plugin));
-            }
-        }
-        out.extend(self.adopt.drain(..).map(|p| p.plugin));
-        self.synced = (usize::MAX, usize::MAX, usize::MAX);
-        out
+    /// Every strip of the active plan.
+    fn plan_strips(&mut self) -> impl Iterator<Item = &mut Strip> {
+        self.plan.iter_mut().flat_map(|p| p.tables.strips.iter_mut())
     }
 
     pub fn max_block(&self) -> usize {
         self.max_block
     }
 
-    /// Format of the main mix as of the last sync.
+    /// Format of the main mix of the active plan.
     pub fn main_format(&self) -> ChannelFormat {
-        self.plan.as_deref().map_or(self.main_fmt, |p| p.tables.main_fmt)
+        self.plan.as_deref().map_or(ChannelFormat::Stereo, |p| p.tables.main_fmt)
     }
 
-    /// Channels of the main mix as of the last sync.
+    /// Channels of the main mix of the active plan.
     pub fn main_channels(&self) -> usize {
-        self.plan.as_deref().map_or(self.main.len(), |p| p.tables.main.len())
+        self.plan.as_deref().map_or(MAIN_CHANNELS, |p| p.tables.main.len())
     }
 
     /// Play (velocity > 0) or release (velocity 0) `pitch` on a track's instrument at the next
-    /// block, outside the clips: the MIDI Editor's audition. Does nothing before `sync`.
+    /// block, outside the clips: the MIDI Editor's audition. Does nothing before a plan is adopted.
     ///
     /// Superseded by [`MixEngine::queue_event`] (F10), which carries the source, channel, voice
     /// identity and due frame and reserves the release; kept until the Player migrates. Notes
     /// sent here are not tracked: a revocation or seek does not release them.
     pub fn live_note(&mut self, track: TrackId, pitch: u8, velocity: u8) {
-        let strip = match self.plan.as_deref_mut() {
-            Some(p) => p.tables.strip_of(track).and_then(|i| p.tables.strips.get_mut(i)),
-            None => self.strips.get_mut(&track),
-        };
+        let Some(p) = self.plan.as_deref_mut() else { return };
+        let strip = p.tables.strip_of(track).and_then(|i| p.tables.strips.get_mut(i));
         let Some(inst) = strip.and_then(|s| s.instrument.as_mut()) else { return };
         if velocity > 0 { inst.plugin.note_on(0, pitch.min(127), velocity.min(127)) } else { inst.plugin.note_off(0, pitch.min(127)) }
     }
@@ -1217,7 +874,7 @@ impl MixEngine {
     /// [`MixEngine::set_transport_epoch`] and the position jump in [`MixEngine::render_active`]
     /// instead, which release only what the clips play (see the `events` module).
     pub fn reset(&mut self) {
-        for s in self.all_strips() {
+        for s in self.plan_strips() {
             for p in s.plugins.iter_mut().flatten() {
                 p.plugin.reset();
                 p.failed = false;
@@ -1236,9 +893,7 @@ impl MixEngine {
             s.tap.idle();
             s.tap_pre.idle();
         }
-        self.meters.clear();
-        self.main_meter = StripMeter::default();
-        // Plan mode: meters are fixed storage, zeroed in place.
+        // Meters are fixed storage, zeroed in place.
         if let Some(p) = self.plan.as_deref_mut() {
             for m in p.tables.strips.iter_mut().map(|s| &mut s.meter).chain(std::iter::once(&mut p.tables.main_meter)) {
                 m.peak = [0.0; 2];
@@ -1254,7 +909,7 @@ impl MixEngine {
     /// Every source is released: queued instrument events are dropped and each open note and
     /// pedal gets its release first (stop and panic).
     pub fn all_notes_off(&mut self) {
-        for st in self.all_strips() {
+        for st in self.plan_strips() {
             if let Some(i) = &mut st.instrument {
                 if let Some(e) = i.events.as_deref_mut() {
                     e.release_all(&mut *i.plugin);
@@ -1271,9 +926,9 @@ impl MixEngine {
     /// position is untouched, inserts do not run, and the output is discarded. Allocation-free.
     pub fn flush_releases(&mut self, frames: usize) {
         let frames = frames.min(self.max_block);
-        for st in self.all_strips() {
+        for st in self.plan_strips() {
             let Some(inst) = st.instrument.as_mut().filter(|i| !i.failed) else { continue };
-            // Defensive: `sync` sizes `buf` and `scratch` to `max_block`, but a plug-in must never
+            // Defensive: the compiler sizes `buf` and `scratch` to `max_block`, but a plug-in must never
             // be handed a buffer shorter than `frames`, so clamp to the shortest one.
             if st.buf.len() >= 2 {
                 let frames = frames.min(st.buf.iter().map(Vec::len).min().unwrap_or(0));
@@ -1294,451 +949,14 @@ impl MixEngine {
             }
         }
     }
-
-    /// Bring plugin instances in line with the session (creates/destroys as needed). Allocates;
-    /// call outside the realtime thread when the document changes, or let `render` do it.
-    pub fn sync(&mut self, s: &Session) {
-        let mb = self.max_block;
-        let main_ch = main_channels(s);
-        self.main_fmt = s.main_format();
-        if self.main.len() != main_ch {
-            self.main = vec![vec![0.0; mb]; main_ch];
-        }
-        let mut cx = SlotCtx { sr: self.sample_rate, mb, external: self.external, adopt: &mut self.adopt, retired: &mut self.retired };
-        let gone: Vec<TrackId> = self.strips.keys().filter(|id| s.track(**id).is_none()).copied().collect();
-        for id in gone {
-            if let Some(mut st) = self.strips.remove(&id) {
-                for p in st.plugins.drain(..) {
-                    cx.retire(p);
-                }
-                cx.retire(st.instrument.take());
-                for fx in st.clip_fx.values_mut() {
-                    cx.retire_module(fx.eq.take());
-                    cx.retire_module(fx.comp.take());
-                }
-            }
-        }
-        for t in &s.tracks {
-            let ch = strip_channels(t, main_ch);
-            let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
-            if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
-                strip.buf = vec![vec![0.0; mb]; ch];
-            }
-            // The mono instrument path swaps `scratch` in as a second channel, and
-            // `flush_releases` can run before any `render`, so size it here too.
-            if strip.scratch.len() < mb {
-                strip.scratch.resize(mb, 0.0);
-            }
-            while strip.plugins.len() > t.mixer.inserts.len() {
-                let p = strip.plugins.pop().flatten();
-                cx.retire(p);
-            }
-            strip.plugins.resize_with(t.mixer.inserts.len(), || None);
-            // A reordered chain: each instance follows its insert to the new slot (swaps only).
-            for (idx, ins) in t.mixer.inserts.iter().enumerate() {
-                let Some(ins) = ins else { continue };
-                let uid = ins.uid.get();
-                if strip.plugins.get(idx).and_then(Option::as_ref).is_some_and(|p| p.uid == uid) {
-                    continue;
-                }
-                if let Some(j) = strip.plugins.iter().position(|p| p.as_ref().is_some_and(|p| p.uid == uid)) {
-                    strip.plugins.swap(idx, j);
-                }
-            }
-            for (idx, (slot, ins)) in strip.plugins.iter_mut().zip(t.mixer.inserts.iter()).enumerate() {
-                match ins {
-                    Some(i) if slot.as_ref().is_none_or(|p| p.id != i.plugin || p.ch != ch) || cx.waiting(t.id, idx) => {
-                        let old = slot.take();
-                        cx.retire(old);
-                        *slot = cx.make(t.id, idx, i, ch);
-                    }
-                    None => {
-                        let old = slot.take();
-                        cx.retire(old);
-                    }
-                    _ => {}
-                }
-            }
-            let want = t.instrument.as_ref();
-            let ich = ch.max(2);
-            if strip.instrument.as_ref().map(|p| (p.id.as_str(), p.ch)) != want.map(|i| (i.plugin.as_str(), ich))
-                || (want.is_some() && cx.waiting(t.id, INSTRUMENT_SLOT))
-            {
-                let old = strip.instrument.take();
-                cx.retire(old);
-                strip.instrument = want.and_then(|i| cx.make(t.id, INSTRUMENT_SLOT, i, ich));
-                strip.sample = None;
-            }
-            sync_sample(strip, want, s);
-            if t.kind == TrackKind::Audio {
-                sync_clip_fx(strip, t, s, ch, &mut cx);
-            }
-        }
-        // Instances nobody claimed (the session changed again before they arrived).
-        while let Some(p) = cx.adopt.pop() {
-            cx.retired.push(p.plugin);
-        }
-        if !self.external {
-            self.retired.clear();
-        }
-        for b in &s.busses {
-            let n = b.format.channels().clamp(1, MAX_CHANNELS);
-            let bus = self.busses.entry(b.id).or_insert_with(|| BusBuf::new(b.format, Vec::new()));
-            bus.fmt = b.format;
-            if bus.buf.len() != n {
-                bus.buf = vec![vec![0.0; mb]; n];
-            }
-        }
-        self.busses.retain(|id, _| s.bus(*id).is_some());
-    }
-
-    /// Re-syncs plugin instances and the routing order when the session's structure changed
-    /// since the last sync (or instances were adopted). `render` calls it; a realtime host may
-    /// also call it right after swapping sessions so slots are filled before playback starts.
-    ///
-    /// It is also the control-side step of delay compensation in a legacy engine: delay lines a
-    /// render had to clamp (a plug-in's latency rose past their capacity, see
-    /// [`MixEngine::status`]) grow here, keeping their history. A render never grows them on a
-    /// thread marked as the audio thread.
-    ///
-    /// On a thread marked as the audio thread ([`mark_audio_thread`]: playback's callback, where
-    /// playback calls this today) it never grows a line: it clamps and counts like a render. A
-    /// new strip gets lines of the smallest capacity, made with its other buffers. The control
-    /// side grows them with [`PreparedLines`] and [`MixEngine::adopt_lines`].
-    pub fn ensure_synced(&mut self, s: &Session) {
-        self.sync_if_changed(s);
-        if self.plan.is_none() && self.legacy_status.capacity_exceeded > 0 && !on_audio_thread() {
-            self.size_lines(s);
-        }
-    }
-
-    /// Audio side (legacy engines): takes in the delay lines `lines` prepared off the audio thread
-    /// for a strip whose own are shorter (or missing), each carrying the old line's history over so
-    /// the delay continues; what it replaced goes back into `lines`, to drop on the control side.
-    /// A prepared line that is not longer than the current one, has another channel count, or has a
-    /// ring too small for a full block of this engine at its length stays in `lines` (to drop on
-    /// the control side too), and its strip keeps its clamp report. Allocates and frees nothing;
-    /// copies at most each replaced line's samples. Clears the clamp
-    /// report ([`MixEngine::status`]) when the lines now hold what a render asked for. Call it after
-    /// [`MixEngine::ensure_synced`] for the session the lines were prepared from.
-    pub fn adopt_lines(&mut self, lines: &mut PreparedLines) {
-        let mut holds = usize::MAX;
-        let block = self.max_block;
-        for (track, post, pre) in &mut lines.lines {
-            let Some(st) = self.strips.get_mut(track) else { continue };
-            let ch = st.buf.len();
-            for (new, old) in [(post, &mut st.tap), (pre, &mut st.tap_pre)] {
-                // A line is only taken in when its ring holds a full block of this engine at the
-                // longest delay; a shorter ring would drop samples and silently misalign the strip.
-                if new.bufs.len() == ch && new.len > old.len && new.ring() >= new.len.saturating_add(block) {
-                    new.take_history(old);
-                    std::mem::swap(new, old);
-                }
-            }
-            holds = holds.min(st.tap.len);
-        }
-        if holds != usize::MAX && holds >= self.legacy_status.required_latency as usize {
-            self.legacy_status = PlanStatus::default();
-        }
-    }
-
-    /// Re-syncs when the structure changed. Reorders (without allocating once the route storage
-    /// holds the session) only when the routing changed, and sizes the delay lines for the
-    /// slowest path (growing only when that rose).
-    fn sync_if_changed(&mut self, s: &Session) {
-        let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
-        if key != self.synced {
-            self.sync(s);
-            let route = route_fingerprint(s);
-            if self.route_key != Some(route) {
-                self.route.reserve(s);
-                self.order.clear();
-                self.order.reserve(s.tracks.len());
-                processing_order(s, &mut self.route, &mut self.order);
-                self.route_key = Some(route);
-            }
-            self.size_lines(s);
-            self.synced = key;
-        }
-    }
-
-    /// Sizes the strips' delay lines for the slowest path of `s` with its instances' current
-    /// latency, or for the delay a render last had to clamp if that is more, and clears the clamp
-    /// report. A pre-fader line only for a strip with a pre-fader send. On the audio thread it
-    /// only gives a new strip (no lines yet) the smallest lines, and grows nothing.
-    fn size_lines(&mut self, s: &Session) {
-        let audio = on_audio_thread();
-        let need = if audio {
-            0
-        } else {
-            let strips = &self.strips;
-            let latency = |t: &Track| strips.get(&t.id).map_or(0, |st| strip_latency(t, st));
-            path_need_with(s, &self.route, &mut self.bus_need, &latency, false).max(self.legacy_status.required_latency as usize)
-        };
-        let mb = self.max_block;
-        for t in &s.tracks {
-            let Some(st) = self.strips.get_mut(&t.id) else { continue };
-            let ch = st.buf.len();
-            let has_pre = t.mixer.sends.iter().flatten().any(|x| x.pre_fader);
-            if !audio || st.tap.bufs.is_empty() {
-                st.tap.grow(need, ch, mb);
-            }
-            if has_pre && (!audio || st.tap_pre.bufs.is_empty()) {
-                st.tap_pre.grow(need, ch, mb);
-            }
-        }
-        if !audio {
-            self.legacy_status = PlanStatus::default();
-        }
-    }
-
-    /// Put the strips taken out for processing back into the engine, every one of them so none is
-    /// dropped by an unwind, leaving `work` empty.
-    fn restore_strips(&mut self, work: &mut Vec<(usize, Strip)>, s: &Session) {
-        for (i, st) in work.drain(..) {
-            if let Some(t) = s.tracks.get(i) {
-                self.strips.insert(t.id, st);
-            }
-        }
-    }
-
-    /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
-    ///
-    /// This legacy path does not deliver instrument events ([`MixEngine::queue_event`]) and does
-    /// not advance [`MixEngine::next_frame`]: events need an adopted plan and
-    /// [`MixEngine::render_active`].
-    pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
-        let frames = frames.min(self.max_block);
-        // Stopped, the position stands still: not a seek (it would cut auditioned notes).
-        if pos != self.last_end && !self.monitor_only {
-            // Seek: silence held notes and ringing plugins.
-            for st in self.strips.values_mut() {
-                if let Some(i) = &mut st.instrument {
-                    i.plugin.all_notes_off();
-                }
-                st.chase = true;
-            }
-        }
-        self.last_end = pos.saturating_add(frames as i64);
-        self.sync_if_changed(s);
-        // An offline render grows clamped lines right away; on the audio thread they wait for
-        // the control side (`ensure_synced`).
-        if self.legacy_status.capacity_exceeded > 0 && !on_audio_thread() {
-            self.size_lines(s);
-        }
-        for b in self.busses.values_mut() {
-            b.clear(frames);
-        }
-        for c in &mut self.main {
-            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-        }
-        let any_solo = s.tracks.iter().any(|t| t.mixer.solo && !t.inactive);
-        let order = std::mem::take(&mut self.order);
-        let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
-        let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
-        // Phase 1: independent strips (audio, instrument, MIDI) in parallel.
-        let mut work = std::mem::take(&mut self.work);
-        work.clear();
-        for &i in &order {
-            let Some(t) = s.tracks.get(i).filter(|t| live(t) && !is_aux(t)) else { continue };
-            if let Some(st) = self.strips.remove(&t.id) {
-                work.push((i, st));
-            }
-        }
-        for (_, st) in work.iter_mut() {
-            if st.scratch.len() < self.max_block {
-                st.scratch.resize(self.max_block, 0.0);
-            }
-        }
-        // Sidechain keys are a plan-mode feature (ADR 0015): this renderer leaves every insert on its own input.
-        let no_keys = KeyBank::default();
-        let busses = std::mem::take(&mut self.busses);
-        let live_in = LiveInput {
-            input: &self.input,
-            monitor_only: self.monitor_only,
-            recording: self.recording,
-            no_suspend: self.no_suspend,
-            frame: 0,
-            io: None,
-        };
-        // A plug-in that panics unwinds out of here (the first strip's panic, see `guarded`). The
-        // strips go back into the engine first, so their instances (and any other strip's panic)
-        // can still be drained and torn down off the audio thread, not dropped by the unwind.
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_strips(&mut work, !self.serial, |(i, st)| {
-                if let Some(t) = s.tracks.get(*i) {
-                    guarded(st, |st| process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo, &no_keys));
-                }
-            });
-        }));
-        self.busses = busses;
-        if let Some(panic) = ran.err().or_else(|| work.iter_mut().find_map(|(_, st)| st.panic.take())) {
-            self.restore_strips(&mut work, s);
-            self.work = work;
-            self.order = order;
-            std::panic::resume_unwind(panic);
-        }
-        // Delay compensation (F05), path by path: every signal summed onto a bus or the main mix
-        // arrives with the slowest path into it. Aux latency has to be read before anything is
-        // routed, or the first block (and a one-block bounce probe) still sees zero.
-        let pdc = s.edit.delay_compensation;
-        if pdc {
-            for t in s.tracks.iter().filter(|t| is_aux(t) && !t.inactive) {
-                if let Some(st) = self.strips.get_mut(&t.id) {
-                    note_insert_latency(t, st, pos);
-                }
-            }
-        }
-        // The master faders' inserts delay the whole main mix, so their latency is part of the
-        // mix's too (the faders run one after the other: it adds up).
-        let mut lmax_m = 0usize;
-        if pdc {
-            for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
-                if let Some(st) = self.strips.get_mut(&t.id) {
-                    note_insert_latency(t, st, pos);
-                    lmax_m = lmax_m.saturating_add(st.latency);
-                }
-            }
-        }
-        // Forward pass in render order: phase-1 strips, then the auxes.
-        let mut main_arrival = 0usize;
-        for (at, (i, st)) in work.iter_mut().enumerate() {
-            if let Some(t) = s.tracks.get(*i) {
-                pdc_visit(t, st, at, true, &mut self.busses, &mut [], &mut main_arrival, pdc);
-            }
-        }
-        let auxes = order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| is_aux(t));
-        for (at, t) in (work.len()..).zip(auxes) {
-            if let Some(st) = self.strips.get_mut(&t.id) {
-                pdc_visit(t, st, at, live(t), &mut self.busses, &mut [], &mut main_arrival, pdc);
-            }
-        }
-        self.main_arrival = main_arrival;
-        self.latency = main_arrival.saturating_add(lmax_m);
-        for (i, st) in work.iter_mut() {
-            if let Some(t) = s.tracks.get(*i) {
-                self.route_strip(t, st, pos, frames);
-            }
-        }
-        self.restore_strips(&mut work, s);
-        self.work = work;
-        let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
-        // Phase 2: auxes in dependency order (they read busses).
-        for t in order.iter().filter_map(|&i| s.tracks.get(i)).filter(|t| live(t)).filter(|t| is_aux(t)) {
-            let Some(mut st) = self.strips.remove(&t.id) else { continue };
-            if st.scratch.len() < self.max_block {
-                st.scratch.resize(self.max_block, 0.0);
-            }
-            let live_in = LiveInput {
-                input: &self.input,
-                monitor_only: self.monitor_only,
-                recording: self.recording,
-                no_suspend: self.no_suspend,
-                frame: 0,
-                io: None,
-            };
-            // As in phase 1: a panicking plug-in leaves its strip in the engine, not dropped by the unwind.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo, &no_keys);
-            }));
-            if let Err(panic) = ran {
-                self.strips.insert(t.id, st);
-                self.order = order;
-                std::panic::resume_unwind(panic);
-            }
-            self.route_strip(t, &mut st, pos, frames);
-            self.strips.insert(t.id, st);
-        }
-        self.order = order;
-        // Master faders process the main mix.
-        let transport = transport_at(s, pos, !self.monitor_only, self.recording);
-        for t in s.tracks.iter().filter(|t| t.kind == TrackKind::Master && !t.inactive) {
-            if let Some(strip) = self.strips.get_mut(&t.id) {
-                process_master(t, strip, &mut self.main, pos, frames, &transport, self.no_suspend);
-                let m = self.meters.entry(t.id).or_default();
-                m.measure(&self.main, frames, 0.0);
-                m.plugin_failures = strip.failures;
-            }
-        }
-        // Metronome: summed after the master fader, so it reaches the speakers without passing
-        // through any track, send or insert. Only the playback engine sets `metronome`.
-        // Not while monitoring only (transport stopped): the position does not advance there, so the
-        // start of the same beat would repeat every block as a buzz.
-        if self.metronome && !self.monitor_only && s.edit.click && (!s.edit.flag("click.only_during_record") || self.recording) {
-            click::render(s, pos, frames, &mut self.main, self.metronome_gain);
-        }
-        if let Some(c) = self.count_in {
-            click::render_count_in(s, c, frames, &mut self.main, self.metronome_gain);
-        }
-        // Output: min(out.len(), main channels) channels; any further output channels are silent.
-        for (c, o) in out.iter_mut().enumerate() {
-            let src = self.main.get(c);
-            for i in 0..frames {
-                let v = src.and_then(|m| m.get(i)).copied().unwrap_or(0.0);
-                if let Some(d) = o.get_mut(i) {
-                    *d = if v.is_finite() { v } else { 0.0 };
-                }
-            }
-        }
-        self.main_meter.measure(&self.main, frames, 0.0);
-    }
-
-    /// The delay-compensation latency of what was summed onto `bus` in the last block: the
-    /// slowest path into it.
-    #[cfg(feature = "legacy-render")]
-    fn bus_latency(&self, bus: BusId) -> usize {
-        self.busses.get(&bus).map_or(0, |b| b.arrival)
-    }
-
-    /// Copy one rendered block of `bus` into `out`. A missing bus stays silent.
-    #[cfg(feature = "legacy-render")]
-    fn copy_bus(&self, bus: BusId, frames: usize, out: &mut [Vec<f32>]) {
-        for o in out.iter_mut() {
-            for x in o.iter_mut().take(frames) {
-                *x = 0.0;
-            }
-        }
-        let Some(src) = self.busses.get(&bus) else { return };
-        for (o, c) in out.iter_mut().zip(src.buf.iter()) {
-            for i in 0..frames {
-                let v = c.get(i).copied().unwrap_or(0.0);
-                if let Some(d) = o.get_mut(i) {
-                    *d = if v.is_finite() { v } else { 0.0 };
-                }
-            }
-        }
-    }
-
-    /// Send, meter and pan a processed strip into the busses / main mix.
-    fn route_strip(&mut self, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
-        let m = self.meters.entry(t.id).or_default();
-        m.measure(&strip.buf, frames, strip.gr);
-        m.plugin_failures = strip.failures;
-        let mix = MixOut {
-            busses: &mut self.busses,
-            main: &mut self.main,
-            main_fmt: self.main_fmt,
-            sinks: &mut [],
-            law: self.pan_law,
-            main_arrival: self.main_arrival,
-        };
-        let need = route_into(t, strip, pos, frames, mix);
-        if need > 0 {
-            let st = &mut self.legacy_status;
-            st.capacity_exceeded = st.capacity_exceeded.saturating_add(1);
-            st.required_latency = st.required_latency.max(u32::try_from(need).unwrap_or(u32::MAX));
-            st.affected = Some((t.id, strip.generation));
-        }
-    }
 }
 
 /// Where [`route_into`] sends a strip: the busses, the main mix and its format, and the pan law.
-struct MixOut<'a, B: Busses + ?Sized> {
-    busses: &'a mut B,
+struct MixOut<'a> {
+    busses: &'a mut BusTable,
     main: &'a mut [Vec<f32>],
     main_fmt: ChannelFormat,
-    /// The output paths plan mode renders into; none in a legacy engine, where a route to a path
-    /// is dropped.
+    /// The output paths the plan renders into.
     sinks: &'a mut [Sink],
     law: PanLaw,
     /// The slowest path into the main mix this block ([`pdc_visit`]).
@@ -1752,16 +970,7 @@ struct MixOut<'a, B: Busses + ?Sized> {
 /// feedback, from an older session) does not count: [`route_into`] drops that edge. An inactive
 /// aux (`live` false) still marks the bus it reads, so the edges dropped are exactly the route
 /// graph's [`RouteScratch::dropped`] (render order is the graph's, inactive tracks included).
-fn pdc_visit<B: Busses + ?Sized>(
-    t: &Track,
-    st: &mut Strip,
-    at: usize,
-    live: bool,
-    busses: &mut B,
-    sinks: &mut [Sink],
-    main_arrival: &mut usize,
-    pdc: bool,
-) {
+fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut BusTable, sinks: &mut [Sink], main_arrival: &mut usize, pdc: bool) {
     let mut arrive = 0usize;
     if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
         && let Route::Bus(b) = &t.mixer.input
@@ -1805,12 +1014,12 @@ fn pdc_visit<B: Busses + ?Sized>(
 /// strip's own ([`pdc_visit`]), read from the strip's delay lines. An edge into a bus already read
 /// this block is a routing loop's feedback and is dropped. Returns the longest delay a plan-mode
 /// line had to clamp (0: none).
-fn route_into<B: Busses + ?Sized>(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_, B>) -> usize {
+fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_>) -> usize {
     let MixOut { busses, main, main_fmt, sinks, law, main_arrival } = out;
     let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, .. } = strip;
     let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
     // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
-    let delay_of = |busses: &B, sinks: &[Sink], r: &Route| match r {
+    let delay_of = |busses: &BusTable, sinks: &[Sink], r: &Route| match r {
         Route::Main => Some(main_arrival.saturating_sub(o)),
         Route::Bus(b) => busses.bus(*b).filter(|x| at < x.reader).map(|x| x.arrival.saturating_sub(o)),
         Route::Hardware(h) => sink_index(sinks, h).and_then(|k| sinks.get(k)).map(|x| x.arrival.saturating_sub(o)),
@@ -1944,17 +1153,16 @@ struct LiveInput<'a> {
     no_suspend: bool,
     /// The block's first render frame (plan mode: instrument events are due against it).
     frame: u64,
-    /// The machine's I/O paths, which resolve an input route's name (plan mode; a legacy engine
-    /// has none and reads the number out of the label).
+    /// The machine's I/O paths, which resolve an input route's name (a label's number is the fallback).
     io: Option<&'a soundcraft_model::IoMap>,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_strip<B: Busses + ?Sized>(
+fn process_strip(
     s: &Session,
     t: &Track,
     strip: &mut Strip,
-    busses: &B,
+    busses: &BusTable,
     live: &LiveInput<'_>,
     pos: Samples,
     frames: usize,
@@ -2000,20 +1208,16 @@ fn process_strip<B: Busses + ?Sized>(
                         }
                         render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
                         let sr = s.sample_rate.as_f64() as f32;
+                        // The compiler placed the chain with its modules. A clip without
+                        // one (only a gain, or modules still on their way) uses a chain without
+                        // modules here, which allocates nothing.
                         let mut gain_only;
-                        let fx = if strip.external {
-                            // Realtime: `sync` placed the chain with its modules. A clip without
-                            // one (only a gain, or modules still on their way) uses a chain
-                            // without modules here, which allocates nothing.
-                            match strip.clip_fx.get_mut(clip.id.0) {
-                                Some(fx) => fx,
-                                None => {
-                                    gain_only = ClipFx::new(sr, nch, false);
-                                    &mut gain_only
-                                }
+                        let fx = match strip.clip_fx.get_mut(clip.id.0) {
+                            Some(fx) => fx,
+                            None => {
+                                gain_only = ClipFx::new(sr, nch, false);
+                                &mut gain_only
                             }
-                        } else {
-                            strip.clip_fx.get_or_insert_with(clip.id.0, || ClipFx::new(sr, nch, true))
                         };
                         fx.configure(params);
                         fx.process(&mut strip.clipbuf, frames);
@@ -2345,7 +1549,7 @@ impl ClipFx {
         })
     }
     /// A module runs only while one of its parameters is set. Offline, modules are made and
-    /// dropped here accordingly; realtime, `sync` places and retires them.
+    /// dropped here accordingly; in a plan the compiler places and retires them.
     fn configure<'a>(&mut self, params: impl Iterator<Item = (&'a str, f32)> + Clone) {
         self.gain_db = 0.0;
         self.eq_on = params.clone().any(|(k, _)| k.starts_with("eq."));
@@ -2396,83 +1600,12 @@ impl ClipFx {
     }
 }
 
-/// Brings an audio strip's clip-effect chains in line with its clips: places the modules the
-/// host handed over (realtime), and retires modules whose clip is gone or whose parameters no
-/// longer use them (bypassed clips included), so they are dropped off the audio thread. A
-/// realtime strip also gets its clip buffer and room for [`CLIP_FX_RESERVE`] chains here, when
-/// it is made, instead of when a clip effect is first added during playback.
-fn sync_clip_fx(strip: &mut Strip, t: &Track, s: &Session, ch: usize, cx: &mut SlotCtx<'_>) {
-    strip.external = cx.external;
-    if cx.external {
-        if strip.clipbuf.len() != ch || strip.clipbuf.first().map_or(0, Vec::len) < cx.mb {
-            strip.clipbuf = vec![vec![0.0; cx.mb]; ch];
-        }
-        if strip.clip_fx.0.capacity() == 0 {
-            strip.clip_fx.0.reserve(CLIP_FX_RESERVE);
-        }
-    }
-    while let Some((clip, comp, p)) = cx.take_clip_module(t.id) {
-        if p.ch != ch {
-            cx.retired.push(p.plugin);
-            continue;
-        }
-        let fx = strip.clip_fx.get_or_insert_with(clip, || ClipFx::new(cx.sr, ch, !cx.external));
-        let slot = clip_fx_slot(clip, comp).unwrap_or(CLIP_FX_BIT);
-        let module = Some(PluginSlot::new(p.plugin, p.id, p.ch, slot));
-        let old = if comp { std::mem::replace(&mut fx.comp, module) } else { std::mem::replace(&mut fx.eq, module) };
-        cx.retire_module(old);
-    }
-    strip.clip_fx.retain(|clip, fx| {
-        let exists = t.clips().iter().any(|c| c.id.0 == clip);
-        let (eq, comp) = if exists { clip_fx_modules(s, clip) } else { (false, false) };
-        if !eq {
-            cx.retire_module(fx.eq.take());
-        }
-        if !comp {
-            cx.retire_module(fx.comp.take());
-        }
-        exists
-    });
-}
-
-/// Hash of everything `sync`/`processing_order` depend on (tracks, kinds, routing, plugins, sends).
-fn structure_fingerprint(s: &Session) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for t in &s.tracks {
-        t.id.hash(&mut h);
-        t.kind.hash(&mut h);
-        t.format.hash(&mut h);
-        t.inactive.hash(&mut h);
-        t.mixer.inserts.len().hash(&mut h);
-        t.mixer.input.hash(&mut h);
-        t.mixer.output.hash(&mut h);
-        for i in &t.mixer.inserts {
-            i.as_ref().map(|x| (x.plugin.as_str(), x.uid.get(), x.key)).hash(&mut h);
-        }
-        for snd in t.mixer.sends.iter().flatten() {
-            snd.target.hash(&mut h);
-        }
-        t.instrument.as_ref().map(|x| x.plugin.as_str()).hash(&mut h);
-        let sample = t.instrument.as_ref().and_then(|x| x.sample);
-        sample.hash(&mut h);
-        // Which decoded audio it is, so new audio under the same id (another session) re-syncs.
-        sample.and_then(|id| s.pool.get(id)).map(|a| Arc::as_ptr(a) as usize).hash(&mut h);
-    }
-    for b in &s.busses {
-        b.id.hash(&mut h);
-        b.format.hash(&mut h);
-    }
-    s.main_format().hash(&mut h);
-    h.finish() as usize
-}
-
 std::thread_local! {
     static AUDIO_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Mark the calling thread as the realtime audio thread (`soundcraft_playback`'s cpal callbacks
-/// do, every call: one thread-local store). Strips [`MixEngine::render`] hands to worker threads
+/// do, every call: one thread-local store). Strips [`MixEngine::render_active`] hands to worker threads
 /// count as the audio thread while they render for it. Code that might run there asks
 /// [`on_audio_thread`] before doing anything that blocks; the desktop app's logger does, so a
 /// `log::` record from the audio thread never takes a lock or touches a file.
@@ -2555,7 +1688,7 @@ pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_REND
 /// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
 ///
 /// The audio callback thread is promoted by the audio backend (`playback`), before its first data
-/// callback; `MixEngine::render` makes no OS priority call (MMCSS registration is a service call
+/// callback; `MixEngine::render_active` makes no OS priority call (MMCSS registration is a service call
 /// that can block). Only the pool workers are promoted here, by their start handler at pool
 /// build, off the callback. The pool
 /// is still built (and its workers promoted) so [`MixEngine::force_serial`]`(false)` and
@@ -2708,44 +1841,6 @@ fn log_loops(s: &Session, loops: &[RouteCycle]) {
     }
 }
 
-/// A track's own latency with its strip's instances: the instrument and the active inserts that
-/// have not failed (as [`process_strip`] counts it).
-fn strip_latency(t: &Track, st: &Strip) -> usize {
-    let mut l = st.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
-    for (ins, slot) in t.mixer.inserts.iter().zip(st.plugins.iter()) {
-        if let (Some(ins), Some(slot)) = (ins, slot)
-            && ins.active
-            && !ins.bypass
-            && !slot.failed
-        {
-            l = l.saturating_add(slot.plugin.latency());
-        }
-    }
-    l.min(MAX_LATENCY)
-}
-
-/// Hash of the routing (`processing_order` depends on nothing else).
-fn route_fingerprint(s: &Session) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for t in &s.tracks {
-        t.kind.hash(&mut h);
-        t.mixer.input.hash(&mut h);
-        t.mixer.output.hash(&mut h);
-        t.mixer.sends.len().hash(&mut h);
-        for snd in &t.mixer.sends {
-            snd.as_ref().map(|x| &x.target).hash(&mut h);
-        }
-        for i in &t.mixer.inserts {
-            i.as_ref().and_then(|x| x.key).hash(&mut h);
-        }
-    }
-    for b in &s.busses {
-        b.id.hash(&mut h);
-    }
-    h.finish() as usize
-}
-
 /// The longest delay compensation can ask of any edge of `s`: the slowest path into any bus or
 /// the main mix, with `latency` giving each track's own (instrument and inserts). Control thread
 /// (it allocates): plans size their delay lines with it.
@@ -2753,16 +1848,9 @@ fn path_need(s: &Session, latency: &dyn Fn(&Track) -> usize) -> usize {
     let mut route = RouteScratch::new();
     route.reserve(s);
     route.layer(s);
-    path_need_with(s, &route, &mut Vec::new(), latency, true)
-}
-
-/// [`path_need`] over a solved route graph of `s`, with `bus` as per-bus scratch: allocates
-/// nothing once `bus` holds the bus count. Same rule as the render: tracks in the graph's order,
-/// a write into a bus already read does not count.
-fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)>, latency: &dyn Fn(&Track) -> usize, keys: bool) -> usize {
-    bus.clear();
-    // With `keys` (plan mode), the output latency of each track follows the busses' entries.
-    bus.resize(s.busses.len() + if keys { s.tracks.len() } else { 0 }, (0, false));
+    // Same rule as the render: tracks in the graph's order, a write into a bus already read does
+    // not count. The output latency of each track follows the busses' entries.
+    let mut bus = vec![(0usize, false); s.busses.len() + s.tracks.len()];
     let nbus = s.busses.len();
     let mut need = 0usize;
     // Every output path is padded to the one device latency Main has, master inserts included
@@ -2781,23 +1869,21 @@ fn path_need_with(s: &Session, route: &RouteScratch, bus: &mut Vec<(usize, bool)
         // A key that arrives later than the strip's own signal holds it back (`KeyBank::align`):
         // at worst the strip's input waits for the slowest of its keys, whatever sits before the
         // keyed insert.
-        if keys {
-            for e in route.edges() {
-                let (soundcraft_model::EdgeKind::Key { .. }, soundcraft_model::RouteNode::Track(to)) = (e.kind, e.to) else { continue };
-                if to != i {
-                    continue;
-                }
-                let from = match e.from {
-                    soundcraft_model::RouteNode::Track(j) => bus.get(nbus + j).map_or(0, |x| x.0),
-                    soundcraft_model::RouteNode::Bus(b) => bus.get(b).map_or(0, |x| x.0),
-                    soundcraft_model::RouteNode::Main => 0,
-                };
-                arrive = arrive.max(from);
+        for e in route.edges() {
+            let (soundcraft_model::EdgeKind::Key { .. }, soundcraft_model::RouteNode::Track(to)) = (e.kind, e.to) else { continue };
+            if to != i {
+                continue;
             }
+            let from = match e.from {
+                soundcraft_model::RouteNode::Track(j) => bus.get(nbus + j).map_or(0, |x| x.0),
+                soundcraft_model::RouteNode::Bus(b) => bus.get(b).map_or(0, |x| x.0),
+                soundcraft_model::RouteNode::Main => 0,
+            };
+            arrive = arrive.max(from);
         }
         let out = arrive.saturating_add(latency(t));
         need = need.max(out);
-        if keys && let Some(x) = bus.get_mut(nbus + i) {
+        if let Some(x) = bus.get_mut(nbus + i) {
             x.0 = out;
         }
         let targets = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target));
@@ -2914,7 +2000,7 @@ mod click {
     }
 }
 
-/// Channel-width law (shared by legacy, prepared-plan and consolidate rendering): when the
+/// Channel-width law (shared by plan and consolidate rendering): when the
 /// source is wider, destination j averages source channels j, j + destination_width, ... .
 /// Mono therefore gets the mean of ALL channels, (L + R) / 2 for stereo. This is an ordinal,
 /// layout-agnostic fold, not a speaker-aware surround matrix: six channels into stereo become
@@ -3223,25 +2309,6 @@ impl SampleSource for PoolSample {
     fn channel(&self, ch: usize) -> Option<&[f32]> {
         self.0.channel(ch)
     }
-}
-
-/// Hands a strip's instrument the audio of its insert's sample source when it changed (a new
-/// sample, a cleared one, or a new instance). Missing media plays nothing.
-fn sync_sample(strip: &mut Strip, want: Option<&soundcraft_model::Insert>, s: &Session) {
-    let audio = want.and_then(|i| i.sample).and_then(|id| s.pool.get(id));
-    let same = match (strip.sample.as_ref(), audio) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
-    };
-    if same {
-        return;
-    }
-    if let Some(inst) = strip.instrument.as_mut() {
-        let shared = audio.map(|a| Arc::new(PoolSample(Arc::clone(a))) as Arc<dyn SampleSource>);
-        inst.plugin.set_sample(shared);
-    }
-    strip.sample = audio.cloned();
 }
 
 /// Record insert latency without processing audio, so this block can compensate for it.
@@ -3790,79 +2857,6 @@ impl RangeRender {
     }
 }
 
-/// The offline renderer that predates the plan renderer: [`RangeRender`] on [`MixEngine::render`].
-/// Kept only as the oracle of the parity tests until it is deleted (ADR 0015, slice 0 part 2).
-#[cfg(feature = "legacy-render")]
-pub struct LegacyRangeRender {
-    eng: MixEngine,
-    bus: Option<BusId>,
-    tmp: Vec<Vec<f32>>,
-    start: Samples,
-    done: usize,
-    total: usize,
-    latency: usize,
-}
-
-#[cfg(feature = "legacy-render")]
-impl LegacyRangeRender {
-    pub fn new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Self {
-        let nch = source_channels(s, bus);
-        let eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-        let tmp = vec![vec![0.0f32; eng.max_block()]; nch];
-        let len = if nch == 0 { 0 } else { usize::try_from(range.len().max(0)).unwrap_or(0) };
-        LegacyRangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 }
-    }
-
-    fn render(&mut self, s: &Session, pos: Samples, n: usize) {
-        match self.bus {
-            Some(id) => {
-                self.eng.render(s, pos, n, &mut []);
-                self.eng.copy_bus(id, n, &mut self.tmp);
-            }
-            None => self.eng.render(s, pos, n, &mut self.tmp),
-        }
-    }
-
-    /// As [`RangeRender::next_block`], rendering `s` (the session given to [`LegacyRangeRender::new`]).
-    pub fn next_block(&mut self, s: &Session) -> Option<(&[Vec<f32>], usize)> {
-        if self.done >= self.total {
-            return None;
-        }
-        let n = (self.total - self.done).min(self.eng.max_block());
-        self.render(s, self.start + self.done as i64, n);
-        if self.done == 0 {
-            self.latency = match self.bus {
-                Some(b) => self.eng.bus_latency(b),
-                None => self.eng.latency,
-            };
-            self.total = self.total.saturating_add(self.latency);
-        }
-        let skip = self.latency.saturating_sub(self.done).min(n);
-        self.done += n;
-        if skip > 0 && skip < n {
-            for c in &mut self.tmp {
-                c.copy_within(skip..n, 0);
-            }
-        }
-        Some((&self.tmp, n - skip))
-    }
-}
-
-/// [`render_range`] or [`render_bus`] on the legacy renderer (the parity oracle).
-#[cfg(feature = "legacy-render")]
-pub fn render_legacy(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Vec<Vec<f32>> {
-    let nch = source_channels(s, bus);
-    let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
-    let mut out: Vec<Vec<f32>> = (0..nch).map(|_| Vec::with_capacity(len)).collect();
-    let mut render = LegacyRangeRender::new(s, bus, Range::new(range.start, range.start + len as i64), block);
-    while let Some((chunk, n)) = render.next_block(s) {
-        for (o, c) in out.iter_mut().zip(chunk) {
-            o.extend_from_slice(c.get(..n).unwrap_or_default());
-        }
-    }
-    out
-}
-
 /// ITU-R BS.775 stereo fold-down of planar audio in `fmt` (C and surrounds at -3 dB, LFE dropped;
 /// Ambisonics play their W channel). Mono/stereo input is returned unchanged.
 pub fn fold_down_stereo(fmt: ChannelFormat, ch: &[Vec<f32>]) -> Vec<Vec<f32>> {
@@ -4096,7 +3090,7 @@ mod audio_thread_tests {
     /// Render `blocks` blocks of 512 on a fresh thread, marked as the audio thread or not.
     fn render_blocks(s: &Session, serial: bool, audio: bool, blocks: i64) -> Vec<Vec<f32>> {
         let s = s.clone();
-        let mut eng = MixEngine::new(48_000.0, 512);
+        let mut eng = RangeRender::new(&s, None, Range::new(0, blocks * 512), 512).eng;
         eng.serial = serial;
         std::thread::spawn(move || {
             if audio {
@@ -4105,7 +3099,7 @@ mod audio_thread_tests {
             let mut all = vec![Vec::new(); 2];
             let mut out = vec![vec![0.0f32; 512]; 2];
             for b in 0..blocks {
-                eng.render(&s, b * 512, 512, &mut out);
+                eng.render_active(b * 512, 512, &mut out);
                 for (a, o) in all.iter_mut().zip(&out) {
                     a.extend_from_slice(o);
                 }
@@ -4131,12 +3125,54 @@ mod audio_thread_tests {
 mod tests {
     //! Rule: tests never call the real plug-in hosts. Third-party ids are not created here
     //! (create_plugin returns None under cfg(test)); a test that needs a hosted plug-in
-    //! adopts a fake under a clap:test.* id via MixEngine::adopt.
+    //! hands a fake to `PlanRig::fake`.
 
     use super::*;
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{Insert, SourceAudio, SourceId};
     use std::sync::Arc;
+
+    /// A plan engine for tests. A `fake` stands in for the instance of its (track, slot); every
+    /// other plug-in is built as playback builds it.
+    struct PlanRig {
+        eng: MixEngine,
+        comp: PlanCompiler,
+        fakes: Vec<(TrackId, usize, Box<dyn Plugin>)>,
+        issued: u64,
+        block: usize,
+    }
+
+    impl PlanRig {
+        fn new(block: usize) -> Self {
+            let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: block as u32, out_channels: 0, in_channels: 0 };
+            PlanRig { eng: MixEngine::realtime(target), comp: PlanCompiler::new(target, PlanLimits::default()), fakes: Vec::new(), issued: 0, block }
+        }
+
+        fn fake(mut self, track: TrackId, slot: usize, plugin: impl Plugin + 'static) -> Self {
+            self.fakes.push((track, slot, Box::new(plugin)));
+            self
+        }
+
+        /// Compiles `s` and adopts it.
+        fn publish(&mut self, s: &Session) {
+            self.issued += 1;
+            let (sr, block, fakes) = (s.sample_rate.as_f64() as f32, self.block, &mut self.fakes);
+            let mut make = |spec: &InstanceSpec, _: SlotGen| match fakes.iter().position(|(t, slot, _)| (*t, *slot) == (spec.track, spec.slot)) {
+                Some(i) => Some(NewInstance { plugin: fakes.swap_remove(i).2, refused_state: false }),
+                None => create_instance(&spec.id, spec.state.as_deref(), sr, block, spec.ch),
+            };
+            let mut env = self.comp.compile(Arc::new(s.clone()), self.comp.active(), PlanGeneration::from_raw(self.issued), &mut make).unwrap();
+            assert_eq!(self.eng.adopt_plan(&mut env), Adoption::Adopted);
+            self.comp.reclaim(env);
+        }
+
+        /// Renders one block at `pos` and returns it.
+        fn render(&mut self, pos: i64) -> Vec<Vec<f32>> {
+            let mut out = vec![vec![0.0f32; self.block]; self.eng.main_channels().max(2)];
+            self.eng.render_active(pos, self.block, &mut out);
+            out
+        }
+    }
 
     fn synth_session(level_db: f32) -> Session {
         use soundcraft_midi::{Note, Sequence};
@@ -4171,27 +3207,26 @@ mod tests {
     fn live_notes_sound_while_stopped_without_the_clips() {
         let s = synth_session(-6.0);
         let t = s.tracks[0].id;
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.monitor_only = true;
-        let mut out = vec![vec![0.0f32; 512]; 2];
+        let mut rig = PlanRig::new(512);
+        rig.publish(&s);
+        rig.eng.monitor_only = true;
         let peak = |out: &[Vec<f32>]| out.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
         let mut loudest = 0.0f32;
         for _ in 0..8 {
-            eng.render(&s, 0, 512, &mut out);
-            loudest = loudest.max(peak(&out));
+            loudest = loudest.max(peak(&rig.render(0)));
         }
         assert_eq!(loudest, 0.0, "stopped: the clip's note must not play");
-        eng.live_note(t, 72, 100);
+        rig.eng.live_note(t, 72, 100);
         for _ in 0..8 {
-            eng.render(&s, 0, 512, &mut out);
-            loudest = loudest.max(peak(&out));
+            loudest = loudest.max(peak(&rig.render(0)));
         }
         assert!(loudest > 0.01, "the auditioned note should sound: {loudest}");
-        eng.live_note(t, 72, 0);
+        rig.eng.live_note(t, 72, 0);
+        let mut last = Vec::new();
         for _ in 0..400 {
-            eng.render(&s, 0, 512, &mut out);
+            last = rig.render(0);
         }
-        assert!(peak(&out) < 1e-4, "the released note should die away: {}", peak(&out));
+        assert!(peak(&last) < 1e-4, "the released note should die away: {}", peak(&last));
     }
 
     #[test]
@@ -4261,42 +3296,6 @@ mod tests {
         assert_eq!(slots, [(0, "room_reverb"), (1, "clap:test.x"), (clip_fx_slot(clip, true).unwrap(), CLIP_COMP)]);
         assert!(specs.iter().all(|x| x.state.is_none()));
         assert_eq!(instance_specs(&s).iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["clap:test.x"]);
-    }
-
-    #[test]
-    fn a_realtime_engine_creates_no_builtin_and_plays_adopted_ones() {
-        let (mut s, t) = session_with_dc(0.5, 4800);
-        let mut ins = Insert::new("gain");
-        ins.params.insert("gain".into(), -12.0);
-        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
-        let render = |eng: &mut MixEngine| {
-            let mut out = vec![vec![0.0; 256]; 2];
-            (0..8)
-                .flat_map(|b| {
-                    eng.render(&s, b * 256, 256, &mut out);
-                    out[0].clone()
-                })
-                .collect::<Vec<f32>>()
-        };
-        let realtime = || {
-            let mut eng = MixEngine::new(48_000.0, 256);
-            eng.set_external_instances(true);
-            eng
-        };
-        let reference = render(&mut MixEngine::new(48_000.0, 256));
-        let dry = render(&mut realtime());
-        let tail = |x: &[f32]| peak(x.get(x.len() - 256..).unwrap_or_default());
-        assert!(tail(&dry) > tail(&reference) * 2.0, "nothing adopted: the slot passes audio through");
-        let mut eng = realtime();
-        let spec = realtime_instance_specs(&s).remove(0);
-        let plugin = create_instance(&spec.id, None, 48_000.0, 256, spec.ch).unwrap().plugin;
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: spec.id, ch: spec.ch, plugin }]);
-        assert_eq!(render(&mut eng), reference, "the adopted gain plays as the offline engine's own");
-        assert_eq!(eng.take_retired().capacity(), 0, "nothing retired");
-        // The engine keeps the host's (now empty) vector until the next hand-over returns it.
-        eng.adopt(Vec::new());
-        let back = eng.take_retired();
-        assert!(back.is_empty() && back.capacity() > 0, "the emptied hand-over vector comes back to the host");
     }
 
     #[test]
@@ -4439,28 +3438,6 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_insert_keeps_its_instance_in_a_legacy_engine() {
-        let (mut s, t) = session_with_dc(0.5, 4800);
-        {
-            let ins = &mut s.track_mut(t).unwrap().mixer.inserts;
-            ins[0] = Some(Insert::new("gain"));
-            ins[1] = Some(Insert::new("gain"));
-            ins[2] = Some(Insert::new("compressor"));
-        }
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.ensure_synced(&s);
-        let ptr = |eng: &MixEngine, i: usize| eng.strips[&t].plugins[i].as_ref().map(|p| &*p.plugin as *const dyn Plugin as *const () as usize);
-        let before: Vec<_> = (0..3).map(|i| ptr(&eng, i)).collect();
-        assert!(before.iter().all(Option::is_some));
-        let mut moved = s.clone();
-        assert!(moved.track_mut(t).unwrap().move_insert(0, 2));
-        eng.ensure_synced(&moved);
-        assert_eq!([ptr(&eng, 0), ptr(&eng, 1), ptr(&eng, 2)], [before[1], before[2], before[0]], "each instance followed its insert");
-        eng.ensure_synced(&s);
-        assert_eq!((0..3).map(|i| ptr(&eng, i)).collect::<Vec<_>>(), before, "and back");
-    }
-
-    #[test]
     fn inserts_process_and_survive_unknown_plugins() {
         let (mut s, t) = session_with_dc(0.5, 4800);
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("does-not-exist"));
@@ -4543,12 +3520,11 @@ mod tests {
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.clock"));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let clock = Clock { inner: soundcraft_dsp::create("gain").unwrap(), seen: Arc::clone(&seen) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.clock".into(), ch: 1, plugin: Box::new(clock) }]);
-        render_block(&mut eng, &s, 96_000);
-        eng.monitor_only = true;
-        render_block(&mut eng, &s, 96_000);
+        let mut rig = PlanRig::new(512).fake(t, 0, clock);
+        rig.publish(&s);
+        render_block(&mut rig, 96_000);
+        rig.eng.monitor_only = true;
+        render_block(&mut rig, 96_000);
         let seen = seen.lock().unwrap();
         let t0 = seen[0];
         assert!(t0.playing && !t0.recording);
@@ -4598,14 +3574,16 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 48_000 * 4, seq));
         let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ears = Ears { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears".into(), ch: 2, plugin: Box::new(ears) }]);
-        render_block(&mut eng, &s, 0);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, ears);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
         assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (100, [0xB0, 64, 127])]);
-        render_block(&mut eng, &s, 36_000);
-        assert_eq!(std::mem::take(&mut *heard.lock().unwrap()), vec![(0, [0xB0, 121, 0]), (0, [0xB0, 64, 127]), (0, [0xE0, 0, 0])]);
-        render_block(&mut eng, &s, 36_512);
+        render_block(&mut rig, 36_000);
+        assert_eq!(
+            std::mem::take(&mut *heard.lock().unwrap()),
+            vec![(0, [0xB0, 64, 0]), (0, [0xB0, 121, 0]), (0, [0xB0, 64, 127]), (0, [0xE0, 0, 0])]
+        );
+        render_block(&mut rig, 36_512);
         assert!(heard.lock().unwrap().is_empty());
     }
 
@@ -4651,10 +3629,9 @@ mod tests {
         s.edit.values.insert(format!("rtp.{}.velocity", t.0), -20.0);
         let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
         let keys = Keys { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.keys".into(), ch: 2, plugin: Box::new(keys) }]);
-        render_block(&mut eng, &s, 0);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, keys);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
         assert_eq!(*heard.lock().unwrap(), vec![(72, 80)]);
     }
 
@@ -4702,15 +3679,14 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 1024, seq));
         let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ears = Ears2 { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears2".into(), ch: 2, plugin: Box::new(ears) }]);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, ears);
+        rig.publish(&s);
         for pos in [0, 512, 1024] {
-            render_block(&mut eng, &s, pos);
+            render_block(&mut rig, pos);
         }
         assert_eq!(*heard.lock().unwrap(), vec![("on", 0, 60), ("off", 0, 60)]);
         // Past the clip nothing more is sent.
-        render_block(&mut eng, &s, 1536);
+        render_block(&mut rig, 1536);
         assert_eq!(heard.lock().unwrap().len(), 2);
     }
 
@@ -4779,14 +3755,16 @@ mod tests {
         clips.push(Clip::midi(early, "a", 0, 24_000, note()));
         let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
         let ears = Ears2 { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.ears2".into(), ch: 2, plugin: Box::new(ears) }]);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, ears);
+        rig.publish(&s);
         // One beat at 120 bpm / 48 kHz is 24 000 samples, so the boundary sits on a tick and lands
         // at offset 256 of the block starting 256 samples before it.
-        render_block(&mut eng, &s, 0);
+        for pos in (0..23_552).step_by(512) {
+            render_block(&mut rig, pos);
+        }
+        rig.eng.render_active(23_552, 192, &mut vec![vec![0.0; 512]; 2]);
         heard.lock().unwrap().clear();
-        render_block(&mut eng, &s, 23_744);
+        render_block(&mut rig, 23_744);
         assert_eq!(*heard.lock().unwrap(), vec![("off", 256, 60), ("on", 256, 60)]);
     }
 
@@ -4801,16 +3779,15 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 48_000 * 4, seq));
         let calls = Arc::new(std::sync::Mutex::new(Calls::default()));
         let spy = Spy { inner: soundcraft_dsp::create("gain").unwrap(), calls: Arc::clone(&calls) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.spy".into(), ch: 2, plugin: Box::new(spy) }]);
-        render_block(&mut eng, &s, 0);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, spy);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
         let (offs, resets) = {
             let c = calls.lock().unwrap();
             assert_eq!(c.on, vec![60]);
             (c.all_off, c.resets)
         };
-        eng.all_notes_off();
+        rig.eng.all_notes_off();
         let c = calls.lock().unwrap();
         assert_eq!(c.all_off, offs + 1, "the instrument was told to release");
         assert_eq!(c.resets, resets, "reset would discard the queued releases");
@@ -4827,17 +3804,15 @@ mod tests {
         s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::midi(cid, "m", 0, 48_000, seq));
         let calls = Arc::new(std::sync::Mutex::new(Calls::default()));
         let spy = Spy { inner: soundcraft_dsp::create("gain").unwrap(), calls: Arc::clone(&calls) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.spy".into(), ch: 2, plugin: Box::new(spy) }]);
-        eng.ensure_synced(&s);
-        eng.flush_releases(512);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, spy);
+        rig.publish(&s);
+        rig.eng.flush_releases(512);
         {
             let c = calls.lock().unwrap();
             assert_eq!(c.processed, 1, "one pass");
             assert!(c.on.is_empty(), "nothing was scheduled");
         }
-        render_block(&mut eng, &s, 0);
+        render_block(&mut rig, 0);
         assert_eq!(calls.lock().unwrap().on, vec![60], "the position was untouched, so the first note still schedules");
     }
 
@@ -4849,22 +3824,19 @@ mod tests {
         s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.spy"));
         let calls = Arc::new(std::sync::Mutex::new(Calls::default()));
         let spy = Spy { inner: soundcraft_dsp::create("gain").unwrap(), calls: Arc::clone(&calls) };
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(vec![PreparedInstance { track: t, slot: INSTRUMENT_SLOT, id: "clap:test.spy".into(), ch: 2, plugin: Box::new(spy) }]);
-        eng.ensure_synced(&s);
-        assert_eq!(eng.strips[&t].buf.len(), 1, "a mono strip");
-        eng.flush_releases(512);
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, spy);
+        rig.publish(&s);
+        let plan = rig.eng.plan.as_deref().unwrap();
+        assert_eq!(plan.tables.strips[plan.tables.strip_of(t).unwrap()].buf.len(), 1, "a mono strip");
+        rig.eng.flush_releases(512);
         let c = calls.lock().unwrap();
         assert_eq!(c.shapes.len(), 1, "one pass");
         assert_eq!(c.shapes[0].0, 512);
         assert!(c.shapes[0].1 >= 512, "shortest channel of {} samples", c.shapes[0].1);
     }
 
-    fn render_block(eng: &mut MixEngine, s: &Session, pos: i64) -> f32 {
-        let mut out = vec![vec![0.0f32; 512]; 2];
-        eng.render(s, pos, 512, &mut out);
-        out[0][500]
+    fn render_block(rig: &mut PlanRig, pos: i64) -> f32 {
+        rig.render(pos)[0][500]
     }
 
     /// An effect that reports a fixed [`ProcessStatus`] and tail, counts its `process` calls and
@@ -5172,18 +4144,17 @@ mod tests {
                 calls: Arc::clone(&calls),
                 told: Arc::clone(&told),
             };
-            let mut eng = MixEngine::new(48_000.0, 512);
-            eng.set_external_instances(true);
-            eng.no_suspend = row.no_suspend;
-            let ch = if row.instrument { 2 } else { 1 };
-            eng.adopt(vec![PreparedInstance { track: t, slot, id: id.into(), ch, plugin: Box::new(fake) }]);
+            let mut rig = PlanRig::new(512).fake(t, slot, fake);
+            rig.eng.no_suspend = row.no_suspend;
+            rig.publish(&s);
             for (b, (&pos, &want)) in row.blocks.iter().zip(row.calls).enumerate() {
                 if row.param_at == Some(b)
                     && let Some(Some(ins)) = s.track_mut(t).unwrap().mixer.inserts.get_mut(0)
                 {
                     ins.params.insert("gain".into(), -6.0);
+                    rig.publish(&s);
                 }
-                let out = render_block(&mut eng, &s, pos);
+                let out = render_block(&mut rig, pos);
                 assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), want, "row {n} ({:?}), block {b} at {pos}", row.status);
                 if pos != LOUD && row.decay == 0 {
                     assert_eq!(out, 0.0, "row {n}: silent in, silent out");
@@ -5193,48 +4164,6 @@ mod tests {
             let want_sets = usize::from(row.param_at.is_some());
             assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), want_sets, "row {n} ({:?}): set_param", row.status);
         }
-    }
-
-    #[test]
-    fn external_instances_are_adopted_and_retired() {
-        let (mut s, t) = session_with_dc(0.5, 48_000);
-        let mut ins = Insert::new("clap:test.fake");
-        ins.params.insert("gain".into(), -6.0);
-        s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
-        let specs = instance_specs(&s);
-        assert_eq!(specs, vec![InstanceSpec { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, state: None, uid: specs[0].uid }]);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        // Nothing to adopt yet: the slot passes audio through (and sync never tried to load a
-        // CLAP plugin on this thread).
-        let dry = render_block(&mut eng, &s, 0);
-        assert!(dry > 0.3, "{dry}");
-        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut gain = soundcraft_dsp::create("gain").unwrap();
-        gain.prepare(48_000.0, 512, 1);
-        let fake = Stateful { inner: gain, blob: Vec::new(), sets: Arc::clone(&sets) };
-        // An instance for the wrong channel count is retired, not used.
-        let wrong = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 2, plugin: Box::new(wrong) }]);
-        assert!(render_block(&mut eng, &s, 512) > 0.3);
-        assert_eq!(eng.take_retired().len(), 1);
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: Box::new(fake) }]);
-        let mut wet = 0.0;
-        for b in 2..20 {
-            wet = render_block(&mut eng, &s, b * 512);
-        }
-        assert!((wet / dry - 0.501).abs() < 0.01, "{wet} vs {dry}");
-        assert!(sets.load(std::sync::atomic::Ordering::Relaxed) > 0, "no stored state: session params are pushed");
-        assert!(eng.take_retired().is_empty());
-        // Removing the insert retires the instance instead of dropping it here.
-        s.track_mut(t).unwrap().mixer.inserts[0] = None;
-        render_block(&mut eng, &s, 20 * 512);
-        assert_eq!(eng.take_retired().len(), 1);
-        // Instances nobody claims are retired too; drain_plugins empties the engine.
-        eng.adopt(vec![PreparedInstance { track: t, slot: 3, id: "clap:x".into(), ch: 1, plugin: soundcraft_dsp::create("gain").unwrap() }]);
-        render_block(&mut eng, &s, 21 * 512);
-        assert_eq!(eng.take_retired().len(), 1);
-        assert!(eng.drain_plugins().is_empty());
     }
 
     struct Nan(Box<dyn Plugin>);
@@ -5260,73 +4189,26 @@ mod tests {
         }
     }
 
-    fn nan(track: TrackId, slot: usize, ch: usize) -> Vec<PreparedInstance> {
-        vec![PreparedInstance { track, slot, id: "clap:test.nan".into(), ch, plugin: Box::new(Nan(soundcraft_dsp::create("gain").unwrap())) }]
-    }
-
-    /// A plug-in whose `process` panics.
-    struct Panics(Box<dyn Plugin>);
-
-    impl Plugin for Panics {
-        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
-            self.0.info()
-        }
-        fn prepare(&mut self, sr: f32, mb: usize, ch: usize) {
-            self.0.prepare(sr, mb, ch);
-        }
-        fn reset(&mut self) {
-            self.0.reset();
-        }
-        fn set_param(&mut self, id: &str, v: f32) -> bool {
-            self.0.set_param(id, v)
-        }
-        fn param(&self, id: &str) -> Option<f32> {
-            self.0.param(id)
-        }
-        fn process(&mut self, _io: &mut [Vec<f32>], _frames: usize) {
-            std::panic::panic_any("a plug-in bug");
-        }
-    }
-
-    /// A plug-in that panics while a block renders must leave its strip in the engine, so the
-    /// instance can be drained and torn down off the audio thread instead of by the unwind. One row
-    /// per phase: an insert on an ordinary track, and one on an aux.
-    #[test]
-    fn a_panicking_plugin_leaves_its_strip_drainable() {
-        for on_aux in [false, true] {
-            let (mut s, t) = session_with_dc(0.5, 48_000);
-            let aux = s.add_track(TrackKind::Aux, ChannelFormat::Mono, None);
-            let track = if on_aux { aux } else { t };
-            s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.panics"));
-            let mut eng = MixEngine::new(48_000.0, 512);
-            eng.set_external_instances(true);
-            let mut gain = soundcraft_dsp::create("gain").unwrap();
-            gain.prepare(48_000.0, 512, 1);
-            eng.adopt(vec![PreparedInstance { track, slot: 0, id: "clap:test.panics".into(), ch: 1, plugin: Box::new(Panics(gain)) }]);
-            let mut out = vec![vec![0.0; 512]; 2];
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eng.render(&s, 0, 512, &mut out)));
-            assert!(ran.is_err(), "the plug-in's panic comes out of render (on_aux: {on_aux})");
-            assert_eq!(eng.drain_plugins().len(), 1, "the instance is still in the engine after the panic (on_aux: {on_aux})");
-        }
-    }
-
     #[test]
     fn an_insert_that_puts_out_nan_is_taken_out_until_the_next_reset() {
         let (mut s, a) = session_with_dc(0.5, 48_000);
         let b = add_dc_track(&mut s, 0.5, 48_000);
         s.track_mut(a).unwrap().mixer.inserts[2] = Some(Insert::new("clap:test.nan"));
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        let both = render_block(&mut eng, &s, 0);
-        eng.adopt(nan(a, 2, 1));
-        let only_b = render_block(&mut eng, &s, 512);
+        // Without the instance the slot passes audio through.
+        let mut dry = PlanRig::new(512);
+        dry.publish(&s);
+        let both = render_block(&mut dry, 0);
+        let mut rig = PlanRig::new(512).fake(a, 2, Nan(soundcraft_dsp::create("gain").unwrap()));
+        rig.publish(&s);
+        let only_b = render_block(&mut rig, 512);
         assert!(only_b > 0.3 && (only_b - both / 2.0).abs() < 1e-6, "{only_b} vs {both}");
-        assert_eq!(eng.meters[&a].plugin_failures, PluginFailures { count: 1, last: 2 });
-        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
-        assert_eq!(render_block(&mut eng, &s, 1024), both);
-        eng.reset();
-        assert_eq!(render_block(&mut eng, &s, 1536), only_b);
-        assert_eq!(eng.meters[&a].plugin_failures.count, 2);
+        let failures = |rig: &PlanRig, t: TrackId| rig.eng.meters().find(|(id, _)| *id == t).map(|(_, m)| m.plugin_failures).unwrap();
+        assert_eq!(failures(&rig, a), PluginFailures { count: 1, last: 2 });
+        assert_eq!(failures(&rig, b), PluginFailures::default());
+        assert_eq!(render_block(&mut rig, 1024), both);
+        rig.eng.reset();
+        assert_eq!(render_block(&mut rig, 1536), only_b);
+        assert_eq!(failures(&rig, a).count, 2);
     }
 
     #[test]
@@ -5335,45 +4217,23 @@ mod tests {
         let synth = s.tracks[0].id;
         s.track_mut(synth).unwrap().instrument = Some(Insert::new("clap:test.nan"));
         let b = add_dc_track(&mut s, 0.5, 48_000);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        eng.adopt(nan(synth, INSTRUMENT_SLOT, 2));
-        let only_b = render_block(&mut eng, &s, 0);
-        assert!(only_b > 0.3, "{only_b}");
-        assert_eq!(eng.meters[&synth].plugin_failures, PluginFailures { count: 1, last: INSTRUMENT_SLOT });
-        assert_eq!(eng.meters[&b].plugin_failures, PluginFailures::default());
         let m = s.add_track(TrackKind::Master, ChannelFormat::Stereo, None);
         s.track_mut(m).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.nan"));
-        eng.adopt(nan(m, 0, 2));
-        assert_eq!(render_block(&mut eng, &s, 512), 0.0);
-        assert_eq!(eng.meters[&m].plugin_failures, PluginFailures { count: 1, last: 0 });
-        assert_eq!(render_block(&mut eng, &s, 1024), only_b);
-    }
-
-    #[test]
-    fn a_new_instance_replaces_a_matching_one_in_its_slot() {
-        // The host removed and re-added the plugin, and both session updates reached the audio
-        // thread in one go: the slot still holds the old instance (same id, same channels), but
-        // the host made a new one and drives its editor. The new one must win, or the editor
-        // talks to an instance that was retired ("the plugin is gone").
-        let (mut s, t) = session_with_dc(0.5, 48_000);
-        s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.fake"));
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
-        let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let make = |blob: &[u8]| {
-            let mut gain = soundcraft_dsp::create("gain").unwrap();
-            gain.prepare(48_000.0, 512, 1);
-            Box::new(Stateful { inner: gain, blob: blob.to_vec(), sets: Arc::clone(&sets) })
-        };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"old") }]);
-        render_block(&mut eng, &s, 0);
-        assert!(eng.take_retired().is_empty());
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "clap:test.fake".into(), ch: 1, plugin: make(b"new") }]);
-        render_block(&mut eng, &s, 512);
-        let mut retired = eng.take_retired();
-        assert_eq!(retired.len(), 1, "the old instance is retired");
-        assert_eq!(retired[0].save_state(), Some(b"old".to_vec()), "the new instance stays");
+        let mut rig = PlanRig::new(512).fake(synth, INSTRUMENT_SLOT, Nan(soundcraft_dsp::create("gain").unwrap()));
+        // The master insert is absent in the first plan.
+        let mut without = s.clone();
+        without.track_mut(m).unwrap().mixer.inserts[0] = None;
+        rig.publish(&without);
+        let failures = |rig: &PlanRig, t: TrackId| rig.eng.meters().find(|(id, _)| *id == t).map(|(_, m)| m.plugin_failures).unwrap();
+        let only_b = render_block(&mut rig, 0);
+        assert!(only_b > 0.3, "{only_b}");
+        assert_eq!(failures(&rig, synth), PluginFailures { count: 1, last: INSTRUMENT_SLOT });
+        assert_eq!(failures(&rig, b), PluginFailures::default());
+        rig.fakes.push((m, 0, Box::new(Nan(soundcraft_dsp::create("gain").unwrap()))));
+        rig.publish(&s);
+        assert_eq!(render_block(&mut rig, 512), 0.0);
+        assert_eq!(failures(&rig, m), PluginFailures { count: 1, last: 0 });
+        assert_eq!(render_block(&mut rig, 1024), only_b);
     }
 
     #[test]
@@ -5384,19 +4244,19 @@ mod tests {
         ins.set_state_bytes(b"stored");
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
         assert_eq!(instance_specs(&s)[0].state.as_deref(), Some(&b"stored"[..]));
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
         let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: "vst3:00000000000000000000000000000001".into(), ch: 1, plugin: Box::new(fake) }]);
-        render_block(&mut eng, &s, 0);
+        let mut rig = PlanRig::new(512).fake(t, 0, fake);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
         assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1, "session params apply once");
-        render_block(&mut eng, &s, 512);
+        render_block(&mut rig, 512);
         assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 1);
         s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("gain".into(), -12.0);
-        render_block(&mut eng, &s, 1024);
+        rig.publish(&s);
+        render_block(&mut rig, 1024);
         assert_eq!(sets.load(std::sync::atomic::Ordering::Relaxed), 2, "later session edits apply");
-        // Offline (not external): third-party plugins are simply absent (tests never load real ones).
+        // Offline: third-party plugins are simply absent (tests never load real ones).
         let out = render_range(&s, Range::new(0, 1024), 512);
         assert!(out[0][100] > 0.3);
     }
@@ -5410,22 +4270,23 @@ mod tests {
         ins.params.insert("gain".into(), 0.0);
         ins.set_state_bytes(b"stored");
         s.track_mut(t).unwrap().mixer.inserts[0] = Some(ins);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
         let sets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fake = Stateful { inner: soundcraft_dsp::create("gain").unwrap(), blob: Vec::new(), sets: Arc::clone(&sets) };
-        eng.adopt(vec![PreparedInstance { track: t, slot: 0, id: id.into(), ch: 1, plugin: Box::new(fake) }]);
+        let mut rig = PlanRig::new(512).fake(t, 0, fake);
+        rig.publish(&s);
         let count = || sets.load(std::sync::atomic::Ordering::Relaxed);
-        render_block(&mut eng, &s, 0);
+        render_block(&mut rig, 0);
         assert_eq!(count(), 0, "a stored default is not pushed over the restored plugin");
-        render_block(&mut eng, &s, 512);
+        render_block(&mut rig, 512);
         assert_eq!(count(), 0);
         // Later edits are pushed, including a return to the default.
         s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("gain".into(), -6.0);
-        render_block(&mut eng, &s, 1024);
+        rig.publish(&s);
+        render_block(&mut rig, 1024);
         assert_eq!(count(), 1);
         s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().params.insert("gain".into(), 0.0);
-        render_block(&mut eng, &s, 1536);
+        rig.publish(&s);
+        render_block(&mut rig, 1536);
         assert_eq!(count(), 2);
     }
 
@@ -5483,14 +4344,15 @@ mod tests {
         let mut comp = Insert::new("compressor");
         comp.params.insert("lookahead".into(), 5.0);
         s.track_mut(latent).unwrap().mixer.inserts[0] = Some(comp);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        let mut out = vec![vec![0.0f32; 512]; 2];
+        let mut rig = PlanRig::new(512);
+        rig.publish(&s);
+        let mut out = Vec::new();
         for b in 0..9 {
-            eng.render(&s, b * 512, 512, &mut out);
+            out = rig.render(b * 512);
         }
-        assert!(eng.latency > 0 && out[1][500] > 0.3, "the fixture plays through the alignment delay");
-        eng.reset();
-        eng.render(&s, 1_000_000, 512, &mut out);
+        assert!(rig.eng.latency > 0 && out[1][500] > 0.3, "the fixture plays through the alignment delay");
+        rig.eng.reset();
+        let out = rig.render(1_000_000);
         assert!(out.iter().flatten().all(|x| *x == 0.0), "old aligned audio after a reset");
     }
 
@@ -5605,37 +4467,39 @@ mod tests {
         }
         let (mut s, t) = session_with_dc(0.5, 48_000);
         let aux = s.add_track(TrackKind::Aux, ChannelFormat::Mono, None);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.set_external_instances(true);
+        let mut rig = PlanRig::new(512);
         for track in [t, aux] {
             s.track_mut(track).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
             let mut gain = soundcraft_dsp::create("gain").unwrap();
             gain.prepare(48_000.0, 512, 1);
-            eng.adopt(vec![PreparedInstance { track, slot: 0, id: "clap:test.latent".into(), ch: 1, plugin: Box::new(Latent(gain)) }]);
+            rig.fakes.push((track, 0, Box::new(Latent(gain))));
         }
-        render_block(&mut eng, &s, 0);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
         // Both strips feed the main mix in parallel: the slowest path is one capped latency.
-        assert_eq!(eng.latency, MAX_LATENCY);
+        assert_eq!(rig.eng.latency, MAX_LATENCY);
     }
 
     #[test]
     fn input_monitoring_replaces_clips() {
         let (mut s, t) = session_with_dc(0.5, 4800);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.input = vec![vec![0.25; 512]];
-        let mut out = vec![vec![0.0; 512]; 2];
+        let mut rig = PlanRig::new(512);
+        rig.publish(&s);
+        rig.eng.input = vec![vec![0.25; 512]];
         // Not monitored: the clip plays.
-        eng.render(&s, 0, 512, &mut out);
+        let out = rig.render(0);
         assert!((out[0][100] - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
         // Monitored: the input replaces it, and it still sounds when stopped.
         s.track_mut(t).unwrap().mixer.input_monitor = true;
-        eng.render(&s, 512, 512, &mut out);
+        rig.publish(&s);
+        let out = rig.render(512);
         assert!((out[0][100] - 0.25 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3, "{}", out[0][100]);
-        eng.monitor_only = true;
-        eng.render(&s, 1024, 512, &mut out);
+        rig.eng.monitor_only = true;
+        let out = rig.render(1024);
         assert!(out[0][100] > 0.1);
         s.track_mut(t).unwrap().mixer.input_monitor = false;
-        eng.render(&s, 1024, 512, &mut out);
+        rig.publish(&s);
+        let out = rig.render(1024);
         assert!(out[0][100].abs() < 1e-6, "stopped, unmonitored: silence");
     }
 
@@ -5647,45 +4511,29 @@ mod tests {
     }
 
     #[test]
-    fn strip_workspace_keeps_its_allocation_between_blocks() {
-        let mut s = Session::default();
-        for _ in 0..6 {
-            s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
-        }
-        let mut eng = MixEngine::new(48_000.0, 512);
-        let mut out = vec![vec![0.0; 512]; 2];
-        eng.render(&s, 0, 512, &mut out);
-        let capacity = eng.work.capacity();
-        assert!(capacity >= 6);
-        eng.render(&s, 512, 512, &mut out);
-        assert_eq!(eng.work.capacity(), capacity);
-    }
-
-    #[test]
     fn stopped_monitoring_does_not_click() {
         let mut s = Session::default();
         s.edit.click = true;
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.metronome = true;
-        eng.monitor_only = true;
-        let mut out = vec![vec![0.0f32; 512]; 2];
+        let mut rig = PlanRig::new(512);
+        rig.publish(&s);
+        rig.eng.metronome = true;
+        rig.eng.monitor_only = true;
         for _ in 0..4 {
-            eng.render(&s, 0, 512, &mut out);
-            assert!(out.iter().all(|c| c.iter().all(|x| *x == 0.0)));
+            assert!(rig.render(0).iter().all(|c| c.iter().all(|x| *x == 0.0)));
         }
     }
 
     /// Renders `len` frames from zero the way playback does (metronome on), in blocks of `block`.
     fn render_playback(s: &Session, len: usize, block: usize, recording: bool) -> Vec<Vec<f32>> {
-        let mut eng = MixEngine::new(s.sample_rate.as_f64() as f32, block);
-        eng.metronome = true;
-        eng.recording = recording;
+        let mut rig = PlanRig::new(block);
+        rig.publish(s);
+        rig.eng.metronome = true;
+        rig.eng.recording = recording;
         let mut out = vec![vec![0.0f32; len]; 2];
-        let mut tmp = vec![vec![0.0f32; block]; 2];
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(block);
-            eng.render(s, done as i64, n, &mut tmp);
+            let tmp = rig.render(done as i64);
             for (o, t) in out.iter_mut().zip(tmp.iter()) {
                 if let (Some(d), Some(src)) = (o.get_mut(done..done + n), t.get(..n)) {
                     d.copy_from_slice(src);
@@ -5785,15 +4633,16 @@ mod tests {
         assert!(out.iter().enumerate().all(|(c, x)| c == 2 || x[100].abs() < 1e-4));
         // Rear right with LFE: Rs plus the LFE send.
         s.track_mut(t).unwrap().mixer.surround = Some(SurroundPan { x: 1.0, y: -1.0, lfe_db: -6.0, ..SurroundPan::default() });
-        let mut eng = MixEngine::new(48_000.0, 512);
-        let mut buf = vec![vec![0.0; 512]; 6];
-        eng.render(&s, 0, 512, &mut buf);
+        let mut rig = PlanRig::new(512);
+        rig.publish(&s);
+        let buf = rig.render(0);
+        assert_eq!(buf.len(), 6);
         assert!((buf[5][100] - 0.5).abs() < 1e-4 && (buf[3][100] - 0.5 * db_to_gain(-6.0)).abs() < 1e-4);
-        assert_eq!(eng.main_meter.peaks.len(), 6);
-        assert_eq!(eng.meters.get(&t).map(|m| m.peaks.len()), Some(1));
+        assert_eq!(rig.eng.active_main_meter().peaks.len(), 6);
+        assert_eq!(rig.eng.meters().find(|(id, _)| *id == t).map(|(_, m)| m.peaks.len()), Some(1));
         // A stereo device buffer gets the first two channels.
         let mut two = vec![vec![1.0; 512]; 2];
-        eng.render(&s, 512, 512, &mut two);
+        rig.eng.render_active(512, 512, &mut two);
         assert!(two[0][10].abs() < 1e-6);
     }
 
@@ -5835,56 +4684,5 @@ mod tests {
         }
         let e_ls = out[4][100].powi(2) + out[6][100].powi(2);
         assert!((e_ls - x(4).powi(2)).abs() < 1e-5, "Ls energy is preserved");
-    }
-
-    /// A legacy delay line grown mid-render (the control side, after a clamp) keeps its history in
-    /// order: a tap at the same delay continues the signal without a jump.
-    #[test]
-    fn a_grown_delay_line_keeps_its_history_in_order() {
-        let block = 16;
-        let mut line = DelayLine::default();
-        line.grow(100, 1, block);
-        let cap = line.len;
-        let mut n = 0usize;
-        let mut out = vec![Vec::with_capacity(block)];
-        let mut got = Vec::new();
-        let mut step = |line: &mut DelayLine, got: &mut Vec<f32>| {
-            let src = vec![(0..block).map(|i| (n + i) as f32).collect::<Vec<f32>>()];
-            line.write(&src, block);
-            line.read(50, &mut out, block);
-            got.extend_from_slice(&out[0]);
-            n += block;
-        };
-        for _ in 0..(cap / block + 3) {
-            step(&mut line, &mut got);
-        }
-        line.grow(cap * 4, 1, block);
-        assert!(line.len >= cap * 4);
-        for _ in 0..8 {
-            step(&mut line, &mut got);
-        }
-        // Past the first 50 samples, every sample is the input 50 samples earlier.
-        for (k, x) in got.iter().enumerate().skip(50) {
-            assert_eq!(*x, (k - 50) as f32, "sample {k}");
-        }
-        // A tap reaching back past the old ring finds silence there, not stale samples.
-        line.read(line.len, &mut out, block);
-        assert!(out[0].iter().all(|x| *x == 0.0));
-    }
-
-    /// A legacy engine sizes a pre-fader line only for a strip with a pre-fader send.
-    #[test]
-    fn only_strips_with_a_pre_fader_send_get_a_pre_fader_line() {
-        let (mut s, t) = session_with_dc(0.5, 4800);
-        let other = add_dc_track(&mut s, 0.25, 4800);
-        let bus = s.add_bus("B", ChannelFormat::Stereo);
-        let mut send = soundcraft_model::SendSlot::new(Route::Bus(bus));
-        send.pre_fader = true;
-        s.track_mut(t).unwrap().mixer.sends[0] = Some(send);
-        let mut eng = MixEngine::new(48_000.0, 512);
-        eng.ensure_synced(&s);
-        let (with, without) = (&eng.strips[&t], &eng.strips[&other]);
-        assert!(!with.tap.bufs.is_empty() && !with.tap_pre.bufs.is_empty());
-        assert!(!without.tap.bufs.is_empty() && without.tap_pre.bufs.is_empty(), "no pre-fader send, no pre-fader line");
     }
 }

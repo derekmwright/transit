@@ -96,7 +96,7 @@ pub struct SlotGen(pub(crate) u64);
 pub type SlotBinding = (TrackId, usize, SlotGen);
 
 impl SlotGen {
-    /// Not a cell: a strip shell waiting for its state, or legacy (non-plan) storage.
+    /// Not a cell: a strip shell waiting for its state.
     pub const VACANT: Self = SlotGen(0);
 
     /// The generation's number.
@@ -402,17 +402,16 @@ pub struct Retired {
     pub(crate) tables: Option<PlanTables>,
     /// Displaced attachment storage: held so it drops with the rest, on the control thread.
     pub(crate) _attach: Box<[Attach]>,
-    pub(crate) legacy: Vec<Box<dyn Plugin>>,
 }
 
 impl Retired {
     pub(crate) fn from_plan(p: PreparedPlan) -> Self {
-        Retired { session: Some(p.session), tables: p.tables, _attach: p.attach, legacy: Vec::new() }
+        Retired { session: Some(p.session), tables: p.tables, _attach: p.attach }
     }
 
     /// The plug-in instances inside.
     pub fn plugins(&self) -> impl Iterator<Item = &dyn Plugin> {
-        self.tables.iter().flat_map(PlanTables::plugins).map(|s| &*s.plugin).chain(self.legacy.iter().map(|p| &**p))
+        self.tables.iter().flat_map(PlanTables::plugins).map(|s| &*s.plugin)
     }
 
     /// The Session inside (the displaced one).
@@ -422,7 +421,7 @@ impl Retired {
     }
 
     /// The binding of every plan-mode instance inside: dropping `self` destroys them, so
-    /// playback releases their handles (legacy instances have none).
+    /// playback releases their handles.
     #[must_use]
     pub fn instances(&self) -> Vec<SlotBinding> {
         self.tables.as_ref().map(PlanTables::bindings).unwrap_or_default()

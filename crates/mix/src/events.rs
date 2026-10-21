@@ -42,9 +42,8 @@
 //!   jump in [`MixEngine::render_active`]: only the clips' notes and pedals are released and
 //!   queued clip-derived events cancelled. Live notes and pedals keep sounding: CC 121 is
 //!   suppressed on channels with remaining pedal holders, avoiding an up-then-down glitch.
-//! - The legacy [`MixEngine::render`] does not deliver queued events (it renders the legacy
-//!   strips, not the plan's instruments): events need [`MixEngine::render_active`]. An engine
-//!   without an adopted plan refuses every event ([`EventOutcome::NoInstrument`]).
+//! - Events reach instruments only through [`MixEngine::render_active`]. An engine without an
+//!   adopted plan refuses every event ([`EventOutcome::NoInstrument`]).
 //! - An instrument that fails, or whose track is inactive, does not process its queue: the queue
 //!   is voided (counted `voided`), its notes and pedals are released at the plug-in, and it takes
 //!   no events until it plays again. Refused releases stay pending until accepted.
@@ -1183,7 +1182,7 @@ pub(crate) fn message_from_midi1(msg: [u8; 3]) -> Option<Message> {
 
 /// The engine's side: epoch, limits, the render clock, the transport and the counters.
 pub(crate) struct EngineEvents {
-    /// `None`: the engine takes no realtime events (offline and legacy engines).
+    /// `None`: the engine takes no realtime events (offline engines).
     pub(crate) epoch: Option<EngineEpoch>,
     pub(crate) limits: EventLimits,
     /// The render frame of the next block's first sample.
@@ -1244,8 +1243,7 @@ impl MixEngine {
     ///
     /// Events reach instruments only through the plan path: adopt a plan and render with
     /// [`MixEngine::render_active`], which delivers them and advances [`MixEngine::next_frame`].
-    /// The legacy [`MixEngine::render`] does neither; before the first adoption every event is
-    /// refused ([`EventOutcome::NoInstrument`]).
+    /// Before the first adoption every event is refused ([`EventOutcome::NoInstrument`]).
     #[must_use]
     pub fn realtime_with_events(target: super::RenderTarget, epoch: EngineEpoch, limits: EventLimits) -> Self {
         let mut eng = MixEngine::realtime(target);
@@ -1307,7 +1305,7 @@ impl MixEngine {
         if self.events.revoked.get(port).copied().flatten().is_some_and(|r| ev.source.generation <= r) {
             return (EventOutcome::RevokedSource, None);
         }
-        // No adopted plan (or a legacy `render` engine): there is no instrument to take it.
+        // No adopted plan: there is no instrument to take it.
         let Some(plan) = self.plan.as_deref_mut() else { return (EventOutcome::NoInstrument, None) };
         if plan.faulted {
             return (EventOutcome::Faulted, None);

@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 fn prepared() -> (Player, DeviceOutput) {
     // Allocates clocks/queues only. No device discovery, stream or fallback worker.
     let (player, access, _clock) = Player::prepare(Arc::new(Session::default()), 48_000, soundcraft_model::IoMap::default()).unwrap();
-    let output = DeviceOutput::new(access, &player, 2, 48_000);
+    let output = DeviceOutput::new(access, &player, 2);
     (player, output)
 }
 
@@ -284,7 +284,7 @@ fn lost_or_rejected_device_callback_never_owns_plugin_destruction() {
     // failure or device loss without another render callback to return ownership.
     for rendered in [false, true] {
         let (player, access, control, drops) = probe_player(None, None);
-        let mut callback = DeviceOutput::new(access, &player, 2, 48_000);
+        let mut callback = DeviceOutput::new(access, &player, 2);
         std::thread::spawn(move || {
             if rendered {
                 callback.fill(&mut [0.0f32; 128]);
@@ -304,7 +304,7 @@ fn lost_or_rejected_device_callback_never_owns_plugin_destruction() {
 fn escaped_plugin_panic_and_endpoint_loss_reclaim_payload_and_plugin_on_main() {
     let payload = DropTrace::new();
     let (player, access, control, drops) = probe_player(Some(Arc::clone(&payload)), None);
-    let mut callback = DeviceOutput::new(access, &player, 2, 48_000);
+    let mut callback = DeviceOutput::new(access, &player, 2);
     std::thread::spawn(move || {
         let mut out = [0.75f32; 128];
         callback.fill(&mut out);
@@ -328,7 +328,7 @@ fn escaped_plugin_panic_and_endpoint_loss_reclaim_payload_and_plugin_on_main() {
 #[test]
 fn unexpected_callback_unwind_releases_guard_without_moving_destruction_to_worker() {
     let (player, access, control, drops) = probe_player(None, None);
-    let mut callback = DeviceOutput::new(access, &player, 2, 48_000);
+    let mut callback = DeviceOutput::new(access, &player, 2);
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
         callback.fill(&mut [0.0f32; 128]);
@@ -348,7 +348,7 @@ fn unexpected_callback_unwind_releases_guard_without_moving_destruction_to_worke
 fn shutdown_waits_for_active_render_without_requiring_backend_join() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (player, access, control, drops) = probe_player(None, Some(entered_tx));
-    let mut callback = DeviceOutput::new(access, &player, 2, 48_000);
+    let mut callback = DeviceOutput::new(access, &player, 2);
     // Deliberately do not put this handle in Player: fake a backend returning
     // from stream destruction while callback teardown still runs on its worker.
     let worker = std::thread::spawn(move || {
@@ -404,10 +404,8 @@ fn multichunk_conversion_and_main_control_activity_do_not_lock_or_allocate_on_au
     player.service().unwrap();
     player.play(0, None, None).unwrap();
     let mut out = vec![1i16; 65_536];
-    // Main may hold both control and the legacy meter mutex while audio renders:
-    // neither is part of the prepared callback access path.
+    // Main may hold control while audio renders: it is not part of the prepared callback access path.
     let _owner = player.owner().unwrap();
-    let _meters = player.shared.meters.lock().unwrap();
     let ((), heap) = measure(|| callback.fill(&mut out));
     assert!(heap.is_zero(), "{heap:?}");
     assert!(player.is_playing());
@@ -421,7 +419,7 @@ fn failed_open_retaining_callback_cannot_hold_shutdown_or_plugin_reclamation_hos
     // returning a Stream handle; WebAudio also retains a closure after closing.
     // A retained endpoint must not make Player Drop wait for closure destruction.
     let (player, access, control, drops) = probe_player(None, None);
-    let mut callback = DeviceOutput::new(access, &player, 2, 48_000);
+    let mut callback = DeviceOutput::new(access, &player, 2);
     callback.fill(&mut [0.0f32; 128]);
     drop(player);
     drop(control);

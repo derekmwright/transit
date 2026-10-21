@@ -3,13 +3,31 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
-use soundcraft_mix::{MixEngine, mark_audio_thread};
+use soundcraft_mix::{
+    Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, SlotGen, create_instance,
+    mark_audio_thread,
+};
 use soundcraft_model::{ChannelFormat, Clip, Session, SourceAudio, SourceId, TrackKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const FRAMES: usize = 512;
+
+/// An engine that has adopted the plan of `s`.
+fn planned_engine(s: &Session) -> MixEngine {
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: FRAMES as u32, out_channels: 0, in_channels: 0 };
+    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
+    let mut plan = compiler
+        .compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut |spec: &InstanceSpec, _: SlotGen| {
+            create_instance(&spec.id, spec.state.as_deref(), 48_000.0, FRAMES, spec.ch)
+        })
+        .unwrap();
+    let mut engine = MixEngine::realtime(target);
+    assert_eq!(engine.adopt_plan(&mut plan), Adoption::Adopted);
+    compiler.reclaim(plan);
+    engine
+}
 /// A 512-frame block of sixteen plain strips takes well under a millisecond; this leaves room for
 /// a loaded CI machine and is still far below the time the global pool stays busy.
 const BOUND: Duration = Duration::from_millis(50);
@@ -67,10 +85,10 @@ impl Drop for Saturated {
 fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
     MixEngine::force_serial(false); // the pool is opt-in; this test is about the pool path
     let s = sixteen_strips();
-    let mut eng = MixEngine::new(48_000.0, FRAMES);
+    let mut eng = planned_engine(&s);
     let mut out = vec![vec![0.0f32; FRAMES]; 2];
-    // Warm up (sync, buffers) before the global pool is taken.
-    eng.render(&s, 0, FRAMES, &mut out);
+    // Warm up before the global pool is taken.
+    eng.render_active(0, FRAMES, &mut out);
     let busy = Saturated::new();
     let (worst, peak) = std::thread::spawn(move || {
         mark_audio_thread();
@@ -78,7 +96,7 @@ fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
         let mut peak = 0.0f32;
         for b in 1..=8 {
             let t = Instant::now();
-            eng.render(&s, b * FRAMES as i64, FRAMES, &mut out);
+            eng.render_active(b * FRAMES as i64, FRAMES, &mut out);
             worst = worst.max(t.elapsed());
             peak = out.iter().flatten().fold(peak, |m, x| m.max(x.abs()));
         }
@@ -98,7 +116,13 @@ fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
 #[test]
 fn render_pool_workers_promote_themselves_at_start() {
     MixEngine::force_serial(false); // the pool is opt-in; this test is about its workers
-    let _eng = MixEngine::new(48_000.0, FRAMES);
+    let _eng = MixEngine::realtime(RenderTarget {
+        device: DeviceGeneration(1),
+        sample_rate: 48_000,
+        max_block: FRAMES as u32,
+        out_channels: 0,
+        in_channels: 0,
+    });
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let workers = cores.saturating_sub(1).min(soundcraft_mix::MAX_RENDER_WORKERS);
     if workers < 2 {

@@ -976,7 +976,6 @@ impl PlanCompiler {
             st.scratch = vec![0.0; block];
             st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
             st.clipbuf = vec![vec![0.0; block]; ch];
-            st.external = true;
             st.key_pre = desc.keys.iter().any(|k| k.pre && k.from == KeyEnd::Strip(si as u16));
             // A line for the strip's own signal before each keyed insert, in case its key arrives late.
             st.key_in = desc.keys.iter().filter(|k| usize::from(k.keyed) == si).map(|k| KeyIn::new(k.slot, ch, cap, block)).collect();

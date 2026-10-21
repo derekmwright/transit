@@ -4,8 +4,7 @@
 //! rest go back to the control side with the strips. Before this, Rayon re-raised one panic of a
 //! parallel render and dropped the others' payloads on the render pool's workers.
 //!
-//! Every path: the realtime plan on the render pool and serially, and an offline (legacy) render
-//! on Rayon's global pool. The serial run also counts the audio thread's heap operations: the
+//! Both paths: the plan on the render pool and serially. The serial run also counts the audio thread's heap operations: the
 //! render adds none to what the panics themselves cost (each panic's payload box and the unwind's
 //! own exception box, plus one more exception box for the re-raise).
 //!
@@ -15,8 +14,8 @@
 
 use soundcraft_dsp::Plugin;
 use soundcraft_mix::{
-    DeviceGeneration, INSTRUMENT_SLOT, InstanceSpec, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, PreparedInstance,
-    RenderTarget, mark_audio_thread,
+    DeviceGeneration, INSTRUMENT_SLOT, InstanceSpec, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget,
+    mark_audio_thread,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
 use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
@@ -223,25 +222,4 @@ fn serial_panicking_instruments_keep_their_payloads_and_allocate_nothing_more() 
     assert_eq!(stats, expected, "the render adds no heap operation to the panics' own");
     assert!(shared.raised.lock().unwrap().iter().all(|t| *t == here), "serial: every strip rendered on this thread");
     assert_all_dropped_here("serial", &shared, panic, mix);
-}
-
-#[test]
-fn offline_panicking_instruments_drop_no_payload_on_a_global_pool_worker() {
-    let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    silence_panics();
-    let shared = Shared::new();
-    let (s, ids) = session(TRACKS);
-    let mut eng = MixEngine::new(SR as f32, BLOCK);
-    eng.set_external_instances(true);
-    eng.adopt(
-        ids.iter()
-            .map(|&track| PreparedInstance { track, slot: INSTRUMENT_SLOT, id: "clap:test.panics".into(), ch: 2, plugin: panics(&shared, 2) })
-            .collect(),
-    );
-    let mut out = vec![vec![0.0; BLOCK]; 2];
-    eng.render(&s, 0, BLOCK, &mut out);
-    shared.armed.store(true, Ordering::Relaxed);
-    let panic =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eng.render(&s, BLOCK as i64, BLOCK, &mut out))).expect_err("the render panics");
-    assert_all_dropped_here("offline", &shared, panic, eng);
 }

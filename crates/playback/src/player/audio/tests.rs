@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::{
-    MeterSnapshot, OutputCallback,
+    OutputCallback,
     device_clock::{ClockKey, Direction},
 };
 use soundcraft_mix::{DeviceGeneration, InstanceSpec, NewInstance, SlotGen};
@@ -21,7 +21,6 @@ pub(super) fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Contr
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
         metro: crate::Metro::default(),
     });
@@ -174,7 +173,6 @@ fn owner_fixture() -> (crate::player::RuntimeControl<Command, ActionResult>, Aud
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
         metro: crate::Metro::default(),
     });
@@ -313,7 +311,6 @@ fn invalid_audio_initialization_returns_every_endpoint_for_main_thread_retiremen
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
             speed: AtomicU32::new(1000),
-            meters: Mutex::new(MeterSnapshot::default()),
             editors_open: AtomicBool::new(false),
             metro: crate::Metro::default(),
         });
@@ -430,7 +427,7 @@ fn conversion_chunks_share_the_actual_device_callback_action_budget() {
     for _ in 0..64 {
         control.send_action(Command::Recording(true), false).unwrap();
     }
-    let mut device = OutputCallback::new(2, 48_000);
+    let mut device = OutputCallback::new(2);
     let mut out = vec![1.0; 20_000 * 2];
     let ((), heap) = measure(|| device.fill_with(&mut out, |buffer, plans, actions| audio.fill(buffer, 2, plans, actions).unwrap()));
     assert!(heap.is_zero(), "{heap:?}");
@@ -1013,7 +1010,6 @@ fn play_on_device(session: Session, channels: usize, io: Option<soundcraft_model
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
         metro: crate::Metro::default(),
     });
@@ -1074,7 +1070,6 @@ fn a_path_table_edit_on_an_open_stream_moves_main_through_the_published_plan() {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
         speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
         metro: crate::Metro::default(),
     });

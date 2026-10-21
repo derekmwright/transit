@@ -8,6 +8,7 @@ use super::plan::{ActivePlan, Attach, CellKind, CellLoc, PlanTables, Shape};
 use super::*;
 
 /// The Session of an engine without a plan.
+static NO_METER: std::sync::LazyLock<StripMeter> = std::sync::LazyLock::new(StripMeter::default);
 static NO_SESSION: std::sync::LazyLock<Arc<Session>> = std::sync::LazyLock::new(|| Arc::new(Session::default()));
 
 /// The identity of an engine without a plan.
@@ -200,8 +201,7 @@ impl MixEngine {
     #[must_use]
     pub fn realtime(target: RenderTarget) -> Self {
         let target = target.normalized();
-        let mut eng = MixEngine::new(target.sample_rate as f32, target.block());
-        eng.set_external_instances(true);
+        let mut eng = MixEngine::new(target.block());
         eng.plan = Some(Box::new(ActivePlan {
             id: PlanIdentity { generation: PlanGeneration::EMPTY, base: PlanGeneration::EMPTY, target },
             session: Arc::new(Session::default()),
@@ -297,8 +297,7 @@ impl MixEngine {
         Adoption::Adopted
     }
 
-    /// The active plan's identity ([`PlanGeneration::EMPTY`] before the first adoption, and for
-    /// an engine not made with [`MixEngine::realtime`]).
+    /// The active plan's identity ([`PlanGeneration::EMPTY`] before the first adoption).
     #[must_use]
     pub fn active(&self) -> &PlanIdentity {
         self.plan.as_deref().map_or(&NO_PLAN, |p| &p.id)
@@ -335,17 +334,16 @@ impl MixEngine {
         self.plan.as_deref().into_iter().flat_map(|p| p.tables.strips.iter().map(|st| (st.id, &st.meter)))
     }
 
-    /// The main mix's meter in the active plan (a legacy engine's is [`MixEngine::main_meter`]).
+    /// The main mix's meter in the active plan.
     #[must_use]
     pub fn active_main_meter(&self) -> &StripMeter {
-        self.plan.as_deref().map_or(&self.main_meter, |p| &p.tables.main_meter)
+        self.plan.as_deref().map_or(&*NO_METER, |p| &p.tables.main_meter)
     }
 
     /// What the audio thread noticed since the last adoption, in fixed storage.
     #[must_use]
     pub fn status(&self) -> PlanStatus {
-        // A legacy engine reports its delay lines' clamps (until `ensure_synced` grows them).
-        let Some(p) = self.plan.as_deref() else { return self.legacy_status };
+        let Some(p) = self.plan.as_deref() else { return PlanStatus::default() };
         let mismatch = p.tables.plugins().fold(0u32, |n, s| n.saturating_add(s.applied.mismatch));
         PlanStatus { applied_mismatch: mismatch, ..p.status }
     }
@@ -360,19 +358,17 @@ impl MixEngine {
     /// Control thread, after the audio side is quiescent (also after a fault): everything the
     /// engine owns, to drop there.
     pub fn into_retired(mut self) -> Retired {
-        let legacy = self.drain_plugins();
         match self.plan.take() {
             Some(p) => {
                 let p = *p;
-                Retired { session: Some(p.session), tables: Some(p.tables), _attach: Box::new([]), legacy }
+                Retired { session: Some(p.session), tables: Some(p.tables), _attach: Box::new([]) }
             }
-            None => Retired { session: None, tables: None, _attach: Box::new([]), legacy },
+            None => Retired { session: None, tables: None, _attach: Box::new([]) },
         }
     }
 
     /// Audio thread: renders `frames` (≤ max block) samples of the active plan starting at `pos`
-    /// into `out`, as [`MixEngine::render`] renders a Session. Silence before the first adoption
-    /// and after a fault.
+    /// into `out`. Silence before the first adoption and after a fault.
     pub fn render_active(&mut self, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
         let frames = frames.min(self.max_block);
         let Some(plan) = self.plan.as_deref_mut().filter(|p| !p.faulted) else {

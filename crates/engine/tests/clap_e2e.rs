@@ -92,11 +92,9 @@ fn clap_state_is_captured_stored_and_restored_before_the_first_block() {
     s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "dc", SourceId(78), 0, 0, 4800));
     e.execute("mix.insert", &json!({"track": t.0, "plugin": gain, "params": {"7": 2.0}})).unwrap();
 
-    // A realtime-style engine: the instance is created "on the UI thread" from the specs and
-    // adopted; its live state (gain 1.5, changed behind the session's back as a plugin GUI
-    // would) is captured and stored on the insert.
-    let mut eng = soundcraft_mix::MixEngine::new(48_000.0, 512);
-    eng.set_external_instances(true);
+    // A realtime-style instance, created "on the UI thread" from the specs: its live state (gain
+    // 1.5, changed behind the session's back as a plugin GUI would) is captured and stored on the
+    // insert.
     let specs = soundcraft_mix::instance_specs(e.session());
     assert_eq!(specs.len(), 1);
     let mut p = soundcraft_mix::create_instance(&specs[0].id, None, 48_000.0, 512, specs[0].ch).unwrap().plugin;
@@ -104,11 +102,9 @@ fn clap_state_is_captured_stored_and_restored_before_the_first_block() {
     let mut io = vec![vec![0.0f32; 64]];
     p.process(&mut io, 64);
     let mut reader = p.state_reader().unwrap();
-    eng.adopt(vec![soundcraft_mix::PreparedInstance { track: t, slot: 0, id: gain.into(), ch: 1, plugin: p }]);
-    eng.ensure_synced(e.session());
     let blob = reader.save_state().unwrap();
     e.execute("mix.insert_state", &json!({"track": t.0, "slot": 0, "state": soundcraft_model::b64::encode(&blob)})).unwrap();
-    assert_eq!(eng.take_retired().len(), 0);
+    drop(p);
 
     // Offline render (synchronous creation): the state is restored before the first block.
     // With the gain absent from the session's params, the state's 1.5 is what plays.

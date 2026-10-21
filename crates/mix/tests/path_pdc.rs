@@ -1,16 +1,15 @@
 //! G8 / F05: path-based delay compensation. An impulse placed at the same timeline position on
 //! every source arrives at the main mix at the same output sample, within one sample, whatever
 //! path it takes: latent inserts, a latent instrument, pre- and post-fader sends, aux → bus → aux
-//! cascades, and chains deeper than eight hops. Checked in the legacy realtime path (playback
-//! today), the prepared-plan path, and the two are bit-identical. A session loaded with a routing
+//! cascades, and chains deeper than eight hops. Checked in the prepared-plan path. A session loaded with a routing
 //! loop renders without hanging, deterministically, with the loop broken.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
 use soundcraft_dsp::Plugin;
 use soundcraft_mix::{
-    Adoption, DeviceGeneration, InstanceSpec, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, PreparedInstance, RenderTarget,
-    create_instance, render_range,
+    Adoption, DeviceGeneration, InstanceSpec, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, create_instance,
+    render_range,
 };
 use soundcraft_model::{
     Bus, BusId, ChannelFormat, Clip, EdgeKind, Insert, Route, RouteEdge, RouteNode, SendSlot, Session, SourceAudio, SourceId, TrackId, TrackKind,
@@ -168,28 +167,9 @@ fn target() -> RenderTarget {
     RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
-/// Renders `s` from 0 for `LEN` samples plus the mix latency through one path, and returns the
+/// Renders `s` from 0 for `LEN` samples plus the mix latency, and returns the
 /// main mix's first channel with the latency removed (index = timeline position), and the latency.
-fn render_legacy(s: &Session) -> (Vec<f32>, usize) {
-    MixEngine::force_serial(true);
-    let mut mix = MixEngine::new(SR as f32, BLOCK);
-    mix.set_external_instances(true);
-    let specs = soundcraft_mix::realtime_instance_specs(s);
-    let instances = specs
-        .iter()
-        .filter_map(|spec| {
-            instance(s, spec).map(|plugin| PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id.clone(), ch: spec.ch, plugin })
-        })
-        .collect();
-    mix.adopt(instances);
-    mix.ensure_synced(s);
-    run(s, |pos, out| {
-        mix.render(s, pos, BLOCK, out);
-        mix.latency
-    })
-}
-
-fn render_planned(s: &Session) -> (Vec<f32>, usize) {
+fn render(s: &Session) -> (Vec<f32>, usize) {
     MixEngine::force_serial(true);
     let mut mix = MixEngine::realtime(target());
     let mut compiler = PlanCompiler::new(target(), PlanLimits::default());
@@ -224,15 +204,11 @@ fn arrivals(x: &[f32]) -> Vec<usize> {
     x.iter().enumerate().filter(|(_, v)| v.abs() > 1e-3).map(|(i, _)| i).collect()
 }
 
-/// Every arrival within one sample of `AT`, through both realtime paths, and both bit-identical.
+/// Every arrival within one sample of `AT`.
 /// Returns the arrivals.
 #[track_caller]
 fn assert_aligned(name: &str, s: &Session) -> Vec<usize> {
-    let (a, la) = render_legacy(s);
-    let (b, lb) = render_planned(s);
-    assert_eq!(la, lb, "{name}: legacy and plan mix latency");
-    let diff = a.iter().zip(&b).position(|(x, y)| x.to_bits() != y.to_bits());
-    assert!(diff.is_none(), "{name}: legacy and plan differ at {diff:?}");
+    let (a, la) = render(s);
     let hits = arrivals(&a);
     assert!(!hits.is_empty(), "{name}: the impulses are heard");
     let off: Vec<usize> = hits.iter().copied().filter(|&i| i.abs_diff(AT) > 1).collect();
@@ -244,7 +220,7 @@ fn assert_aligned(name: &str, s: &Session) -> Vec<usize> {
 /// The main mix at `AT` is `level` (every path summed there, none lost).
 #[track_caller]
 fn assert_heard_at(s: &Session, level: f32) {
-    let (a, _) = render_legacy(s);
+    let (a, _) = render(s);
     assert!((a[AT] - level).abs() < 1e-4, "at {AT}: {} (expected {level})", a[AT]);
 }
 
@@ -430,7 +406,7 @@ fn a_loaded_routing_loop_renders_without_the_feedback_edge() {
 fn without_delay_compensation_paths_keep_their_own_latency() {
     let mut s = two_aux_probe();
     s.edit.delay_compensation = false;
-    let (a, la) = render_legacy(&s);
+    let (a, la) = render(&s);
     assert_eq!(la, 0);
     assert_eq!(arrivals(&a), vec![AT, AT + 480]);
 }
@@ -507,7 +483,7 @@ fn a_master_insert_and_a_track_with_no_output_line_up() {
     s.track_mut(m).unwrap().mixer.inserts[0] = Some(delay(77));
     assert_aligned("output none + master insert", &s);
     assert_heard_at(&s, 1.0);
-    assert_eq!(render_legacy(&s).1, 277);
+    assert_eq!(render(&s).1, 277);
 }
 
 #[test]
@@ -520,10 +496,10 @@ fn inactive_tracks_do_not_raise_latency_and_muted_ones_keep_it() {
     let b = bus(&mut s, "B");
     let a = aux(&mut s, "A", b, vec![delay(900)], Route::Main);
     s.track_mut(a).unwrap().inactive = true;
-    assert_eq!((render_legacy(&s).1, render_planned(&s).1), (0, 0));
+    assert_eq!(render(&s).1, 0);
     s.track_mut(slow).unwrap().inactive = false;
     s.track_mut(slow).unwrap().mixer.mute = true;
-    assert_eq!((render_legacy(&s).1, render_planned(&s).1), (500, 500));
+    assert_eq!(render(&s).1, 500);
 }
 
 /// An aux whose output and a send both feed its own input (a loaded self-loop).
@@ -536,9 +512,7 @@ fn a_self_looped_aux_renders_without_feedback() {
     s.track_mut(a).unwrap().mixer.sends[0] = send(b, false);
     s.track_mut(src).unwrap().mixer.sends[0] = send(b, false);
     s.track_mut(src).unwrap().mixer.output = Route::None;
-    let (x, _) = render_legacy(&s);
-    let (y, _) = render_planned(&s);
-    assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()));
+    let (x, _) = render(&s);
     assert!(arrivals(&x).is_empty(), "the aux only feeds itself: dropped, nothing reaches main");
 }
 
@@ -564,9 +538,7 @@ fn the_reported_cut_set_is_the_one_the_render_drops() {
     let l = s.route_graph().layering();
     let yi = s.track_index(y).unwrap();
     let y_to_r = RouteEdge { from: RouteNode::Track(yi), to: RouteNode::Bus(0), kind: EdgeKind::Output };
-    let (a, _) = render_legacy(&s);
-    let (b, _) = render_planned(&s);
-    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()), "legacy == plan");
+    let (a, _) = render(&s);
     // S reaches main through W and R: 0.5. S2 does through Y and R only if Y to R In plays.
     let y_plays = (a[AT] - 1.0).abs() < 1e-4;
     assert!(y_plays || (a[AT] - 0.5).abs() < 1e-4, "level {}", a[AT]);
@@ -587,7 +559,7 @@ fn a_failed_latent_aux_insert_stops_counting() {
     s.track_mut(src).unwrap().mixer.sends[0] = send(b, false);
     let hits = assert_aligned("failed aux insert", &s);
     assert_eq!(hits, vec![AT]);
-    assert_eq!(render_legacy(&s).1, 0, "the failed insert's latency no longer counts");
+    assert_eq!(render(&s).1, 0, "the failed insert's latency no longer counts");
 }
 
 /// A pre-fader send with no compensation delay still takes the pre-fader signal.
@@ -806,10 +778,9 @@ fn moving_an_insert_keeps_the_chain_latency() {
         ins[2] = Some(delay(50));
     }
     assert_aligned("before the move", &s);
-    let (_, latency) = render_planned(&s);
+    let (_, latency) = render(&s);
     let mut moved = s.clone();
     assert!(moved.track_mut(t).unwrap().move_insert(0, 2));
     assert_aligned("after the move", &moved);
-    assert_eq!(render_planned(&moved).1, latency, "the chain's latency does not depend on its order");
-    assert_eq!(render_legacy(&moved).1, latency);
+    assert_eq!(render(&moved).1, latency, "the chain's latency does not depend on its order");
 }

@@ -703,7 +703,7 @@ fn the_real_device_adapter_shares_action_and_urgent_budgets_across_chunks() {
     for i in 0..100 {
         control.send(i, Class::Ordinary, None).unwrap();
     }
-    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut callback = crate::OutputCallback::new(2);
     let mut device = vec![0.0f32; 40_000];
     let (mut actions, mut chunks) = (0, 0);
     let ((), stats) = measure(|| {

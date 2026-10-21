@@ -389,13 +389,12 @@ fn a_new_engine_epoch_refuses_an_aliased_binding() {
 }
 
 #[test]
-fn offline_and_legacy_engines_refuse_every_event() {
+fn an_engine_without_an_epoch_refuses_every_event() {
     let rig = Rig::new();
     let ev = rig.event(port(1, 0), Due::Next, on(60));
-    for mut eng in [MixEngine::new(48_000.0, BLOCK), MixEngine::realtime(target())] {
-        assert_eq!(eng.queue_event(&ev), EventOutcome::StaleEngine);
-        assert_eq!(eng.queue_event(&InstrumentEvent { message: off(60), ..ev }), EventOutcome::StaleEngine);
-    }
+    let mut eng = MixEngine::realtime(target());
+    assert_eq!(eng.queue_event(&ev), EventOutcome::StaleEngine);
+    assert_eq!(eng.queue_event(&InstrumentEvent { message: off(60), ..ev }), EventOutcome::StaleEngine);
 }
 
 #[test]

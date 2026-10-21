@@ -421,7 +421,7 @@ fn the_device_adapter_carries_one_budget_across_conversion_chunks_and_fault_retu
     let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
     control.request(Arc::new(session(ChannelFormat::Stereo)), None);
     control.prepare(&mut make).unwrap();
-    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut callback = crate::OutputCallback::new(2);
     let mut device = vec![0.0f32; 40_000]; // three real scratch-conversion chunks
     let mut chunks = 0;
     callback.fill_with(&mut device, |_, budget, _actions| {
@@ -456,7 +456,7 @@ fn prolonged_render_ahead_deferral_is_counted_once_per_actual_callback() {
     let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
     control.request(Arc::new(session(ChannelFormat::Stereo)), None);
     control.prepare(&mut make).unwrap();
-    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut callback = crate::OutputCallback::new(2);
     let mut device = vec![0.0f32; 40_000];
     let ((), stats) = measure(|| {
         for _ in 0..10 {
@@ -486,7 +486,7 @@ fn returning_an_unadopted_plan_spends_the_callback_budget_before_a_new_publicati
     let (mut control, mut audio) = plan_bridge::pair(target(), PlanLimits::default());
     control.request(Arc::new(session(ChannelFormat::Stereo)), None);
     control.prepare(&mut make).unwrap();
-    let mut callback = crate::OutputCallback::new(2, 48_000);
+    let mut callback = crate::OutputCallback::new(2);
     let mut device = vec![0.0f32; 40_000];
     let mut chunks = 0;
     callback.fill_with(&mut device, |_, budget, _actions| {

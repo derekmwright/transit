@@ -14,7 +14,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
-use soundcraft_mix::{MixEngine, mark_audio_thread};
+use soundcraft_mix::{
+    Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, SlotGen, create_instance,
+    mark_audio_thread,
+};
 use soundcraft_model::{ChannelFormat, Clip, Insert, Session, SourceAudio, SourceId, TrackKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +26,21 @@ use std::time::{Duration, Instant};
 const FRAMES: usize = 128;
 const BLOCKS: usize = 2000;
 const DEADLINE: Duration = Duration::from_micros(2667);
+
+/// An engine that has adopted the plan of `s`.
+fn planned_engine(s: &Session) -> MixEngine {
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: FRAMES as u32, out_channels: 0, in_channels: 0 };
+    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
+    let mut plan = compiler
+        .compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut |spec: &InstanceSpec, _: SlotGen| {
+            create_instance(&spec.id, spec.state.as_deref(), 48_000.0, FRAMES, spec.ch)
+        })
+        .unwrap();
+    let mut engine = MixEngine::realtime(target);
+    assert_eq!(engine.adopt_plan(&mut plan), Adoption::Adopted);
+    compiler.reclaim(plan);
+    engine
+}
 
 fn sixteen_strips() -> Session {
     let mut s = Session::default();
@@ -82,13 +100,13 @@ struct Stats {
 fn run(s: &Session, serial: bool, promote: bool) -> Stats {
     MixEngine::force_serial(serial);
     let s = s.clone();
-    let mut eng = MixEngine::new(48_000.0, FRAMES);
+    let mut eng = planned_engine(&s);
     let mut times = std::thread::spawn(move || {
         let p = if promote { soundcraft_rt::promote_audio_thread() } else { soundcraft_rt::Promotion::Unsupported("disabled") };
         mark_audio_thread();
         let mut out = vec![vec![0.0f32; FRAMES]; 2];
         for b in 0..64 {
-            eng.render(&s, b * FRAMES as i64, FRAMES, &mut out);
+            eng.render_active(b * FRAMES as i64, FRAMES, &mut out);
         }
         let mut times = Vec::with_capacity(BLOCKS);
         // Paced like a device callback: one block per period, idle in between (a back-to-back
@@ -99,7 +117,7 @@ fn run(s: &Session, serial: bool, promote: bool) -> Stats {
                 std::thread::sleep(wait);
             }
             let t = Instant::now();
-            eng.render(&s, b as i64 * FRAMES as i64, FRAMES, &mut out);
+            eng.render_active(b as i64 * FRAMES as i64, FRAMES, &mut out);
             times.push(t.elapsed());
         }
         soundcraft_rt::demote(p);
@@ -122,7 +140,7 @@ fn run(s: &Session, serial: bool, promote: bool) -> Stats {
 fn headroom_serial_vs_pool_under_load() {
     let promote = !std::env::var(soundcraft_mix::RENDER_NO_PRIORITY_ENV).is_ok_and(|v| v.trim() == "1");
     let s = sixteen_strips();
-    let _warm = MixEngine::new(48_000.0, FRAMES);
+    let _warm = planned_engine(&s);
     std::thread::sleep(Duration::from_millis(100));
     println!("priority: {}; workers: {:?}", if promote { "promoted" } else { "default" }, soundcraft_mix::render_worker_promotions());
     println!("{:<6} {:<6} {:>10} {:>10} {:>10} {:>6}", "path", "load", "worst_us", "p99_us", "median_us", "late");

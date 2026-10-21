@@ -281,7 +281,7 @@ fn only_main_falls_back_and_a_path_table_without_routes_adds_nothing() {
 }
 
 #[test]
-fn a_legacy_render_drops_a_path_route_without_panicking() {
+fn an_offline_render_drops_a_path_route_without_panicking() {
     let mut s = session();
     impulse_track(&mut s, "Cue", Route::Hardware("Out 3-4".into()));
     let out = render_range(&s, Range::new(0, LEN as i64), 512);

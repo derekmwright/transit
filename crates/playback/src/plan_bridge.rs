@@ -4,7 +4,6 @@
 //! in control-owned holders; callbacks borrow the audio endpoint. The caller admits a plan
 //! only at a drained render-ahead boundary, and shares one [`CallbackBudget`] across every
 //! conversion chunk of an actual device callback. Device/rate transitions need a new pair.
-//! The legacy Player path is replaced separately after this bridge's contract tests.
 
 use crate::{MeterSnapshot, fold_gains, publication, record::InputRing, session_has_hosted};
 use soundcraft_mix::{

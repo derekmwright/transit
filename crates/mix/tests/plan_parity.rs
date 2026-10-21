@@ -1,24 +1,16 @@
 //! Parity (F01b): for representative sessions and edit sequences, a realtime engine fed through
 //! `PlanCompiler::compile` + `MixEngine::adopt_plan` + `render_active` puts out what the golden
-//! outputs in `tests/golden/plan_parity` hold (generated from the legacy renderer, which these
-//! sessions matched bit for bit: `UPDATE_GOLDEN=1` rewrites them from the plan path).
-//!
-//! While the `legacy-render` feature exists the same sessions are also compared against today's
-//! realtime path (`MixEngine::adopt` + `render`, instances from `realtime_instance_specs`) sample
-//! for sample on every channel. Everything behind `cfg(feature = "legacy-render")` goes away with
-//! the legacy renderer (ADR 0015, slice 0 part 2); the golden checks stay.
+//! outputs in `tests/golden/plan_parity` hold. They were generated from the pre-plan renderer,
+//! which these sessions matched bit for bit; they are the oracle now (`UPDATE_GOLDEN=1` rewrites
+//! them from the plan path, which a change in the mix's output must justify).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
 use soundcraft_midi::{Note, Sequence};
-#[cfg(feature = "legacy-render")]
-use soundcraft_mix::PreparedInstance;
 use soundcraft_mix::{Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, create_instance};
 use soundcraft_model::{
     Bus, BusId, ChannelFormat, Clip, Insert, OutputPath, Route, SendSlot, Session, SourceAudio, SourceId, SurroundPan, TrackId, TrackKind,
 };
-#[cfg(feature = "legacy-render")]
-use std::collections::HashMap;
 use std::sync::Arc;
 
 const SR: u32 = 48_000;
@@ -26,41 +18,6 @@ const BLOCK: usize = 256;
 
 fn target() -> RenderTarget {
     RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
-}
-
-/// Today's realtime path, as `playback` drives it.
-#[cfg(feature = "legacy-render")]
-struct Legacy {
-    mix: MixEngine,
-    shadow: HashMap<(TrackId, usize), (String, usize)>,
-}
-
-#[cfg(feature = "legacy-render")]
-impl Legacy {
-    fn new() -> Self {
-        let mut mix = MixEngine::new(SR as f32, BLOCK);
-        mix.set_external_instances(true);
-        Legacy { mix, shadow: HashMap::new() }
-    }
-
-    fn update(&mut self, s: &Session) {
-        let specs = soundcraft_mix::realtime_instance_specs(s);
-        self.shadow.retain(|k, _| specs.iter().any(|x| (x.track, x.slot) == *k));
-        let mut out = Vec::new();
-        for spec in specs {
-            let key = (spec.track, spec.slot);
-            if self.shadow.get(&key).is_some_and(|(id, ch)| *id == spec.id && *ch == spec.ch) {
-                continue;
-            }
-            self.shadow.insert(key, (spec.id.clone(), spec.ch));
-            if let Some(n) = create_instance(&spec.id, spec.state.as_deref(), SR as f32, BLOCK, spec.ch) {
-                out.push(PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, plugin: n.plugin });
-            }
-        }
-        self.mix.adopt(out);
-        self.mix.ensure_synced(s);
-        drop(self.mix.take_retired());
-    }
 }
 
 /// The plan path.
@@ -93,7 +50,6 @@ impl Planned {
 /// multiply-adds differently, Apple libm) round the transcendental functions in the filters and the
 /// plate reverb differently. In the feedback paths that drift is absolute, not proportional: CI saw
 /// 8.2e-5 at a level of 0.045 (Linux) and 5.0e-5 at 0.0023 (macOS) in the aux chains session.
-/// Legacy-versus-plan parity stays bit for bit on every platform; only the goldens get slack.
 const GOLDEN_ABS_TOLERANCE: f32 = 3e-4;
 const GOLDEN_REL_TOLERANCE: f32 = 2e-3;
 
@@ -140,45 +96,23 @@ impl Golden {
 }
 
 /// Renders `sessions` one after the other (each one an edit of the one before), `blocks` blocks
-/// each, through the plan path and checks the golden output; with the legacy renderer present it
-/// also renders the legacy path and compares every channel of every block bit for bit.
+/// each, through the plan path and checks the golden output.
 fn assert_parity(name: &str, sessions: &[Session], blocks: usize) {
     MixEngine::force_serial(true);
-    #[cfg(feature = "legacy-render")]
-    let mut legacy = Legacy::new();
     let mut planned = Planned::new();
     let mut golden = Golden::new(name);
     let mut pos = 0i64;
     let mut heard = false;
-    #[cfg_attr(not(feature = "legacy-render"), allow(unused_variables))]
-    for (step, s) in sessions.iter().enumerate() {
-        #[cfg(feature = "legacy-render")]
-        legacy.update(s);
+    for s in sessions {
         planned.update(s);
         let ch = soundcraft_mix::main_channels(s);
         let mut b = vec![vec![0.0f32; BLOCK]; ch];
         for k in 0..blocks {
             planned.mix.render_active(pos, BLOCK, &mut b);
-            #[cfg(feature = "legacy-render")]
-            {
-                let mut a = vec![vec![0.0f32; BLOCK]; ch];
-                legacy.mix.render(s, pos, BLOCK, &mut a);
-                for c in 0..ch {
-                    let diff = a[c].iter().zip(&b[c]).position(|(x, y)| x.to_bits() != y.to_bits());
-                    assert!(
-                        diff.is_none(),
-                        "{name}: step {step}, block {k}, channel {c}, frame {diff:?}: {:?} vs {:?}",
-                        a[c][diff.unwrap()],
-                        b[c][diff.unwrap()]
-                    );
-                }
-            }
             golden.block(k, &b);
             heard |= b.iter().flatten().any(|x| *x != 0.0);
             pos += BLOCK as i64;
         }
-        #[cfg(feature = "legacy-render")]
-        assert_eq!(legacy.mix.latency, planned.mix.latency, "{name}: step {step}: delay compensation");
         golden.value(planned.mix.latency);
     }
     assert!(heard, "{name}: the sessions make sound");
@@ -210,7 +144,7 @@ fn send(bus: BusId, pre: bool) -> Option<SendSlot> {
 }
 
 #[test]
-fn inserts_sends_auxes_and_a_master_fader_match_todays_path() {
+fn inserts_sends_auxes_and_a_master_fader_match_the_golden() {
     let mut s = Session::default();
     s.edit.delay_compensation = true;
     let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);
@@ -246,7 +180,7 @@ fn inserts_sends_auxes_and_a_master_fader_match_todays_path() {
 }
 
 #[test]
-fn instruments_and_midi_match_todays_path() {
+fn instruments_and_midi_match_the_golden() {
     let mut s = Session::default();
     let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
     let mut seq = Sequence::default();
@@ -267,7 +201,7 @@ fn instruments_and_midi_match_todays_path() {
 }
 
 #[test]
-fn surround_and_clip_effects_match_todays_path() {
+fn surround_and_clip_effects_match_the_golden() {
     let mut s =
         Session { outputs: vec![OutputPath { name: "5.1".into(), first_channel: 0, format: ChannelFormat::Surround51 }], ..Session::default() };
     let mono = add_audio(&mut s, ChannelFormat::Mono, 1, 0.03);
@@ -288,7 +222,7 @@ fn surround_and_clip_effects_match_todays_path() {
 }
 
 #[test]
-fn aux_chains_folders_inactive_tracks_and_two_masters_match_todays_path() {
+fn aux_chains_folders_inactive_tracks_and_two_masters_match_the_golden() {
     let mut s = Session::default();
     s.edit.delay_compensation = true;
     let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);
@@ -337,7 +271,7 @@ fn aux_chains_folders_inactive_tracks_and_two_masters_match_todays_path() {
 }
 
 #[test]
-fn seeks_with_held_notes_match_todays_path() {
+fn seeks_with_held_notes_match_the_golden() {
     MixEngine::force_serial(true);
     let mut s = Session::default();
     let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
@@ -349,35 +283,23 @@ fn seeks_with_held_notes_match_todays_path() {
     let tr = s.track_mut(t).unwrap();
     tr.playlist_mut().unwrap().clips.push(Clip::midi(cid, "n", 0, 96_000, seq));
     tr.instrument = Some(builtin("subtractive_synth"));
-    #[cfg(feature = "legacy-render")]
-    let mut legacy = Legacy::new();
     let mut planned = Planned::new();
-    #[cfg(feature = "legacy-render")]
-    legacy.update(&s);
     planned.update(&s);
     let mut golden = Golden::new("seeks with held notes");
     let mut b = vec![vec![0.0f32; BLOCK]; 2];
     for (k, pos) in [0i64, 256, 512, 768, 20_000, 20_256, 0, 256, 512].into_iter().enumerate() {
         if k == 5 {
             s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("chorus"));
-            #[cfg(feature = "legacy-render")]
-            legacy.update(&s);
             planned.update(&s);
         }
         planned.mix.render_active(pos, BLOCK, &mut b);
-        #[cfg(feature = "legacy-render")]
-        {
-            let mut a = vec![vec![0.0f32; BLOCK]; 2];
-            legacy.mix.render(&s, pos, BLOCK, &mut a);
-            assert_eq!(a, b, "block {k} at {pos}");
-        }
         golden.block(k, &b);
     }
     golden.check();
 }
 
 #[test]
-fn reordered_tracks_match_todays_path() {
+fn reordered_tracks_match_the_golden() {
     let mut s = Session::default();
     let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);
     let b = add_audio(&mut s, ChannelFormat::Stereo, 2, 0.07);
@@ -431,7 +353,7 @@ fn an_inactive_aux_keeps_its_latency_across_a_structural_plan() {
 /// latent instrument, a lookahead change at runtime, and a routing loop (an older session) added
 /// and removed.
 #[test]
-fn path_based_delay_compensation_matches_todays_path() {
+fn path_based_delay_compensation_matches_the_golden() {
     let mut s = Session::default();
     s.edit.delay_compensation = true;
     let a = add_audio(&mut s, ChannelFormat::Stereo, 1, 0.02);

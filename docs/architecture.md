@@ -31,8 +31,7 @@ records one undo step. See [`commands.md`](contributing/knowledge/commands.md).
 
 ## Audio
 
-The plan renderer serves realtime playback, bounces and freezes. (The old `MixEngine::render` path
-is being removed; until it is gone it stays in `crates/mix` only as the oracle of the parity tests.) The control
+The plan renderer serves realtime playback, bounces and freezes. (The old `MixEngine::render` path is gone.) The control
 side compiles a session into a preallocated `PreparedPlan`; the audio callback adopts it at a block
 boundary and renders without allocating or locking. Plug-in delay compensation aligns every path to
 the sinks. Details: [`plan-renderer.md`](contributing/knowledge/plan-renderer.md),

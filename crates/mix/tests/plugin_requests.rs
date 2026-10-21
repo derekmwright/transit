@@ -8,11 +8,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_dsp::PluginStateReader;
-use soundcraft_mix::{MixEngine, PreparedInstance, realtime_instance_specs};
+use soundcraft_mix::{
+    Adoption, DeviceGeneration, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, SlotGen, realtime_instance_specs,
+};
 use soundcraft_model::{ChannelFormat, Insert, Route, Session, TrackKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 const REQUESTS: &str = "clap:org.soundcraft.test.requests";
@@ -68,7 +70,7 @@ fn session() -> Session {
     s
 }
 
-/// A realtime-mode engine holding a requests instance made and prepared here, then given
+/// A plan engine holding a requests instance made and prepared here, then given
 /// `command` (a fixture `CMD:`), with that instance's state reader.
 fn engine(s: &Session, command: &[u8]) -> (MixEngine, Box<dyn PluginStateReader>) {
     fixture();
@@ -77,9 +79,14 @@ fn engine(s: &Session, command: &[u8]) -> (MixEngine, Box<dyn PluginStateReader>
     p.prepare(48_000.0, BLOCK, spec.ch);
     assert!(p.load_state(command));
     let reader = p.state_reader().unwrap();
-    let mut eng = MixEngine::new(48_000.0, BLOCK);
-    eng.set_external_instances(true);
-    eng.adopt(vec![PreparedInstance { track: spec.track, slot: spec.slot, id: spec.id, ch: spec.ch, plugin: p }]);
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
+    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
+    let mut instance = Some(p);
+    let mut make = |_: &soundcraft_mix::InstanceSpec, _: SlotGen| instance.take().map(|plugin| NewInstance { plugin, refused_state: false });
+    let mut plan = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut make).unwrap();
+    let mut eng = MixEngine::realtime(target);
+    assert_eq!(eng.adopt_plan(&mut plan), Adoption::Adopted);
+    compiler.reclaim(plan);
     (eng, reader)
 }
 
@@ -100,7 +107,7 @@ fn a_sleeping_clap_effect_that_requests_process_is_woken_by_the_mixer() {
     let mut pos = 0;
     let mut blocks = 0;
     let mut render = |eng: &mut MixEngine| {
-        eng.render(&s, pos, BLOCK, &mut out);
+        eng.render_active(pos, BLOCK, &mut out);
         pos += BLOCK as i64;
         blocks += 1;
     };
@@ -126,12 +133,12 @@ fn the_latency_after_a_clap_restart_reaches_delay_compensation() {
     // Asked before it ever processed; after the restart it reports 64 samples.
     let (mut eng, mut reader) = engine(&s, b"CMD:restart-now:64");
     let mut out = vec![vec![0.0f32; BLOCK]; 2];
-    eng.render(&s, 0, BLOCK, &mut out);
+    eng.render_active(0, BLOCK, &mut out);
     assert_eq!(eng.latency, 5, "the fixture starts at 5 samples");
     let mut pos = BLOCK as i64;
     for _ in 0..10 {
         soundcraft_clap_host::service_requests();
-        eng.render(&s, pos, BLOCK, &mut out);
+        eng.render_active(pos, BLOCK, &mut out);
         pos += BLOCK as i64;
         if eng.latency == 64 {
             break;
@@ -162,7 +169,7 @@ fn a_parked_clap_effect_is_silent_not_dry_and_keeps_its_compensation() {
     let mut out = vec![vec![0.0f32; BLOCK]; 2];
     let mut pos = 0i64;
     let mut block = |eng: &mut MixEngine| {
-        eng.render(&s, pos, BLOCK, &mut out);
+        eng.render_active(pos, BLOCK, &mut out);
         pos += BLOCK as i64;
         out[0].clone()
     };

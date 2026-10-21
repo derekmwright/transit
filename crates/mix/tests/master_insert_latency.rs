@@ -3,12 +3,29 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
-use soundcraft_mix::{MixEngine, render_range};
+use soundcraft_mix::{
+    Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, SlotGen, create_instance,
+    render_range,
+};
 use soundcraft_model::{ChannelFormat, Clip, Insert, Route, Session, SourceAudio, SourceId, TrackKind};
 use soundcraft_time::Range;
 use std::sync::Arc;
 
 const AT: usize = 2000;
+
+const FRAMES: usize = 512;
+
+/// An engine that has adopted the plan of `s`.
+fn planned_engine(s: &Session) -> MixEngine {
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: FRAMES as u32, out_channels: 0, in_channels: 0 };
+    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
+    let mut make = |spec: &InstanceSpec, _: SlotGen| create_instance(&spec.id, spec.state.as_deref(), 48_000.0, FRAMES, spec.ch);
+    let mut plan = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut make).unwrap();
+    let mut engine = MixEngine::realtime(target);
+    assert_eq!(engine.adopt_plan(&mut plan), Adoption::Adopted);
+    compiler.reclaim(plan);
+    engine
+}
 
 /// One track with an impulse at `AT` (and a loud steady tone after it, so a limiter has work),
 /// routed to the main mix, plus a master fader carrying `insert` when given.
@@ -46,9 +63,9 @@ fn a_master_insert_with_lookahead_does_not_delay_the_bounce() {
     assert_eq!(out[0].len(), 12_000);
     assert_eq!(peak_at(&out[0]), AT, "the limited impulse lines up with the mix without the master insert");
     assert_eq!(peak_at(&out[1]), AT);
-    let mut probe = MixEngine::new(48_000.0, 512);
+    let mut probe = planned_engine(&s);
     let mut tmp = vec![vec![0.0f32; 512]; 2];
-    probe.render(&s, 0, 512, &mut tmp);
+    probe.render_active(0, 512, &mut tmp);
     assert!(probe.latency > 0, "the Maximizer reports a lookahead");
     // With Delay Compensation off nothing is compensated (and nothing is dropped).
     let mut off = s.clone();

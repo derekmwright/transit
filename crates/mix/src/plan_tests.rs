@@ -1147,7 +1147,7 @@ fn a_hint_sizes_every_strip_below_it_once_and_is_dropped_when_it_does_not_fit() 
     rig.publish(&s);
     let cap = |rig: &Rig, t: TrackId| {
         let p = rig.eng.plan.as_deref().unwrap();
-        p.tables.strips[p.tables.strip_of(t).unwrap()].tap.cap
+        Some(p.tables.strips[p.tables.strip_of(t).unwrap()].tap.len)
     };
     // Status without a clamp changes nothing.
     rig.comp.observe(&PlanStatus { required_latency: 40_000, ..PlanStatus::default() });

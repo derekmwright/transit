@@ -26,10 +26,5 @@ rayon.workspace = true
 soundcraft-rt = { workspace = true, features = ["testing"] }
 soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
 
-[features]
-# The pre-plan offline renderer, kept as the parity oracle until ADR 0015 slice 0 part 2 deletes it.
-default = ["legacy-render"]
-legacy-render = []
-
 [lints]
 workspace = true

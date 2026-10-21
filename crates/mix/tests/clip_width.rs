@@ -1,9 +1,12 @@
-//! Width conversion must keep every source channel, on both realtime render paths, without
+//! Width conversion must keep every source channel, in the plan renderer, without
 //! allocating. Values are deliberately asymmetric: copying only the left channel cannot pass.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
-use soundcraft_mix::{Adoption, DeviceGeneration, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, render_clips};
+use soundcraft_mix::{
+    Adoption, DeviceGeneration, InstanceSpec, MixEngine, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, SlotGen, create_instance,
+    render_clips,
+};
 use soundcraft_model::{ChannelFormat, Clip, ClipId, Session, SourceAudio, SourceId, TrackId, TrackKind};
 use soundcraft_rt::testing::{CountingAlloc, measure};
 use soundcraft_time::Range;
@@ -30,35 +33,36 @@ fn assert_fold(values: &[f32], format: ChannelFormat, expected: &[f32]) {
     let dry = render_clips(&s, t, Range::new(0, BLOCK as i64));
     assert_eq!(dry, expected.iter().map(|v| vec![*v; BLOCK]).collect::<Vec<_>>());
 
-    let mut legacy = MixEngine::new(48_000.0, BLOCK);
-    legacy.set_external_instances(true);
-    legacy.ensure_synced(&s);
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
-    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
-    let mut plan = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut |_, _| None).unwrap();
-    let mut planned = MixEngine::realtime(target);
-    assert_eq!(planned.adopt_plan(&mut plan), Adoption::Adopted);
-    compiler.reclaim(plan);
-    let mut a = vec![vec![0.0; BLOCK]; 2];
-    let mut b = a.clone();
-    let mut reference = a.clone();
-    // Like alloc_probe: initialize the legacy path's lazy storage before measuring callbacks.
-    legacy.render(&s, 0, BLOCK, &mut a);
+    let mut planned = planned_engine(&s);
+    let mut b = vec![vec![0.0; BLOCK]; 2];
+    let mut reference = b.clone();
     // An already-folded source is the oracle for panning, faders, and master processing.
     let (reference_session, _) = session(expected, format);
-    let mut reference_mix = MixEngine::new(48_000.0, BLOCK);
+    let mut reference_mix = planned_engine(&reference_session);
     for block in 0..4 {
         let pos = (block * BLOCK) as i64;
-        let (_, legacy_allocs) = measure(|| legacy.render(&s, pos, BLOCK, &mut a));
         let (_, planned_allocs) = measure(|| planned.render_active(pos, BLOCK, &mut b));
-        assert_eq!((legacy_allocs.allocs, legacy_allocs.frees), (0, 0), "legacy: {legacy_allocs:?}");
         assert_eq!((planned_allocs.allocs, planned_allocs.frees), (0, 0), "plan: {planned_allocs:?}");
-        reference_mix.render(&reference_session, pos, BLOCK, &mut reference);
-        for ((x, y), expected) in a.iter().flatten().zip(b.iter().flatten()).zip(reference.iter().flatten()) {
-            assert_eq!(x.to_bits(), y.to_bits(), "legacy and plan must be bit-identical");
-            assert_eq!(x.to_bits(), expected.to_bits(), "folded signal must reach the mix");
+        reference_mix.render_active(pos, BLOCK, &mut reference);
+        for (y, expected) in b.iter().flatten().zip(reference.iter().flatten()) {
+            assert_eq!(y.to_bits(), expected.to_bits(), "folded signal must reach the mix");
         }
     }
+}
+
+/// An engine that has adopted the plan of `s`.
+fn planned_engine(s: &Session) -> MixEngine {
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
+    let mut compiler = PlanCompiler::new(target, PlanLimits::default());
+    let mut plan = compiler
+        .compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut |spec: &InstanceSpec, _: SlotGen| {
+            create_instance(&spec.id, spec.state.as_deref(), 48_000.0, BLOCK, spec.ch)
+        })
+        .unwrap();
+    let mut engine = MixEngine::realtime(target);
+    assert_eq!(engine.adopt_plan(&mut plan), Adoption::Adopted);
+    compiler.reclaim(plan);
+    engine
 }
 
 #[test]

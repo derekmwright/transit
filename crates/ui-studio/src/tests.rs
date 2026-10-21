@@ -2187,11 +2187,26 @@ fn change_width_remaps_hardware_inputs_and_undo_restores_both() {
         // Pure planning only: no recorder or hardware device is opened.
         let takes = soundcraft_engine::io::plan_takes(&app.engine, std::path::Path::new(env!("CARGO_MANIFEST_DIR")), 4);
         assert_eq!(takes[0].1, channels);
-        let mut mix = soundcraft_mix::MixEngine::new(48_000.0, 64);
+        let target = soundcraft_mix::RenderTarget {
+            device: soundcraft_mix::DeviceGeneration(1),
+            sample_rate: 48_000,
+            max_block: 64,
+            out_channels: 0,
+            in_channels: 0,
+        };
+        let mut compiler = soundcraft_mix::PlanCompiler::new(target, soundcraft_mix::PlanLimits::default());
+        let mut make = |spec: &soundcraft_mix::InstanceSpec, _: soundcraft_mix::SlotGen| {
+            soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 64, spec.ch)
+        };
+        let session = std::sync::Arc::new(app.engine.session().clone());
+        let mut plan = compiler.compile(session, compiler.active(), soundcraft_mix::PlanGeneration::from_raw(1), &mut make).unwrap();
+        let mut mix = soundcraft_mix::MixEngine::realtime(target);
+        assert_eq!(mix.adopt_plan(&mut plan), soundcraft_mix::Adoption::Adopted);
+        compiler.reclaim(plan);
         mix.monitor_only = true;
         mix.input = vec![vec![0.2; 64], vec![0.4; 64], vec![0.6; 64], vec![0.8; 64]];
         let mut out = vec![vec![0.0; 64]; 2];
-        mix.render(app.engine.session(), 0, 64, &mut out);
+        mix.render_active(0, 64, &mut out);
         for (c, output) in out.iter().enumerate() {
             let expected =
                 if channels.len() == 1 { mix.input[channels[0]][32] * std::f32::consts::FRAC_1_SQRT_2 } else { mix.input[channels[c]][32] };
