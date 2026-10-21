@@ -30,7 +30,7 @@ const BLOCK: usize = 256;
 const BLOCKS: i64 = 64;
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
 /// Shared by every fake instance: drop threads, and the latency `clap:test.latent` reports.

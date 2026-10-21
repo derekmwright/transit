@@ -253,7 +253,7 @@ pub fn pair<T: Copy>(bridge: &plan_bridge::Control) -> (Control<T>, Audio<T>) {
 /// use soundcraft_playback::{action_lane, plan_bridge};
 /// use soundcraft_mix::{DeviceGeneration, PlanLimits, RenderTarget};
 /// let (bridge, _) = plan_bridge::pair(
-///     RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 },
+///     RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 },
 ///     PlanLimits::default(),
 /// );
 /// let _ = action_lane::pair_with_result::<(), [u8; 65]>(&bridge);

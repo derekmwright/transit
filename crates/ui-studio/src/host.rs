@@ -613,6 +613,7 @@ impl StudioApp {
             self.ensure_input();
         }
         self.audio_devices.begin_verification();
+        self.io_adopt = true;
         Ok(captured)
     }
 

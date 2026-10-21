@@ -161,6 +161,10 @@ pub struct Engine {
     pub last_selection: Option<(soundcraft_time::Range, Vec<TrackId>)>,
     /// Audio imports being prepared on worker threads (L30); emptied when the session is replaced.
     pub imports: import::Imports,
+    /// This machine's I/O paths for the open audio device (ADR 0015). Per machine, not part of
+    /// the document: editing it neither dirties the session nor makes an undo step.
+    io: soundcraft_model::IoMap,
+    io_revision: u64,
 }
 
 /// Logs the routing loops a document holds as it is opened (an older file: the mix renders it
@@ -206,7 +210,26 @@ impl Engine {
             messages: Vec::new(),
             last_selection: None,
             imports: import::Imports::default(),
+            io: soundcraft_model::IoMap::default(),
+            io_revision: 0,
         }
+    }
+
+    /// The machine's I/O map. Headless and test engines hold the stereo default until the host
+    /// hands over the opened device's table (`set_io_map`, `setup.io_map`).
+    pub fn io_map(&self) -> &soundcraft_model::IoMap {
+        &self.io
+    }
+
+    /// Counts every change to the I/O map, so a host can pass it on to the audio device.
+    pub fn io_revision(&self) -> u64 {
+        self.io_revision
+    }
+
+    /// Replace the machine's I/O map (the host, after opening a device).
+    pub fn set_io_map(&mut self, io: soundcraft_model::IoMap) {
+        self.io = io;
+        self.io_revision = self.io_revision.wrapping_add(1);
     }
 
     pub fn session(&self) -> &Session {

@@ -32,7 +32,7 @@ pub use player::{ActionResult, Player, PlayerCommand, PlayerError, PlayerNotice}
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
-use soundcraft_model::{Session, TrackId, TrackKind};
+use soundcraft_model::{MAX_DEVICE_CHANNELS, Session, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
@@ -771,10 +771,9 @@ impl LegacyPlayer {
             editors_open: AtomicBool::new(false),
         });
         let want = session.sample_rate.hz();
-        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
-        match open_device(want, want_ch, cfg) {
+        match open_device(want, cfg) {
             Ok((device, config, format, name, system)) => {
                 let duplex = input_with_output(system, || {
                     use cpal::traits::DeviceTrait;
@@ -1328,45 +1327,53 @@ where
     Ok((stream, reader))
 }
 
+/// What an output stream is opened with: the configuration, the buffer sizes it allows, the format.
+type OutputChoice = (cpal::StreamConfig, cpal::SupportedBufferSize, cpal::SampleFormat);
+
+/// The best output configuration at one of `rates` (tried in order): the best sample format first
+/// (f32, else 32- or 16-bit integers), then the most channels the device offers, stereo or wider
+/// and at most [`MAX_DEVICE_CHANNELS`] (ADR 0015: every output opens, not only the main bus's
+/// width; paths other than Main stay silent in this slice). A stereo-only device gets its two
+/// channels exactly as before. WASAPI shared mode lists only the system mix format's channel
+/// count, so on Windows more than that is ASIO.
+fn choose_output(configs: &[cpal::SupportedStreamConfigRange], rates: &[u32]) -> Option<OutputChoice> {
+    let better = |c: &cpal::SupportedStreamConfigRange, x: &OutputChoice| {
+        let (rc, rx) = (devices::format_rank(c.sample_format()).unwrap_or(usize::MAX), devices::format_rank(x.2).unwrap_or(usize::MAX));
+        rc < rx || (rc == rx && c.channels() > x.0.channels)
+    };
+    for &rate in rates {
+        let mut chosen: Option<OutputChoice> = None;
+        for c in configs {
+            if devices::format_rank(c.sample_format()).is_some()
+                && c.min_sample_rate().0 <= rate
+                && c.max_sample_rate().0 >= rate
+                && c.channels() >= 2
+                && usize::from(c.channels()) <= MAX_DEVICE_CHANNELS
+                && chosen.as_ref().is_none_or(|x| better(c, x))
+            {
+                chosen = Some((c.with_sample_rate(cpal::SampleRate(rate)).config(), *c.buffer_size(), c.sample_format()));
+            }
+        }
+        if chosen.is_some() {
+            return chosen;
+        }
+    }
+    None
+}
+
 /// Open the output device `cfg` chooses (else the default) at the chosen rate (else the session
-/// rate) if possible, in the best sample format it offers (f32, else 32- or 16-bit integers),
-/// with as many channels as it offers up to `want_ch` (at least stereo when available), and the
-/// chosen buffer size when the device allows it.
+/// rate) if possible, with every channel it offers ([`choose_output`]), and the chosen buffer
+/// size when the device allows it.
 /// Also returns the audio system's name.
-fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<OpenedDevice, String> {
+fn open_device(want_rate: u32, cfg: &AudioConfig) -> Result<OpenedDevice, String> {
     use cpal::traits::DeviceTrait;
     let host = devices::host(cfg).ok_or_else(|| "no audio system".to_string())?;
     let device = devices::device(host, cfg.output.as_deref(), true).ok_or_else(|| "no output device".to_string())?;
     #[allow(deprecated)]
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
     // Prefer a config at the chosen (else session) rate; else the device default (we resample).
-    let want_ch = want_ch.max(2);
     let rates: Vec<u32> = cfg.sample_rate.into_iter().chain(Some(want_rate)).collect();
-    let mut chosen: Option<(cpal::StreamConfig, cpal::SupportedBufferSize, cpal::SampleFormat)> = None;
-    // Better: a preferred format first, then more channels.
-    let better = |c: &cpal::SupportedStreamConfigRange, x: &(cpal::StreamConfig, cpal::SupportedBufferSize, cpal::SampleFormat)| {
-        let (rc, rx) = (devices::format_rank(c.sample_format()).unwrap_or(usize::MAX), devices::format_rank(x.2).unwrap_or(usize::MAX));
-        rc < rx || (rc == rx && c.channels() > x.0.channels)
-    };
-    if let Ok(configs) = device.supported_output_configs() {
-        let configs: Vec<cpal::SupportedStreamConfigRange> = configs.collect();
-        for rate in rates {
-            for c in &configs {
-                if devices::format_rank(c.sample_format()).is_some()
-                    && c.min_sample_rate().0 <= rate
-                    && c.max_sample_rate().0 >= rate
-                    && c.channels() >= 2
-                    && c.channels() <= want_ch
-                    && chosen.as_ref().is_none_or(|x| better(c, x))
-                {
-                    chosen = Some((c.with_sample_rate(cpal::SampleRate(rate)).config(), *c.buffer_size(), c.sample_format()));
-                }
-            }
-            if chosen.is_some() {
-                break;
-            }
-        }
-    }
+    let chosen = device.supported_output_configs().ok().and_then(|configs| choose_output(&configs.collect::<Vec<_>>(), &rates));
     let (config, format) = match chosen {
         Some((mut c, buffers, format)) => {
             c.buffer_size = devices::buffer_size(cfg.buffer_size, &buffers);
@@ -1390,6 +1397,50 @@ fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<Opened
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Output ranges as an ASIO driver lists them: every width 1..=`most` at 44.1 and 48 kHz.
+    fn widths(most: u16, format: cpal::SampleFormat) -> Vec<cpal::SupportedStreamConfigRange> {
+        (1..=most)
+            .map(|n| {
+                cpal::SupportedStreamConfigRange::new(
+                    n,
+                    cpal::SampleRate(44_100),
+                    cpal::SampleRate(48_000),
+                    cpal::SupportedBufferSize::Range { min: 64, max: 2048 },
+                    format,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_two_channel_device_opens_the_same_two_channels_as_before() {
+        let (config, _, format) = choose_output(&widths(2, cpal::SampleFormat::F32), &[48_000]).unwrap();
+        assert_eq!((config.channels, config.sample_rate.0, format), (2, 48_000, cpal::SampleFormat::F32));
+        // A device that lists only stereo (WASAPI's mix format) is the same.
+        let only = widths(2, cpal::SampleFormat::F32).split_off(1);
+        assert_eq!(choose_output(&only, &[48_000]).unwrap().0.channels, 2);
+    }
+
+    #[test]
+    fn a_wide_device_opens_every_output_up_to_the_cap() {
+        assert_eq!(choose_output(&widths(10, cpal::SampleFormat::I32), &[48_000]).unwrap().0.channels, 10);
+        let capped = choose_output(&widths(34, cpal::SampleFormat::I32), &[48_000]).unwrap().0.channels;
+        assert_eq!(usize::from(capped), MAX_DEVICE_CHANNELS, "a 34-channel device opens its first 32");
+        // A device that lists only an over-cap width gets the default configuration instead.
+        assert!(choose_output(&widths(34, cpal::SampleFormat::I32).split_off(33), &[48_000]).is_none());
+        // A mono-only device is not chosen here either (the default configuration serves it).
+        assert!(choose_output(&widths(1, cpal::SampleFormat::F32), &[48_000]).is_none());
+    }
+
+    #[test]
+    fn format_beats_width_and_the_wanted_rate_beats_the_other() {
+        let mut configs = widths(10, cpal::SampleFormat::I32);
+        configs.extend(widths(2, cpal::SampleFormat::F32));
+        assert_eq!(choose_output(&configs, &[48_000]).unwrap().0.channels, 2, "f32 stereo is preferred over 32-bit integers");
+        let (config, ..) = choose_output(&widths(4, cpal::SampleFormat::F32), &[96_000, 44_100]).unwrap();
+        assert_eq!((config.channels, config.sample_rate.0), (4, 44_100));
+    }
 
     #[test]
     fn reusable_meter_snapshot_updates_and_drops_stale_tracks() {

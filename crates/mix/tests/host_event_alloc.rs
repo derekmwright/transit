@@ -195,7 +195,7 @@ fn midi_dialect_source_revocation_keeps_the_other_source_sounding_without_alloca
     let mut plugin = clap_events(true);
     plugin.prepare(48_000.0, BLOCK, 2);
     let mut plugin: Option<Box<dyn Plugin>> = Some(Box::new(OffObserver { inner: plugin, offs: Arc::clone(&offs) }));
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
     let mut mix = MixEngine::realtime_with_events(target, EngineEpoch::FIRST, EventLimits::default());
     let mut comp = PlanCompiler::new(target, PlanLimits::default());
     let mut s = Session::default();

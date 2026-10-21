@@ -165,7 +165,7 @@ fn instance(s: &Session, spec: &InstanceSpec) -> Option<Box<dyn Plugin>> {
 }
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
 /// Renders `s` from 0 for `LEN` samples plus the mix latency through one path, and returns the

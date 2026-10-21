@@ -64,7 +64,7 @@ impl Rig {
     fn new() -> Self {
         fixture();
         soundcraft_mix::mark_audio_thread();
-        let target = RenderTarget { device: DeviceGeneration(3), sample_rate: 48_000, max_block: BLOCK as u32 };
+        let target = RenderTarget { device: DeviceGeneration(3), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
         Self {
             compiler: PlanCompiler::new(target, PlanLimits::default()),
             mix: MixEngine::realtime(target),

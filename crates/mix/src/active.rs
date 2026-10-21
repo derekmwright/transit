@@ -14,7 +14,7 @@ static NO_SESSION: std::sync::LazyLock<Arc<Session>> = std::sync::LazyLock::new(
 const NO_PLAN: PlanIdentity = PlanIdentity {
     generation: PlanGeneration::EMPTY,
     base: PlanGeneration::EMPTY,
-    target: RenderTarget { device: DeviceGeneration(0), sample_rate: 0, max_block: 0 },
+    target: RenderTarget { device: DeviceGeneration(0), sample_rate: 0, max_block: 0, out_channels: 0, in_channels: 0 },
 };
 
 #[cfg(test)]

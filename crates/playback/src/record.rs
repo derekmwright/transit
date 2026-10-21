@@ -299,6 +299,7 @@ fn input_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::Suppor
             .ok()?
             .filter(|c| {
                 c.channels() > 0
+                    && usize::from(c.channels()) <= soundcraft_model::MAX_DEVICE_CHANNELS
                     && crate::devices::format_rank(c.sample_format()).is_some()
                     && c.min_sample_rate().0 <= r
                     && c.max_sample_rate().0 >= r
@@ -318,6 +319,18 @@ fn input_config(device: &cpal::Device, rate: Option<u32>) -> Result<cpal::Suppor
         return Err(format!("unsupported input sample format {format:?}"));
     }
     Ok(cfg)
+}
+
+/// How many channels an input opened on `device` at `rate` would have (0 when it has none), for
+/// the I/O map of a duplex device.
+#[cfg(not(target_os = "freebsd"))]
+pub(crate) fn input_channels_on(device: &cpal::Device, rate: u32) -> u16 {
+    input_config(device, Some(rate)).map_or(0, |c| c.channels())
+}
+
+#[cfg(target_os = "freebsd")]
+pub(crate) fn input_channels_on(_device: &cpal::Device, _rate: u32) -> u16 {
+    0
 }
 
 impl Recorder {

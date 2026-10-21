@@ -8,7 +8,7 @@ use soundcraft_playback::{
 
 fn control() -> soundcraft_playback::player::Control<PlayerCommand, ActionResult> {
     soundcraft_playback::player::endpoints(
-        soundcraft_mix::RenderTarget { device: Default::default(), sample_rate: 48_000, max_block: 512 },
+        soundcraft_mix::RenderTarget { device: Default::default(), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 },
         soundcraft_mix::PlanLimits::default(),
     )
     .0

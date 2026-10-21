@@ -82,7 +82,7 @@ impl Plugin for Probe {
 }
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
 fn setup(kinds: &[TrackKind]) -> (MixEngine, PlanCompiler, Session, Vec<Arc<State>>) {

@@ -61,6 +61,15 @@ pub fn specs() -> Vec<CommandSpec> {
             io_setup
         ),
         cmd!(
+            noundo "setup.io_map",
+            "I/O Paths...",
+            ["Setup"],
+            None,
+            "{action?: list|set|add_path|rename_path|remove_path|set_channels|set_main, name?, new_name?, direction?: input|output, channels?: [0-based device channels], map?: IoMap} — this machine's device paths (per machine: no undo step, session untouched)",
+            always,
+            io_map_setup
+        ),
+        cmd!(
             "setup.current_timecode",
             "Current Timecode Position...",
             ["Setup"],
@@ -219,6 +228,60 @@ fn peripherals(e: &mut Engine, p: &Value) -> Result<Value> {
 
 fn io_state(s: &Session) -> Value {
     json!({"busses": s.busses, "outputs": s.outputs})
+}
+
+fn io_map_state(e: &Engine) -> Value {
+    let io = e.io_map();
+    let overlaps: Vec<Value> = io.overlaps().into_iter().map(|(a, b, c)| json!({"a": a, "b": b, "channel": c})).collect();
+    json!({"io": io, "overlaps": overlaps})
+}
+
+/// `setup.io_map`: the machine's I/O paths. Not a session edit (the table is per machine, kept by
+/// the app with its preferences), so there is no undo step and the document stays clean.
+fn io_map_setup(e: &mut Engine, p: &Value) -> Result<Value> {
+    use soundcraft_model::{IoDirection, IoMap, IoPath};
+    let id = "setup.io_map";
+    let action = str_param(p, "action").unwrap_or("list");
+    let refuse = |error: soundcraft_model::IoError| bad(id, error.to_string());
+    let name = || str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).ok_or_else(|| bad(id, "`name` required"));
+    let channels = || -> Result<Vec<u16>> {
+        let list = p.get("channels").and_then(Value::as_array).ok_or_else(|| bad(id, "`channels` required (0-based device channels)"))?;
+        list.iter().map(|c| c.as_u64().and_then(|c| u16::try_from(c).ok()).ok_or_else(|| bad(id, "channels are small whole numbers"))).collect()
+    };
+    let mut io = e.io_map().clone();
+    match action {
+        "list" => return Ok(io_map_state(e)),
+        "set" => {
+            let map: IoMap = serde_json::from_value(p.get("map").cloned().ok_or_else(|| bad(id, "`map` required"))?)
+                .map_err(|error| bad(id, format!("`map` is not an I/O map: {error}")))?;
+            let mut checked = IoMap { paths: Vec::new(), ..map.clone() };
+            for path in map.paths {
+                checked.add_path(path).map_err(refuse)?;
+            }
+            checked.set_main(&map.main).map_err(refuse)?;
+            io = checked;
+        }
+        "add_path" => {
+            let direction = match str_param(p, "direction") {
+                Some("input") => IoDirection::Input,
+                Some("output") | None => IoDirection::Output,
+                Some(other) => return Err(bad(id, format!("direction is input or output, not `{other}`"))),
+            };
+            let channels = channels()?;
+            let format = soundcraft_model::ChannelFormat::for_channels(channels.len());
+            io.add_path(IoPath { name: name()?, direction, channels, format }).map_err(refuse)?;
+        }
+        "rename_path" => {
+            let to = str_param(p, "new_name").ok_or_else(|| bad(id, "`new_name` required"))?;
+            io.rename_path(&name()?, to).map_err(refuse)?;
+        }
+        "remove_path" => io.remove_path(&name()?).map_err(refuse)?,
+        "set_channels" => io.set_channels(&name()?, channels()?).map_err(refuse)?,
+        "set_main" => io.set_main(&name()?).map_err(refuse)?,
+        other => return Err(bad(id, format!("unknown action `{other}`"))),
+    }
+    e.set_io_map(io);
+    Ok(io_map_state(e))
 }
 
 fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -541,6 +604,58 @@ mod tests {
         assert_eq!(e.session().outputs.len(), 2);
         assert!(e.execute("setup.io", &json!({"action": "nope", "name": "x"})).is_err());
         assert!(e.can_undo());
+    }
+
+    #[test]
+    fn io_map_commands_edit_the_machine_table_without_an_undo_step_or_a_dirty_session() {
+        let mut e = Engine::default();
+        let saved = e.session().clone();
+        let (undo, revision) = (e.can_undo(), e.revision);
+        assert_eq!(e.execute("setup.io_map", &json!({})).unwrap()["io"]["main"], "Out 1-2", "headless engines hold the stereo default");
+        e.set_io_map(soundcraft_model::IoMap::for_device("ASIO", "TASCAM", 12, 10));
+        let r = e.execute("setup.io_map", &json!({"action": "add_path", "name": "Headphones", "channels": [2]})).unwrap();
+        assert_eq!(r["overlaps"][0]["b"], "Headphones");
+        e.execute("setup.io_map", &json!({"action": "rename_path", "name": "Headphones", "new_name": "Cue"})).unwrap();
+        e.execute("setup.io_map", &json!({"action": "set_channels", "name": "Cue", "channels": [8, 9]})).unwrap();
+        e.execute("setup.io_map", &json!({"action": "set_main", "name": "Out 3-4"})).unwrap();
+        assert_eq!(e.io_map().main_channels(), [2, 3]);
+        e.execute("setup.io_map", &json!({"action": "remove_path", "name": "Cue"})).unwrap();
+        assert!(e.io_map().path("Cue").is_none());
+        assert_eq!((e.can_undo(), e.revision), (undo, revision), "no undo entry, no document change");
+        assert!(!e.is_dirty());
+        assert_eq!(e.session(), &saved);
+        assert!(e.io_revision() >= 6, "the host sees every change");
+    }
+
+    #[test]
+    fn io_map_commands_refuse_bad_paths_and_leave_the_table_alone() {
+        let mut e = Engine::default();
+        e.set_io_map(soundcraft_model::IoMap::for_device("ASIO", "x", 2, 4));
+        let before = (e.io_map().clone(), e.io_revision());
+        for params in [
+            json!({"action": "add_path", "name": "Out 3-4", "channels": [2, 3]}),
+            json!({"action": "add_path", "name": "Far", "channels": [4]}),
+            json!({"action": "add_path", "name": "Wide", "channels": (0..17).collect::<Vec<u16>>()}),
+            json!({"action": "add_path", "name": "Twice", "channels": [1, 1]}),
+            json!({"action": "add_path", "channels": [1]}),
+            json!({"action": "remove_path", "name": "Out 1-2"}),
+            json!({"action": "set_main", "name": "In 1"}),
+            json!({"action": "nope"}),
+        ] {
+            assert!(matches!(e.execute("setup.io_map", &params), Err(crate::EngineError::BadParams(..))), "{params}");
+        }
+        assert_eq!((e.io_map().clone(), e.io_revision()), before);
+    }
+
+    #[test]
+    fn io_map_set_replaces_the_table_and_validates_it() {
+        let mut e = Engine::default();
+        let mut map = soundcraft_model::IoMap::for_device("ASIO", "TASCAM", 12, 10);
+        map.rename_path("Out 3-4", "Cue").unwrap();
+        e.execute("setup.io_map", &json!({"action": "set", "map": map})).unwrap();
+        assert_eq!(e.io_map(), &map);
+        map.paths[0].channels = vec![40];
+        assert!(e.execute("setup.io_map", &json!({"action": "set", "map": map})).is_err());
     }
 
     #[test]

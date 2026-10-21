@@ -192,6 +192,7 @@ fn persist_audio(path: &std::path::Path, ui: &crate::UiState) -> Result<(), Stri
     };
     let obj = value.as_object_mut().ok_or("Settings must be an object")?;
     obj.insert("audio".into(), serde_json::to_value(&ui.audio).map_err(|e| e.to_string())?);
+    obj.insert("io_maps".into(), serde_json::to_value(&ui.io_maps).map_err(|e| e.to_string())?);
     let bytes = serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;

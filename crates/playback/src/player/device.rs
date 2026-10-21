@@ -5,7 +5,7 @@ use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputCallback, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
 use soundcraft_mix::{Arrival, DeviceGeneration, Due, EngineEpoch, InstrumentEvent, Message, NoteId, PlanLimits, RenderTarget, Source};
-use soundcraft_model::{Session, TrackId};
+use soundcraft_model::{IoMap, Session, TrackId};
 use soundcraft_rt::handoff::{Anchor, AudioAccess};
 use soundcraft_time::{Range, Samples};
 use std::cell::{Cell, RefCell, RefMut};
@@ -48,6 +48,8 @@ pub struct Player {
     pub device_name: String,
     pub device_rate: u32,
     pub device_channels: u16,
+    /// This machine's paths on the open device (ADR 0015).
+    io: RefCell<Arc<IoMap>>,
     pub device_buffer: Option<u32>,
     pub silent: bool,
 }
@@ -74,7 +76,7 @@ impl Player {
     #[doc(hidden)]
     pub fn prepare_device_free(session: Arc<Session>) -> Result<Self, String> {
         let rate = session.sample_rate.hz();
-        Self::prepare(session, rate).map(|(mut player, access, _clock)| {
+        Self::prepare(session, rate, IoMap::default()).map(|(mut player, access, _clock)| {
             let output = DeviceOutput::new(access, &player, 2, rate);
             *player.test_output.get_mut() = Some(output);
             player
@@ -134,6 +136,7 @@ impl Player {
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
             device_channels: 0,
+            io: RefCell::new(Arc::new(IoMap::default())),
             device_buffer: None,
             silent: true,
         }
@@ -141,10 +144,16 @@ impl Player {
 
     /// The stream clock is allocated BEFORE the engine; its exact generation is
     /// shared by the target, event identity, and consumed-output timeline.
-    fn prepare(session: Arc<Session>, device_rate: u32) -> Result<(Self, AudioAccess<Audio>, device_clock::CallbackClock), String> {
+    fn prepare(session: Arc<Session>, device_rate: u32, io: IoMap) -> Result<(Self, AudioAccess<Audio>, device_clock::CallbackClock), String> {
         let (callback_clock, reader) = device_clock::stream_clock(device_clock::Direction::Output, device_rate)?;
         let key = reader.key();
-        let target = RenderTarget { device: DeviceGeneration(key.generation), sample_rate: session.sample_rate.hz(), max_block: 512 };
+        let target = RenderTarget {
+            device: DeviceGeneration(key.generation),
+            sample_rate: session.sample_rate.hz(),
+            max_block: 512,
+            out_channels: io.outputs,
+            in_channels: io.inputs,
+        };
         let mut player = Self::empty(device_rate);
         player.epoch = EngineEpoch(key.generation);
         player.origin = reader.host_origin();
@@ -156,6 +165,9 @@ impl Player {
                 return Err(error.to_string());
             }
         };
+        let io = Arc::new(io);
+        owner.use_io(Arc::clone(&io));
+        *player.io.get_mut() = io;
         owner.service();
         if owner.faulted() {
             owner.retire(ports);
@@ -195,16 +207,19 @@ impl Player {
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
         use cpal::traits::{DeviceTrait, StreamTrait};
-        let want_channels = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
-        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), want_channels, cfg)?;
+        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), cfg)?;
         let duplex = crate::input_with_output(system, || device.default_input_config().is_ok_and(|c| record::input_usable(&c)));
+        // Every output the stream opened, and the duplex device's inputs, get default paths; the
+        // app replaces them with this machine's saved table (`set_io`).
+        let inputs = if duplex { record::input_channels_on(&device, config.sample_rate.0) } else { 0 };
+        let io = IoMap::for_device(system, &name, inputs, config.channels);
         let mut attempts = vec![config.clone()];
         if config.buffer_size != cpal::BufferSize::Default {
             attempts.push(cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..config });
         }
         let mut error = "no usable output stream".to_owned();
         for config in attempts {
-            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0)?;
+            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0, io.clone())?;
             *player.input.get_mut() = if duplex {
                 match record::Recorder::build_on(&device, config.sample_rate.0, config.buffer_size) {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
@@ -269,7 +284,7 @@ impl Player {
 
     fn silent_runtime(session: Arc<Session>, error: String) -> Self {
         let rate = session.sample_rate.hz();
-        let (mut player, access, _clock) = match Self::prepare(session, rate) {
+        let (mut player, access, _clock) = match Self::prepare(session, rate, IoMap::default()) {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let mut player = Self::empty(rate);
@@ -358,6 +373,24 @@ impl Player {
     /// Includes view-only copy-on-write changes that do not advance Engine::revision.
     pub fn has_requested_session(&self, session: &Arc<Session>) -> bool {
         self.owner().is_ok_and(|owner| Arc::ptr_eq(owner.requested_session(), session))
+    }
+    /// The path table in use: this machine's, once the app has set it, else the defaults for the
+    /// opened device.
+    pub fn io_map(&self) -> Arc<IoMap> {
+        Arc::clone(&self.io.borrow())
+    }
+    /// Use `io` as the path table. The opened output count stays the stream's (a different count
+    /// is a reopen), so paths that do not fit are dropped; the table reaches the audio thread as
+    /// a plan, with no device reopen.
+    pub fn set_io(&self, mut io: IoMap) -> Result<SessionRequestId, PlayerError> {
+        let opened = if self.silent { io.outputs } else { self.device_channels };
+        io.reconcile(io.inputs, opened);
+        let io = Arc::new(io);
+        let id = self.owner()?.set_io(Arc::clone(&io))?;
+        if let Ok(mut held) = self.io.try_borrow_mut() {
+            *held = io;
+        }
+        Ok(id)
     }
     pub fn set_input(&self, input: Arc<record::InputRing>) -> Result<SessionRequestId, PlayerError> {
         self.owner()?.set_input(Some(input))

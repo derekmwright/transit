@@ -24,7 +24,7 @@ pub(super) fn fixture_session(device_rate: u32, session: Arc<Session>) -> (Contr
         meters: Mutex::new(MeterSnapshot::default()),
         editors_open: AtomicBool::new(false),
     });
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let key = ClockKey { generation: 1, domain: 1, direction: Direction::Output };
     let (mut control, audio) = pair(target, PlanLimits::default(), key, device_rate, Arc::clone(&shared)).unwrap();
     control.request(session, None).unwrap();
@@ -165,7 +165,7 @@ fn owner_fixture() -> (crate::player::RuntimeControl<Command, ActionResult>, Aud
     let mut session = Session::default();
     let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
     session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
-    let target = RenderTarget { device: DeviceGeneration(73), sample_rate: 48_000, max_block: 512 };
+    let target = RenderTarget { device: DeviceGeneration(73), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let key = ClockKey { generation: 73, domain: 73, direction: Direction::Output };
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
@@ -303,7 +303,7 @@ fn invalid_audio_initialization_returns_every_endpoint_for_main_thread_retiremen
     for (device_rate, generation) in [(0, 73), (48_000, 74)] {
         let session = Arc::new(Session::default());
         let weak = Arc::downgrade(&session);
-        let target = RenderTarget { device: DeviceGeneration(73), sample_rate: 48_000, max_block: 512 };
+        let target = RenderTarget { device: DeviceGeneration(73), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
         let key = ClockKey { generation, domain: generation, direction: Direction::Output };
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
@@ -926,7 +926,7 @@ fn retained_payload_cleanup_cannot_escape_quiescent_endpoint_return() {
     let (mut owner, ports) = super::super::RuntimeControl::<Command, ActionResult>::new(
         Arc::new(Session::default()),
         None,
-        RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 },
+        RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 },
         PlanLimits::default(),
     )
     .unwrap();
@@ -936,4 +936,63 @@ fn retained_payload_cleanup_cannot_escape_quiescent_endpoint_return() {
     audio.panic_payload = RetainedPanic(Some(Box::new(Payload)));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.retire(audio.into_ports())));
     assert!(result.is_ok());
+}
+
+/// Four 256-frame callbacks of the click on a device with `channels` outputs, planar by channel.
+fn click_on_device(channels: usize, io: Option<soundcraft_model::IoMap>) -> Vec<Vec<f32>> {
+    let mut session = Session::default();
+    session.edit.click = true;
+    let shared = Arc::new(Shared {
+        position: AtomicI64::new(0),
+        playing: AtomicBool::new(false),
+        speed: AtomicU32::new(1000),
+        meters: Mutex::new(MeterSnapshot::default()),
+        editors_open: AtomicBool::new(false),
+    });
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: channels as u16, in_channels: 0 };
+    let key = ClockKey { generation: 1, domain: 1, direction: Direction::Output };
+    let (mut control, mut audio) = pair(target, PlanLimits::default(), key, 48_000, shared).unwrap();
+    if let Some(io) = io {
+        control.sessions.set_io(Arc::new(io));
+    }
+    control.request(Arc::new(session), None).unwrap();
+    control.service(&mut make);
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    let mut planar = vec![Vec::new(); channels];
+    for _ in 0..4 {
+        let mut block = vec![f32::NAN; 256 * channels];
+        audio.fill(&mut block, channels, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()).unwrap();
+        for frame in block.chunks_exact(channels) {
+            for (c, v) in frame.iter().enumerate() {
+                planar[c].push(*v);
+            }
+        }
+    }
+    control.retire(audio.plans, audio.actions);
+    planar
+}
+
+#[test]
+fn a_wide_device_plays_main_on_its_first_pair_and_zeroes_every_other_channel() {
+    let stereo = click_on_device(2, None);
+    assert!(stereo[0].iter().any(|v| v.abs() > 0.1), "the click is audible");
+    let wide = click_on_device(10, None);
+    assert_eq!(wide[0], stereo[0]);
+    assert_eq!(wide[1], stereo[1]);
+    for (c, channel) in wide.iter().enumerate().skip(2) {
+        assert!(channel.iter().all(|v| *v == 0.0), "device channel {c} is written as silence, never left as it was");
+    }
+}
+
+#[test]
+fn main_follows_the_path_the_io_map_names() {
+    let stereo = click_on_device(2, None);
+    let mut io = soundcraft_model::IoMap::for_device("test", "test", 0, 10);
+    io.set_main("Out 3-4").unwrap();
+    let moved = click_on_device(10, Some(io));
+    assert_eq!(moved[2], stereo[0]);
+    assert_eq!(moved[3], stereo[1]);
+    for c in [0, 1, 4, 5, 6, 7, 8, 9] {
+        assert!(moved[c].iter().all(|v| *v == 0.0), "channel {c}");
+    }
 }

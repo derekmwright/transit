@@ -39,7 +39,7 @@ fn audio_dispatch_recovery_is_independent_of_stale_worker_signals_and_main_polli
 }
 
 fn setup() -> (plan_bridge::Control, plan_bridge::Audio, Control, Audio) {
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let (plans, audio) = plan_bridge::pair(target, PlanLimits::default());
     let (sources, ingress) = pair(&plans).unwrap();
     (plans, audio, sources, ingress)

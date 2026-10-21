@@ -107,6 +107,26 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         Ok(request)
     }
 
+    /// The path table for the first plan, before anything is requested again.
+    pub(super) fn use_io(&mut self, io: Arc<soundcraft_model::IoMap>) {
+        self.control.sessions.set_io(io);
+    }
+
+    /// Adopt a new path table: a plan for the same document is prepared with it and published
+    /// like any other, so the device stays open.
+    pub fn set_io(&mut self, io: Arc<soundcraft_model::IoMap>) -> Result<SessionRequestId, PlayerError> {
+        if self.faulted() {
+            return Err(PlayerError::Faulted);
+        }
+        self.control.sessions.set_io(io);
+        let request = self.control.request(Arc::clone(&self.requested), self.input.clone())?;
+        self.request = request;
+        self.state = RequestState::Preparing;
+        self.attempted_latency = 0;
+        self.confirmed = None;
+        Ok(request)
+    }
+
     pub fn set_input(&mut self, input: Option<Arc<InputRing>>) -> Result<SessionRequestId, PlayerError> {
         if self.faulted() {
             return Err(PlayerError::Faulted);

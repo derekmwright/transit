@@ -33,7 +33,7 @@ fn assert_fold(values: &[f32], format: ChannelFormat, expected: &[f32]) {
     let mut legacy = MixEngine::new(48_000.0, BLOCK);
     legacy.set_external_instances(true);
     legacy.ensure_synced(&s);
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
     let mut compiler = PlanCompiler::new(target, PlanLimits::default());
     let mut plan = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut |_, _| None).unwrap();
     let mut planned = MixEngine::realtime(target);

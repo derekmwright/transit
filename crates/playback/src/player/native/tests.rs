@@ -42,7 +42,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(session: Session, io: MidiIo) -> Self {
-        let target = RenderTarget { device: DeviceGeneration(EPOCH.0), sample_rate: 48_000, max_block: 512 };
+        let target = RenderTarget { device: DeviceGeneration(EPOCH.0), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
         let (owner, ports) = Owner::new(Arc::new(session), None, target, PlanLimits::default()).unwrap();
         let (lane, midi) = owner.midi_lane().unwrap();
         let mut native = Native::new(lane, HostOrigin::default()).unwrap();

@@ -24,7 +24,7 @@ const BLOCK: usize = 256;
 fn dense_clip_sorting_and_live_pedal_merge_allocate_nothing() {
     MixEngine::force_serial(true);
     mark_audio_thread();
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
     let mut mix = MixEngine::realtime_with_events(target, EngineEpoch::FIRST, EventLimits::default());
     let mut comp = PlanCompiler::new(target, PlanLimits::default());
     let mut s = Session::default();
@@ -75,7 +75,7 @@ fn dense_clip_sorting_and_live_pedal_merge_allocate_nothing() {
 fn admission_delivery_revocation_and_panic_allocate_nothing() {
     MixEngine::force_serial(true);
     mark_audio_thread();
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 };
     let epoch = EngineEpoch::FIRST;
     let mut mix = MixEngine::realtime_with_events(target, epoch, EventLimits::default());
     let mut comp = PlanCompiler::new(target, PlanLimits::default());

@@ -20,6 +20,7 @@ pub mod groups;
 pub mod host;
 pub mod icons;
 pub mod import;
+mod io_settings;
 pub mod keys;
 pub mod menus;
 mod midi_input;
@@ -52,6 +53,8 @@ const MAX_IMPORTS_PACE: u32 = 600;
 pub struct UiState {
     /// The audio device choice, kept with the preferences: per machine.
     pub audio: soundcraft_playback::AudioConfig,
+    /// This machine's I/O paths, one table per audio system plus device (ADR 0015).
+    pub io_maps: Vec<soundcraft_model::IoMap>,
     /// The user's own VST3 and CLAP folders.
     pub plugin_dirs: plugin_scan::PluginDirs,
     /// Plug-in editors to have open, as (track, slot); the instrument is
@@ -125,6 +128,7 @@ impl Default for UiState {
     fn default() -> Self {
         UiState {
             audio: soundcraft_playback::AudioConfig::default(),
+            io_maps: Vec::new(),
             plugin_dirs: plugin_scan::PluginDirs::default(),
             plugin_windows: Vec::new(),
             track_height: 46.0,
@@ -237,6 +241,9 @@ pub struct StudioApp {
     pub frame_ms: f32,
     last_frame: Option<f64>,
     last_rev: u64,
+    /// The opened device still needs its saved I/O table; the engine's table revision last passed on.
+    io_adopt: bool,
+    io_pushed: u64,
     /// A ResetSession boundary awaiting successful admission or device reopen.
     restore_pending: bool,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -311,6 +318,8 @@ impl StudioApp {
             frame_ms: 0.0,
             last_frame: None,
             last_rev: 0,
+            io_adopt: true,
+            io_pushed: 0,
             restore_pending: false,
             control_rx: None,
             pending_shots: Vec::new(),
@@ -642,6 +651,7 @@ impl StudioApp {
         self.handle_transport(dt);
         automation::write_pass(self, ctx);
         if self.player_requests.play.is_none() && self.player_requests.locate.is_none() && self.player_requests.recording.is_none() {
+            self.sync_io();
             self.sync_player_session();
         }
         self.autosave_changes();

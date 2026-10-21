@@ -8,7 +8,7 @@ use soundcraft_rt::testing::measure;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 }
 }
 fn session() -> Arc<Session> {
     let mut session = Session::default();
@@ -622,5 +622,30 @@ fn editor_handles_follow_a_moved_insert() {
     runtime.service();
     assert!(runtime.has_editor(track, 2), "moved insert's editor handle must be reachable at its new slot");
     assert_eq!(runtime.capture_states(&moved).unwrap().first().map(|s| s.1), Some(2));
+    runtime.retire(ports);
+}
+
+#[test]
+fn a_path_table_edit_is_a_plan_on_the_same_engine_and_the_callback_allocates_nothing() {
+    let (mut runtime, mut ports, _) = setup(PlanLimits::default());
+    let engine = ports.plans.engine().active().target;
+    let first = ports.plans.engine().active().generation;
+    let mut io = soundcraft_model::IoMap::for_device("test", "test", 0, 2);
+    io.add_path(soundcraft_model::IoPath {
+        name: "Cue".into(),
+        direction: soundcraft_model::IoDirection::Output,
+        channels: vec![0],
+        format: ChannelFormat::Mono,
+    })
+    .unwrap();
+    let request = runtime.set_io(Arc::new(io)).unwrap();
+    assert_eq!(runtime.requested_state(), (request, RequestState::Preparing));
+    runtime.service();
+    let RequestState::Published(next) = runtime.requested_state().1 else { panic!("the table is published as a plan") };
+    adopt(&mut ports.plans);
+    render(&mut ports.plans);
+    assert_eq!(ports.plans.engine().active().generation, next);
+    assert!(next > first);
+    assert_eq!(ports.plans.engine().active().target, engine, "same device generation: no reopen");
     runtime.retire(ports);
 }

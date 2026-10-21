@@ -804,4 +804,24 @@ mod tests {
         assert_eq!(tr.mixer.volume_db, 0.0);
         assert!(s.next_id > t.0);
     }
+
+    /// ADR 0015, slice (a): `Session::outputs` stays in the file and stays the main-format source,
+    /// so a surround session never silently becomes stereo (golden: a stored 5.1 file).
+    #[test]
+    fn a_5_1_session_round_trips_its_outputs_and_main_format() {
+        let mut stored: serde_json::Value = serde_json::from_str(&Session::default().to_json().unwrap()).unwrap();
+        stored["outputs"] = serde_json::json!([
+            {"name": "Out 1-6", "first_channel": 0, "format": "Surround51"},
+            {"name": "Out 7-8", "first_channel": 6, "format": "Stereo"}
+        ]);
+        let loaded = Session::from_json(&stored.to_string()).unwrap();
+        assert_eq!(loaded.main_format(), ChannelFormat::Surround51);
+        assert_eq!(loaded.outputs.len(), 2);
+        let saved = loaded.to_json().unwrap();
+        let again = Session::from_json(&saved).unwrap();
+        assert_eq!(again.outputs, loaded.outputs);
+        assert_eq!(again.main_format(), ChannelFormat::Surround51);
+        let text: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(text["outputs"], stored["outputs"], "the file keeps the field in its current shape");
+    }
 }

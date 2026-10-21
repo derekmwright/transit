@@ -10,7 +10,10 @@ fn route() -> Route {
     Route { engine: EngineEpoch(1), target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: u16::MAX, lookahead: 128 }
 }
 fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
-    plan_bridge::pair(RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 }, PlanLimits::default())
+    plan_bridge::pair(
+        RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 },
+        PlanLimits::default(),
+    )
 }
 fn pump(lane: action_lane::Control<Packet, ActionResult>) -> (SyncSender<Update>, Pump) {
     let (send, receive) = mpsc::sync_channel(sources::PORTS);
@@ -201,7 +204,7 @@ fn shared_note_budget_is_not_renewed_for_ingress_or_scratch_chunks() {
 
 #[test]
 fn stop_cutoff_rejects_already_drained_raw_events_and_preserves_later_input() {
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let (mut owner, mut ports) =
         RuntimeControl::<(), ()>::new(Arc::new(soundcraft_model::Session::default()), None, target, PlanLimits::default()).unwrap();
     let token = owner.register_source(3).unwrap();

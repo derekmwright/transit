@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 
 fn prepared() -> (Player, DeviceOutput) {
     // Allocates clocks/queues only. No device discovery, stream or fallback worker.
-    let (player, access, _clock) = Player::prepare(Arc::new(Session::default()), 48_000).unwrap();
+    let (player, access, _clock) = Player::prepare(Arc::new(Session::default()), 48_000, soundcraft_model::IoMap::default()).unwrap();
     let output = DeviceOutput::new(access, &player, 2, 48_000);
     (player, output)
 }
@@ -253,7 +253,7 @@ fn probe_player(
     session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
     let mut player = Player::empty(48_000);
     let key = device_clock::ClockKey { generation: 1, domain: 1, direction: device_clock::Direction::Output };
-    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 };
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 };
     let (mut control, audio) = super::super::audio::pair(target, PlanLimits::default(), key, 48_000, Arc::clone(&player.shared)).unwrap();
     control.request(Arc::new(session), None).unwrap();
     let drops = DropTrace::new();

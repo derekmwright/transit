@@ -113,6 +113,26 @@ mod tests {
     }
 
     #[test]
+    fn the_io_map_round_trips_through_ui_json_and_old_files_load_without_it() {
+        let dir = std::env::temp_dir().join(format!("transit-io-map-{}", std::process::id()));
+        let path = dir.join("ui.json");
+        let mut ui = soundcraft_ui_studio::UiState::default();
+        let mut map = soundcraft_engine::model::IoMap::for_device("ASIO", "TASCAM Model 12", 12, 10);
+        map.rename_path("Out 3-4", "Cue").unwrap();
+        ui.io_maps.push(map.clone());
+        save_ui(&path, &ui).unwrap();
+        let back = load_ui(&path).unwrap().unwrap();
+        assert_eq!(back.io_maps, [map]);
+        assert_eq!((back.io_maps[0].inputs, back.io_maps[0].outputs), (12, 10), "the opened channel counts are stored inside");
+        // A file written before the table existed.
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("io_maps");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(load_ui(&path).unwrap().unwrap().io_maps.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!("transit-ui-prefs-{}", std::process::id()));
         let path = dir.join("ui.json");

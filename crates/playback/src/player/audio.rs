@@ -636,8 +636,11 @@ impl Audio {
                         *out = right.clamp(-1.0, 1.0);
                     }
                 } else {
-                    for (channel, out) in frame.iter_mut().enumerate() {
-                        *out = sample(channel).clamp(-1.0, 1.0);
+                    // The frame was zeroed above: device channels outside Main's path stay silent.
+                    for (channel, &dest) in self.plans.main_dest().iter().enumerate().take(output.len()) {
+                        if let Some(out) = frame.get_mut(usize::from(dest)) {
+                            *out = sample(channel).clamp(-1.0, 1.0);
+                        }
                     }
                 }
             }

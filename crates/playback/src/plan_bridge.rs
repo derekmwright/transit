@@ -11,7 +11,7 @@ use soundcraft_mix::{
     Adoption, CompileError, CompileMode, EnvelopeState, InstanceSpec, MAX_CHANNELS, MixEngine, NewInstance, PlanCompiler, PlanEnvelope,
     PlanGeneration, PlanLimits, PlanStatus, RenderTarget, SlotBinding, SlotGen, StripMeter, main_channels,
 };
-use soundcraft_model::{Session, TrackId, TrackKind};
+use soundcraft_model::{IoMap, MAX_DEVICE_CHANNELS, Session, TrackId, TrackKind};
 use soundcraft_time::Samples;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ const PLAYBACK_BYTES: usize = 16 << 20;
 /// No reader takes the callback's lock or asks it to allocate a snapshot.
 struct AtomicMeter {
     peak: [AtomicU32; 2],
-    peaks: [AtomicU32; MAX_CHANNELS],
+    peaks: [AtomicU32; MAX_DEVICE_CHANNELS],
     channels: AtomicUsize,
     reduction: AtomicU32,
     failures: AtomicU32,
@@ -50,7 +50,7 @@ impl AtomicMeter {
         for (dst, src) in self.peaks.iter().zip(&source.peaks) {
             dst.store(src.to_bits(), Ordering::Relaxed);
         }
-        self.channels.store(source.peaks.len().min(MAX_CHANNELS), Ordering::Relaxed);
+        self.channels.store(source.peaks.len().min(MAX_DEVICE_CHANNELS), Ordering::Relaxed);
         self.reduction.store(source.gain_reduction_db.to_bits(), Ordering::Relaxed);
         self.failures.store(source.plugin_failures.count, Ordering::Relaxed);
         self.last_failure.store(source.plugin_failures.last, Ordering::Relaxed);
@@ -67,7 +67,7 @@ impl AtomicMeter {
         for (dst, src) in out.peak.iter_mut().zip(&self.peak) {
             *dst = f32::from_bits(src.load(Ordering::Relaxed));
         }
-        out.peaks.resize(self.channels.load(Ordering::Relaxed).min(MAX_CHANNELS), 0.0);
+        out.peaks.resize(self.channels.load(Ordering::Relaxed).min(MAX_DEVICE_CHANNELS), 0.0);
         for (dst, src) in out.peaks.iter_mut().zip(&self.peaks) {
             *dst = f32::from_bits(src.load(Ordering::Relaxed));
         }
@@ -119,6 +119,9 @@ impl MeterBank {
 /// All playback resources that change with a plan. Swapped whole, never dropped on audio.
 struct Buffers {
     output: Vec<Vec<f32>>,
+    /// The device channel each main channel plays on (the `IoMap`'s Main path). Every other
+    /// device channel is written as silence by the callback.
+    main_dest: Vec<u16>,
     input_storage: Vec<Vec<f32>>,
     input: Option<Arc<InputRing>>,
     meters: Arc<MeterBank>,
@@ -128,7 +131,7 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn prepare(session: &Session, input: Option<Arc<InputRing>>, target: RenderTarget, limits: PlanLimits) -> Result<Self, CompileError> {
+    fn prepare(session: &Session, input: Option<Arc<InputRing>>, target: RenderTarget, io: &IoMap, limits: PlanLimits) -> Result<Self, CompileError> {
         let channels = main_channels(session);
         let input_channels = input.as_ref().map_or(0, |r| r.channels.load(Ordering::Relaxed).clamp(1, u16::MAX as usize));
         let block = target.max_block.clamp(16, 16_384) as usize;
@@ -158,6 +161,7 @@ impl Buffers {
         }
         Ok(Self {
             output: vec![vec![0.0; block]; channels],
+            main_dest: main_destination(io, channels, usize::from(target.out_channels)),
             input_storage: vec![vec![0.0; block]; input_channels],
             monitoring: session.tracks.iter().any(|t| {
                 (t.mixer.input_monitor || t.mixer.record_arm) && (input.is_some() || matches!(t.kind, TrackKind::Instrument | TrackKind::Midi))
@@ -167,6 +171,17 @@ impl Buffers {
             fold: fold_gains(session),
             hosted: session_has_hosted(session),
         })
+    }
+}
+
+/// Where each of `main` channels goes on a device with `device` output channels: the Main path's
+/// channels when they match Main's width and are all open, else channels 0.. (the stereo default).
+fn main_destination(io: &IoMap, main: usize, device: usize) -> Vec<u16> {
+    let want = io.main_channels();
+    if want.len() == main && want.iter().all(|&c| device == 0 || usize::from(c) < device) {
+        want
+    } else {
+        (0..main).map(|c| u16::try_from(c).unwrap_or(u16::MAX)).collect()
     }
 }
 
@@ -253,6 +268,8 @@ pub struct Control {
     latest: Option<Request>,
     target: RenderTarget,
     limits: PlanLimits,
+    /// This machine's path table for the open device; read when a plan is prepared.
+    io: Arc<IoMap>,
     issued: PlanGeneration,
     meters: Arc<MeterBank>,
     pending_meters: Option<Arc<MeterBank>>,
@@ -282,6 +299,7 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
     let meters = Arc::new(MeterBank { tracks: Vec::new(), main: AtomicMeter::new() });
     let buffers = Buffers {
         output: Vec::new(),
+        main_dest: Vec::new(),
         input_storage: Vec::new(),
         input: None,
         meters: Arc::clone(&meters),
@@ -300,6 +318,7 @@ pub fn pair(target: RenderTarget, limits: PlanLimits) -> (Control, Audio) {
             latest: None,
             target,
             limits,
+            io: Arc::new(IoMap::for_device("", "", target.in_channels, if target.out_channels == 0 { 2 } else { target.out_channels })),
             issued: PlanGeneration::EMPTY,
             meters,
             pending_meters: None,
@@ -315,6 +334,12 @@ impl Control {
     pub(super) fn runtime_identity(&self) -> RuntimeIdentity {
         RuntimeIdentity(Arc::clone(&self.counters))
     }
+    /// The path table the next prepared plan uses. The caller requests the session again; the
+    /// change then travels like any other plan, with no device reopen.
+    pub fn set_io(&mut self, io: Arc<IoMap>) {
+        self.io = io;
+    }
+
     /// Coalesce before construction. Replaced unsent owners die here, on control.
     pub fn request(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) {
         self.request_with_mode(session, input, CompileMode::Update);
@@ -366,7 +391,7 @@ impl Control {
             return Err(CompileError::TargetMismatch { compiler: self.target });
         }
         let next = self.issued.checked_next().ok_or(CompileError::GenerationExhausted)?;
-        let buffers = Buffers::prepare(&request.session, request.input, self.target, self.limits)?;
+        let buffers = Buffers::prepare(&request.session, request.input, self.target, &self.io, self.limits)?;
         let plan = self.compiler.compile_with_mode(request.session, self.compiler.active(), next, request.mode, make)?;
         self.issued = next;
         self.pending_meters = Some(Arc::clone(&buffers.meters));
@@ -617,6 +642,10 @@ impl Audio {
     }
     pub fn output(&self) -> &[Vec<f32>] {
         &self.buffers.output
+    }
+    /// The device channel of each main channel; the callback leaves every other channel at zero.
+    pub fn main_dest(&self) -> &[u16] {
+        &self.buffers.main_dest
     }
     pub fn fold(&self) -> &[(f32, f32); MAX_CHANNELS] {
         &self.buffers.fold

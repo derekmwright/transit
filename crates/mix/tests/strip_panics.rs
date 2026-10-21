@@ -110,7 +110,7 @@ fn session(tracks: usize) -> (Session, Vec<TrackId>) {
 }
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
 /// The instruments' panics report nothing (the default hook would format and print them, which

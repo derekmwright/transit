@@ -27,7 +27,7 @@ const SR: u32 = 48_000;
 const BLOCK: usize = 256;
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(7), sample_rate: SR, max_block: BLOCK as u32 }
+    RenderTarget { device: DeviceGeneration(7), sample_rate: SR, max_block: BLOCK as u32, out_channels: 0, in_channels: 0 }
 }
 
 /// Where and on which thread test instances were dropped.

@@ -3512,8 +3512,14 @@ impl RangeRender {
 
     /// The headless target an offline render compiles for: the session's rate, no device.
     fn target(s: &Session, block: usize) -> RenderTarget {
-        RenderTarget { device: DeviceGeneration(0), sample_rate: s.sample_rate.hz(), max_block: u32::try_from(block).unwrap_or(u32::MAX) }
-            .normalized()
+        RenderTarget {
+            device: DeviceGeneration(0),
+            sample_rate: s.sample_rate.hz(),
+            max_block: u32::try_from(block).unwrap_or(u32::MAX),
+            out_channels: 0,
+            in_channels: 0,
+        }
+        .normalized()
     }
 
     /// Plan limits for an offline render: the live defaults, with track and bus counts raised to

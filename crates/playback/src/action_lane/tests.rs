@@ -13,7 +13,13 @@ fn generation(n: u64) -> PlanGeneration {
 
 fn bridge() -> (crate::plan_bridge::Control, crate::plan_bridge::Audio) {
     crate::plan_bridge::pair(
-        soundcraft_mix::RenderTarget { device: soundcraft_mix::DeviceGeneration(1), sample_rate: 48_000, max_block: 512 },
+        soundcraft_mix::RenderTarget {
+            device: soundcraft_mix::DeviceGeneration(1),
+            sample_rate: 48_000,
+            max_block: 512,
+            out_channels: 0,
+            in_channels: 0,
+        },
         soundcraft_mix::PlanLimits::default(),
     )
 }

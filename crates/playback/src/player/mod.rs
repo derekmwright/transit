@@ -178,6 +178,10 @@ impl SessionControl {
         }
         Ok(id)
     }
+    /// A new path table for the open device. The caller then requests the session again.
+    pub fn set_io(&mut self, io: Arc<soundcraft_model::IoMap>) {
+        self.bridge.set_io(io);
+    }
     /// Replace the document even when IDs/topology are unchanged. Ordinary requests
     /// coalesce into this boundary until its successful adoption.
     pub fn replace_session(&mut self, session: Arc<Session>, input: Option<Arc<InputRing>>) -> Result<SessionRequestId, PlayerError> {

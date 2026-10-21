@@ -57,6 +57,10 @@ pub struct RenderTarget {
     pub sample_rate: u32,
     /// Largest block rendered at once. Clamped to 16..=16384 by the engine and the compiler alike.
     pub max_block: u32,
+    /// Output and input channels the device opened (ADR 0015); 0 when there is no device (headless,
+    /// offline), where the mix renders at Main's width.
+    pub out_channels: u16,
+    pub in_channels: u16,
 }
 
 impl RenderTarget {

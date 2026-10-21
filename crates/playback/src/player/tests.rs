@@ -6,7 +6,7 @@ use soundcraft_model::{ChannelFormat, Insert, TrackKind};
 use soundcraft_rt::testing::measure;
 
 fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512 }
+    RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 }
 }
 fn session(name: &str) -> Arc<Session> {
     Arc::new(Session { name: name.into(), ..Session::default() })
