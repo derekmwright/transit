@@ -31,12 +31,14 @@ const KNOWN_UNREACHED: &[&str] = &[
     "options.post_roll",
     "options.pre_roll",
     "setup.hardware",        // menu opens the Playback Engine window, which doesn't run it
+    "setup.io_map",          // studio UI only (Audio Devices I/O path table); the old UI has no named I/O paths
     "setup.playback_engine", // same
     "setup.reset_edit_state",
     "track.load_preset",
     "track.pin",
     "track.trim_automation_write",
     "track.vca",
+    "transport.loop", // studio UI only (loop strip on the arrangement ruler); the old UI has no loop strip
     "transport.pause",
     "transport.status",
     "video.offset",
