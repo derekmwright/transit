@@ -24,6 +24,7 @@ pub mod icons;
 pub mod import;
 mod io_settings;
 pub mod keys;
+pub mod load_readout;
 mod loopbar;
 pub mod menus;
 pub mod metronome;

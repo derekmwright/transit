@@ -205,6 +205,7 @@ fn tokens_are_the_only_colors() {
         ("mixer.rs", include_str!("mixer.rs")),
         ("transport.rs", include_str!("transport.rs")),
         ("telemetry.rs", include_str!("telemetry.rs")),
+        ("load_readout.rs", include_str!("load_readout.rs")),
         ("waveform.rs", include_str!("waveform.rs")),
         ("icons.rs", include_str!("icons.rs")),
         ("shortcuts.rs", include_str!("shortcuts.rs")),
@@ -244,6 +245,7 @@ fn every_handler_takes_its_keys_from_the_table() {
         include_str!("devices.rs"),
         include_str!("transport.rs"),
         include_str!("telemetry.rs"),
+        include_str!("load_readout.rs"),
         include_str!("lib.rs"),
         include_str!("finish.rs"),
         include_str!("automation.rs"),
@@ -383,6 +385,7 @@ fn painted_corners_use_the_radius_tokens() {
         ("mixer.rs", include_str!("mixer.rs")),
         ("transport.rs", include_str!("transport.rs")),
         ("telemetry.rs", include_str!("telemetry.rs")),
+        ("load_readout.rs", include_str!("load_readout.rs")),
     ] {
         // (call, index of the radius argument)
         for (call, at) in
@@ -498,6 +501,9 @@ fn snap() -> soundcraft_playback::telemetry::CallbackTelemetry {
         timed_callbacks: 100,
         max_duration_ns: 3_000_000,
         max_load_ppm: 123_456,
+        current_load_ppm: 123_456,
+        callback_frames: 128,
+        sample_rate: 48_000,
         over_budget_callbacks: 2,
         duration_histogram: h,
         backend_errors: 3,
@@ -524,18 +530,17 @@ fn the_telemetry_readout_is_absent_without_a_player() {
 
 #[test]
 fn the_telemetry_readout_texts_and_click_open_the_details_window() {
-    use crate::telemetry::{detail_rows, load_text, readout_text};
+    use crate::telemetry::{detail_rows, load_text};
     let s = snap();
     assert_eq!(load_text(123_456), "12.3%");
     assert_eq!(load_text(1_000_000), "100.0%");
     assert_eq!(load_text(0), "0.0%");
-    assert_eq!(readout_text(&s), "Load 12.3%  Over 2");
     let mut t = T::new();
     t.app.telemetry.injected = Some(s);
     t.frames(30);
     let tel = t.inspect()["telemetry"].clone();
     assert_eq!(tel["shown"], true);
-    assert_eq!(tel["text"], "Load 12.3%  Over 2");
+    assert_eq!(tel["text"], "12%  128 @ 48 kHz");
     assert_eq!(tel["warning"], 3, "the warning icon carries the backend error count");
     assert_eq!(tel["open"], false);
     let rect: [f32; 4] = serde_json::from_value(tel["rect"].clone()).unwrap();
@@ -566,7 +571,7 @@ fn the_telemetry_readout_has_no_warning_without_errors() {
     t.app.telemetry.injected = Some(soundcraft_playback::telemetry::CallbackTelemetry::default());
     t.frames(30);
     let tel = t.inspect()["telemetry"].clone();
-    assert_eq!(tel["text"], "Load 0.0%  Over 0");
+    assert_eq!(tel["text"], "0%  -- @ -- kHz");
     assert!(tel["warning"].is_null());
 }
 
@@ -595,4 +600,86 @@ fn the_telemetry_is_read_a_few_times_a_second_not_every_frame() {
     t.frames(120); // two seconds at 60 fps
     let reads = t.app.telemetry.reads;
     assert!((7..=9).contains(&reads), "about four reads a second, not 120: {reads}");
+}
+
+fn load_snap(ppm: u64) -> soundcraft_playback::telemetry::CallbackTelemetry {
+    soundcraft_playback::telemetry::CallbackTelemetry {
+        current_load_ppm: ppm,
+        max_load_ppm: 755_000,
+        callback_frames: 128,
+        sample_rate: 48_000,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_load_readout_formats_buffer_rate_and_host() {
+    use crate::load_readout::{format_text, host_text, percent_text};
+    assert_eq!(format_text(128, 48_000), "128 @ 48 kHz");
+    assert_eq!(format_text(64, 44_100), "64 @ 44.1 kHz");
+    assert_eq!(format_text(256, 96_000), "256 @ 96 kHz");
+    assert_eq!(format_text(0, 48_000), "-- @ 48 kHz");
+    assert_eq!(percent_text(425_000), "42%");
+    assert_eq!(host_text("ASIO"), "ASIO");
+    assert_eq!(host_text("WASAPI"), "WASAPI");
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(load_snap(300_000));
+    t.app.telemetry.injected_host = Some("ASIO".into());
+    t.frames(30);
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["text"], "30%  128 @ 48 kHz  ASIO");
+    assert_eq!(tel["level"], "ok");
+}
+
+#[test]
+fn the_load_readout_warns_above_eighty_percent_and_alerts_at_a_hundred() {
+    let mut t = T::new();
+    for (ppm, level) in [(800_000, "ok"), (850_000, "warning"), (1_000_000, "alert"), (1_050_000, "alert"), (200_000, "ok")] {
+        t.app.telemetry.injected = Some(load_snap(ppm));
+        t.app.telemetry.alert_until = 0.0;
+        t.frames(30);
+        assert_eq!(t.inspect()["telemetry"]["level"], level, "{ppm}");
+    }
+}
+
+#[test]
+fn an_over_budget_callback_holds_the_alert_for_two_seconds() {
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(load_snap(100_000));
+    t.frames(30);
+    assert_eq!(t.inspect()["telemetry"]["level"], "ok");
+    let mut s = load_snap(100_000);
+    s.over_budget_callbacks = 1;
+    s.recent_over_budget = 1;
+    t.app.telemetry.injected = Some(s);
+    t.frames(20);
+    assert_eq!(t.inspect()["telemetry"]["level"], "alert");
+    // The window has moved on (no recent over-budget); the hold keeps the color.
+    s.recent_over_budget = 0;
+    t.app.telemetry.injected = Some(s);
+    t.frames(60);
+    assert_eq!(t.inspect()["telemetry"]["level"], "alert", "about one second later");
+    t.frames(120);
+    assert_eq!(t.inspect()["telemetry"]["level"], "ok", "released after the hold");
+}
+
+#[test]
+fn clicking_the_load_readout_opens_the_details_window_and_reset_peak_clears_the_peak() {
+    let mut t = T::new();
+    t.app.telemetry.injected = Some(load_snap(300_000));
+    t.frames(30);
+    let rect: [f32; 4] = serde_json::from_value(t.inspect()["telemetry"]["rect"].clone()).unwrap();
+    t.click(mid(rect));
+    let tel = t.inspect()["telemetry"].clone();
+    assert_eq!(tel["open"], true);
+    let rows: Vec<String> = serde_json::from_value(tel["rows"].clone()).unwrap();
+    assert!(rows.contains(&"Peak callback load (since open): 75.5%".to_string()), "{rows:?}");
+    assert!(rows.contains(&"Load now (about the last second): 30.0%".to_string()), "{rows:?}");
+    let reset: [f32; 4] = serde_json::from_value(tel["reset_peak"].clone()).unwrap();
+    assert!(reset[2] > reset[0], "the Reset peak button is drawn");
+    t.click(mid(reset));
+    assert_eq!(t.app.telemetry.peak_resets, 1);
+    let rows: Vec<String> = serde_json::from_value(t.inspect()["telemetry"]["rows"].clone()).unwrap();
+    assert!(rows.contains(&"Peak callback load (since open): 0.0%".to_string()), "{rows:?}");
+    assert!(rows.contains(&"Load now (about the last second): 30.0%".to_string()), "the current load is untouched: {rows:?}");
 }

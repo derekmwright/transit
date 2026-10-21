@@ -48,6 +48,16 @@ pub struct CallbackTelemetry {
     /// points at the process (a vendor lock, memory pressure, CPU contention), not at a lock of
     /// ours: the callback takes none. A subset of `over_budget_callbacks`.
     pub over_budget_while_creating: u64,
+    /// Highest callback load in the recent window (about one second of callbacks, see
+    /// [`RECENT_SLOTS`]), in millionths. Unlike `max_load_ppm` it decays once the callbacks that
+    /// caused it leave the window. Zero before the first callback.
+    pub current_load_ppm: u64,
+    /// Over-budget callbacks inside the same recent window; decays like `current_load_ppm`.
+    pub recent_over_budget: u64,
+    /// Frames of the most recent callback (the device buffer as the driver delivers it).
+    pub callback_frames: u32,
+    /// Device sample rate the most recent callback was budgeted against.
+    pub sample_rate: u32,
     /// Exclusive bins with inclusive upper limits [`DURATION_LIMITS_NS`], followed by overflow.
     pub duration_histogram: [u64; 16],
     /// CPAL error callbacks of all kinds. These are not necessarily xruns.
@@ -63,6 +73,22 @@ pub struct CallbackTelemetry {
     pub fault_silence_frames: u64,
 }
 
+/// Callbacks kept for the recent window: one second at 48 kHz down to 47-frame buffers. Smaller
+/// buffers see a shorter window (still the last `RECENT_SLOTS` callbacks).
+pub const RECENT_SLOTS: usize = 1024;
+const OVER_BIT: u64 = 1 << 32;
+
+/// The last [`RECENT_SLOTS`] callbacks' loads, one relaxed store per callback and no allocation.
+/// Slot `(n - 1) % RECENT_SLOTS` holds callback `n`: load in millionths (saturated to 32 bits)
+/// with [`OVER_BIT`] set when over budget. Only the output callback writes; the UI reads.
+struct Recent([AtomicU64; RECENT_SLOTS]);
+
+impl Default for Recent {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
+
 /// Atomic publication storage. Only the output callback's `Accumulator` writes timing fields;
 /// the UI only reads them. Other counters have their own writers and are never reset in place.
 #[derive(Default)]
@@ -75,6 +101,11 @@ pub(crate) struct Counters {
     max_load_ppm: AtomicU64,
     over_budget_callbacks: AtomicU64,
     over_budget_while_creating: AtomicU64,
+    /// Peak reset requests from the UI; the callback zeroes its maxima when this moves.
+    peak_resets: AtomicU64,
+    last_frames: AtomicU64,
+    last_rate: AtomicU64,
+    recent: Recent,
     duration_histogram: [AtomicU64; 16],
     pub backend_errors: AtomicU64,
     pub device_lost_errors: AtomicU64,
@@ -85,8 +116,23 @@ pub(crate) struct Counters {
 
 impl Counters {
     pub fn snapshot(&self) -> CallbackTelemetry {
+        let callbacks = self.callbacks.load(Ordering::Relaxed);
+        let frames = self.last_frames.load(Ordering::Relaxed);
+        let rate = self.last_rate.load(Ordering::Relaxed);
+        // About one second of callbacks at the current buffer size and rate.
+        let window = if frames == 0 { RECENT_SLOTS as u64 } else { rate.div_ceil(frames).clamp(1, RECENT_SLOTS as u64) };
+        let (mut current, mut over) = (0u64, 0u64);
+        for back in 0..window.min(callbacks) {
+            let slot = self.recent.0[((callbacks - 1 - back) % RECENT_SLOTS as u64) as usize].load(Ordering::Relaxed);
+            current = current.max(slot & 0xffff_ffff);
+            over += u64::from(slot & OVER_BIT != 0);
+        }
         CallbackTelemetry {
-            callbacks: self.callbacks.load(Ordering::Relaxed),
+            current_load_ppm: current,
+            recent_over_budget: over,
+            callback_frames: frames.min(u64::from(u32::MAX)) as u32,
+            sample_rate: rate.min(u64::from(u32::MAX)) as u32,
+            callbacks,
             frames: self.frames.load(Ordering::Relaxed),
             timed_callbacks: self.timed_callbacks.load(Ordering::Relaxed),
             total_duration_ns: self.total_duration_ns.load(Ordering::Relaxed),
@@ -103,6 +149,11 @@ impl Counters {
         }
     }
 
+    /// Ask the output callback to start the since-open peak (load and longest callback) over.
+    pub fn reset_peak(&self) {
+        self.peak_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn error(&self, device_lost: bool) {
         self.backend_errors.fetch_add(1, Ordering::Relaxed);
         if device_lost {
@@ -113,7 +164,7 @@ impl Counters {
 
 /// Owned by the FnMut device callback. Local maxima avoid atomic compare/exchange retry loops.
 #[derive(Default)]
-pub(crate) struct Accumulator(CallbackTelemetry);
+pub(crate) struct Accumulator(CallbackTelemetry, u64);
 
 impl Accumulator {
     pub fn record(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>) {
@@ -122,9 +173,17 @@ impl Accumulator {
 
     /// Like [`Self::record`]; `creating` says a plug-in creation was running during the callback.
     pub fn record_overlap(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>, creating: bool) {
+        let seen = counters.peak_resets.load(Ordering::Relaxed);
+        if seen != self.1 {
+            // The UI asked for a new peak: forget the since-open maxima, once per request.
+            self.1 = seen;
+            self.0.max_duration_ns = 0;
+            self.0.max_load_ppm = 0;
+        }
         let s = &mut self.0;
         s.callbacks = s.callbacks.saturating_add(1);
         s.frames = s.frames.saturating_add(frames as u64);
+        let mut slot = 0u64;
         if let Some(elapsed) = elapsed {
             let ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
             s.timed_callbacks = s.timed_callbacks.saturating_add(1);
@@ -142,6 +201,7 @@ impl Accumulator {
                 let budget = frames as u128 * 1_000_000_000;
                 let load = (used * 1_000_000 / budget).min(u128::from(u64::MAX)) as u64;
                 s.max_load_ppm = s.max_load_ppm.max(load);
+                slot = load.min(u64::from(u32::MAX)) | if used > budget { OVER_BIT } else { 0 };
                 s.over_budget_callbacks = s.over_budget_callbacks.saturating_add(u64::from(used > budget));
                 s.over_budget_while_creating = s.over_budget_while_creating.saturating_add(u64::from(used > budget && creating));
             }
@@ -152,6 +212,12 @@ impl Accumulator {
             counters.over_budget_callbacks.store(s.over_budget_callbacks, Ordering::Relaxed);
             counters.over_budget_while_creating.store(s.over_budget_while_creating, Ordering::Relaxed);
         }
+        // The slot first: a reader that sees this callback counted also sees its load.
+        if let Some(cell) = counters.recent.0.get((s.callbacks.saturating_sub(1) % RECENT_SLOTS as u64) as usize) {
+            cell.store(slot, Ordering::Relaxed);
+        }
+        counters.last_frames.store(frames as u64, Ordering::Relaxed);
+        counters.last_rate.store(u64::from(rate), Ordering::Relaxed);
         counters.frames.store(s.frames, Ordering::Relaxed);
         counters.callbacks.store(s.callbacks, Ordering::Relaxed);
     }
@@ -261,5 +327,81 @@ mod tests {
         let s = counters.snapshot();
         assert_eq!((s.callbacks, s.frames, s.timed_callbacks), (20_000, 960_000, 20_000));
         assert_eq!(s.duration_histogram.iter().sum::<u64>(), 20_000);
+    }
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::*;
+
+    #[test]
+    fn current_load_follows_recent_callbacks_and_decays_while_the_peak_stays() {
+        let counters = Counters::default();
+        let mut accumulate = Accumulator::default();
+        // 4800 frames at 48 kHz: a 100 ms budget, so a window of 10 callbacks.
+        let run = |accumulate: &mut Accumulator, ms: u64| accumulate.record(&counters, 4800, 48_000, Some(Duration::from_millis(ms)));
+        run(&mut accumulate, 150);
+        run(&mut accumulate, 120);
+        let s = counters.snapshot();
+        assert_eq!((s.current_load_ppm, s.recent_over_budget, s.max_load_ppm), (1_500_000, 2, 1_500_000));
+        assert_eq!((s.callback_frames, s.sample_rate), (4800, 48_000));
+        for _ in 0..5 {
+            run(&mut accumulate, 10);
+        }
+        let s = counters.snapshot();
+        assert_eq!((s.current_load_ppm, s.recent_over_budget), (1_500_000, 2), "still inside the window");
+        for _ in 0..95 {
+            run(&mut accumulate, 10);
+        }
+        let s = counters.snapshot();
+        assert_eq!((s.current_load_ppm, s.recent_over_budget), (100_000, 0), "the window moved past both");
+        assert_eq!((s.max_load_ppm, s.over_budget_callbacks), (1_500_000, 2), "the lifetime figures stay");
+    }
+
+    #[test]
+    fn the_window_covers_about_one_second_of_callbacks() {
+        let counters = Counters::default();
+        let mut accumulate = Accumulator::default();
+        accumulate.record(&counters, 128, 48_000, Some(Duration::from_millis(5)));
+        for _ in 0..374 {
+            accumulate.record(&counters, 128, 48_000, Some(Duration::from_micros(100)));
+        }
+        let s = counters.snapshot();
+        assert_eq!((s.recent_over_budget, s.current_load_ppm), (1, 1_875_000), "375 callbacks of 2.67 ms is one second");
+        accumulate.record(&counters, 128, 48_000, Some(Duration::from_micros(100)));
+        assert_eq!(counters.snapshot().recent_over_budget, 0);
+    }
+
+    #[test]
+    fn recording_a_callback_does_not_allocate() {
+        use soundcraft_rt::testing::measure;
+        let counters = Counters::default();
+        let mut accumulate = Accumulator::default();
+        let (_, stats) = measure(|| {
+            for i in 0..3000u64 {
+                accumulate.record_overlap(&counters, 128, 48_000, Some(Duration::from_micros(i % 4000)), i % 7 == 0);
+            }
+        });
+        assert!(stats.is_zero());
+        assert_eq!(counters.snapshot().callbacks, 3000);
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    #[test]
+    fn a_peak_reset_restarts_the_peak_but_not_the_counts() {
+        let counters = Counters::default();
+        let mut accumulate = Accumulator::default();
+        accumulate.record(&counters, 48, 48_000, Some(Duration::from_millis(2)));
+        counters.reset_peak();
+        accumulate.record(&counters, 48, 48_000, Some(Duration::from_micros(100)));
+        let s = counters.snapshot();
+        assert_eq!((s.max_load_ppm, s.max_duration_ns), (100_000, 100_000));
+        assert_eq!((s.over_budget_callbacks, s.callbacks), (1, 2));
+        accumulate.record(&counters, 48, 48_000, Some(Duration::from_micros(50)));
+        assert_eq!(counters.snapshot().max_load_ppm, 100_000, "one reset applies once");
     }
 }

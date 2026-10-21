@@ -92,7 +92,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 crate::tempo_edit::meter_field(app, ui);
                 ui.add_space(2.0 * crate::theme::SPACE);
                 main_meter(app, ui);
-                crate::telemetry::readout(app, ui);
+                crate::load_readout::readout(app, ui);
                 if let Some(hint) = app.record_hint() {
                     ui.add_space(crate::theme::SPACE);
                     ui.label(egui::RichText::new(hint).color(TOKENS.record));

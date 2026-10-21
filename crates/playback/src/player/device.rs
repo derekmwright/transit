@@ -46,6 +46,8 @@ pub struct Player {
     #[cfg(not(target_arch = "wasm32"))]
     silent_stop: Arc<AtomicBool>,
     pub device_name: String,
+    /// The audio system (cpal host) of the open device: "ASIO", "WASAPI", ...; empty for the silent clock.
+    pub device_system: String,
     pub device_rate: u32,
     pub device_channels: u16,
     /// This machine's paths on the open device (ADR 0015).
@@ -135,6 +137,7 @@ impl Player {
             #[cfg(not(target_arch = "wasm32"))]
             silent_stop: Arc::new(AtomicBool::new(false)),
             device_name: "No audio device (silent)".into(),
+            device_system: String::new(),
             device_rate: rate,
             device_channels: 0,
             io: RefCell::new(Arc::new(IoMap::default())),
@@ -268,6 +271,7 @@ impl Player {
             }
             log::info!("audio output opened with {} channels (asked for {})", config.channels, wide);
             player.device_name = name.clone();
+            player.device_system = system.to_string();
             player.device_channels = config.channels;
             player.device_buffer = match config.buffer_size {
                 cpal::BufferSize::Fixed(n) => Some(n),
@@ -650,6 +654,10 @@ impl Player {
     }
     pub fn thread_priority(&self) -> scheduling::WorkerPriority {
         scheduling::observe(self.stream.as_ref())
+    }
+    /// Start the since-open peak load over; the output callback applies it at its next block.
+    pub fn reset_peak_load(&self) {
+        self.fault.telemetry.reset_peak();
     }
     pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
         self.fault.telemetry.snapshot()
