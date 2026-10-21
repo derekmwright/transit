@@ -996,3 +996,53 @@ fn main_follows_the_path_the_io_map_names() {
         assert!(moved[c].iter().all(|v| *v == 0.0), "channel {c}");
     }
 }
+
+#[test]
+fn a_path_table_edit_on_an_open_stream_moves_main_through_the_published_plan() {
+    let mut session = Session::default();
+    session.edit.click = true;
+    let session = Arc::new(session);
+    let shared = Arc::new(Shared {
+        position: AtomicI64::new(0),
+        playing: AtomicBool::new(false),
+        speed: AtomicU32::new(1000),
+        meters: Mutex::new(MeterSnapshot::default()),
+        editors_open: AtomicBool::new(false),
+    });
+    let channels = 10;
+    let target = RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: channels as u16, in_channels: 0 };
+    let key = ClockKey { generation: 1, domain: 1, direction: Direction::Output };
+    let (mut control, mut audio) = pair(target, PlanLimits::default(), key, 48_000, shared).unwrap();
+    control.sessions.set_io(Arc::new(soundcraft_model::IoMap::for_device("test", "test", 0, 10)));
+    control.request(Arc::clone(&session), None).unwrap();
+    control.service(&mut make);
+    control.send_action(Command::Play { from: 0, end: None, looped: None }, true).unwrap();
+    let block = |audio: &mut Audio| {
+        let mut block = vec![f32::NAN; 256 * channels];
+        audio.fill(&mut block, channels, &mut plan_bridge::callback_scope(), &mut action_lane::callback_scope()).unwrap();
+        block
+    };
+    let loud = |block: &[f32], c: usize| block.chunks_exact(channels).any(|f| f[c].abs() > 0.1);
+    // The click is audible on Out 1-2 and nowhere else; the stream stays open from here on.
+    let mut before = Vec::new();
+    for _ in 0..4 {
+        before.extend(block(&mut audio));
+    }
+    assert!(loud(&before, 0) && !loud(&before, 2) && !loud(&before, 3));
+    let generation = audio.plans.engine().active().generation;
+    // Main moves to Out 3-4 (device channels 2 and 3) as a plan on the same device generation.
+    let mut io = soundcraft_model::IoMap::for_device("test", "test", 0, 10);
+    io.set_main("Out 3-4").unwrap();
+    control.sessions.set_io(Arc::new(io));
+    control.request(Arc::clone(&session), None).unwrap();
+    control.service(&mut make);
+    // The next click is a beat later: play past it (256 frames a block, 120 bpm at 48 kHz).
+    let mut after = Vec::new();
+    for _ in 0..120 {
+        after.extend(block(&mut audio));
+    }
+    assert!(audio.plans.engine().active().generation > generation, "the new table arrived as a plan");
+    assert!(loud(&after, 2) && loud(&after, 3), "Main plays on device channels 2 and 3");
+    assert!(!loud(&after, 0) && !loud(&after, 1), "and no longer on 0 and 1");
+    control.retire(audio.plans, audio.actions);
+}

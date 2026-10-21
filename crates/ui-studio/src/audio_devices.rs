@@ -44,6 +44,8 @@ pub struct AudioDevicesLayout {
     pub opened: Vec<String>,
     /// Fallbacks and notes, as shown with the warning icon.
     pub notes: Vec<String>,
+    /// The path table the I/O section showed (the engine's, read this frame).
+    pub io: Option<soundcraft_model::IoMap>,
 }
 
 /// Devices standing in for the machine's (the control channel's `audio.fake_devices`, tests):
@@ -90,6 +92,7 @@ pub struct AudioDevicesState {
     input_reported: Option<(String, String)>,
     pub layout: AudioDevicesLayout,
     verification: Option<Verification>,
+    io_editor: crate::audio_devices_io::IoEditor,
 }
 
 impl AudioDevicesState {
@@ -454,12 +457,22 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let recording = app.recording_active();
     let audio_on = app.player.is_some() || app.audio_devices.fake.is_some();
     let (mut apply, mut reconnect, mut rescan, mut panel) = (false, false, false, false);
+    // The path table is the engine's, read again every frame; one edit at most per frame.
+    let io = app.engine.io_map().clone();
+    let wasapi = crate::audio_devices_io::is_wasapi(&if io.system.is_empty() {
+        pick_system(&systems, app.ui.audio.system.as_deref()).map(|s| s.name.clone()).unwrap_or_default()
+    } else {
+        io.system.clone()
+    });
+    let mut editor = std::mem::take(&mut app.audio_devices.io_editor);
+    let mut io_edit = None;
+    let mut io_items = Vec::new();
     let mut open = true;
     let r = egui::Window::new("Audio Devices")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .default_pos(ctx.content_rect().center() - egui::vec2(260.0, 200.0))
+        .default_pos(ctx.content_rect().center() - egui::vec2(260.0, 320.0))
         .show(ctx, |ui| {
             ui.set_width(520.0);
             let sys = pick_system(&systems, draft.system.as_deref());
@@ -538,6 +551,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
             if recording {
                 ui.label(egui::RichText::new(REFUSED_RECORDING).color(TOKENS.record).size(11.5));
             }
+            io_edit = crate::audio_devices_io::section(ui, &io, wasapi, &mut editor, &mut io_items);
             ui.add_space(SPACE);
             ui.horizontal(|ui| {
                 let b = ui.add_enabled(!recording, egui::Button::new("Apply"));
@@ -556,14 +570,23 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 }
             });
             lay.controls = controls.into_iter().map(|(text, key, rect)| MenuItem::at(ui, text, key.into(), rect)).collect();
+            lay.controls.append(&mut io_items);
         });
     if let Some(r) = r {
         lay.window = r4(r.response.rect);
     }
+    lay.io = Some(io);
     lay.draft = draft.clone();
     lay.notes = app.audio_devices.notes.clone();
     app.audio_devices.draft = draft.clone();
     app.audio_devices.layout = lay;
+    if let Some(edit) = io_edit {
+        match app.run("setup.io_map", edit.params()) {
+            Ok(_) => editor.done(&edit),
+            Err(error) => app.status = error,
+        }
+    }
+    app.audio_devices.io_editor = editor;
     if apply {
         let _ = app.apply_audio(draft);
     }

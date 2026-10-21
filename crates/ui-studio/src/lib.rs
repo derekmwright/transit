@@ -10,6 +10,7 @@ pub mod actions;
 pub mod arrange;
 mod audio_connection;
 pub mod audio_devices;
+pub mod audio_devices_io;
 pub mod automation;
 pub mod browser;
 pub mod control;

@@ -773,7 +773,8 @@ impl LegacyPlayer {
         let want = session.sample_rate.hz();
         let side_rate = session.sample_rate.as_f64() as f32;
         let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| Mutex::new(Side::new(side_rate, garbage));
-        match open_device(want, cfg) {
+        let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
+        match open_device(want, want_ch, cfg) {
             Ok((device, config, format, name, system)) => {
                 let duplex = input_with_output(system, || {
                     use cpal::traits::DeviceTrait;
@@ -784,10 +785,8 @@ impl LegacyPlayer {
                 }
                 let mut input_error = "no audio input device".to_string();
                 // The chosen buffer size first; if the device refuses it, its default.
-                let mut attempts = vec![config.clone()];
-                if config.buffer_size != cpal::BufferSize::Default {
-                    attempts.push(cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..config });
-                }
+                let wide = config.channels;
+                let attempts = output_attempts(&config, want_ch);
                 for config in attempts {
                     let rate = config.sample_rate.0;
                     let channels = usize::from(config.channels);
@@ -848,7 +847,7 @@ impl LegacyPlayer {
                                 cpal::BufferSize::Default => None,
                             };
                             log::info!(
-                                "audio device: {name} @ {rate} Hz, {channels} ch, {format}, buffer {}",
+                                "audio device: {name} @ {rate} Hz, {channels} ch (widest {wide}), {format}, buffer {}",
                                 buffer.map_or("default".to_string(), |n| n.to_string())
                             );
                             return LegacyPlayer {
@@ -1330,13 +1329,24 @@ where
 /// What an output stream is opened with: the configuration, the buffer sizes it allows, the format.
 type OutputChoice = (cpal::StreamConfig, cpal::SupportedBufferSize, cpal::SampleFormat);
 
+/// Hosts whose channel order is the driver's physical order, so opening every channel puts
+/// device channel 1 on output 1 (ADR 0015). Elsewhere (ALSA, CoreAudio, others) a wide config may
+/// map the first channels to something other than the front pair (PipeWire's 32-channel
+/// "default", aggregate devices).
+// TODO(ADR 0015): validate each remaining host's channel order, then add it here.
+fn physical_channel_order(host: &str) -> bool {
+    host == devices::ASIO_SYSTEM || host == "WASAPI"
+}
+
 /// The best output configuration at one of `rates` (tried in order): the best sample format first
-/// (f32, else 32- or 16-bit integers), then the most channels the device offers, stereo or wider
-/// and at most [`MAX_DEVICE_CHANNELS`] (ADR 0015: every output opens, not only the main bus's
-/// width; paths other than Main stay silent in this slice). A stereo-only device gets its two
-/// channels exactly as before. WASAPI shared mode lists only the system mix format's channel
-/// count, so on Windows more than that is ASIO.
-fn choose_output(configs: &[cpal::SupportedStreamConfigRange], rates: &[u32]) -> Option<OutputChoice> {
+/// (f32, else 32- or 16-bit integers), then the most channels. On ASIO and WASAPI
+/// ([`physical_channel_order`]) that is the widest offered from stereo up to
+/// [`MAX_DEVICE_CHANNELS`] (ADR 0015: every output opens; paths other than Main stay silent in
+/// this slice). On every other host the previous rule holds: stereo up to `want_ch`, the session's
+/// width. A stereo-only device gets its two channels exactly as before. WASAPI shared mode lists
+/// only the system mix format's channel count, so on Windows more than that is ASIO.
+fn choose_output(configs: &[cpal::SupportedStreamConfigRange], rates: &[u32], host: &str, want_ch: u16) -> Option<OutputChoice> {
+    let most = if physical_channel_order(host) { MAX_DEVICE_CHANNELS } else { usize::from(want_ch.max(2)) };
     let better = |c: &cpal::SupportedStreamConfigRange, x: &OutputChoice| {
         let (rc, rx) = (devices::format_rank(c.sample_format()).unwrap_or(usize::MAX), devices::format_rank(x.2).unwrap_or(usize::MAX));
         rc < rx || (rc == rx && c.channels() > x.0.channels)
@@ -1348,7 +1358,7 @@ fn choose_output(configs: &[cpal::SupportedStreamConfigRange], rates: &[u32]) ->
                 && c.min_sample_rate().0 <= rate
                 && c.max_sample_rate().0 >= rate
                 && c.channels() >= 2
-                && usize::from(c.channels()) <= MAX_DEVICE_CHANNELS
+                && usize::from(c.channels()) <= most
                 && chosen.as_ref().is_none_or(|x| better(c, x))
             {
                 chosen = Some((c.with_sample_rate(cpal::SampleRate(rate)).config(), *c.buffer_size(), c.sample_format()));
@@ -1361,11 +1371,28 @@ fn choose_output(configs: &[cpal::SupportedStreamConfigRange], rates: &[u32]) ->
     None
 }
 
+/// The stream configurations to try, in order: the chosen one with its buffer size, then with the
+/// device's default buffer; and, when the chosen width is wider than the session's (every output
+/// opened, ADR 0015), the same two at `session_width` (at least 2), so a driver that refuses a
+/// wide buffer set still opens as it did before.
+fn output_attempts(config: &cpal::StreamConfig, session_width: u16) -> Vec<cpal::StreamConfig> {
+    let narrow = session_width.max(2);
+    let widths: Vec<u16> = if config.channels > narrow { vec![config.channels, narrow] } else { vec![config.channels] };
+    let mut attempts = Vec::new();
+    for channels in widths {
+        attempts.push(cpal::StreamConfig { channels, ..config.clone() });
+        if config.buffer_size != cpal::BufferSize::Default {
+            attempts.push(cpal::StreamConfig { channels, buffer_size: cpal::BufferSize::Default, ..config.clone() });
+        }
+    }
+    attempts
+}
+
 /// Open the output device `cfg` chooses (else the default) at the chosen rate (else the session
 /// rate) if possible, with every channel it offers ([`choose_output`]), and the chosen buffer
 /// size when the device allows it.
 /// Also returns the audio system's name.
-fn open_device(want_rate: u32, cfg: &AudioConfig) -> Result<OpenedDevice, String> {
+fn open_device(want_rate: u32, want_ch: u16, cfg: &AudioConfig) -> Result<OpenedDevice, String> {
     use cpal::traits::DeviceTrait;
     let host = devices::host(cfg).ok_or_else(|| "no audio system".to_string())?;
     let device = devices::device(host, cfg.output.as_deref(), true).ok_or_else(|| "no output device".to_string())?;
@@ -1373,7 +1400,8 @@ fn open_device(want_rate: u32, cfg: &AudioConfig) -> Result<OpenedDevice, String
     let name = device.name().unwrap_or_else(|_| "Audio device".into());
     // Prefer a config at the chosen (else session) rate; else the device default (we resample).
     let rates: Vec<u32> = cfg.sample_rate.into_iter().chain(Some(want_rate)).collect();
-    let chosen = device.supported_output_configs().ok().and_then(|configs| choose_output(&configs.collect::<Vec<_>>(), &rates));
+    let chosen =
+        device.supported_output_configs().ok().and_then(|configs| choose_output(&configs.collect::<Vec<_>>(), &rates, host.id().name(), want_ch));
     let (config, format) = match chosen {
         Some((mut c, buffers, format)) => {
             c.buffer_size = devices::buffer_size(cfg.buffer_size, &buffers);
@@ -1415,30 +1443,60 @@ mod tests {
 
     #[test]
     fn a_two_channel_device_opens_the_same_two_channels_as_before() {
-        let (config, _, format) = choose_output(&widths(2, cpal::SampleFormat::F32), &[48_000]).unwrap();
+        let (config, _, format) = choose_output(&widths(2, cpal::SampleFormat::F32), &[48_000], "ASIO", 2).unwrap();
         assert_eq!((config.channels, config.sample_rate.0, format), (2, 48_000, cpal::SampleFormat::F32));
         // A device that lists only stereo (WASAPI's mix format) is the same.
         let only = widths(2, cpal::SampleFormat::F32).split_off(1);
-        assert_eq!(choose_output(&only, &[48_000]).unwrap().0.channels, 2);
+        assert_eq!(choose_output(&only, &[48_000], "ASIO", 2).unwrap().0.channels, 2);
     }
 
     #[test]
     fn a_wide_device_opens_every_output_up_to_the_cap() {
-        assert_eq!(choose_output(&widths(10, cpal::SampleFormat::I32), &[48_000]).unwrap().0.channels, 10);
-        let capped = choose_output(&widths(34, cpal::SampleFormat::I32), &[48_000]).unwrap().0.channels;
+        assert_eq!(choose_output(&widths(10, cpal::SampleFormat::I32), &[48_000], "ASIO", 2).unwrap().0.channels, 10);
+        let capped = choose_output(&widths(34, cpal::SampleFormat::I32), &[48_000], "ASIO", 2).unwrap().0.channels;
         assert_eq!(usize::from(capped), MAX_DEVICE_CHANNELS, "a 34-channel device opens its first 32");
         // A device that lists only an over-cap width gets the default configuration instead.
-        assert!(choose_output(&widths(34, cpal::SampleFormat::I32).split_off(33), &[48_000]).is_none());
+        assert!(choose_output(&widths(34, cpal::SampleFormat::I32).split_off(33), &[48_000], "ASIO", 2).is_none());
         // A mono-only device is not chosen here either (the default configuration serves it).
-        assert!(choose_output(&widths(1, cpal::SampleFormat::F32), &[48_000]).is_none());
+        assert!(choose_output(&widths(1, cpal::SampleFormat::F32), &[48_000], "ASIO", 2).is_none());
+    }
+
+    #[test]
+    fn hosts_without_a_known_channel_order_keep_the_session_width_rule() {
+        // PipeWire's ALSA "default" lists up to 32 channels: not opened wide.
+        for host in ["ALSA", "CoreAudio", "JACK"] {
+            let wide = widths(32, cpal::SampleFormat::F32);
+            assert_eq!(choose_output(&wide, &[48_000], host, 2).unwrap().0.channels, 2, "{host}: a stereo session");
+            assert_eq!(choose_output(&wide, &[48_000], host, 6).unwrap().0.channels, 6, "{host}: a 5.1 session");
+            assert_eq!(choose_output(&wide, &[48_000], host, 1).unwrap().0.channels, 2, "{host}: never below stereo");
+        }
+        // ASIO and WASAPI open the widest, whatever the session width.
+        for host in ["ASIO", "WASAPI"] {
+            assert_eq!(choose_output(&widths(10, cpal::SampleFormat::F32), &[48_000], host, 2).unwrap().0.channels, 10, "{host}");
+        }
+    }
+
+    #[test]
+    fn a_refused_wide_open_retries_at_the_session_width_before_giving_up() {
+        let wide = cpal::StreamConfig { channels: 10, sample_rate: cpal::SampleRate(48_000), buffer_size: cpal::BufferSize::Fixed(128) };
+        let tried: Vec<(u16, cpal::BufferSize)> = output_attempts(&wide, 2).into_iter().map(|c| (c.channels, c.buffer_size)).collect();
+        assert_eq!(
+            tried,
+            [(10, cpal::BufferSize::Fixed(128)), (10, cpal::BufferSize::Default), (2, cpal::BufferSize::Fixed(128)), (2, cpal::BufferSize::Default)]
+        );
+        // A 5.1 session retries at six; a device already at the session width has nothing narrower.
+        assert_eq!(output_attempts(&wide, 6).last().map(|c| c.channels), Some(6));
+        let stereo = cpal::StreamConfig { channels: 2, buffer_size: cpal::BufferSize::Default, ..wide };
+        assert_eq!(output_attempts(&stereo, 2).len(), 1);
+        assert_eq!(output_attempts(&stereo, 1).len(), 1, "the session width is at least stereo");
     }
 
     #[test]
     fn format_beats_width_and_the_wanted_rate_beats_the_other() {
         let mut configs = widths(10, cpal::SampleFormat::I32);
         configs.extend(widths(2, cpal::SampleFormat::F32));
-        assert_eq!(choose_output(&configs, &[48_000]).unwrap().0.channels, 2, "f32 stereo is preferred over 32-bit integers");
-        let (config, ..) = choose_output(&widths(4, cpal::SampleFormat::F32), &[96_000, 44_100]).unwrap();
+        assert_eq!(choose_output(&configs, &[48_000], "ASIO", 2).unwrap().0.channels, 2, "f32 stereo is preferred over 32-bit integers");
+        let (config, ..) = choose_output(&widths(4, cpal::SampleFormat::F32), &[96_000, 44_100], "ASIO", 2).unwrap();
         assert_eq!((config.channels, config.sample_rate.0), (4, 44_100));
     }
 

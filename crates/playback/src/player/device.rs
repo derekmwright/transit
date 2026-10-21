@@ -207,19 +207,18 @@ impl Player {
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
         use cpal::traits::{DeviceTrait, StreamTrait};
-        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), cfg)?;
+        let want_ch = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
+        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), want_ch, cfg)?;
         let duplex = crate::input_with_output(system, || device.default_input_config().is_ok_and(|c| record::input_usable(&c)));
         // Every output the stream opened, and the duplex device's inputs, get default paths; the
         // app replaces them with this machine's saved table (`set_io`).
         let inputs = if duplex { record::input_channels_on(&device, config.sample_rate.0) } else { 0 };
-        let io = IoMap::for_device(system, &name, inputs, config.channels);
-        let mut attempts = vec![config.clone()];
-        if config.buffer_size != cpal::BufferSize::Default {
-            attempts.push(cpal::StreamConfig { buffer_size: cpal::BufferSize::Default, ..config });
-        }
+        let wide = config.channels;
+        let attempts = crate::output_attempts(&config, want_ch);
         let mut error = "no usable output stream".to_owned();
         for config in attempts {
-            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0, io.clone())?;
+            let io = IoMap::for_device(system, &name, inputs, config.channels);
+            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0, io)?;
             *player.input.get_mut() = if duplex {
                 match record::Recorder::build_on(&device, config.sample_rate.0, config.buffer_size) {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
@@ -266,6 +265,7 @@ impl Player {
                 error = failure.to_string();
                 continue;
             }
+            log::info!("audio output opened with {} channels (asked for {})", config.channels, wide);
             player.device_name = name.clone();
             player.device_channels = config.channels;
             player.device_buffer = match config.buffer_size {

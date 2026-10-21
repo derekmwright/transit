@@ -254,7 +254,9 @@ fn io_map_setup(e: &mut Engine, p: &Value) -> Result<Value> {
         "set" => {
             let map: IoMap = serde_json::from_value(p.get("map").cloned().ok_or_else(|| bad(id, "`map` required"))?)
                 .map_err(|error| bad(id, format!("`map` is not an I/O map: {error}")))?;
-            let mut checked = IoMap { paths: Vec::new(), ..map.clone() };
+            // Counts are bounded like a device's: a path beyond them is refused by `add_path`.
+            let cap = soundcraft_model::MAX_DEVICE_CHANNELS as u16;
+            let mut checked = IoMap { paths: Vec::new(), inputs: map.inputs.min(cap), outputs: map.outputs.min(cap), ..map.clone() };
             for path in map.paths {
                 checked.add_path(path).map_err(refuse)?;
             }
@@ -625,6 +627,25 @@ mod tests {
         assert!(!e.is_dirty());
         assert_eq!(e.session(), &saved);
         assert!(e.io_revision() >= 6, "the host sees every change");
+    }
+
+    #[test]
+    fn io_map_set_bounds_the_channel_counts_like_a_device() {
+        let mut e = Engine::default();
+        let mut map = soundcraft_model::IoMap::for_device("ASIO", "x", 2, 2);
+        map.inputs = u16::MAX;
+        map.outputs = 40;
+        let r = e.execute("setup.io_map", &json!({"action": "set", "map": map})).unwrap();
+        assert_eq!((r["io"]["inputs"].clone(), r["io"]["outputs"].clone()), (json!(32), json!(32)));
+        assert_eq!((e.io_map().inputs, e.io_map().outputs), (32, 32));
+        // A path on a channel past the cap is still refused.
+        map.paths.push(soundcraft_model::IoPath {
+            name: "Far".into(),
+            direction: soundcraft_model::IoDirection::Output,
+            channels: vec![33],
+            format: soundcraft_model::ChannelFormat::Mono,
+        });
+        assert!(matches!(e.execute("setup.io_map", &json!({"action": "set", "map": map})), Err(crate::EngineError::BadParams(..))));
     }
 
     #[test]
