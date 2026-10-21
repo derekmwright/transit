@@ -1,6 +1,8 @@
 # Plan renderer
 
-The only renderer. Realtime playback, bounces and freezes all use it.
+The renderer for realtime playback, bounces and freezes. The old `MixEngine::render` path (and
+`render_legacy`, behind the default `legacy-render` feature of `crates/mix`) is being removed; until
+it is gone it exists only as the oracle of the parity tests. Do not build on it.
 
 ## Flow
 
