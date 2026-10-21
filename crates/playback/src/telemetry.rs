@@ -167,11 +167,13 @@ impl Counters {
 pub(crate) struct Accumulator(CallbackTelemetry, u64);
 
 impl Accumulator {
+    /// Test shorthand for a callback that overlapped no plug-in creation.
+    #[cfg(test)]
     pub fn record(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>) {
         self.record_overlap(counters, frames, rate, elapsed, false);
     }
 
-    /// Like [`Self::record`]; `creating` says a plug-in creation was running during the callback.
+    /// Records one callback; `creating` says a plug-in creation was running during it.
     pub fn record_overlap(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>, creating: bool) {
         let seen = counters.peak_resets.load(Ordering::Relaxed);
         if seen != self.1 {

@@ -554,3 +554,30 @@ fn key_alignment_allocates_nothing_when_a_key_or_a_latency_changes() {
     no_cost("removing the key", &rig.edit(&s));
     assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the session plays");
 }
+
+/// A routing change (a send retargeted, a loop as an older file could hold) re-orders the strips
+/// with no allocation on the audio thread.
+#[test]
+fn routing_changes_and_a_loop_allocate_nothing() {
+    use soundcraft_model::SendSlot;
+    let (mut s, t, _) = session_with_clip();
+    s.edit.delay_compensation = true;
+    let b = s.add_bus("B", ChannelFormat::Stereo);
+    let a = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("A"));
+    s.track_mut(a).unwrap().mixer.input = Route::Bus(b);
+    let b2 = s.add_bus("B2", ChannelFormat::Stereo);
+    let a2 = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("A2"));
+    s.track_mut(a2).unwrap().mixer.input = Route::Bus(b2);
+    s.track_mut(t).unwrap().mixer.sends[0] = Some(SendSlot::new(Route::Bus(b)));
+    let mut rig = Rig::new(&s);
+    no_cost("unchanged", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.sends[1] = Some(SendSlot::new(Route::Bus(b2)));
+    no_cost("a new send", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.sends[0].as_mut().unwrap().target = Route::Bus(b2);
+    no_cost("a send retargeted", &rig.edit(&s));
+    // A2 feeds A, A feeds A2: a loop.
+    s.track_mut(a2).unwrap().mixer.output = Route::Bus(b);
+    s.track_mut(a).unwrap().mixer.output = Route::Bus(b2);
+    no_cost("a loop", &rig.edit(&s));
+    assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the track plays");
+}
