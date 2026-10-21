@@ -75,13 +75,13 @@ fn width_conversion_and_input_choices_use_only_available_channels() {
         let tr = app.engine.session().track(t).unwrap();
         let mapped = format!("In {}-{last}", last - 1);
         assert_eq!(tr.mixer.input, Route::Hardware(mapped.clone()));
-        assert!(crate::mixer::input_choices(app.engine.session(), tr, inputs).iter().any(|(_, value)| value == &mapped));
+        assert!(crate::mixer::input_choices(app.engine.session(), tr, inputs, app.engine.io_map()).iter().any(|(_, value)| value == &mapped));
         assert_eq!(capture_inputs(&app), [vec![last - 2, last - 1]]);
     }
     for inputs in [0, 1] {
         let mut app = app(inputs);
         let t = track(&mut app, "stereo", "In 1-2");
-        assert!(crate::mixer::input_choices(app.engine.session(), app.engine.session().track(t).unwrap(), inputs).is_empty());
+        assert!(crate::mixer::input_choices(app.engine.session(), app.engine.session().track(t).unwrap(), inputs, app.engine.io_map()).is_empty());
         // Default (implicit input 1) routes must obey the same boundary.
         app.engine.session_mut().track_mut(t).unwrap().mixer.input = Route::None;
         assert!(width(&mut app, &[t], "stereo").is_err());

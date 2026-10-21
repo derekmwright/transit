@@ -274,6 +274,11 @@ pub fn fallback_notes(cfg: &AudioConfig, systems: Option<&[AudioSystem]>, opened
 }
 
 impl StudioApp {
+    /// The one-line warning about the path table (`audio_devices_io::warning_text`).
+    pub fn io_warning(&self) -> Option<String> {
+        crate::audio_devices_io::warning_text(&self.engine.unresolved_routes(), &self.engine.io_map().overlaps())
+    }
+
     /// Audio › Audio Devices: open the window with the saved choices.
     pub fn open_audio_devices(&mut self) {
         let s = &mut self.audio_devices;

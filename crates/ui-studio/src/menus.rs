@@ -278,6 +278,13 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(egui::RichText::new(&app.status).color(TOKENS.text_dim).size(11.5));
+                if let Some(w) = app.io_warning() {
+                    ui.add_space(crate::theme::SPACE);
+                    let text = egui::RichText::new(format!("\u{26a0} {w}")).color(TOKENS.record).size(11.5);
+                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text("Open Audio Devices").clicked() {
+                        app.open_audio_devices();
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let c = app.cursor();
                     let text = format!("Cursor {}  ·  {}", crate::transport::bars_beats(app, c).trim(), crate::transport::min_sec(app, c));

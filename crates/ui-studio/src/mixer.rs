@@ -27,7 +27,7 @@ use crate::fine::{self, Target};
 use crate::theme::{self, TOKENS};
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{BusId, Route, SendSlot, Session, Track, TrackId, TrackKind};
+use soundcraft_model::{BusId, IoDirection, IoMap, IoPath, Route, SendSlot, Session, Track, TrackId, TrackKind};
 
 /// Strip width and gap (points).
 pub const STRIP_W: f32 = 88.0;
@@ -394,14 +394,62 @@ pub fn takes_sends(kind: TrackKind) -> bool {
 
 /// Where a send from `t` can go: `(label, bus name)` for every bus that is not already one of its
 /// sends (`except` slot aside) and would not close a loop.
-pub fn send_targets(s: &Session, t: &Track, except: Option<usize>) -> Vec<(String, String)> {
+pub fn send_targets(s: &Session, t: &Track, except: Option<usize>, io: &IoMap) -> Vec<(String, String)> {
     let taken: Vec<&Route> =
         t.mixer.sends.iter().enumerate().filter(|(i, _)| Some(*i) != except).filter_map(|(_, x)| x.as_ref()).map(|x| &x.target).collect();
-    s.busses
+    let mut v: Vec<(String, String)> = s
+        .busses
         .iter()
         .filter(|b| !taken.contains(&&Route::Bus(b.id)) && !feeding_loops(s, t, b.id) && heard(s, b.id))
         .map(|b| (bus_label(s, b.id), b.name.clone()))
+        .collect();
+    let paths: Vec<(String, String)> =
+        path_choices(io, IoDirection::Output).into_iter().filter(|(_, name)| !taken.contains(&&Route::Hardware(name.clone()))).collect();
+    push_paths(&mut v, paths);
+    v
+}
+
+/// A dropdown entry that draws a separator line and picks nothing.
+const SEPARATOR: &str = "\u{1}separator";
+
+/// A separator, then `paths`, when there are any.
+fn push_paths(v: &mut Vec<(String, String)>, paths: Vec<(String, String)>) {
+    if !paths.is_empty() {
+        v.push((String::new(), SEPARATOR.into()));
+        v.extend(paths);
+    }
+}
+
+/// A path as a dropdown label: its name, with the device channels after it when the name does not
+/// already say them: "Out 3-4", "Headphones (Out 3-4)".
+fn path_label(p: &IoPath) -> String {
+    let prefix = if p.direction == IoDirection::Input { "In" } else { "Out" };
+    let channels = format!("{prefix} {}", crate::audio_devices_io::channel_label(&p.channels));
+    if p.name.eq_ignore_ascii_case(&channels) { p.name.clone() } else { format!("{} ({channels})", p.name) }
+}
+
+/// The I/O map's paths of one direction as `(label, path name)`, in the map's order; Main's path
+/// is left out of the outputs (that is the "Main" entry).
+pub fn path_choices(io: &IoMap, direction: IoDirection) -> Vec<(String, String)> {
+    io.paths_of(direction)
+        .filter(|p| direction == IoDirection::Input || !p.name.eq_ignore_ascii_case(&io.main))
+        .map(|p| (path_label(p), p.name.clone()))
         .collect()
+}
+
+/// A route naming an output path this machine does not have: it plays silent until the path
+/// exists again (`Engine::unresolved_routes`).
+fn unresolved_output(io: &IoMap, r: &Route) -> bool {
+    matches!(r, Route::Hardware(h) if io.path(h).is_none_or(|p| p.direction != IoDirection::Output))
+}
+
+const NOT_HERE: &str = "not on this device";
+
+/// How an output route reads in a dropdown or a send row: its label, with a warning marker when
+/// the path is not on this machine.
+fn output_text(s: &Session, io: &IoMap, r: &Route, channels: usize) -> String {
+    let label = route_label(s, r, false, channels);
+    if unresolved_output(io, r) { format!("\u{26a0} {label}") } else { label }
 }
 
 /// Whether picking `value` from a route dropdown would leave the route as it is: the same route,
@@ -433,7 +481,7 @@ pub fn route_label(s: &Session, r: &Route, input: bool, format_channels: usize) 
 }
 
 /// The outputs a track can pick: `(label, value for track.output)`.
-pub fn output_choices(s: &Session, t: &Track) -> Vec<(String, String)> {
+pub fn output_choices(s: &Session, t: &Track, io: &IoMap) -> Vec<(String, String)> {
     let mut v = vec![("Main".to_string(), "main".to_string())];
     for b in &s.busses {
         // Never a bus that comes back to this track's input, however many hops away.
@@ -442,23 +490,28 @@ pub fn output_choices(s: &Session, t: &Track) -> Vec<(String, String)> {
         }
         v.push((bus_label(s, b.id), b.name.clone()));
     }
+    push_paths(&mut v, path_choices(io, IoDirection::Output));
     v.push(("No output".into(), "none".into()));
     v
 }
 
 /// The inputs a track can pick: hardware inputs (`In 1`.. or `In 1-2`..) and busses.
-pub fn input_choices(s: &Session, t: &Track, device_inputs: usize) -> Vec<(String, String)> {
+pub fn input_choices(s: &Session, t: &Track, device_inputs: usize, io: &IoMap) -> Vec<(String, String)> {
     let mut v = Vec::new();
     let n = device_inputs;
     if t.kind == TrackKind::Audio || t.kind == TrackKind::Aux {
-        if t.channels() >= 2 {
-            for i in (1..n).step_by(2) {
-                v.push((format!("In {i}-{}", i + 1), format!("In {i}-{}", i + 1)));
-            }
-        } else {
-            for i in 1..=n {
-                v.push((format!("In {i}"), format!("In {i}")));
-            }
+        let width = if t.channels() >= 2 { 2 } else { 1 };
+        // The map's named paths of the strip's width first; a legacy "In N" label stays only for
+        // channels no named path covers, so a renamed path replaces its label.
+        let named: Vec<&IoPath> = io.paths_of(IoDirection::Input).filter(|p| p.channels.len() == width).collect();
+        v.extend(named.iter().map(|p| (path_label(p), p.name.clone())));
+        let covered = |first: usize| {
+            let want: Vec<u16> = (first - 1..first - 1 + width).filter_map(|c| u16::try_from(c).ok()).collect();
+            named.iter().any(|p| p.channels == want)
+        };
+        for i in (1..=n).step_by(width).filter(|&i| i + width - 1 <= n && !covered(i)) {
+            let label = if width == 2 { format!("In {i}-{}", i + 1) } else { format!("In {i}") };
+            v.push((label.clone(), label));
         }
     }
     for b in &s.busses {
@@ -639,7 +692,8 @@ impl StudioApp {
         let s = self.engine.session_arc();
         if let Some(tr) = s.track(t) {
             let cur = route_label(&s, &tr.mixer.output, false, tr.channels());
-            let label = output_choices(&s, tr).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
+            let label =
+                output_choices(&s, tr, self.engine.io_map()).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
             if same_route(&s, &tr.mixer.output, &cur, value, &label) {
                 return Ok(json!({"unchanged": true}));
             }
@@ -654,8 +708,10 @@ impl StudioApp {
         if let Some(tr) = s.track(t) {
             let ch = if tr.kind == TrackKind::Audio { tr.channels() } else { 0 };
             let cur = route_label(&s, &tr.mixer.input, true, ch);
-            let label =
-                input_choices(&s, tr, self.device_inputs()).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
+            let label = input_choices(&s, tr, self.device_inputs(), self.engine.io_map())
+                .into_iter()
+                .find(|(_, v)| v == value)
+                .map_or_else(|| value.to_string(), |(l, _)| l);
             if same_route(&s, &tr.mixer.input, &cur, value, &label) {
                 return Ok(json!({"unchanged": true}));
             }
@@ -1094,8 +1150,21 @@ fn small_button(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, label: &str, on:
 
 /// A dropdown field: its current value, and a menu of `choices` when clicked. Returns the value
 /// picked. The open menu's entries go to `menu` for `ui.inspect`.
-fn dropdown(ui: &mut Ui, clip: Rect, r: Rect, id: egui::Id, current: &str, choices: &[(String, String)], menu: &mut Vec<MenuItem>) -> Option<String> {
-    let resp = ui.interact(r.intersect(clip), id, Sense::click());
+#[allow(clippy::too_many_arguments)]
+fn dropdown(
+    ui: &mut Ui,
+    clip: Rect,
+    r: Rect,
+    id: egui::Id,
+    current: &str,
+    tip: Option<&str>,
+    choices: &[(String, String)],
+    menu: &mut Vec<MenuItem>,
+) -> Option<String> {
+    let mut resp = ui.interact(r.intersect(clip), id, Sense::click());
+    if let Some(tip) = tip {
+        resp = resp.on_hover_text(tip);
+    }
     let p = ui.painter().with_clip_rect(clip);
     p.rect_filled(r, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
     let text_r = r.shrink2(vec2(4.0, 0.0));
@@ -1113,10 +1182,15 @@ fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)
             ui.weak("Nothing to pick");
         }
         for (label, value) in choices {
+            if value == SEPARATOR {
+                ui.separator();
+                continue;
+            }
             if value == NEW_FX || value == REMOVE_UNUSED {
                 ui.separator();
             }
-            let b = crate::menus::check_button(ui, label == current, label.as_str());
+            // The current entry is marked by label, or by the path name the route holds.
+            let b = crate::menus::check_button(ui, label == current || (!value.is_empty() && value == current), label.as_str());
             menu.push(MenuItem::at(ui, label.clone(), value.clone(), b.rect));
             if b.clicked() {
                 picked = Some(value.clone());
@@ -1185,8 +1259,9 @@ pub(crate) fn send_row(
     let p = ui.painter().with_clip_rect(clip);
     let target = match &snd.target {
         Route::Bus(b) => bus_label(s, *b),
-        other => route_label(s, other, false, 0),
+        other => output_text(s, app.engine.io_map(), other, 0),
     };
+    let not_here = unresolved_output(app.engine.io_map(), &snd.target);
     let mut row = SendRow { slot, target: target.clone(), level_db: snd.level_db, pre_fader: snd.pre_fader, rect: r4(r), ..SendRow::default() };
     p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.bg);
     // The level as a thin line along the bottom, so the row reads as a small fader.
@@ -1214,15 +1289,18 @@ pub(crate) fn send_row(
     }
     // Target: another bus, or right-click for pre/post and remove.
     let th = above(tr);
-    let resp = ui.interact(th.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
+    let mut resp = ui.interact(th.intersect(clip), ui.id().with(("send_target", salt)), Sense::click());
+    if not_here {
+        resp = resp.on_hover_text(NOT_HERE);
+    }
     if resp.hovered() {
         p.rect_filled(th, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
     let text_r = tr.shrink2(vec2(4.0, 0.0));
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
     row.target_rect = r4(th);
-    let mut choices = send_targets(s, t, Some(slot));
-    if !choices.iter().any(|(l, _)| *l == target) {
+    let mut choices = send_targets(s, t, Some(slot), app.engine.io_map());
+    if !choices.iter().any(|(l, v)| *l == target || matches!(&snd.target, Route::Hardware(h) if h.eq_ignore_ascii_case(v))) {
         choices.insert(0, (target.clone(), String::new()));
     }
     push_unused_entry(s, &mut choices);
@@ -1372,7 +1450,7 @@ pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Tr
         p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.button_hover);
     }
     crate::icons::paint_labeled(&p, r, true, crate::icons::Icon::Plus, 11.0, "Send", FontId::proportional(10.5), TOKENS.text_dim);
-    let mut choices = send_targets(s, t, None);
+    let mut choices = send_targets(s, t, None, app.engine.io_map());
     choices.push(("New FX Channel…".into(), NEW_FX.into()));
     push_unused_entry(s, &mut choices);
     if let Some(v) = choice_menu(&resp, "", &choices, menu) {
@@ -1614,9 +1692,9 @@ fn strip(
     let in_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
     if matches!(t.kind, TrackKind::Audio | TrackKind::Aux) {
         let cur = route_label(s, &m.input, true, if t.kind == TrackKind::Audio { t.channels() } else { 0 });
-        let mut choices = input_choices(s, t, app.device_inputs());
+        let mut choices = input_choices(s, t, app.device_inputs(), app.engine.io_map());
         push_unused_entry(s, &mut choices);
-        if let Some(v) = dropdown(ui, clip, in_r, ui.id().with(("input", id.0)), &cur, &choices, menu) {
+        if let Some(v) = dropdown(ui, clip, in_r, ui.id().with(("input", id.0)), &cur, None, &choices, menu) {
             if v == REMOVE_UNUSED {
                 let _ = app.remove_unused_busses();
             } else {
@@ -1649,10 +1727,11 @@ fn strip(
     y += rows as f32 * SEND_ROW_H;
     // Output.
     let out_r = Rect::from_min_size(pos2(x0, y), vec2(w, 16.0));
-    let cur = route_label(s, &m.output, false, t.channels());
-    let mut choices = output_choices(s, t);
+    let cur = output_text(s, app.engine.io_map(), &m.output, t.channels());
+    let mut choices = output_choices(s, t, app.engine.io_map());
     push_unused_entry(s, &mut choices);
-    if let Some(v) = dropdown(ui, clip, out_r, ui.id().with(("output", id.0)), &cur, &choices, menu) {
+    let tip = unresolved_output(app.engine.io_map(), &m.output).then_some(NOT_HERE);
+    if let Some(v) = dropdown(ui, clip, out_r, ui.id().with(("output", id.0)), &cur, tip, &choices, menu) {
         if v == REMOVE_UNUSED {
             let _ = app.remove_unused_busses();
         } else {

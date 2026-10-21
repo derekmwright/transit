@@ -865,16 +865,17 @@ fn routing_menus_never_offer_a_loop() {
     app.set_output(fx1, "FX 2").unwrap();
     app.set_output(fx2, "FX 3").unwrap();
     let s = app.engine.session_arc();
+    let io = app.engine.io_map().clone();
     let labels = |v: Vec<(String, String)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
-    let out3 = labels(output_choices(&s, s.track(fx3).unwrap()));
+    let out3 = labels(output_choices(&s, s.track(fx3).unwrap(), &io));
     assert!(!out3.iter().any(|l| l == "FX 1" || l == "FX 2" || l == "FX 3"), "three hops back: {out3:?}");
-    let out2 = labels(output_choices(&s, s.track(fx2).unwrap()));
+    let out2 = labels(output_choices(&s, s.track(fx2).unwrap(), &io));
     assert!(!out2.contains(&"FX 1".to_string()) && out2.contains(&"FX 3".to_string()), "{out2:?}");
-    let sends3 = labels(send_targets(&s, s.track(fx3).unwrap(), None));
+    let sends3 = labels(send_targets(&s, s.track(fx3).unwrap(), None, &io));
     assert!(sends3.is_empty(), "an FX 3 send could only loop: {sends3:?}");
-    let sends1 = labels(send_targets(&s, s.track(fx1).unwrap(), None));
+    let sends1 = labels(send_targets(&s, s.track(fx1).unwrap(), None, &io));
     assert_eq!(sends1, vec!["FX 2", "FX 3"], "a bus may feed another bus downstream");
-    let ins = labels(input_choices(&s, s.track(a).unwrap(), 2));
+    let ins = labels(input_choices(&s, s.track(a).unwrap(), 2, &io));
     assert!(ins.iter().all(|l| !l.starts_with("Bus")), "A feeds all three busses: {ins:?}");
     // The dropdown in the window agrees.
     app.ui.show_mixer = true;
@@ -1810,8 +1811,8 @@ fn orphan_buses_leave_the_routing_menus_and_one_entry_removes_them() {
     assert!(!labels.iter().any(|l| l.contains("Lost")), "{labels:?}");
     assert_eq!(labels.last().map(String::as_str), Some("Remove unused buses (2)"));
     let s = app.engine.session_arc();
-    assert!(crate::mixer::send_targets(&s, s.track(fx).unwrap(), None).is_empty());
-    assert!(!crate::mixer::input_choices(&s, s.track(t).unwrap(), 2).iter().any(|(l, _)| l.contains("Lost")));
+    assert!(crate::mixer::send_targets(&s, s.track(fx).unwrap(), None, &Default::default()).is_empty());
+    assert!(!crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default()).iter().any(|(l, _)| l.contains("Lost")));
     let before = undo_len(&mut app);
     let item = app.mixer.layout.menu.last().cloned().unwrap();
     click(&mut app, mid(item.rect));
@@ -2134,7 +2135,7 @@ fn a_mono_track_can_take_input_two() {
     let r = app.add_audio_track("mono");
     let t = new_audio(&mut app, r);
     let s = app.engine.session_arc();
-    let labels: Vec<String> = crate::mixer::input_choices(&s, s.track(t).unwrap(), 2).into_iter().map(|c| c.0).collect();
+    let labels: Vec<String> = crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default()).into_iter().map(|c| c.0).collect();
     assert_eq!(labels, ["In 1", "In 2"]);
     app.set_input(t, "In 2").unwrap();
     assert_eq!(input_label(&app, t), "In 2");
@@ -2373,4 +2374,133 @@ fn alt_dragging_a_device_copies_it_into_the_drop_position() {
     assert!(ins[0].as_ref().unwrap().bypass, "the copy has the original's settings");
     assert_ne!(ins[0].as_ref().unwrap().uid.get(), ins[3].as_ref().unwrap().uid.get());
     assert_eq!(undo_len(&mut app), steps + 1, "one undo step");
+}
+
+mod output_paths {
+    use super::*;
+    use crate::mixer::{input_choices, output_choices, path_choices, send_targets};
+    use soundcraft_model::{IoDirection, IoMap, Route};
+
+    /// Eight in, six out; "Out 3-4" renamed "Headphones", "In 5" renamed "Guitar".
+    fn map() -> IoMap {
+        let mut io = IoMap::for_device("ASIO", "Test", 8, 6);
+        io.rename_path("Out 3-4", "Headphones").unwrap();
+        io.rename_path("In 5", "Guitar").unwrap();
+        io
+    }
+
+    fn click_item(app: &mut StudioApp, ctx: &egui::Context, time: &mut f64, label: &str) {
+        frames(app, ctx, 6, time);
+        let item = app.mixer.layout.menu.iter().find(|m| m.label == label).cloned().unwrap_or_else(|| panic!("no `{label}` in the menu"));
+        click(app, mid(item.rect));
+        frames(app, ctx, 6, time);
+    }
+
+    #[test]
+    fn path_labels_say_the_channels_and_main_is_left_out() {
+        let io = map();
+        let out: Vec<_> = path_choices(&io, IoDirection::Output).into_iter().map(|(l, v)| format!("{l}={v}")).collect();
+        assert_eq!(out, ["Headphones (Out 3-4)=Headphones", "Out 5-6=Out 5-6"]);
+        let ins = path_choices(&io, IoDirection::Input);
+        assert!(ins.contains(&("Guitar (In 5)".to_string(), "Guitar".to_string())) && ins.contains(&("In 1-2".to_string(), "In 1-2".to_string())));
+    }
+
+    #[test]
+    fn the_lists_order_main_buses_separator_then_paths() {
+        let mut app = app();
+        let t = new_track(&mut app, json!({"kind": "audio"}));
+        let fx = app.add_fx_channel().unwrap();
+        let s = app.engine.session_arc();
+        let values = |v: Vec<(String, String)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+        let out = values(output_choices(&s, s.track(t).unwrap(), &map()));
+        assert_eq!(out, ["Main", "FX 1", "", "Headphones (Out 3-4)", "Out 5-6", "No output"]);
+        let other = new_track(&mut app, json!({"kind": "audio"}));
+        let s = app.engine.session_arc();
+        let sends = values(send_targets(&s, s.track(other).unwrap(), None, &map()));
+        assert_eq!(sends, ["FX 1", "", "Headphones (Out 3-4)", "Out 5-6"]);
+        // No paths beyond Main: no separator.
+        let plain = values(output_choices(&s, s.track(fx).unwrap(), &IoMap::default()));
+        assert!(!plain.contains(&String::new()), "{plain:?}");
+    }
+
+    #[test]
+    fn the_output_dropdown_lists_a_path_and_picking_it_runs_track_output_once() {
+        let (mut app, ctx, mut time, t) = mixer_app();
+        app.engine.set_io_map(map());
+        frames(&mut app, &ctx, 3, &mut time);
+        let before = undo_len(&mut app);
+        let at = mid(strip(&app, t).output);
+        click(&mut app, at);
+        click_item(&mut app, &ctx, &mut time, "Headphones (Out 3-4)");
+        assert_eq!(undo_len(&mut app), before + 1, "one track.output");
+        assert_eq!(app.engine.session().track(t).unwrap().mixer.output, Route::Hardware("Headphones".into()));
+        assert_eq!(strip(&app, t).output_label, "Headphones");
+        assert!(app.io_warning().is_none());
+    }
+
+    #[test]
+    fn a_send_to_a_path_runs_mix_send() {
+        let (mut app, ctx, mut time, t) = mixer_app();
+        app.engine.set_io_map(map());
+        frames(&mut app, &ctx, 3, &mut time);
+        let at = mid(strip(&app, t).add_send);
+        click(&mut app, at);
+        click_item(&mut app, &ctx, &mut time, "Out 5-6");
+        let sends = &app.engine.session().track(t).unwrap().mixer.sends;
+        assert_eq!(sends[0].as_ref().map(|x| x.target.clone()), Some(Route::Hardware("Out 5-6".into())));
+        assert_eq!(app.mixer.devices.sends[0].target, "Out 5-6");
+    }
+
+    #[test]
+    fn a_renamed_input_path_replaces_its_legacy_label() {
+        let mut app = app();
+        let r = app.add_audio_track("mono");
+        let t = new_audio(&mut app, r);
+        app.engine.set_io_map(map());
+        let s = app.engine.session_arc();
+        let labels: Vec<String> = input_choices(&s, s.track(t).unwrap(), 8, app.engine.io_map()).into_iter().map(|c| c.0).collect();
+        assert!(labels.contains(&"Guitar (In 5)".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"In 5".to_string()), "{labels:?}");
+        assert_eq!(labels.iter().filter(|l| *l == "In 4").count(), 1, "a path named like its label is listed once: {labels:?}");
+        app.set_input(t, "Guitar").unwrap();
+        assert_eq!(input_label(&app, t), "Guitar");
+    }
+
+    #[test]
+    fn the_input_dropdown_shows_the_path_name() {
+        let (mut app, ctx, mut time, _) = mixer_app();
+        let r = app.add_audio_track("mono");
+        let t = new_audio(&mut app, r);
+        app.engine.set_io_map(map());
+        frames(&mut app, &ctx, 3, &mut time);
+        let at = mid(strip(&app, t).input);
+        click(&mut app, at);
+        frames(&mut app, &ctx, 6, &mut time);
+        let labels: Vec<String> = app.mixer.layout.menu.iter().map(|m| m.label.clone()).collect();
+        assert!(labels.iter().any(|l| l.starts_with("Guitar")) && !labels.contains(&"In 5".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn an_unresolved_route_is_marked_and_the_status_line_counts_it() {
+        let (mut app, ctx, mut time, t) = mixer_app();
+        assert!(app.io_warning().is_none());
+        app.engine.set_io_map(map());
+        app.run("track.output", json!({"tracks": [t.0], "output": "Headphones"})).unwrap();
+        assert!(app.io_warning().is_none());
+        // The path goes away (another machine): the route keeps its name and plays silent.
+        app.engine.set_io_map(IoMap::default());
+        frames(&mut app, &ctx, 3, &mut time);
+        assert_eq!(app.io_warning().as_deref(), Some("1 route not on this device"));
+        assert_eq!(strip(&app, t).output_label, "\u{26a0} Headphones");
+        assert_eq!(app.engine.session().track(t).unwrap().mixer.output, Route::Hardware("Headphones".into()));
+    }
+
+    #[test]
+    fn overlapping_output_paths_are_named_in_the_status_line() {
+        let mut app = app();
+        let mut io = map();
+        io.set_channels("Out 5-6", vec![2, 3, 4]).unwrap();
+        app.engine.set_io_map(io);
+        assert_eq!(app.io_warning().as_deref(), Some("Output paths overlap: Headphones, Out 5-6"));
+    }
 }

@@ -74,6 +74,29 @@ pub fn overlap_lines(io: &IoMap) -> Vec<String> {
     io.overlaps().into_iter().map(|(a, b, c)| format!("{a} and {b} share channel {} and add together there.", c + 1)).collect()
 }
 
+/// The status line for a path table that needs a look: routes naming paths this machine lacks,
+/// and output paths that share a channel. `None` when both are fine.
+pub fn warning_text(unresolved: &[String], overlaps: &[(String, String, u16)]) -> Option<String> {
+    let mut parts = Vec::new();
+    match unresolved.len() {
+        0 => {}
+        1 => parts.push("1 route not on this device".to_string()),
+        n => parts.push(format!("{n} routes not on this device")),
+    }
+    if !overlaps.is_empty() {
+        let mut names: Vec<&str> = Vec::new();
+        for (a, b, _) in overlaps {
+            for n in [a.as_str(), b.as_str()] {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        parts.push(format!("Output paths overlap: {}", names.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("  \u{b7}  "))
+}
+
 /// The note under the counts: WASAPI shared mode offers one channel count.
 pub const WASAPI_NOTE: &str = "WASAPI shared mode offers only the system mix format's channel count; more channels need ASIO.";
 
