@@ -1,5 +1,5 @@
 //! A panic out of a strip's processing (a plug-in's) never has its payload dropped on the thread
-//! that rendered the strip (notes/10: every last-owner drop happens on the permitted thread). The
+//! that rendered the strip (every last-owner drop happens on the permitted thread). The
 //! render keeps each strip's payload in the strip, re-raises the first one to its caller, and the
 //! rest go back to the control side with the strips. Before this, Rayon re-raised one panic of a
 //! parallel render and dropped the others' payloads on the render pool's workers.

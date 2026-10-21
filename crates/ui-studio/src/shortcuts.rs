@@ -3,7 +3,7 @@
 //! menus show its text ([`label`]); Help > Keyboard Shortcuts renders it.
 //!
 //! The map is our own, not the engine's Pro Tools strings. Where Ableton and Cubase disagree,
-//! Ableton wins (Derek's muscle memory); each such choice is noted on its row. Logic keys stay
+//! the Ableton binding wins; each such choice is noted on its row. Logic keys stay
 //! where neither Ableton nor Cubase has one for the action.
 //!
 //! Matching is exact: a row fires only when the held modifiers are the row's, no more (egui's own

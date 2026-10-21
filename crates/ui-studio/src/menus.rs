@@ -267,6 +267,11 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         app.ui.show_shortcuts = true;
                         ui.close();
                     }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Based on SoundCraft by storytold").color(TOKENS.text_dim));
+                        ui.hyperlink_to("github.com/storytold/soundcraft", "https://github.com/storytold/soundcraft");
+                    });
                 });
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Help".into(), String::new(), help.response.rect));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

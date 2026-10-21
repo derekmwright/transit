@@ -2432,7 +2432,7 @@ pub const MAX_RENDER_WORKERS: usize = 8;
 /// Environment variable: `1` opts in to the render pool for audio-thread strips, as
 /// [`MixEngine::force_serial`]`(false)` does. Read once, when the render pool is built.
 ///
-/// Serial is the realtime default until the bounded render plan (notes/10) lands; measured
+/// Serial is the realtime default until the bounded render plan lands; measured
 /// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
 pub const RENDER_POOL_ENV: &str = "SOUNDCRAFT_RENDER_POOL";
 
@@ -2473,7 +2473,7 @@ pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_REND
 /// priority behind whatever they queued. `None` when the machine has too few cores for a pool to
 /// pay (or the threads could not be spawned): the audio thread then renders its strips itself.
 ///
-/// Serial is the realtime default until the bounded render plan (notes/10) lands; measured
+/// Serial is the realtime default until the bounded render plan lands; measured
 /// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
 ///
 /// The audio callback thread is promoted by the audio backend (`playback`), before its first data
@@ -2544,7 +2544,7 @@ fn build_render_pool(promote: bool) -> Option<rayon::ThreadPool> {
 /// Runs `f` (one phase-1 strip's processing) unless the strip holds a panic, and keeps a panic
 /// out of it in [`Strip::panic`] instead of letting it unwind. A panic that reached a render pool
 /// worker's frame would end there: Rayon re-raises one panic of a parallel call and drops the
-/// others' payloads, owners plug-ins may have made, on its workers (notes/10: every last-owner
+/// others' payloads, owners plug-ins may have made, on its workers (every last-owner
 /// drop on the permitted thread). Caught the same way on every path, serial, pool and offline,
 /// so the render behaves the same whichever way its strips ran: it re-raises the first strip's.
 fn guarded(strip: &mut Strip, f: impl FnOnce(&mut Strip)) {

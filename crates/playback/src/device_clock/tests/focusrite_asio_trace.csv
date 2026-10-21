@@ -1,6 +1,6 @@
 # Focusrite USB ASIO, 48000 Hz, first 512 callbacks of each saved stream/open.
 # Metadata only; captured 2026-10-19. No audio or physical latency reference.
-# Source: transitDAW tools/engine-audit/evidence/clock-live-asio-trace.log
+# Source: live ASIO callback trace, Focusrite Scarlett 2i2 4th Gen, Windows 11, 2026-10-18
 # Source SHA256: 42aba5fdee44224abef9d5b09ba7938ea2afa099410ccde9a7285bd3c61e6c27
 # Backend and host origins translated independently; signed relative offsets retained.
 # open,direction,frames,backend_callback_ns,backend_frame_ns,host_callback_ns

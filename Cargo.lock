@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "transit"
-version = "0.8.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "eframe",
  "egui",

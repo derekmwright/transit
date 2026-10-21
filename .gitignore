@@ -10,3 +10,11 @@ plan/
 /craft-fonts/
 plans/
 .DS_Store
+
+# Local sessions, audio and tool output (fixtures live under tests/)
+*.scraft
+!/crates/**/tests/**/*.scraft
+Audio Files/
+Backups/
+__pycache__/
+*.log

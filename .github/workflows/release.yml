@@ -1,14 +1,12 @@
+# Builds transit for Windows, macOS and Linux and attaches the archives to the GitHub Release for
+# the tag. Everything is unsigned: Windows is WASAPI-only (no ASIO feature, see the README), macOS
+# is ad-hoc signed by the linker only.
 name: Release
 
 on:
   push:
-    branches: [release]
+    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version override for a test run, e.g. 0.2.0-rc.1 (empty: Cargo.toml)"
-        type: string
-        default: ""
 
 permissions:
   contents: write
@@ -17,26 +15,84 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
-    # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
-    uses: storytold/craft-common-actions/.github/workflows/release.yml@main
-    with:
-      app-name: soundcraft
-      app-title: SoundCraft
-      version: ${{ inputs.version }}
-    secrets:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
-      AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
-      AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x86_64, os: windows-latest }
+          - { name: macos-arm64, os: macos-14 }
+          - { name: linux-x86_64, os: ubuntu-22.04 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p transit --release
+      - name: Package version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then v="${GITHUB_REF_NAME}"; else v="dev-${GITHUB_SHA::7}"; fi
+          echo "name=transit-${v}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $d = "${{ steps.ver.outputs.name }}"
+          New-Item -ItemType Directory $d | Out-Null
+          Copy-Item target/release/transit.exe, LICENSE-MIT, LICENSE-APACHE, NOTICE $d
+          @"
+          transit for Windows (pre-alpha)
+
+          - Audio is WASAPI only; this build has no ASIO support.
+          - The program is unsigned. If SmartScreen blocks it, click "More info", then "Run anyway".
+          - Settings and logs: %APPDATA%\transitDAW (set TRANSIT_CONFIG_DIR to change).
+          - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
+          "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
+          Compress-Archive -Path $d -DestinationPath "$d.zip"
+      - name: Package (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          d="${{ steps.ver.outputs.name }}"
+          mkdir "$d"
+          cp target/release/transit LICENSE-MIT LICENSE-APACHE NOTICE "$d"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            printf '%s\n' 'transit for macOS (pre-alpha, Apple silicon)' '' \
+              'Unsigned and not notarized (ad-hoc only). Run: xattr -dr com.apple.quarantine transit' \
+              'or right-click the file and choose Open the first time.' > "$d/README-MACOS.txt"
+          fi
+          tar -czf "$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.name }}
+          path: |
+            transit-*.zip
+            transit-*.tar.gz
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          prerelease: true
+          generate_release_notes: true

@@ -302,7 +302,7 @@ fn lookahead_comp() -> Insert {
     c
 }
 
-/// (a) Codex's two-aux probe (notes/08 F05): a dry path to main, and a path through two serial
+/// (a) Two-aux probe: a dry path to main, and a path through two serial
 /// auxes each carrying a 5 ms lookahead compressor at ratio 1. Before: the cascade landed 240
 /// samples late.
 fn two_aux_probe() -> Session {
