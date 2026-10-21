@@ -1608,6 +1608,8 @@ pub(crate) struct BusBuffers {
     frames: usize,
     /// Every channel of the next block is silent: `refresh` sets each bus's `silenceFlags` to all ones.
     silent: bool,
+    /// Per-bus silence set by [`BusBuffers::set_bus_silent`]; wins over `silent` for that bus.
+    bus_silent: Vec<Option<bool>>,
 }
 
 // SAFETY: the raw pointers only ever point into `data`, which this struct owns; moving the struct
@@ -1628,7 +1630,8 @@ impl BusBuffers {
                 __field0: sv::AudioBusBuffers__type0 { channelBuffers32: std::ptr::null_mut() },
             })
             .collect();
-        BusBuffers { data, ptrs, bufs, frames, silent: false }
+        let bus_silent = vec![None; data.len()];
+        BusBuffers { data, ptrs, bufs, frames, silent: false, bus_silent }
     }
 
     pub fn channels(&self, bus: usize) -> usize {
@@ -1643,15 +1646,29 @@ impl BusBuffers {
         self.data.get_mut(bus).and_then(|p| p.get_mut(ch)).map(Vec::as_mut_slice)
     }
 
-    /// Flags every channel of the next block silent, or clears the flags.
+    /// Flags every channel of the next block silent, or clears the flags (every bus, including
+    /// any set by [`BusBuffers::set_bus_silent`]).
     pub fn set_silent(&mut self, silent: bool) {
         self.silent = silent;
+        self.bus_silent.iter_mut().for_each(|b| *b = None);
+    }
+
+    /// Flags one bus silent, or clears its flags, whatever [`BusBuffers::set_silent`] said.
+    pub fn set_bus_silent(&mut self, bus: usize, silent: bool) {
+        if let Some(b) = self.bus_silent.get_mut(bus) {
+            *b = Some(silent);
+        }
+    }
+
+    /// The planar channels of one bus.
+    pub fn bus_mut(&mut self, bus: usize) -> Option<&mut [Vec<f32>]> {
+        self.data.get_mut(bus).map(Vec::as_mut_slice)
     }
 
     /// Points the VST3 tables at the current data (no allocation).
     fn refresh(&mut self) {
-        let silent = self.silent;
-        for ((d, p), b) in self.data.iter_mut().zip(self.ptrs.iter_mut()).zip(self.bufs.iter_mut()) {
+        for (((d, p), b), own) in self.data.iter_mut().zip(self.ptrs.iter_mut()).zip(self.bufs.iter_mut()).zip(&self.bus_silent) {
+            let silent = own.unwrap_or(self.silent);
             for (dc, pc) in d.iter_mut().zip(p.iter_mut()) {
                 *pc = dc.as_mut_ptr();
             }
@@ -1691,6 +1708,9 @@ pub(crate) struct Layout {
     pub inputs: Vec<u32>,
     pub outputs: Vec<u32>,
     pub event_input: bool,
+    /// The activated auxiliary (sidechain) audio input bus, when the plug-in declares one and
+    /// accepted an arrangement for it.
+    pub key_bus: Option<usize>,
 }
 
 fn apply_transport(c: &mut sv::ProcessContext, t: &Transport) {
@@ -1917,6 +1937,24 @@ impl Instance {
         }
     }
 
+    /// Whether the component declares an auxiliary audio input (a sidechain) to activate.
+    pub fn declares_key_input(&self) -> bool {
+        self.aux_input_bus(self.bus_count(sv::MediaTypes_::kAudio, sv::BusDirections_::kInput)).is_some()
+    }
+
+    /// The first audio input bus after the main one that the plug-in declares auxiliary (`kAux`).
+    fn aux_input_bus(&self, count: i32) -> Option<i32> {
+        (1..count).find(|&i| {
+            // SAFETY: plain data; all-zero is valid.
+            let mut info: sv::BusInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: valid component; index below the bus count; `info` is writable.
+            let got = unsafe {
+                self.component.getBusInfo(sv::MediaTypes_::kAudio as sv::MediaType, sv::BusDirections_::kInput as sv::BusDirection, i, &mut info)
+            };
+            ok(got) && info.busType == sv::BusTypes_::kAux as sv::BusType
+        })
+    }
+
     /// Stops processing, deactivates, negotiates the bus layout (main buses mono or stereo as
     /// asked, falling back to stereo and then to the plugin's own choice), activates the main
     /// buses, sets up 32-bit processing and activates the component.
@@ -1932,21 +1970,32 @@ impl Instance {
         };
         let want = if mono { sv::SpeakerArr::kMono } else { sv::SpeakerArr::kStereo };
         let p = self.processor().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?.clone();
+        let aux = self.aux_input_bus(nin);
         let mut tried_ok = false;
-        for main in [want, sv::SpeakerArr::kStereo] {
-            let mut ins = current(self, din, nin);
-            let mut outs = current(self, dout, nout);
-            if let Some(a) = ins.first_mut() {
-                *a = main;
-            }
-            if let Some(a) = outs.first_mut() {
-                *a = main;
-            }
-            // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
-            // outlive the call.
-            if ok(unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) }) {
-                tried_ok = true;
-                break;
+        'arrangements: for main in [want, sv::SpeakerArr::kStereo] {
+            // The sidechain bus follows the main bus; failing that, it keeps its own arrangement.
+            for follow in [true, false] {
+                let mut ins = current(self, din, nin);
+                let mut outs = current(self, dout, nout);
+                if let Some(a) = ins.first_mut() {
+                    *a = main;
+                }
+                if let Some(a) = outs.first_mut() {
+                    *a = main;
+                }
+                if follow {
+                    if let Some(a) = aux.and_then(|i| ins.get_mut(usize::try_from(i).unwrap_or(usize::MAX))) {
+                        *a = main;
+                    }
+                } else if aux.is_none() {
+                    break;
+                }
+                // SAFETY: valid processor; the arrays hold exactly `nin`/`nout` arrangements and
+                // outlive the call.
+                if ok(unsafe { p.setBusArrangements(ins.as_mut_ptr(), nin, outs.as_mut_ptr(), nout) }) {
+                    tried_ok = true;
+                    break 'arrangements;
+                }
             }
             if main == sv::SpeakerArr::kStereo {
                 break;
@@ -1954,17 +2003,21 @@ impl Instance {
         }
         if !tried_ok {
             log::debug!("vst3: plugin refused mono/stereo bus arrangements; using its own");
+            if aux.is_some() {
+                log::warn!("vst3: plugin refused an arrangement for its sidechain input; the key is not delivered");
+            }
         }
-        let layout = Layout {
-            inputs: (0..nin).map(|i| self.bus_channels(din, i)).collect(),
-            outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(),
-            event_input: self.bus_count(event, din) > 0,
-        };
-        // Main buses on, aux buses off (VST3 still gets buffers for every bus).
+        let inputs: Vec<u32> = (0..nin).map(|i| self.bus_channels(din, i)).collect();
+        let key_bus = aux.filter(|_| tried_ok).and_then(|i| usize::try_from(i).ok()).filter(|&i| inputs.get(i).is_some_and(|&c| c > 0));
+        let layout =
+            Layout { inputs, outputs: (0..nout).map(|i| self.bus_channels(dout, i)).collect(), event_input: self.bus_count(event, din) > 0, key_bus };
+        // Main buses on, plus the sidechain bus when it has an arrangement; other aux buses off
+        // (VST3 still gets buffers for every bus).
         for (dir, n) in [(din, nin), (dout, nout)] {
             for i in 0..n {
+                let on = i == 0 || (dir == din && layout.key_bus == usize::try_from(i).ok());
                 // SAFETY: valid component; index below the bus count.
-                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(i == 0)) };
+                unsafe { self.component.activateBus(audio as sv::MediaType, dir as sv::BusDirection, i, u8::from(on)) };
             }
         }
         if layout.event_input {

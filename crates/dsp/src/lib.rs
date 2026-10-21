@@ -207,6 +207,48 @@ pub enum ProcessStatus {
     Sleep,
 }
 
+fn key_part(s: &[f32], start: usize) -> impl Iterator<Item = f32> + '_ {
+    s.get(start..).unwrap_or(&[]).iter().copied()
+}
+
+/// Whether the built-in plug-in `id` detects on a sidechain key ([`Plugin::process_with_key`]).
+pub fn builtin_takes_key(id: &str) -> bool {
+    matches!(id, "compressor" | "expander_gate")
+}
+
+/// Maps the key `src` onto the planar channels `dst` for `n` frames from frame `start` of `src`
+/// (into `dst[..n]`): the same channels when the counts match, a mono key onto every channel, a
+/// fold-down to the average when `dst` is mono, else channel k from `src[k % src.len()]`. An
+/// empty key, or frames past its end, give silence. Never allocates.
+pub fn map_key_channels(src: &[Vec<f32>], dst: &mut [Vec<f32>], start: usize, n: usize) {
+    let ns = src.len();
+    let nd = dst.len();
+    for (c, d) in dst.iter_mut().enumerate() {
+        let Some(d) = d.get_mut(..n) else { continue };
+        match (ns, nd) {
+            (0, _) => d.fill(0.0),
+            (_, 1) if ns > 1 => {
+                d.fill(0.0);
+                for s in src {
+                    for (x, y) in d.iter_mut().zip(key_part(s, start)) {
+                        *x += y;
+                    }
+                }
+                let g = 1.0 / ns as f32;
+                d.iter_mut().for_each(|x| *x *= g);
+            }
+            _ => {
+                d.fill(0.0);
+                if let Some(s) = src.get(c % ns) {
+                    for (x, y) in d.iter_mut().zip(key_part(s, start)) {
+                        *x = y;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A realtime audio processor or instrument.
 ///
 /// Contract: `process` never allocates or panics. It processes `min(frames, io[c].len())` frames
@@ -227,6 +269,11 @@ pub trait Plugin: Send {
     /// what hosted plug-ins do until their hosts wire an auxiliary input.
     fn process_with_key(&mut self, io: &mut [Vec<f32>], _key: &[Vec<f32>], frames: usize) {
         self.process(io, frames);
+    }
+    /// Whether the plug-in has a sidechain input that [`Plugin::process_with_key`] feeds. Built-in
+    /// detectors and hosted plug-ins that declare an auxiliary input say so; the default is no.
+    fn has_key_input(&self) -> bool {
+        false
     }
     /// Processing latency in samples (for delay compensation).
     fn latency(&self) -> usize {

@@ -27,7 +27,7 @@ use crate::fine::{self, Target};
 use crate::theme::{self, TOKENS};
 use egui::{Align2, Color32, CursorIcon, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{BusId, IoDirection, IoMap, IoPath, Route, SendSlot, Session, Track, TrackId, TrackKind};
+use soundcraft_model::{BusId, IoDirection, IoMap, IoPath, KeyFrom, Route, SendSlot, Session, Track, TrackId, TrackKind};
 
 /// Strip width and gap (points).
 pub const STRIP_W: f32 = 88.0;
@@ -206,6 +206,10 @@ pub struct DeviceCard {
     pub drag_handle: R4,
     /// The instrument card's name (or "Choose…" when there is none): opens the instrument menu.
     pub pick_button: R4,
+    /// The sidechain key dropdown of an insert that takes a key (zero when it has none).
+    pub key_button: R4,
+    /// What the key dropdown reads, e.g. "Key: Kick (post)" or "Key: None".
+    pub key_label: String,
 }
 
 /// Last frame's device chain geometry.
@@ -266,6 +270,8 @@ pub struct MixerState {
     pub hover: Option<Target>,
     /// A control took the wheel this frame, so the strips don't scroll.
     wheel_taken: bool,
+    /// The key dropdown's tap choice while an insert has no key yet: pre-fader when true.
+    pub(crate) key_pre: bool,
 }
 
 /// Fader position 0..1 for a gain in dB: the fourth root of the amplitude, scaled so +12 dB is
@@ -731,6 +737,20 @@ impl StudioApp {
 
     pub fn toggle_bypass(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
         self.run("mix.insert_bypass", json!({"track": t.0, "slot": slot}))
+    }
+
+    /// Sets (or with `from` `None` clears) the sidechain key of `t`'s insert in `slot`: one
+    /// `mix.insert_key`. The engine refuses a key that would close a loop (or comes from a
+    /// source that renders later); the reason goes to the status line.
+    pub fn set_insert_key(&mut self, t: TrackId, slot: usize, from: Option<KeyFrom>, pre: bool) -> Result<Value, String> {
+        // A bus key is always post-fader.
+        let pre = pre && !matches!(from, Some(KeyFrom::Bus(_)));
+        let from = match from {
+            None => Value::Null,
+            Some(KeyFrom::Track(id)) => json!({"track": id.0}),
+            Some(KeyFrom::Bus(id)) => json!({"bus": id.0}),
+        };
+        self.run("mix.insert_key", json!({"track": t.0, "slot": slot, "from": from, "tap": if pre { "pre" } else { "post" }}))
     }
 
     /// Reorder (`copy` false: `mix.insert_move`) or duplicate (`copy` true: `mix.insert_copy`) a

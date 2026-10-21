@@ -21,4 +21,7 @@ requests = []
 # Builds a binary that lists only the events plug-in (F10, see src/lib.rs).
 events = []
 
+# Builds a binary that lists only the sidechain plug-in (ADR 0015 slice c, see src/lib.rs).
+sidechain = []
+
 [workspace]

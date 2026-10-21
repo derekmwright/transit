@@ -191,6 +191,9 @@ impl Plugin for Compressor {
         self.mix.snap();
     }
 
+    fn has_key_input(&self) -> bool {
+        true
+    }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         self.run(io, None, frames);
     }
@@ -337,6 +340,9 @@ impl Plugin for ExpanderGate {
         self.gr_meter = 0.0;
     }
 
+    fn has_key_input(&self) -> bool {
+        true
+    }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         self.run(io, None, frames);
     }

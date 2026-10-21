@@ -312,6 +312,9 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.handles.has_editor(track, slot)
     }
+    pub fn has_key_input(&self, track: TrackId, slot: usize) -> bool {
+        self.handles.has_key_input(track, slot)
+    }
     pub fn open_editor(&mut self, track: TrackId, slot: usize) -> Result<(), String> {
         self.handles.open_editor(track, slot)
     }

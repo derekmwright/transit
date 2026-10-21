@@ -17,7 +17,7 @@ use crate::mixer::{DeviceCard, DevicesLayout, MenuItem, PluginEntry};
 use crate::theme::{self, TOKENS};
 use egui::{Align2, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::Value;
-use soundcraft_model::{Insert, TrackId, TrackKind};
+use soundcraft_model::{Insert, KeyFrom, Tap, TrackId, TrackKind};
 
 /// Height of the device pane.
 pub const PANE_H: f32 = 132.0;
@@ -392,6 +392,9 @@ fn card(
             return c;
         }
     }
+    if let Some(slot) = slot {
+        key_control(app, ui, p, lane, t, slot, &plugin, r, menu, &mut c);
+    }
     // Open editor: the plug-in's own window, through the same path as `ui.set {plugin_windows}`.
     let key_slot = slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
     let enabled = app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
@@ -419,6 +422,134 @@ fn card(
     c.editor_open = open;
     c.editor_enabled = enabled;
     c
+}
+
+/// What an insert's key dropdown reads: "Key: None", or "Key: Kick (post)" naming the source
+/// track or bus and the tap (a bus key is always post-fader).
+pub(crate) fn key_label(s: &soundcraft_model::Session, ins: &Insert) -> String {
+    let Some(k) = ins.key else { return "Key: None".to_string() };
+    let (name, tap) = match k.from {
+        KeyFrom::Track(id) => (s.track(id).map_or("?".to_string(), |t| t.name.clone()), if k.tap == Tap::Pre { "pre" } else { "post" }),
+        KeyFrom::Bus(id) => (s.busses.iter().find(|b| b.id == id).map_or("?".to_string(), |b| b.name.clone()), "post"),
+    };
+    format!("Key: {name} ({tap})")
+}
+
+/// The sources an insert on track `t` can take a key from: every other track that carries audio
+/// (an aux or folder only for an aux or folder track, which render after the audio tracks), then,
+/// for an aux or folder track, every bus. The engine refuses what remains impossible, a loop.
+fn key_sources(s: &soundcraft_model::Session, t: TrackId) -> (Vec<(TrackId, String)>, Vec<(soundcraft_model::BusId, String)>) {
+    let late = s.track(t).is_some_and(|x| matches!(x.kind, TrackKind::Aux | TrackKind::Folder));
+    let tracks = s
+        .tracks
+        .iter()
+        .filter(|x| x.id != t && !matches!(x.kind, TrackKind::Master | TrackKind::Vca | TrackKind::Video))
+        .filter(|x| late || !matches!(x.kind, TrackKind::Aux | TrackKind::Folder))
+        .map(|x| (x.id, x.name.clone()))
+        .collect();
+    let busses = if late { s.busses.iter().map(|b| (b.id, b.name.clone())).collect() } else { Vec::new() };
+    (tracks, busses)
+}
+
+/// The "Key" dropdown on an insert that takes a sidechain key: the built-in compressor and gate,
+/// and a hosted plug-in whose live instance reports a sidechain input. It reads the current key
+/// ("Key: Kick (post)") and lists None, a Post/Pre-fader choice, the other tracks and the busses;
+/// a pick runs one `mix.insert_key` ([`StudioApp::set_insert_key`]), and a refusal (a loop) is in
+/// the status line.
+#[allow(clippy::too_many_arguments)]
+fn key_control(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    lane: Rect,
+    t: TrackId,
+    slot: usize,
+    plugin: &str,
+    r: Rect,
+    menu: &mut Vec<MenuItem>,
+    c: &mut DeviceCard,
+) {
+    let takes = soundcraft_dsp::builtin_takes_key(plugin) || (hosted(plugin) && app.player.as_ref().is_some_and(|pl| pl.has_key_input(t, slot)));
+    if !takes {
+        return;
+    }
+    let s = app.engine.session_arc();
+    let Some(ins) = s.track(t).and_then(|x| x.mixer.inserts.get(slot)).and_then(Option::as_ref) else { return };
+    let label = key_label(&s, ins);
+    let kb = Rect::from_min_size(pos2(r.min.x + 8.0, r.max.y - 52.0), vec2(r.width() - 16.0, 20.0));
+    let resp = ui.interact(kb.intersect(lane), ui.id().with(("key", t.0, slot as u64)), Sense::click());
+    let pc = p.with_clip_rect(lane);
+    pc.rect_filled(kb, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    pc.with_clip_rect(kb.shrink2(vec2(6.0, 0.0)).intersect(lane)).text(
+        pos2(kb.min.x + 6.0, kb.center().y),
+        Align2::LEFT_CENTER,
+        &label,
+        FontId::proportional(10.5),
+        TOKENS.text,
+    );
+    crate::icons::paint(&pc, pos2(kb.max.x - 10.0, kb.center().y), Icon::ChevronDown, 12.0, TOKENS.text_dim);
+    c.key_button = r4(kb);
+    c.key_label = label;
+    let resp = resp.on_hover_text("Sidechain key: detect on another track or bus instead of this track");
+    let current = ins.key;
+    let pre = current.map_or(app.mixer.key_pre, |k| k.tap == Tap::Pre);
+    let (tracks, busses) = key_sources(&s, t);
+    let mut pick: Option<KeyPick> = None;
+    egui::Popup::menu(&resp).width(200.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        let mut item = |ui: &mut Ui, on: bool, label: &str, value: String, to: KeyPick| {
+            let b = crate::menus::check_button(ui, on, label);
+            menu.push(MenuItem::at(ui, label.to_string(), value, b.rect));
+            if b.clicked() {
+                pick = Some(to);
+                ui.close();
+            }
+        };
+        item(ui, current.is_none(), "None", "key:none".into(), KeyPick::Clear);
+        ui.separator();
+        // A tap change keeps the source; with no key yet it is what the next pick will use.
+        item(ui, !pre, "Post-fader", "tap:post".into(), KeyPick::Tap(false));
+        item(ui, pre, "Pre-fader", "tap:pre".into(), KeyPick::Tap(true));
+        ui.separator();
+        ui.label(egui::RichText::new("Tracks").color(TOKENS.text_dim).size(10.5));
+        for (id, name) in &tracks {
+            let on = current.is_some_and(|k| k.from == KeyFrom::Track(*id));
+            item(ui, on, name, format!("track:{}", id.0), KeyPick::Source(KeyFrom::Track(*id)));
+        }
+        if tracks.is_empty() {
+            ui.weak("No other tracks");
+        }
+        if !busses.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Busses").color(TOKENS.text_dim).size(10.5));
+            for (id, name) in &busses {
+                let on = current.is_some_and(|k| k.from == KeyFrom::Bus(*id));
+                item(ui, on, name, format!("bus:{}", id.0), KeyPick::Source(KeyFrom::Bus(*id)));
+            }
+        }
+    });
+    match pick {
+        None => {}
+        Some(KeyPick::Clear) => {
+            let _ = app.set_insert_key(t, slot, None, pre);
+        }
+        Some(KeyPick::Tap(pre)) => {
+            app.mixer.key_pre = pre;
+            // With a key, the same source at the other tap; without one, only the choice is kept.
+            if let Some(k) = current {
+                let _ = app.set_insert_key(t, slot, Some(k.from), pre);
+            }
+        }
+        Some(KeyPick::Source(from)) => {
+            let _ = app.set_insert_key(t, slot, Some(from), pre);
+        }
+    }
+}
+
+/// A choice in the key dropdown.
+enum KeyPick {
+    Clear,
+    Tap(bool),
+    Source(KeyFrom),
 }
 
 /// A hosted plug-in the instrument menu offers.

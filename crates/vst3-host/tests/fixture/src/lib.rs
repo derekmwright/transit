@@ -48,6 +48,8 @@ use vst3::{Class, ComRef, ComWrapper, uid};
 const GAIN_CID: TUID = uid(0x5C0A1D00, 0x11112222, 0x33334444, 0x55556666);
 const GAIN_CTRL_CID: TUID = uid(0x5C0A1D01, 0x11112222, 0x33334444, 0x55556666);
 const SYNTH_CID: TUID = uid(0x5C0A1D02, 0x11112222, 0x33334444, 0x55556666);
+const KEYED_CID: TUID = uid(0x5C0A1D04, 0x11112222, 0x33334444, 0x55556666);
+const PICKY_CID: TUID = uid(0x5C0A1D05, 0x11112222, 0x33334444, 0x55556666);
 const EVENTS_CID: TUID = uid(0x5C0A1D03, 0x11112222, 0x33334444, 0x55556666);
 
 fn copy_c8(src: &str, dst: &mut [c_char]) {
@@ -334,6 +336,169 @@ impl IAudioProcessorTrait for GainProcessor {
             }
             for (x, y) in i.iter().zip(o.iter_mut()) {
                 *y = g * x;
+            }
+        }
+        kResultOk
+    }
+    unsafe fn getTailSamples(&self) -> u32 {
+        0
+    }
+}
+
+// ---- sidechain (feature `sidechain`) -------------------------------------------------------
+
+/// What the sidechain plug-in writes for a channel whose aux silence flag is set.
+const KEY_MARK: f32 = 0.125;
+
+/// "Fixture Sidechain": a stereo effect with a second, auxiliary (`kAux`) stereo input bus (the
+/// key, inactive by default). When the aux bus is active, each output channel is the main input
+/// times the RMS of the key's same channel over the block, or `KEY_MARK` when the host flagged
+/// that key channel silent. "Fixture Sidechain Picky" refuses every bus arrangement, so the host
+/// cannot activate the aux bus; it passes the main input through.
+struct Keyed {
+    picky: bool,
+    main: AtomicU64,
+    aux: AtomicU64,
+    aux_active: AtomicBool,
+    _live: Live,
+}
+
+impl Keyed {
+    fn new(picky: bool) -> Keyed {
+        Keyed {
+            picky,
+            main: AtomicU64::new(SpeakerArr::kStereo),
+            aux: AtomicU64::new(SpeakerArr::kStereo),
+            aux_active: AtomicBool::new(false),
+            _live: Live::new(&OBJECTS),
+        }
+    }
+}
+
+impl Class for Keyed {
+    type Interfaces = (IComponent, IAudioProcessor);
+}
+
+impl IPluginBaseTrait for Keyed {
+    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        kResultOk
+    }
+    unsafe fn terminate(&self) -> tresult {
+        kResultOk
+    }
+}
+
+impl IComponentTrait for Keyed {
+    unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn setIoMode(&self, _mode: IoMode) -> tresult {
+        kResultOk
+    }
+    unsafe fn getBusCount(&self, media: MediaType, dir: BusDirection) -> i32 {
+        if media != MediaTypes_::kAudio as MediaType {
+            0
+        } else if dir == BusDirections_::kInput as BusDirection {
+            2
+        } else {
+            1
+        }
+    }
+    unsafe fn getBusInfo(&self, media: MediaType, dir: BusDirection, index: i32, bus: *mut BusInfo) -> tresult {
+        let input = dir == BusDirections_::kInput as BusDirection;
+        if media != MediaTypes_::kAudio as MediaType || index < 0 || index > i32::from(input) {
+            return kInvalidArgument;
+        }
+        audio_bus(bus, dir, if index == 0 { "Main" } else { "Sidechain" });
+        if index == 1 {
+            // SAFETY: the host passes a writable BusInfo; audio_bus just initialized it.
+            let b = unsafe { &mut *bus };
+            b.busType = BusTypes_::kAux as BusType;
+            b.flags = 0;
+        }
+        kResultOk
+    }
+    unsafe fn getRoutingInfo(&self, _i: *mut RoutingInfo, _o: *mut RoutingInfo) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn activateBus(&self, media: MediaType, dir: BusDirection, index: i32, state: TBool) -> tresult {
+        if media == MediaTypes_::kAudio as MediaType && dir == BusDirections_::kInput as BusDirection && index == 1 {
+            self.aux_active.store(state != 0, Ordering::SeqCst);
+        }
+        kResultOk
+    }
+    unsafe fn setActive(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+    unsafe fn setState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+    unsafe fn getState(&self, _state: *mut IBStream) -> tresult {
+        kResultOk
+    }
+}
+
+impl IAudioProcessorTrait for Keyed {
+    unsafe fn setBusArrangements(&self, inputs: *mut SpeakerArrangement, n_in: i32, outputs: *mut SpeakerArrangement, n_out: i32) -> tresult {
+        if self.picky || n_in != 2 || n_out != 1 {
+            return kResultFalse;
+        }
+        // SAFETY: the host passes n_in (2) input and n_out (1) output arrangements, checked above.
+        let (i0, i1, o0) = unsafe { (*inputs, *inputs.add(1), *outputs) };
+        let ok = |a: SpeakerArrangement| a == SpeakerArr::kStereo || a == SpeakerArr::kMono;
+        if i0 != o0 || !ok(i0) || !ok(i1) {
+            return kResultFalse;
+        }
+        self.main.store(i0, Ordering::Relaxed);
+        self.aux.store(i1, Ordering::Relaxed);
+        kResultTrue
+    }
+    unsafe fn getBusArrangement(&self, dir: BusDirection, index: i32, arr: *mut SpeakerArrangement) -> tresult {
+        let input = dir == BusDirections_::kInput as BusDirection;
+        if index < 0 || index > i32::from(input) {
+            return kInvalidArgument;
+        }
+        let v = if input && index == 1 { self.aux.load(Ordering::Relaxed) } else { self.main.load(Ordering::Relaxed) };
+        // SAFETY: the host passes a writable SpeakerArrangement.
+        unsafe { *arr = v };
+        kResultOk
+    }
+    unsafe fn canProcessSampleSize(&self, size: i32) -> tresult {
+        if size == SymbolicSampleSizes_::kSample32 as i32 { kResultOk } else { kNotImplemented }
+    }
+    unsafe fn getLatencySamples(&self) -> u32 {
+        0
+    }
+    unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+        kResultOk
+    }
+    unsafe fn setProcessing(&self, _state: TBool) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        // SAFETY: the host passes a valid ProcessData for this call.
+        let d = unsafe { &*data };
+        if d.numInputs != 2 || d.numOutputs != 1 {
+            return kResultFalse;
+        }
+        let frames = d.numSamples.max(0) as usize;
+        // SAFETY: two input and one output bus (checked above), each with numChannels channel
+        // pointers of `frames` valid samples, owned by the host for this call.
+        let (main, aux, outs) = unsafe { (channels(&*d.inputs, frames), channels(&*d.inputs.add(1), frames), channels(&*d.outputs, frames)) };
+        // SAFETY: as above; only the flags word is read.
+        let flags = unsafe { (*d.inputs.add(1)).silenceFlags };
+        let active = self.aux_active.load(Ordering::SeqCst);
+        for (c, (i, o)) in main.iter().zip(outs).enumerate() {
+            if !active || aux.is_empty() {
+                o.copy_from_slice(i);
+            } else if flags & (1 << c.min(aux.len() - 1)) != 0 {
+                o.fill(KEY_MARK);
+            } else {
+                let k = &aux[c.min(aux.len() - 1)];
+                let rms = (k.iter().map(|v| v * v).sum::<f32>() / frames.max(1) as f32).sqrt();
+                for (y, x) in o.iter_mut().zip(i.iter()) {
+                    *y = x * rms;
+                }
             }
         }
         kResultOk
@@ -1101,6 +1266,10 @@ impl Class for Factory {
     type Interfaces = (IPluginFactory2,);
 }
 
+#[cfg(feature = "sidechain")]
+const CLASSES: [(TUID, &str, &str, &str); 2] =
+    [(KEYED_CID, "Audio Module Class", "Fixture Sidechain", "Fx"), (PICKY_CID, "Audio Module Class", "Fixture Sidechain Picky", "Fx")];
+#[cfg(not(feature = "sidechain"))]
 const CLASSES: [(TUID, &str, &str, &str); 4] = [
     (GAIN_CID, "Audio Module Class", "Fixture Gain", "Fx"),
     (GAIN_CTRL_CID, "Component Controller Class", "Fixture Gain", ""),
@@ -1152,6 +1321,10 @@ impl IPluginFactoryTrait for Factory {
             .to_com_ptr::<FUnknown>()
         } else if cid == SYNTH_CID {
             ComWrapper::new(Synth::new()).to_com_ptr::<FUnknown>()
+        } else if cid == KEYED_CID {
+            ComWrapper::new(Keyed::new(false)).to_com_ptr::<FUnknown>()
+        } else if cid == PICKY_CID {
+            ComWrapper::new(Keyed::new(true)).to_com_ptr::<FUnknown>()
         } else if cid == EVENTS_CID {
             ComWrapper::new(Synth { events: true, ..Synth::new() }).to_com_ptr::<FUnknown>()
         } else {

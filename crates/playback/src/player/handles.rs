@@ -9,6 +9,8 @@ struct Entry {
     editor: Option<Box<dyn PluginEditor>>,
     state: Option<Box<dyn PluginStateReader>>,
     refused: bool,
+    /// The plug-in has a sidechain input (read once, at creation).
+    key_input: bool,
 }
 
 #[derive(Default)]
@@ -42,7 +44,8 @@ impl Handles {
         }
         let editor = made.plugin.editor();
         let state = made.plugin.state_reader();
-        self.entries.insert(key, Entry { editor, state, refused: made.refused_state });
+        let key_input = made.plugin.has_key_input();
+        self.entries.insert(key, Entry { editor, state, refused: made.refused_state, key_input });
         Some(made)
     }
 
@@ -82,6 +85,10 @@ impl Handles {
     }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.entry(track, slot).is_some_and(|entry| entry.editor.is_some())
+    }
+    /// Whether the live plug-in in this slot has a sidechain input.
+    pub fn has_key_input(&self, track: TrackId, slot: usize) -> bool {
+        self.entry(track, slot).is_some_and(|entry| entry.key_input)
     }
     pub fn open_editor(&mut self, track: TrackId, slot: usize) -> Result<(), String> {
         let entry = self.entry_mut(track, slot).ok_or_else(|| "this plugin instance is not active".to_owned())?;

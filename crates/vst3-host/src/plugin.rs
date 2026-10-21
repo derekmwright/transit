@@ -173,6 +173,10 @@ struct Core {
     outputs: BusBuffers,
     has_input: bool,
     has_output: bool,
+    /// The activated sidechain input bus (index into `inputs`), when the plug-in has one.
+    key_bus: Option<usize>,
+    /// The key bus holds key samples (not zeros) from the last block.
+    key_live: bool,
     /// The block size it is set up for, and 0 while it is not (failed or never prepared).
     max_block: usize,
     /// What `prepare` asked for, to set it up again the same way.
@@ -200,6 +204,8 @@ pub(crate) struct Shared {
     latency: AtomicUsize,
     tail: AtomicUsize,
     event_input: AtomicBool,
+    /// The plug-in takes a sidechain key (declared at creation, confirmed by each activation).
+    key_input: AtomicBool,
     /// Bumped by every (re)activation: the audio side then sends the values the host set again.
     activation: AtomicU64,
     map: MidiMap,
@@ -277,6 +283,9 @@ impl Shared {
                 core.outputs = BusBuffers::new(&layout.outputs, core.block);
                 core.has_input = layout.inputs.first().is_some_and(|&c| c > 0);
                 core.has_output = layout.outputs.first().is_some_and(|&c| c > 0);
+                core.key_bus = layout.key_bus;
+                core.key_live = false;
+                self.key_input.store(layout.key_bus.is_some(), Ordering::Relaxed);
                 core.max_block = core.block;
                 self.event_input.store(layout.event_input, Ordering::Relaxed);
                 // VST3: getLatencySamples returns the new latency after setActive(true).
@@ -521,6 +530,7 @@ impl Vst3Plugin {
         let view: Box<[AtomicU64]> = ids.iter().map(|&id| AtomicU64::new(inst.normalized_value(id).unwrap_or(f64::NAN).to_bits())).collect();
         let host = inst.host_ref();
         let link = inst.state_link();
+        let key_input = inst.declares_key_input();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 inst,
@@ -528,6 +538,8 @@ impl Vst3Plugin {
                 outputs: BusBuffers::new(&[], 0),
                 has_input: false,
                 has_output: false,
+                key_bus: None,
+                key_live: false,
                 max_block: 0,
                 block: 0,
                 sample_rate: 48_000.0,
@@ -536,6 +548,7 @@ impl Vst3Plugin {
             latency: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             event_input: AtomicBool::new(false),
+            key_input: AtomicBool::new(key_input),
             activation: AtomicU64::new(0),
             map: MidiMap::new(),
             main: std::thread::current().id(),
@@ -756,6 +769,143 @@ impl Vst3Plugin {
     }
 }
 
+impl Vst3Plugin {
+    /// `process`, with the sidechain key when there is one.
+    fn process_keyed(&mut self, io: &mut [Vec<f32>], key: Option<&[Vec<f32>]>, frames: usize) {
+        // The main thread reactivated it (`kLatencyChanged`, `kIoChanged`): send the values the
+        // host set again, as after `prepare`.
+        let activation = self.shared.activation.load(Ordering::Acquire);
+        if activation != self.activation_seen {
+            self.activation_seen = activation;
+            self.resend_host_set();
+        }
+        // The UI thread re-sampled the curves: the host's plain values may now map elsewhere.
+        let generation = self.curves.generation();
+        if generation != self.curves_seen {
+            self.curves_seen = generation;
+            self.resend_host_set();
+        }
+        let ch = self.channels.min(io.len());
+        let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
+        if frames == 0 || ch == 0 {
+            return;
+        }
+        let shared: &Shared = &self.shared;
+        // Held by the main thread only while it services the instance: a silent block.
+        let Some(mut guard) = try_lock(&shared.core) else {
+            self.gate.skip(io, ch, frames);
+            return;
+        };
+        let core = &mut *guard;
+        if !core.inst.is_active() || core.max_block == 0 {
+            if core.block > 0 {
+                // Prepared, but its (re)activation failed: silent, not the buffer as it was
+                // (review N2).
+                drop(guard);
+                self.gate.skip(io, ch, frames);
+            }
+            return;
+        }
+        core.inputs.set_silent(self.silent);
+        let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
+        for e in &mut self.notes {
+            if e.time() > last {
+                e.set_time(last);
+            }
+        }
+        for c in self.controls.iter_mut().chain(self.timed.iter_mut()) {
+            c.time = c.time.min(last);
+        }
+        let mut start = 0usize;
+        while start < frames {
+            let n = (frames - start).min(core.max_block);
+            let end = u32::try_from(start + n).unwrap_or(u32::MAX);
+            // Feed the main input bus (mono sources fill every bus channel).
+            if core.has_input {
+                for c in 0..core.inputs.channels(0) {
+                    let src = io.get(c.min(ch - 1)).and_then(|s| s.get(start..start + n));
+                    if let (Some(src), Some(dst)) = (src, core.inputs.channel_mut(0, c).and_then(|d| d.get_mut(..n))) {
+                        dst.copy_from_slice(src);
+                    }
+                }
+            }
+            if let Some(kb) = core.key_bus {
+                match key {
+                    Some(key) => {
+                        if let Some(dst) = core.inputs.bus_mut(kb) {
+                            soundcraft_dsp::map_key_channels(key, dst, start, n);
+                        }
+                        core.inputs.set_bus_silent(kb, false);
+                        core.key_live = true;
+                    }
+                    None => {
+                        if core.key_live {
+                            if let Some(dst) = core.inputs.bus_mut(kb) {
+                                dst.iter_mut().for_each(|c| c.fill(0.0));
+                            }
+                            core.key_live = false;
+                        }
+                        core.inputs.set_bus_silent(kb, true);
+                    }
+                }
+            }
+            let k = self.notes.iter().position(|e| e.time() >= end).unwrap_or(self.notes.len());
+            let offset = u32::try_from(start).unwrap_or(u32::MAX);
+            let notes = self.notes.get(..k).unwrap_or(&[]);
+            // This call's points: the host values at its start (leaving queues for the timed and
+            // controller points; the rest waits), then the timed points and the controllers in it.
+            let in_call = |p: &&ParamPoint| p.time >= offset && p.time < end;
+            let timed = self.timed.iter().filter(in_call).count() + self.controls.iter().filter(in_call).count();
+            self.batch.clear();
+            self.pending.take_into(&self.ids, &mut self.batch, PARAM_QUEUE_CAP.saturating_sub(timed));
+            self.points.clear();
+            for (seq, &(id, value)) in (0u32..).zip(&self.batch) {
+                self.points.push(ParamPoint { time: offset, id, class: 0, seq, value, release: false });
+            }
+            self.batch.clear();
+            let room = self.points.capacity();
+            for p in self.timed.iter().chain(self.controls.iter()).filter(in_call) {
+                if self.points.len() < room {
+                    self.points.push(*p);
+                }
+            }
+            let r =
+                core.inst.process(n, &mut core.inputs, &mut core.outputs, &mut self.points, notes, offset, self.position, self.transport.as_ref());
+            self.points.clear();
+            self.notes.drain(..k);
+            self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
+            if let Ok(dropped) = r {
+                self.points_dropped = self.points_dropped.saturating_add(u64::from(dropped));
+            }
+            match r {
+                Ok(_) if core.has_output => {
+                    let oc = core.outputs.channels(0);
+                    for (c, dst) in io.iter_mut().take(ch).enumerate() {
+                        let Some(dst) = dst.get_mut(start..start + n) else { continue };
+                        if ch == 1 && oc >= 2 {
+                            if let (Some(l), Some(r)) = (core.outputs.channel(0, 0), core.outputs.channel(0, 1)) {
+                                for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
+                                    *d = 0.5 * (a + b);
+                                }
+                            }
+                        } else if let Some(src) = core.outputs.channel(0, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                }
+                Err(e) => log::debug!("{}: {e}", self.info.id),
+                _ => {}
+            }
+            start += n;
+        }
+        drop(guard);
+        self.controls.clear();
+        self.timed.clear();
+        self.seq = 0;
+        self.gate.processed(io, ch, frames);
+    }
+}
+
 impl Plugin for Vst3Plugin {
     fn info(&self) -> &'static PluginInfo {
         self.info
@@ -837,117 +987,15 @@ impl Plugin for Vst3Plugin {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        // The main thread reactivated it (`kLatencyChanged`, `kIoChanged`): send the values the
-        // host set again, as after `prepare`.
-        let activation = self.shared.activation.load(Ordering::Acquire);
-        if activation != self.activation_seen {
-            self.activation_seen = activation;
-            self.resend_host_set();
-        }
-        // The UI thread re-sampled the curves: the host's plain values may now map elsewhere.
-        let generation = self.curves.generation();
-        if generation != self.curves_seen {
-            self.curves_seen = generation;
-            self.resend_host_set();
-        }
-        let ch = self.channels.min(io.len());
-        let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
-        if frames == 0 || ch == 0 {
-            return;
-        }
-        let shared: &Shared = &self.shared;
-        // Held by the main thread only while it services the instance: a silent block.
-        let Some(mut guard) = try_lock(&shared.core) else {
-            self.gate.skip(io, ch, frames);
-            return;
-        };
-        let core = &mut *guard;
-        if !core.inst.is_active() || core.max_block == 0 {
-            if core.block > 0 {
-                // Prepared, but its (re)activation failed: silent, not the buffer as it was
-                // (review N2).
-                drop(guard);
-                self.gate.skip(io, ch, frames);
-            }
-            return;
-        }
-        core.inputs.set_silent(self.silent);
-        let last = u32::try_from(frames - 1).unwrap_or(u32::MAX);
-        for e in &mut self.notes {
-            if e.time() > last {
-                e.set_time(last);
-            }
-        }
-        for c in self.controls.iter_mut().chain(self.timed.iter_mut()) {
-            c.time = c.time.min(last);
-        }
-        let mut start = 0usize;
-        while start < frames {
-            let n = (frames - start).min(core.max_block);
-            let end = u32::try_from(start + n).unwrap_or(u32::MAX);
-            // Feed the main input bus (mono sources fill every bus channel).
-            if core.has_input {
-                for c in 0..core.inputs.channels(0) {
-                    let src = io.get(c.min(ch - 1)).and_then(|s| s.get(start..start + n));
-                    if let (Some(src), Some(dst)) = (src, core.inputs.channel_mut(0, c).and_then(|d| d.get_mut(..n))) {
-                        dst.copy_from_slice(src);
-                    }
-                }
-            }
-            let k = self.notes.iter().position(|e| e.time() >= end).unwrap_or(self.notes.len());
-            let offset = u32::try_from(start).unwrap_or(u32::MAX);
-            let notes = self.notes.get(..k).unwrap_or(&[]);
-            // This call's points: the host values at its start (leaving queues for the timed and
-            // controller points; the rest waits), then the timed points and the controllers in it.
-            let in_call = |p: &&ParamPoint| p.time >= offset && p.time < end;
-            let timed = self.timed.iter().filter(in_call).count() + self.controls.iter().filter(in_call).count();
-            self.batch.clear();
-            self.pending.take_into(&self.ids, &mut self.batch, PARAM_QUEUE_CAP.saturating_sub(timed));
-            self.points.clear();
-            for (seq, &(id, value)) in (0u32..).zip(&self.batch) {
-                self.points.push(ParamPoint { time: offset, id, class: 0, seq, value, release: false });
-            }
-            self.batch.clear();
-            let room = self.points.capacity();
-            for p in self.timed.iter().chain(self.controls.iter()).filter(in_call) {
-                if self.points.len() < room {
-                    self.points.push(*p);
-                }
-            }
-            let r =
-                core.inst.process(n, &mut core.inputs, &mut core.outputs, &mut self.points, notes, offset, self.position, self.transport.as_ref());
-            self.points.clear();
-            self.notes.drain(..k);
-            self.position = self.position.saturating_add(i64::try_from(n).unwrap_or(0));
-            if let Ok(dropped) = r {
-                self.points_dropped = self.points_dropped.saturating_add(u64::from(dropped));
-            }
-            match r {
-                Ok(_) if core.has_output => {
-                    let oc = core.outputs.channels(0);
-                    for (c, dst) in io.iter_mut().take(ch).enumerate() {
-                        let Some(dst) = dst.get_mut(start..start + n) else { continue };
-                        if ch == 1 && oc >= 2 {
-                            if let (Some(l), Some(r)) = (core.outputs.channel(0, 0), core.outputs.channel(0, 1)) {
-                                for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
-                                    *d = 0.5 * (a + b);
-                                }
-                            }
-                        } else if let Some(src) = core.outputs.channel(0, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                }
-                Err(e) => log::debug!("{}: {e}", self.info.id),
-                _ => {}
-            }
-            start += n;
-        }
-        drop(guard);
-        self.controls.clear();
-        self.timed.clear();
-        self.seq = 0;
-        self.gate.processed(io, ch, frames);
+        self.process_keyed(io, None, frames);
+    }
+
+    fn process_with_key(&mut self, io: &mut [Vec<f32>], key: &[Vec<f32>], frames: usize) {
+        self.process_keyed(io, Some(key), frames);
+    }
+
+    fn has_key_input(&self) -> bool {
+        self.shared.key_input.load(Ordering::Relaxed)
     }
 
     fn latency(&self) -> usize {

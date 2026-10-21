@@ -1105,6 +1105,8 @@ pub(crate) struct PortBuffers {
     frames: usize,
     /// Every channel holds a constant (silent) block: `refresh` sets each `constant_mask` to all ones.
     constant: bool,
+    /// Per-port override set by [`PortBuffers::set_port_constant`]; wins over `constant` for that port.
+    port_constant: Vec<Option<bool>>,
 }
 
 // SAFETY: the raw pointers only ever point into `data`, which this struct owns; moving the struct
@@ -1121,7 +1123,8 @@ impl PortBuffers {
             .iter()
             .map(|_| clap_audio_buffer { data32: std::ptr::null_mut(), data64: std::ptr::null_mut(), channel_count: 0, latency: 0, constant_mask: 0 })
             .collect();
-        PortBuffers { data, ptrs, bufs, frames, constant: false }
+        let port_constant = vec![None; data.len()];
+        PortBuffers { data, ptrs, bufs, frames, constant: false, port_constant }
     }
 
     pub fn channels(&self, port: usize) -> usize {
@@ -1137,14 +1140,28 @@ impl PortBuffers {
     }
 
     /// Marks every channel of the next block as constant (CLAP's way to say silent), or clears it.
+    /// Also clears every per-port setting of [`PortBuffers::set_port_constant`].
     pub fn set_constant(&mut self, constant: bool) {
         self.constant = constant;
+        self.port_constant.iter_mut().for_each(|p| *p = None);
+    }
+
+    /// Marks one port constant (silent), or clears it, whatever [`PortBuffers::set_constant`] said.
+    pub fn set_port_constant(&mut self, port: usize, constant: bool) {
+        if let Some(p) = self.port_constant.get_mut(port) {
+            *p = Some(constant);
+        }
+    }
+
+    /// The planar channels of one port.
+    pub fn port_mut(&mut self, port: usize) -> Option<&mut [Vec<f32>]> {
+        self.data.get_mut(port).map(Vec::as_mut_slice)
     }
 
     /// Points the CLAP tables at the current data (no allocation).
     fn refresh(&mut self) {
-        let constant = self.constant;
-        for ((d, p), b) in self.data.iter_mut().zip(self.ptrs.iter_mut()).zip(self.bufs.iter_mut()) {
+        for (((d, p), b), own) in self.data.iter_mut().zip(self.ptrs.iter_mut()).zip(self.bufs.iter_mut()).zip(&self.port_constant) {
+            let constant = own.unwrap_or(self.constant);
             for (dc, pc) in d.iter_mut().zip(p.iter_mut()) {
                 *pc = dc.as_mut_ptr();
             }

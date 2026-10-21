@@ -36,7 +36,9 @@
 //! "unsupported".
 //!
 //! The host supplies `IMessage` and `IAttributeList` for processor ↔ controller messaging.
-//! Sidechain (aux buses are kept inactive) and 64-bit processing are not hosted yet.
+//! A plug-in with an auxiliary audio input (a sidechain) has that bus activated at creation and
+//! gets the mix's key on it (planar, mapped onto the bus channels), or silence with the silence
+//! flags set when no key is routed. 64-bit processing is not hosted yet.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

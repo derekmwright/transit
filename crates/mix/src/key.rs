@@ -119,38 +119,6 @@ pub(crate) struct KeyBank {
     entries: Vec<KeyEntry>,
 }
 
-/// Maps `src` onto `dst`'s channels: the same channels when the counts match, a mono key onto
-/// every channel, a fold-down to the average, else channel k from `src[k % n]`.
-fn map_channels(src: &[Vec<f32>], dst: &mut [Vec<f32>], frames: usize) {
-    let n = src.len();
-    let nd = dst.len();
-    for (c, d) in dst.iter_mut().enumerate() {
-        let d = d.get_mut(..frames);
-        let Some(d) = d else { continue };
-        match (n, nd) {
-            (0, _) => d.fill(0.0),
-            (_, 1) if n > 1 => {
-                d.fill(0.0);
-                for s in src {
-                    for (x, y) in d.iter_mut().zip(s) {
-                        *x += *y;
-                    }
-                }
-                let g = 1.0 / n as f32;
-                d.iter_mut().for_each(|x| *x *= g);
-            }
-            _ => match src.get(c % n) {
-                Some(s) => {
-                    for (x, y) in d.iter_mut().zip(s) {
-                        *x = *y;
-                    }
-                }
-                None => d.fill(0.0),
-            },
-        }
-    }
-}
-
 impl KeyBank {
     /// The entries for `specs`, each with a silent buffer of `block` frames and a delay line
     /// holding up to `cap_of(keyed strip)` samples.
@@ -249,7 +217,7 @@ impl KeyBank {
                 KeyEnd::Strip(i) => strip(usize::from(i)).map(|st| if e.spec.pre { st.pre.as_slice() } else { st.buf.as_slice() }),
                 KeyEnd::Bus(b) => busses.bus(b).map(|b| b.buf.as_slice()),
             };
-            map_channels(src.unwrap_or(&[]), &mut e.buf, frames);
+            soundcraft_dsp::map_key_channels(src.unwrap_or(&[]), &mut e.buf, 0, frames);
             e.line.apply(e.want, &mut e.buf, &mut e.scratch, frames);
         }
     }

@@ -105,6 +105,19 @@ static SYNTH_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     features: SYNTH_FEATURES.0.as_ptr(),
 };
 
+static SIDECHAIN_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
+    clap_version: CLAP_VERSION,
+    id: c"org.soundcraft.test.sidechain".as_ptr(),
+    name: c"Fixture Sidechain".as_ptr(),
+    vendor: c"SoundCraft tests".as_ptr(),
+    url: std::ptr::null(),
+    manual_url: std::ptr::null(),
+    support_url: std::ptr::null(),
+    version: c"1.0.0".as_ptr(),
+    description: std::ptr::null(),
+    features: REQUESTS_FEATURES.0.as_ptr(),
+};
+
 static REQUESTS_DESC: clap_plugin_descriptor = clap_plugin_descriptor {
     clap_version: CLAP_VERSION,
     id: c"org.soundcraft.test.requests".as_ptr(),
@@ -147,6 +160,10 @@ struct Fx {
     /// The events plugin (see the crate docs).
     events: bool,
     events_midi: bool,
+    /// The sidechain plug-in: a second, non-main input port (the key); every output sample is
+    /// the main input times the key's RMS over the block, or `KEY_MARK` when the key port's
+    /// `constant_mask` says it is silent.
+    keyed: bool,
     latency: u32,
     /// Latency to take at the next `activate` (requests plugin).
     next_latency: Option<u32>,
@@ -377,7 +394,7 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
         }
         None
     } else {
-        if pr.audio_inputs_count != 1 {
+        if pr.audio_inputs_count != if f.keyed { 2 } else { 1 } {
             return CLAP_PROCESS_ERROR;
         }
         Some(unsafe { &*pr.audio_inputs })
@@ -488,6 +505,28 @@ unsafe extern "C" fn process(p: *const clap_plugin, pr: *const clap_process) -> 
             // SAFETY: c is within the SDK output table; its n writable samples are distinct from first (no input buses).
             let o = unsafe { std::slice::from_raw_parts_mut(*out.data32.add(c), n) };
             o.copy_from_slice(first);
+        }
+        return CLAP_PROCESS_CONTINUE;
+    }
+    if f.keyed {
+        #[deny(clippy::undocumented_unsafe_blocks)]
+        // SAFETY: the host passed two input buffers (checked above), each with channel_count
+        // channels of `n` valid f32 samples, and a writable output with channel_count channels.
+        unsafe {
+            let (inp, key) = (&*pr.audio_inputs, &*pr.audio_inputs.add(1));
+            for c in 0..out.channel_count as usize {
+                let o = std::slice::from_raw_parts_mut(*out.data32.add(c), n);
+                let x = std::slice::from_raw_parts(*inp.data32.add(c.min(inp.channel_count as usize - 1)), n);
+                if key.constant_mask & (1 << c.min(key.channel_count as usize - 1)) != 0 {
+                    o.fill(KEY_MARK);
+                    continue;
+                }
+                let k = std::slice::from_raw_parts(*key.data32.add(c.min(key.channel_count as usize - 1)), n);
+                let rms = (k.iter().map(|v| v * v).sum::<f32>() / n.max(1) as f32).sqrt();
+                for (d, s) in o.iter_mut().zip(x) {
+                    *d = s * rms;
+                }
+            }
         }
         return CLAP_PROCESS_CONTINUE;
     }
@@ -607,11 +646,33 @@ static PARAMS: clap_plugin_params = clap_plugin_params {
     flush: Some(params_flush),
 };
 
+/// What the sidechain plug-in writes while its key port is flagged constant (silent).
+const KEY_MARK: f32 = 0.125;
+
 unsafe extern "C" fn ports_count(p: *const clap_plugin, is_input: bool) -> u32 {
-    if is_input && unsafe { fx(p) }.synth { 0 } else { 1 }
+    // SAFETY (both `fx` calls): the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
+    if is_input && unsafe { fx(p) }.synth {
+        0
+    } else if is_input && unsafe { fx(p) }.keyed {
+        2
+    } else {
+        1
+    }
 }
 
 unsafe extern "C" fn ports_get(p: *const clap_plugin, index: u32, is_input: bool, info: *mut clap_audio_port_info) -> bool {
+    // SAFETY (the `fx` calls): the host passes the plugin pointer this fixture created, so its plugin_data is a live Fx.
+    if index == 1 && is_input && unsafe { fx(p) }.keyed {
+        // SAFETY: the host passes a writable clap_audio_port_info.
+        let info = unsafe { &mut *info };
+        info.id = 2;
+        write_name(&mut info.name, c"sidechain");
+        info.flags = 0;
+        info.channel_count = 2;
+        info.port_type = CLAP_PORT_STEREO.as_ptr();
+        info.in_place_pair = clap_sys::id::CLAP_INVALID_ID;
+        return true;
+    }
     if index != 0 || (is_input && unsafe { fx(p) }.synth) {
         return false;
     }
@@ -827,8 +888,10 @@ unsafe extern "C" fn on_main_thread(p: *const clap_plugin) {
 /// The plug-ins this binary lists: the gain and the synth, or (feature `requests`) only the
 /// requests plug-in, built as a binary of its own so that tests counting the default fixture's
 /// plug-ins (here and in other crates) are unaffected.
-#[cfg(not(any(feature = "requests", feature = "events")))]
+#[cfg(not(any(feature = "requests", feature = "events", feature = "sidechain")))]
 static DESCS: [&clap_plugin_descriptor; 2] = [&GAIN_DESC, &SYNTH_DESC];
+#[cfg(all(feature = "sidechain", not(any(feature = "requests", feature = "events"))))]
+static DESCS: [&clap_plugin_descriptor; 1] = [&SIDECHAIN_DESC];
 #[cfg(feature = "requests")]
 static DESCS: [&clap_plugin_descriptor; 1] = [&REQUESTS_DESC];
 #[cfg(all(feature = "events", not(feature = "requests")))]
@@ -844,16 +907,18 @@ unsafe extern "C" fn factory_desc(_f: *const clap_plugin_factory, i: u32) -> *co
 
 unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const clap_host, id: *const c_char) -> *const clap_plugin {
     let id = unsafe { CStr::from_ptr(id) };
-    let (desc, synth, requests, events) = if id == c"org.soundcraft.test.gain" {
-        (&GAIN_DESC as *const _, false, false, false)
+    let (desc, synth, requests, events, keyed) = if id == c"org.soundcraft.test.gain" {
+        (&GAIN_DESC as *const _, false, false, false, false)
     } else if id == c"org.soundcraft.test.synth" {
-        (&SYNTH_DESC as *const _, true, false, false)
+        (&SYNTH_DESC as *const _, true, false, false, false)
     } else if id == c"org.soundcraft.test.requests" {
-        (&REQUESTS_DESC as *const _, false, true, false)
+        (&REQUESTS_DESC as *const _, false, true, false, false)
     } else if id == c"org.soundcraft.test.events-midi" {
-        (&EVENTS_MIDI_DESC as *const _, true, false, true)
+        (&EVENTS_MIDI_DESC as *const _, true, false, true, false)
     } else if id == c"org.soundcraft.test.events" {
-        (&EVENTS_DESC as *const _, true, false, true)
+        (&EVENTS_DESC as *const _, true, false, true, false)
+    } else if id == c"org.soundcraft.test.sidechain" {
+        (&SIDECHAIN_DESC as *const _, false, false, false, true)
     } else {
         return std::ptr::null();
     };
@@ -877,6 +942,7 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         requests,
         events,
         events_midi: id == c"org.soundcraft.test.events-midi",
+        keyed,
         latency: if requests { 5 } else { 3 },
         next_latency: None,
         restart_at: None,

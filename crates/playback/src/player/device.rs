@@ -553,6 +553,11 @@ impl Player {
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.owner().is_ok_and(|owner| owner.has_editor(track, slot))
     }
+    /// Whether the live plug-in in this insert slot has a sidechain input (the device card's key
+    /// control is offered for it).
+    pub fn has_key_input(&self, track: TrackId, slot: usize) -> bool {
+        self.owner().is_ok_and(|owner| owner.has_key_input(track, slot))
+    }
     pub fn open_editor(&self, track: TrackId, slot: usize) -> Result<(), String> {
         self.owner().map_err(|e| e.to_string())?.open_editor(track, slot)?;
         self.shared.editors_open.store(true, Ordering::Relaxed);

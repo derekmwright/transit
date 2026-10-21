@@ -47,7 +47,7 @@ use clap_sys::ext::params::{CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_
 use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL, clap_process_status};
 use soundcraft_dsp::event::{Message, NoteId, PluginEvent};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -104,6 +104,10 @@ struct Core {
     outputs: PortBuffers,
     in_main: Option<usize>,
     out_main: Option<usize>,
+    /// The sidechain input port (a non-main audio input), when the plug-in declares one.
+    key_port: Option<usize>,
+    /// The key port holds key samples (not zeros) from the last block.
+    key_live: bool,
     /// The block size and rate it is activated for (0 before the first `prepare`).
     max_block: usize,
     sample_rate: f64,
@@ -117,6 +121,8 @@ impl Core {
         let outs = self.inst.audio_ports(false);
         self.in_main = pick_main(&ins);
         self.out_main = pick_main(&outs);
+        self.key_port = pick_key(&ins, self.in_main);
+        self.key_live = false;
         self.inputs = PortBuffers::new(&ins.iter().map(|p| p.channels).collect::<Vec<_>>(), self.max_block);
         self.outputs = PortBuffers::new(&outs.iter().map(|p| p.channels).collect::<Vec<_>>(), self.max_block);
         match self.inst.activate(self.sample_rate, 1, u32::try_from(self.max_block).unwrap_or(u32::MAX)) {
@@ -144,6 +150,8 @@ pub(crate) struct Shared {
     life: AtomicU8,
     /// The latency read after the last activation (the mixer reads it every block).
     latency: AtomicUsize,
+    /// The plug-in has a sidechain input port (read at each activation).
+    key_input: AtomicBool,
     /// The thread that created the instance: its main thread.
     main: ThreadId,
     host: Arc<HostState>,
@@ -349,7 +357,9 @@ impl Shared {
         // Cleared first: a request made while it reactivates asks again.
         self.host.restart.store(false, Ordering::Relaxed);
         core.inst.deactivate();
-        let Some(latency) = core.activate(self.info.id) else {
+        let activated = core.activate(self.info.id);
+        self.key_input.store(core.key_port.is_some(), Ordering::Relaxed);
+        let Some(latency) = activated else {
             self.latency.store(0, Ordering::Release);
             log::warn!("{}: the plug-in refused to activate again after a restart; its slot is silent", self.info.id);
             return false;
@@ -495,6 +505,10 @@ impl ClapPlugin {
         let values = info.params.iter().zip(&ids).map(|(p, id)| inst.param_value(*id).map_or(p.default, |v| p.clamp(v as f32))).collect();
         let host = inst.host_state();
         let link = inst.link();
+        let key_input = {
+            let ins = inst.audio_ports(true);
+            pick_key(&ins, pick_main(&ins)).is_some()
+        };
         let view: Box<[AtomicU64]> =
             info.params.iter().zip(&ids).map(|(p, id)| AtomicU64::new(inst.param_value(*id).unwrap_or(f64::from(p.default)).to_bits())).collect();
         let shared = Arc::new(Shared {
@@ -504,11 +518,14 @@ impl ClapPlugin {
                 outputs: PortBuffers::new(&[], 0),
                 in_main: None,
                 out_main: None,
+                key_port: None,
+                key_live: false,
                 max_block: 0,
                 sample_rate: 48_000.0,
             }),
             life: AtomicU8::new(RUNNING),
             latency: AtomicUsize::new(0),
+            key_input: AtomicBool::new(key_input),
             main: std::thread::current().id(),
             host: Arc::clone(&host),
             link,
@@ -612,6 +629,11 @@ impl ClapPlugin {
     }
 }
 
+/// The sidechain port: the first non-main audio input with channels (the main input is not one).
+fn pick_key(ports: &[crate::ffi::PortInfo], main: Option<usize>) -> Option<usize> {
+    ports.iter().enumerate().position(|(i, p)| !p.main && p.channels > 0 && Some(i) != main)
+}
+
 fn pick_main(ports: &[crate::ffi::PortInfo]) -> Option<usize> {
     ports.iter().position(|p| p.main && p.channels > 0).or_else(|| ports.iter().position(|p| p.channels > 0))
 }
@@ -663,65 +685,9 @@ fn note_mode(p: Option<NotePort>) -> NoteMode {
     }
 }
 
-impl Plugin for ClapPlugin {
-    fn info(&self) -> &'static PluginInfo {
-        self.info
-    }
-
-    fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize) {
-        let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
-        let mb = max_block.clamp(1, MAX_BLOCK);
-        self.channels = channels.clamp(1, MAX_CHANNELS);
-        let shared = Arc::clone(&self.shared);
-        let mut core = lock(&shared.core);
-        core.inst.deactivate();
-        core.inst.service_callback();
-        core.sample_rate = sr;
-        core.max_block = mb;
-        self.gate.set_rate(sr);
-        // A (re)activation starts from a clean state anyway.
-        self.reset_pending = false;
-        let port = core.inst.note_port();
-        self.notes = note_mode(port);
-        self.midi_in = port.is_some_and(|p| p.supported & CLAP_NOTE_DIALECT_MIDI != 0);
-        self.status = ProcessStatus::Continue;
-        // A full (re)activation answers any restart request, including one left half done.
-        self.host.restart.store(false, Ordering::Relaxed);
-        let latency = core.activate(self.info.id).unwrap_or(0);
-        drop(core);
-        shared.latency.store(latency, Ordering::Release);
-        shared.life.store(RUNNING, Ordering::Release);
-    }
-
-    fn reset(&mut self) {
-        // CLAP `reset` (audio thread, active plugin) goes out right before the next block the
-        // plug-in is called for, under the same lock as that block, so a main thread holding the
-        // instance meanwhile can never make it miss one (review R6).
-        self.reset_pending = true;
-        self.prepare_midi_events();
-        keep_releases_on_reset(&mut self.queue, &mut self.held, self.notes);
-        self.midi_voices.fill(None);
-    }
-
-    fn set_param(&mut self, id: &str, value: f32) -> bool {
-        let Some((cid, v)) = self.host_value(id, value) else { return false };
-        // Coalesce with a pending change of the same parameter at the block start.
-        self.param_at(0, cid, v);
-        true
-    }
-
-    /// One `Event::Param` per offset: points of one parameter coalesce only at an equal time.
-    fn set_param_at(&mut self, offset: u32, id: &str, value: f32) -> bool {
-        let Some((cid, v)) = self.host_value(id, value) else { return false };
-        self.param_at(offset, cid, v)
-    }
-
-    fn param(&self, id: &str) -> Option<f32> {
-        let i = self.info.params.iter().position(|p| p.id == id)?;
-        self.values.get(i).copied()
-    }
-
-    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+impl ClapPlugin {
+    /// `process`, with the sidechain key when there is one.
+    fn process_keyed(&mut self, io: &mut [Vec<f32>], key: Option<&[Vec<f32>]>, frames: usize) {
         let ch = self.channels.min(io.len());
         let frames = io.iter().take(ch).map(Vec::len).fold(frames, usize::min);
         if frames == 0 || ch == 0 {
@@ -792,6 +758,26 @@ impl Plugin for ClapPlugin {
                     }
                 }
             }
+            if let Some(kp) = core.key_port {
+                match key {
+                    Some(key) => {
+                        if let Some(dst) = core.inputs.port_mut(kp) {
+                            soundcraft_dsp::map_key_channels(key, dst, start, n);
+                        }
+                        core.inputs.set_port_constant(kp, false);
+                        core.key_live = true;
+                    }
+                    None => {
+                        if core.key_live {
+                            if let Some(dst) = core.inputs.port_mut(kp) {
+                                dst.iter_mut().for_each(|c| c.fill(0.0));
+                            }
+                            core.key_live = false;
+                        }
+                        core.inputs.set_port_constant(kp, true);
+                    }
+                }
+            }
             let k = self.queue.iter().position(|e| e.time() >= end).unwrap_or(self.queue.len());
             let offset = u32::try_from(start).unwrap_or(u32::MAX);
             let events = self.queue.get(..k).unwrap_or(&[]);
@@ -825,6 +811,78 @@ impl Plugin for ClapPlugin {
         shared.processed_gen.store(queued_up_to, Ordering::Release);
         drop(guard);
         self.gate.processed(io, ch, frames);
+    }
+}
+
+impl Plugin for ClapPlugin {
+    fn info(&self) -> &'static PluginInfo {
+        self.info
+    }
+
+    fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize) {
+        let sr = if sample_rate.is_finite() && sample_rate > 0.0 { f64::from(sample_rate) } else { 48_000.0 };
+        let mb = max_block.clamp(1, MAX_BLOCK);
+        self.channels = channels.clamp(1, MAX_CHANNELS);
+        let shared = Arc::clone(&self.shared);
+        let mut core = lock(&shared.core);
+        core.inst.deactivate();
+        core.inst.service_callback();
+        core.sample_rate = sr;
+        core.max_block = mb;
+        self.gate.set_rate(sr);
+        // A (re)activation starts from a clean state anyway.
+        self.reset_pending = false;
+        let port = core.inst.note_port();
+        self.notes = note_mode(port);
+        self.midi_in = port.is_some_and(|p| p.supported & CLAP_NOTE_DIALECT_MIDI != 0);
+        self.status = ProcessStatus::Continue;
+        // A full (re)activation answers any restart request, including one left half done.
+        self.host.restart.store(false, Ordering::Relaxed);
+        let latency = core.activate(self.info.id).unwrap_or(0);
+        shared.key_input.store(core.key_port.is_some(), Ordering::Relaxed);
+        drop(core);
+        shared.latency.store(latency, Ordering::Release);
+        shared.life.store(RUNNING, Ordering::Release);
+    }
+
+    fn reset(&mut self) {
+        // CLAP `reset` (audio thread, active plugin) goes out right before the next block the
+        // plug-in is called for, under the same lock as that block, so a main thread holding the
+        // instance meanwhile can never make it miss one (review R6).
+        self.reset_pending = true;
+        self.prepare_midi_events();
+        keep_releases_on_reset(&mut self.queue, &mut self.held, self.notes);
+        self.midi_voices.fill(None);
+    }
+
+    fn set_param(&mut self, id: &str, value: f32) -> bool {
+        let Some((cid, v)) = self.host_value(id, value) else { return false };
+        // Coalesce with a pending change of the same parameter at the block start.
+        self.param_at(0, cid, v);
+        true
+    }
+
+    /// One `Event::Param` per offset: points of one parameter coalesce only at an equal time.
+    fn set_param_at(&mut self, offset: u32, id: &str, value: f32) -> bool {
+        let Some((cid, v)) = self.host_value(id, value) else { return false };
+        self.param_at(offset, cid, v)
+    }
+
+    fn param(&self, id: &str) -> Option<f32> {
+        let i = self.info.params.iter().position(|p| p.id == id)?;
+        self.values.get(i).copied()
+    }
+
+    fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
+        self.process_keyed(io, None, frames);
+    }
+
+    fn process_with_key(&mut self, io: &mut [Vec<f32>], key: &[Vec<f32>], frames: usize) {
+        self.process_keyed(io, Some(key), frames);
+    }
+
+    fn has_key_input(&self) -> bool {
+        self.shared.key_input.load(Ordering::Relaxed)
     }
 
     fn latency(&self) -> usize {
