@@ -2503,6 +2503,7 @@ mod output_paths {
         app.engine.set_io_map(io);
         assert_eq!(app.io_warning().as_deref(), Some("Output paths overlap: Headphones, Out 5-6"));
     }
+}
 // ---- loop strip (backlog #9) ----
 
 /// An app after a few frames, so the arrangement layout is known.
