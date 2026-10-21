@@ -105,6 +105,7 @@ pub fn specs() -> Vec<CommandSpec> {
             insert_params
         ),
         cmd!("mix.insert_move", "Move Insert", [], None, "{track?, from, to}", has_selection, insert_move),
+        cmd!("mix.insert_copy", "Copy Insert", [], None, "{track?, from, to}", has_selection, insert_copy),
         cmd!(
             "mix.send",
             "Assign Send",
@@ -452,6 +453,20 @@ fn insert_move(e: &mut Engine, p: &Value) -> Result<Value> {
     let tr = e.session_mut().track_mut(t).ok_or_else(|| bad("mix.insert_move", "no track"))?;
     if !tr.move_insert(from, to) {
         return Err(bad("mix.insert_move", "empty slot"));
+    }
+    Ok(json!({"track": t, "from": from, "to": to}))
+}
+
+fn insert_copy(e: &mut Engine, p: &Value) -> Result<Value> {
+    let t = tracks_required(e, "mix.insert_copy", p)?.first().copied().ok_or_else(|| bad("mix.insert_copy", "no track"))?;
+    let from = slot_of(p, "from", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_copy", "`from` slot"))?;
+    let to = slot_of(p, "to", INSERT_SLOTS).ok_or_else(|| bad("mix.insert_copy", "`to` slot"))?;
+    if from == to {
+        return Err(bad("mix.insert_copy", "`from` and `to` are the same slot"));
+    }
+    let tr = e.session_mut().track_mut(t).ok_or_else(|| bad("mix.insert_copy", "no track"))?;
+    if !tr.copy_insert(from, to) {
+        return Err(bad("mix.insert_copy", "empty source slot, or no free slot at or after `to`"));
     }
     Ok(json!({"track": t, "from": from, "to": to}))
 }
@@ -1000,6 +1015,40 @@ mod tests {
             json!({"track": t, "from": 0}),
         ] {
             assert!(e.execute("mix.insert_move", &p).is_err(), "{p}");
+        }
+        assert_eq!(order(&e), original);
+        assert_eq!(e.undo_history().len(), steps);
+    }
+
+    #[test]
+    fn insert_copy_duplicates_state_in_one_undo_step_and_validates() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({})).unwrap();
+        let t = e.session().tracks[0].id;
+        for (slot, plugin) in ["gain", "saturator", "compressor"].iter().enumerate() {
+            e.execute("mix.insert", &json!({"track": t, "slot": slot, "plugin": plugin})).unwrap();
+        }
+        e.execute("mix.insert_bypass", &json!({"track": t, "slot": 1, "value": true})).unwrap();
+        let order = |e: &Engine| -> Vec<String> {
+            e.session().tracks[0].mixer.inserts.iter().take(5).map(|i| i.as_ref().map_or(String::new(), |i| i.plugin.clone())).collect()
+        };
+        let original = order(&e);
+        let steps = e.undo_history().len();
+        e.execute("mix.insert_copy", &json!({"track": t, "from": 1, "to": "a"})).unwrap();
+        assert_eq!(order(&e), ["saturator", "gain", "saturator", "compressor", ""]);
+        let ins = &e.session().tracks[0].mixer.inserts;
+        assert!(ins[0].as_ref().unwrap().bypass, "the copy keeps bypass");
+        assert_ne!(ins[0].as_ref().unwrap().uid.get(), ins[2].as_ref().unwrap().uid.get());
+        assert_eq!(e.undo_history().len(), steps + 1, "one undo step");
+        assert!(e.undo());
+        assert_eq!(order(&e), original);
+        for p in [
+            json!({"track": t, "from": 1, "to": 1}),
+            json!({"track": t, "from": 0, "to": 10}),
+            json!({"track": t, "from": 7, "to": 0}),
+            json!({"track": t, "from": 0}),
+        ] {
+            assert!(e.execute("mix.insert_copy", &p).is_err(), "{p}");
         }
         assert_eq!(order(&e), original);
         assert_eq!(e.undo_history().len(), steps);

@@ -202,6 +202,8 @@ pub struct DeviceCard {
     pub editor_enabled: bool,
     /// The plug-in's editor window is open or wanted (the button then reads "Close editor").
     pub editor_open: bool,
+    /// The title area a press-and-drag on grabs to reorder the device (inserts only).
+    pub drag_handle: R4,
     /// The instrument card's name (or "Choose…" when there is none): opens the instrument menu.
     pub pick_button: R4,
 }
@@ -214,6 +216,8 @@ pub struct DevicesLayout {
     pub area: R4,
     pub cards: Vec<DeviceCard>,
     pub add: R4,
+    /// While a device is dragged: the x of the drop indicator (`None` when releasing now would change nothing).
+    pub drop_x: Option<f32>,
     /// The open menu's entries: "+" or the instrument menu (`value` is the plug-in id), or a
     /// send menu (`value` is the bus name, or [`NEW_FX`]).
     pub menu: Vec<MenuItem>,
@@ -238,6 +242,8 @@ pub struct MixerState {
     pub hscroll: f32,
     pub layout: MixerLayout,
     pub devices: DevicesLayout,
+    /// The device being dragged in the chain (see `devices::chain`).
+    pub(crate) device_drag: Option<crate::devices::DeviceDrag>,
     /// Built-in plug-ins (from `engine.plugins`), read once.
     pub(crate) builtin: Option<Vec<PluginEntry>>,
     /// Display names of hosted plug-ins by id, filled from the scan caches as cards need them.
@@ -676,6 +682,32 @@ impl StudioApp {
 
     pub fn toggle_bypass(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
         self.run("mix.insert_bypass", json!({"track": t.0, "slot": slot}))
+    }
+
+    /// Reorder (`copy` false: `mix.insert_move`) or duplicate (`copy` true: `mix.insert_copy`) a
+    /// device in `t`'s chain, one undo step. Open and wanted plug-in editors follow their inserts
+    /// to the new slots (matched by `Insert.uid`, not by slot).
+    pub fn reorder_device(&mut self, t: TrackId, from: usize, to: usize, copy: bool) -> Result<Value, String> {
+        let uids = |app: &Self| -> Vec<Option<u64>> {
+            app.engine.session().track(t).map(|tr| tr.mixer.inserts.iter().map(|i| i.as_ref().map(|i| i.uid.get())).collect()).unwrap_or_default()
+        };
+        let before = uids(self);
+        let id = if copy { "mix.insert_copy" } else { "mix.insert_move" };
+        let r = self.run(id, json!({"track": t.0, "from": from, "to": to}));
+        if r.is_ok() {
+            let after = uids(self);
+            let follow = |key: (TrackId, usize)| -> (TrackId, usize) {
+                let new = (key.0 == t).then(|| before.get(key.1).copied().flatten()).flatten().and_then(|u| after.iter().position(|a| *a == Some(u)));
+                (key.0, new.unwrap_or(key.1))
+            };
+            for k in &mut self.ui.plugin_windows {
+                *k = follow(*k);
+            }
+            for e in &mut self.editors {
+                e.key = follow(e.key);
+            }
+        }
+        r
     }
 
     /// Remove a device; its editor window closes first.

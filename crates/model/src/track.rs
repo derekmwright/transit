@@ -345,6 +345,36 @@ impl Track {
         true
     }
 
+    /// Copies the insert in slot `from` into slot `to`: the copy lands exactly there, and the
+    /// inserts from `to` up to the first empty slot at or after it shift up one (nothing shifts
+    /// when `to` is empty). The copy keeps the settings, bypass, preset and state but gets a fresh
+    /// [`InsertUid`](crate::InsertUid), and no automation. Plug-in automation lanes of the
+    /// shifted inserts follow them. Returns false, changing nothing, when a slot is out of range,
+    /// `from == to`, `from` is empty, or there is no empty slot at or after `to`.
+    pub fn copy_insert(&mut self, from: usize, to: usize) -> bool {
+        let n = self.mixer.inserts.len();
+        if from == to || from >= n || to >= n {
+            return false;
+        }
+        let Some(mut copy) = self.mixer.inserts.get(from).and_then(Option::clone) else { return false };
+        let Some(free) = self.mixer.inserts.iter().enumerate().skip(to).find(|(_, i)| i.is_none()).map(|(i, _)| i) else { return false };
+        copy.uid = crate::InsertUid::default();
+        if let Some(r) = self.mixer.inserts.get_mut(to..=free) {
+            r.rotate_right(1);
+        }
+        if let Some(slot) = self.mixer.inserts.get_mut(to) {
+            *slot = Some(copy);
+        }
+        for l in &mut self.automation {
+            if let AutoParam::Plugin { slot, .. } = &mut l.param
+                && let Some(new) = u8::try_from(usize::from(*slot) + 1).ok().filter(|_| (to..free).contains(&usize::from(*slot)))
+            {
+                *slot = new;
+            }
+        }
+        true
+    }
+
     pub fn lane(&self, p: &AutoParam) -> Option<&AutomationLane> {
         self.automation.iter().find(|l| &l.param == p)
     }
@@ -459,6 +489,53 @@ mod tests {
         assert!(t.move_insert(3, 1));
         assert_eq!(order(&t), "abcd______");
         assert_eq!([at(&t, 0), at(&t, 1), at(&t, 2), at(&t, 3)], [Some(0.0), Some(1.0), Some(2.0), Some(3.0)]);
+    }
+
+    #[test]
+    fn copy_insert_places_a_fresh_copy_and_shifts_the_rest() {
+        let mut t = chain4();
+        {
+            let b = t.mixer.inserts[1].as_mut().unwrap();
+            b.bypass = true;
+            b.params.insert("x".into(), 0.25);
+            b.preset = "P".into();
+            b.state = Some("AAEC".into());
+        }
+        let uids: Vec<_> = t.mixer.inserts.iter().flatten().map(|i| i.uid.get()).collect();
+        let lane = |slot| AutoParam::Plugin { slot, param: "x".into() };
+        for slot in [0u8, 1, 2, 3] {
+            t.lane_mut(&lane(slot)).set_point(0, f32::from(slot));
+        }
+        assert!(t.copy_insert(1, 3));
+        assert_eq!(order(&t), "abcbd_____");
+        let (orig, copy) = (t.mixer.inserts[1].as_ref().unwrap(), t.mixer.inserts[3].as_ref().unwrap());
+        assert!(copy.bypass && copy.params.get("x") == Some(&0.25) && copy.preset == "P" && copy.state.as_deref() == Some("AAEC"));
+        assert_ne!(copy.uid.get(), orig.uid.get(), "the copy is a new insert");
+        assert_eq!(orig.uid.get(), uids[1]);
+        assert_eq!(t.mixer.inserts[4].as_ref().unwrap().uid.get(), uids[3], "d shifted, keeping its identity");
+        // Lanes: a, b, c keep their slots; d's lane moved with it; the copy has none.
+        let at = |t: &Track, slot| t.lane(&lane(slot)).map(|l| l.points[0].value);
+        assert_eq!([at(&t, 0), at(&t, 1), at(&t, 2), at(&t, 3), at(&t, 4)], [Some(0.0), Some(1.0), Some(2.0), None, Some(3.0)]);
+        // Into an empty slot: nothing shifts.
+        assert!(t.copy_insert(0, 8));
+        assert_eq!(order(&t), "abcbd___a_");
+    }
+
+    #[test]
+    fn copy_insert_rejects_noops_out_of_range_and_a_full_tail() {
+        let mut t = chain4();
+        let before = order(&t);
+        assert!(!t.copy_insert(1, 1));
+        assert!(!t.copy_insert(0, 10));
+        assert!(!t.copy_insert(10, 0));
+        assert!(!t.copy_insert(5, 0), "an empty slot has nothing to copy");
+        for i in 4..10 {
+            t.mixer.inserts[i] = Some(crate::Insert::new("z"));
+        }
+        let full = order(&t);
+        assert!(!t.copy_insert(0, 2), "no empty slot to shift into");
+        assert_eq!(order(&t), full);
+        assert_ne!(before, full);
     }
 
     #[test]

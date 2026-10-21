@@ -5,8 +5,11 @@
 //!
 //! Plan 06 leaks: inserts are ten fixed slots (L1), so the chain shows only the occupied ones and
 //! "+" puts the new device in the slot after the last occupied one, so it lands at the end of the
-//! chain; an eleventh device is refused. There is no drag-reorder: `mix.insert_move` is a swap
-//! that leaves slot-keyed automation (L2) and live instances (L3) behind.
+//! chain; an eleventh device is refused. Dragging a device's title reorders the chain
+//! (`mix.insert_move`; Alt-drag copies it with `mix.insert_copy`): the drop position is among the
+//! occupied devices, so the chain stays packed ([`drop_pos`], [`drop_target`]). Plug-in
+//! automation lanes and live instances follow their insert; open editors are re-keyed by
+//! `Insert.uid` ([`StudioApp::reorder_device`]).
 
 use crate::StudioApp;
 use crate::icons::Icon;
@@ -19,6 +22,46 @@ use soundcraft_model::{Insert, TrackId, TrackKind};
 /// Height of the device pane.
 pub const PANE_H: f32 = 132.0;
 const CARD_W: f32 = 168.0;
+
+/// A device being dragged by its title: the insert slot it started in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeviceDrag {
+    pub track: TrackId,
+    pub slot: usize,
+}
+
+/// Where a pointer at `x` would drop among the occupied devices: the number of cards (given by
+/// their center x, left to right) whose center is left of `x`. 0 is before the first, `len` after
+/// the last.
+pub(crate) fn drop_pos(centers: &[f32], x: f32) -> usize {
+    centers.iter().filter(|c| x > **c).count()
+}
+
+/// The `to` slot for dropping the device in `from` at position `pos` (see [`drop_pos`]) of the
+/// occupied slots `occ` (ascending), or `None` when the drop changes nothing or is not possible.
+/// A move lands so the chain order is exactly "everything else, with the device at `pos`" and
+/// never opens a gap; dropping right before or after itself is a no-op. A copy lands before the
+/// device at `pos` (that one and the rest shift up), or right after the last device; dropping a
+/// copy beside its original puts it right after the original. `slots` is the number of slots.
+pub(crate) fn drop_target(occ: &[usize], from: usize, pos: usize, copy: bool, slots: usize) -> Option<usize> {
+    let rank = occ.iter().position(|s| *s == from)?;
+    let pos = pos.min(occ.len());
+    if copy {
+        let to = match occ.get(pos) {
+            Some(s) => *s,
+            None => occ.last().map_or(0, |s| s + 1),
+        };
+        let to = if to == from { from + 1 } else { to };
+        return (to < slots).then_some(to);
+    }
+    if pos == rank || pos == rank + 1 {
+        None
+    } else if pos < rank {
+        occ.get(pos).copied()
+    } else {
+        occ.get(pos - 1).copied()
+    }
+}
 
 fn r4(r: Rect) -> crate::arrange::R4 {
     [r.min.x, r.min.y, r.max.x, r.max.y]
@@ -159,6 +202,7 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
         crate::icons::paint(&p.with_clip_rect(lane), pos2(ax, r.center().y), Icon::ChevronRight, 14.0, TOKENS.text_dim);
         x += CARD_W + 14.0;
     }
+    drag_devices(app, ui, &p, lane, tid, &mut layout);
     // "+": add a device.
     let add = Rect::from_min_size(pos2(x, lane.min.y), vec2(40.0, lane.height()));
     layout.add = r4(add);
@@ -179,6 +223,47 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
         }
     }
     app.mixer.devices = layout;
+}
+
+/// The device drag in progress, if any: the drop indicator while the pointer moves, and on
+/// release one `mix.insert_move` (or `mix.insert_copy` with Alt held) unless the drop changes
+/// nothing.
+fn drag_devices(app: &mut StudioApp, ui: &Ui, p: &egui::Painter, lane: Rect, tid: TrackId, layout: &mut DevicesLayout) {
+    let Some(d) = app.mixer.device_drag else { return };
+    let inserts: Vec<(usize, Rect)> =
+        layout.cards.iter().filter_map(|c| c.slot.map(|s| (s, Rect::from_min_max(pos2(c.rect[0], c.rect[1]), pos2(c.rect[2], c.rect[3]))))).collect();
+    let occ: Vec<usize> = inserts.iter().map(|(s, _)| *s).collect();
+    if d.track != tid || !occ.contains(&d.slot) {
+        app.mixer.device_drag = None;
+        return;
+    }
+    let (ptr, alt, released) = ui.input(|i| (i.pointer.interact_pos().or(i.pointer.latest_pos()), i.modifiers.alt, i.pointer.any_released()));
+    let Some(ptr) = ptr else {
+        if released {
+            app.mixer.device_drag = None;
+        }
+        return;
+    };
+    let centers: Vec<f32> = inserts.iter().map(|(_, r)| r.center().x).collect();
+    let pos = drop_pos(&centers, ptr.x);
+    let slots = app.engine.session().track(tid).map_or(0, |t| t.mixer.inserts.len());
+    let target = drop_target(&occ, d.slot, pos, alt, slots);
+    if released {
+        app.mixer.device_drag = None;
+        if let Some(to) = target {
+            let _ = app.reorder_device(tid, d.slot, to, alt);
+        }
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    if target.is_some() {
+        let x = match inserts.get(pos) {
+            Some((_, r)) => r.min.x - 7.0,
+            None => inserts.last().map_or(lane.min.x, |(_, r)| r.max.x + 7.0),
+        };
+        layout.drop_x = Some(x);
+        p.with_clip_rect(lane).line_segment([pos2(x, lane.min.y), pos2(x, lane.max.y)], Stroke::new(3.0, TOKENS.accent));
+    }
 }
 
 /// One device card: bypass (power), name, remove; kind; "Open editor". The instrument card has
@@ -233,6 +318,20 @@ fn card(
         c.remove_button = r4(xb);
     }
     let name_r = Rect::from_min_max(pos2(name_x, title.min.y), pos2(r.max.x - 22.0, title.max.y));
+    if let Some(slot) = slot {
+        // Press-and-drag on the title reorders (Alt: copies); the chain handles the drop.
+        let grip = ui.interact(name_r.intersect(lane), ui.id().with(("drag_device", t.0, salt)), Sense::drag());
+        c.drag_handle = r4(name_r);
+        if grip.drag_started() {
+            app.mixer.device_drag = Some(DeviceDrag { track: t, slot });
+        }
+        if grip.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if grip.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        grip.on_hover_text("Drag to reorder; Alt-drag to copy");
+    }
     pc.with_clip_rect(name_r.intersect(lane)).text(
         name_r.left_center(),
         Align2::LEFT_CENTER,
@@ -500,4 +599,57 @@ fn sends_section(
         layout.add_send = crate::mixer::add_send_row(app, ui, s, t, at(i), lane, &mut menu);
     }
     layout.menu = menu;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drop_pos, drop_target};
+
+    #[test]
+    fn drop_pos_counts_the_cards_whose_center_is_left_of_the_pointer() {
+        let centers = [100.0, 300.0, 500.0];
+        assert_eq!(drop_pos(&centers, 10.0), 0, "before the first");
+        assert_eq!(drop_pos(&centers, 100.0), 0, "exactly on a center is still before it");
+        assert_eq!(drop_pos(&centers, 200.0), 1, "between the first and second");
+        assert_eq!(drop_pos(&centers, 450.0), 2);
+        assert_eq!(drop_pos(&centers, 900.0), 3, "after the last");
+        assert_eq!(drop_pos(&[], 50.0), 0);
+    }
+
+    #[test]
+    fn a_move_drops_among_the_occupied_devices_and_same_place_is_a_no_op() {
+        // Devices in slots 0, 2, 3 (a gap at 1): moving never creates or closes a gap by itself.
+        let occ = [0, 2, 3];
+        let mv = |from, pos| drop_target(&occ, from, pos, false, 10);
+        // The first device: before itself and right after itself change nothing.
+        assert_eq!((mv(0, 0), mv(0, 1)), (None, None));
+        assert_eq!(mv(0, 2), Some(2), "after the second device");
+        assert_eq!(mv(0, 3), Some(3), "after the last: the end of the occupied chain, not slot 9");
+        // The last device.
+        assert_eq!((mv(3, 2), mv(3, 3)), (None, None));
+        assert_eq!(mv(3, 0), Some(0), "before the first");
+        assert_eq!(mv(3, 1), Some(2), "between the first and second");
+        // The middle one.
+        assert_eq!(mv(2, 0), Some(0));
+        assert_eq!((mv(2, 1), mv(2, 2)), (None, None));
+        assert_eq!(mv(2, 3), Some(3));
+        assert_eq!(mv(2, 99), Some(3), "a position past the end clamps to the end");
+        assert_eq!(mv(5, 0), None, "not an occupied slot");
+    }
+
+    #[test]
+    fn a_copy_lands_before_the_device_at_the_position_or_after_the_last() {
+        let occ = [0, 1, 2];
+        let cp = |from, pos| drop_target(&occ, from, pos, true, 10);
+        assert_eq!(cp(2, 0), Some(0), "before the first");
+        assert_eq!(cp(2, 1), Some(1), "between");
+        assert_eq!(cp(0, 3), Some(3), "after the last");
+        assert_eq!(cp(1, 1), Some(2), "beside the original: right after it");
+        assert_eq!(cp(1, 2), Some(2));
+        assert_eq!(cp(2, 3), Some(3));
+        // A full ten-slot chain has no room.
+        let full: Vec<usize> = (0..10).collect();
+        assert_eq!(drop_target(&full, 0, 10, true, 10), None);
+        assert_eq!(drop_target(&full, 9, 9, true, 10), None, "beside the device in the last slot");
+    }
 }

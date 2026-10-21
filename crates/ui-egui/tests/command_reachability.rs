@@ -22,6 +22,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "markers.previous",
     "mix.clear_mutes",
     "mix.clear_solos",
+    "mix.insert_copy", // studio UI only (Alt-drag in the device chain); the old UI has no device reorder
     "mix.insert_move",
     "mix.phase_invert",
     "mix.remove_bus", // studio UI only; old UI has no bus management surface

@@ -2151,3 +2151,81 @@ fn width_menu_explains_why_recording_disables_it() {
     }
     assert!(explained, "hovering the disabled width action must explain how to enable it");
 }
+
+/// A chain of gain, saturator, compressor on the focused track; returns (app, ctx, time, track).
+fn chain_app() -> (StudioApp, egui::Context, f64, TrackId) {
+    let (mut app, ctx, mut time, t) = mixer_app();
+    for plugin in ["gain", "saturator", "compressor"] {
+        app.add_device(t, plugin).unwrap();
+    }
+    app.focus(t);
+    frames(&mut app, &ctx, 3, &mut time);
+    (app, ctx, time, t)
+}
+
+fn chain_order(app: &StudioApp, t: TrackId) -> Vec<String> {
+    app.engine.session().track(t).unwrap().mixer.inserts.iter().flatten().map(|i| i.plugin.clone()).collect()
+}
+
+#[test]
+fn dragging_a_device_title_reorders_the_chain_in_one_undo_step() {
+    let (mut app, ctx, mut time, t) = chain_app();
+    assert_eq!(app.mixer.devices.cards.len(), 3);
+    let uid = |app: &StudioApp, plugin: &str| {
+        app.engine.session().track(t).unwrap().mixer.inserts.iter().flatten().find(|i| i.plugin == plugin).map(|i| i.uid.get())
+    };
+    let gain = uid(&app, "gain");
+    let steps = undo_len(&mut app);
+    // An editor window open on the gain (slot 0) follows it.
+    app.ui.plugin_windows = vec![(t, 0)];
+    let c = app.mixer.devices.cards.clone();
+    let grab = mid(c[0].drag_handle);
+    let past_last = (c[2].rect[0] + 100.0, grab.1);
+    drag(&mut app, grab, past_last, json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(chain_order(&app, t), ["saturator", "compressor", "gain"], "dropped after the last device");
+    assert_eq!(uid(&app, "gain"), gain, "the insert kept its identity");
+    assert_eq!(undo_len(&mut app), steps + 1, "one undo step");
+    assert_eq!(app.ui.plugin_windows, vec![(t, 2)], "the open editor followed its plug-in");
+    assert_eq!(app.mixer.devices.drop_x, None, "the indicator is gone after the drop");
+    // Back to the front: drag the last card before the first.
+    let c = app.mixer.devices.cards.clone();
+    drag(&mut app, mid(c[2].drag_handle), (c[0].rect[0] + 10.0, grab.1), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(chain_order(&app, t), ["gain", "saturator", "compressor"]);
+    assert_eq!(undo_len(&mut app), steps + 2);
+    assert_eq!(app.ui.plugin_windows, vec![(t, 0)]);
+}
+
+#[test]
+fn dropping_a_device_where_it_is_does_nothing() {
+    let (mut app, ctx, mut time, t) = chain_app();
+    let steps = undo_len(&mut app);
+    let c = app.mixer.devices.cards.clone();
+    // The middle card, dragged a little within its own bounds, and to just past the next card's
+    // left edge (still before that card's center): both drop where it already is.
+    let grab = mid(c[1].drag_handle);
+    drag(&mut app, grab, (grab.0 + 30.0, grab.1), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    drag(&mut app, grab, (c[2].rect[0] + 10.0, grab.1), json!({}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(chain_order(&app, t), ["gain", "saturator", "compressor"]);
+    assert_eq!(undo_len(&mut app), steps, "no command, no undo entry");
+}
+
+#[test]
+fn alt_dragging_a_device_copies_it_into_the_drop_position() {
+    let (mut app, ctx, mut time, t) = chain_app();
+    app.run("mix.insert_bypass", json!({"track": t.0, "slot": 2, "value": true})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let steps = undo_len(&mut app);
+    let c = app.mixer.devices.cards.clone();
+    let grab = mid(c[2].drag_handle);
+    drag(&mut app, grab, (c[0].rect[0] + 10.0, grab.1), json!({"alt": true}));
+    frames(&mut app, &ctx, 20, &mut time);
+    assert_eq!(chain_order(&app, t), ["compressor", "gain", "saturator", "compressor"], "the copy is first, the original stays");
+    let ins = app.engine.session().track(t).unwrap().mixer.inserts.clone();
+    assert!(ins[0].as_ref().unwrap().bypass, "the copy has the original's settings");
+    assert_ne!(ins[0].as_ref().unwrap().uid.get(), ins[3].as_ref().unwrap().uid.get());
+    assert_eq!(undo_len(&mut app), steps + 1, "one undo step");
+}
