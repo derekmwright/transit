@@ -159,6 +159,7 @@ fn both_themes_keep_text_meters_and_accent_legible() {
         }
         for bg in [t.bg, t.panel, t.panel_raised, t.lane] {
             assert!(contrast(t.accent, bg) >= 3.0, "{name}: accent {}", contrast(t.accent, bg));
+            assert!(contrast(t.loop_region, bg) >= 3.0, "{name}: loop region {}", contrast(t.loop_region, bg));
             assert!(contrast(t.focus_ring, bg) >= 3.0, "{name}: focus ring");
             assert!(contrast(t.cursor, bg) >= 3.0, "{name}: playhead");
         }

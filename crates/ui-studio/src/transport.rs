@@ -73,7 +73,7 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                 if button(app, ui, "record", Icon::Record, recording, TOKENS.record).clicked() {
                     let _ = app.run("transport.record", json!({}));
                 }
-                if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.accent).clicked() {
+                if button(app, ui, "cycle", Icon::Loop, cycle, TOKENS.loop_region).clicked() {
                     let _ = app.run("options.loop_playback", json!({"value": !cycle}));
                 }
                 ui.add_space(2.0 * crate::theme::SPACE);

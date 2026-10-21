@@ -59,6 +59,9 @@ pub struct Tokens {
     /// The one accent: selection, focus, active values. Same hue in both themes (darker in light
     /// so it keeps 3:1 against the light panels).
     pub accent: Color32,
+    /// The loop/cycle region: strip fill and handles, ruler cycle tint, the Cycle button when on.
+    /// A yellowish amber (not the accent) so looping reads apart from selection; darker in light.
+    pub loop_region: Color32,
     pub cursor: Color32,
     pub record: Color32,
     pub mute: Color32,
@@ -96,6 +99,7 @@ pub const DARK: Tokens = Tokens {
     // Lifted from 0x8c8e94 (slice 5) so secondary labels keep 4.5:1 on the raised panels.
     text_dim: Color32::from_rgb(0xb6, 0xb8, 0xbe),
     accent: Color32::from_rgb(0x4c, 0xb1, 0xf0),
+    loop_region: Color32::from_rgb(0xe8, 0xb3, 0x3c),
     cursor: Color32::from_rgb(0xe8, 0xe8, 0xea),
     record: Color32::from_rgb(0xe5, 0x48, 0x48),
     mute: Color32::from_rgb(0xe0, 0xa2, 0x36),
@@ -127,6 +131,7 @@ pub const LIGHT: Tokens = Tokens {
     text: Color32::from_rgb(0x1c, 0x1d, 0x20),
     text_dim: Color32::from_rgb(0x50, 0x53, 0x5b),
     accent: Color32::from_rgb(0x18, 0x73, 0xb8),
+    loop_region: Color32::from_rgb(0xa9, 0x77, 0x06),
     cursor: Color32::from_rgb(0x1c, 0x1d, 0x20),
     record: Color32::from_rgb(0xc6, 0x2f, 0x2f),
     mute: Color32::from_rgb(0xe0, 0xa2, 0x36),

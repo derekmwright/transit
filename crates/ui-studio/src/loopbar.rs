@@ -145,7 +145,7 @@ pub(crate) fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, str
     if !shown.is_empty() {
         let r =
             Rect::from_min_max(pos2(map.x(shown.start), strip.min.y + 1.0), pos2(map.x(shown.end).max(map.x(shown.start) + 1.0), strip.max.y - 1.0));
-        let (fill, edge) = if enabled { (TOKENS.accent, TOKENS.text) } else { (TOKENS.accent.gamma_multiply(0.3), TOKENS.text_dim) };
+        let (fill, edge) = if enabled { (TOKENS.loop_region, TOKENS.text) } else { (TOKENS.loop_region.gamma_multiply(0.3), TOKENS.text_dim) };
         p.rect_filled(r, crate::theme::RADIUS_SM, fill);
         p.rect_stroke(r, crate::theme::RADIUS_SM, Stroke::new(1.0, edge.gamma_multiply(0.6)), StrokeKind::Inside);
         for x in [r.min.x, r.max.x] {

@@ -969,7 +969,7 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
     if s.edit.loop_playback && !sel.is_empty() {
         let r = Rect::from_min_max(pos2(map.x(sel.start), ruler.min.y + crate::loopbar::STRIP_H + 14.0), pos2(map.x(sel.end), ruler.max.y - 1.0))
             .intersect(ruler);
-        p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.55));
+        p.rect_filled(r, crate::theme::RADIUS_SM, TOKENS.loop_region.gamma_multiply(0.55));
     }
     // The take being recorded grows on each armed track where it will land (slice 6: inside the
     // punch range, after a count-in), with a "Recording" name strip.
