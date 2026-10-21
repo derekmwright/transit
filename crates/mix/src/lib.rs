@@ -84,6 +84,7 @@ use std::sync::Arc;
 mod active;
 mod compile;
 mod events;
+mod key;
 mod plan;
 #[cfg(test)]
 mod plan_tests;
@@ -94,6 +95,7 @@ pub use events::{
     Arrival, Due, EngineEpoch, EventLimits, EventOutcome, EventStatus, InstrumentEvent, MAX_OPEN, MAX_PEDALS, MAX_PORTS, Message, NoteId,
     PluginEvent, QUEUE_CAP, RenderFrame, Shed, ShedCounts, Source, TapRecord, TransportEpoch,
 };
+use key::{KeyBank, KeyEnd, KeySpec};
 pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
     RenderTarget, Retired, SlotBinding, SlotGen,
@@ -465,8 +467,10 @@ impl PluginSlot {
 
 struct Strip {
     buf: Vec<Vec<f32>>,
-    /// Pre-fader copy for pre-fader sends.
+    /// Pre-fader copy for pre-fader sends (and pre-fader keys, [`Strip::key_pre`]).
     pre: Vec<Vec<f32>>,
+    /// Plan mode: another strip's insert takes a pre-fader key from this one, so `pre` is filled.
+    key_pre: bool,
     scratch: Vec<f32>,
     plugins: Vec<Option<PluginSlot>>,
     instrument: Option<PluginSlot>,
@@ -795,6 +799,7 @@ impl Strip {
         Strip {
             buf: Vec::new(),
             pre: Vec::new(),
+            key_pre: false,
             scratch: Vec::new(),
             plugins: Vec::new(),
             instrument: None,
@@ -1494,6 +1499,8 @@ impl MixEngine {
                 st.scratch.resize(self.max_block, 0.0);
             }
         }
+        // Sidechain keys are a plan-mode feature (ADR 0015): this renderer leaves every insert on its own input.
+        let no_keys = KeyBank::default();
         let busses = std::mem::take(&mut self.busses);
         let live_in = LiveInput {
             input: &self.input,
@@ -1509,7 +1516,7 @@ impl MixEngine {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_strips(&mut work, !self.serial, |(i, st)| {
                 if let Some(t) = s.tracks.get(*i) {
-                    guarded(st, |st| process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo));
+                    guarded(st, |st| process_strip(s, t, st, &busses, &live_in, pos, frames, any_solo, &no_keys));
                 }
             });
         }));
@@ -1581,7 +1588,7 @@ impl MixEngine {
             };
             // As in phase 1: a panicking plug-in leaves its strip in the engine, not dropped by the unwind.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo);
+                process_strip(s, t, &mut st, &self.busses, &live_in, pos, frames, any_solo, &no_keys);
             }));
             if let Err(panic) = ran {
                 self.strips.insert(t.id, st);
@@ -1898,6 +1905,7 @@ fn process_strip<B: Busses + ?Sized>(
     pos: Samples,
     frames: usize,
     any_solo: bool,
+    keys: &KeyBank,
 ) {
     for c in strip.buf.iter_mut() {
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -2049,7 +2057,9 @@ fn process_strip<B: Busses + ?Sized>(
             continue;
         }
         apply_params(slot, ins, t, i, pos);
-        if run_insert(slot, &mut strip.buf, frames, &transport, live.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
+        // An insert with a key detects on it when the plan made one for the slot (else on its own input).
+        let key = ins.key.and_then(|_| keys.get(t.id, i));
+        if run_insert(slot, &mut strip.buf, key, frames, &transport, live.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
             strip.failures.record(i);
             continue;
         }
@@ -2063,7 +2073,7 @@ fn process_strip<B: Busses + ?Sized>(
     let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
     let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
     strip.muted = t.mixer.mute || auto_mute || soloed_out;
-    if t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
+    if strip.key_pre || t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
         strip.pre.resize_with(strip.buf.len(), Vec::new);
         for (d, src) in strip.pre.iter_mut().zip(strip.buf.iter()) {
             d.clear();
@@ -2120,7 +2130,7 @@ fn process_master(t: &Track, strip: &mut Strip, main: &mut [Vec<f32>], pos: Samp
             && !slot.failed
         {
             apply_params(slot, ins, t, i, pos);
-            if run_insert(slot, &mut strip.buf, frames, transport, no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
+            if run_insert(slot, &mut strip.buf, None, frames, transport, no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
                 strip.failures.record(i);
             }
         }
@@ -2160,13 +2170,14 @@ fn is_silent(buf: &[Vec<f32>], frames: usize) -> bool {
 /// zero, any nonzero sample wakes it; `ContinueIfNotQuiet` once its last output was silent too; `Tail` once `tail_samples()` of
 /// silence have gone through and its last output was silent). The buffers are then left as they
 /// are: silent in, silent out. Any non-silent block resumes it, and a parameter change wakes it
-/// for one block (without restarting its tail count). `no_suspend` runs every insert. True when
-/// the plugin processed the block.
-fn run_insert(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize, transport: &Transport, no_suspend: bool) -> bool {
+/// for one block (without restarting its tail count). `no_suspend` runs every insert. A `key`
+/// (sidechain) counts as input: a silent block with a loud key is not silent. True when the
+/// plugin processed the block.
+fn run_insert(slot: &mut PluginSlot, buf: &mut [Vec<f32>], key: Option<&[Vec<f32>]>, frames: usize, transport: &Transport, no_suspend: bool) -> bool {
     if slot.suspendable {
         // Exactly zero implies below the threshold, so the second scan runs only when it must.
-        let all_zero = is_all_zero(buf, frames);
-        let silent = all_zero || is_silent(buf, frames);
+        let all_zero = is_all_zero(buf, frames) && key.is_none_or(|k| is_all_zero(k, frames));
+        let silent = all_zero || (is_silent(buf, frames) && key.is_none_or(|k| is_silent(k, frames)));
         if silent {
             let skip = !no_suspend
                 && !slot.woken
@@ -2189,7 +2200,10 @@ fn run_insert(slot: &mut PluginSlot, buf: &mut [Vec<f32>], frames: usize, transp
     }
     slot.woken = false;
     slot.plugin.set_transport(transport);
-    slot.plugin.process(buf, frames);
+    match key {
+        Some(k) => slot.plugin.process_with_key(buf, k, frames),
+        None => slot.plugin.process(buf, frames),
+    }
     if slot.suspendable {
         slot.output_silent = is_silent(buf, frames);
     }
@@ -2370,7 +2384,7 @@ fn structure_fingerprint(s: &Session) -> usize {
         t.mixer.input.hash(&mut h);
         t.mixer.output.hash(&mut h);
         for i in &t.mixer.inserts {
-            i.as_ref().map(|x| (x.plugin.as_str(), x.uid.get())).hash(&mut h);
+            i.as_ref().map(|x| (x.plugin.as_str(), x.uid.get(), x.key)).hash(&mut h);
         }
         for snd in t.mixer.sends.iter().flatten() {
             snd.target.hash(&mut h);
@@ -2617,6 +2631,9 @@ fn processing_order(s: &Session, route: &mut RouteScratch, order: &mut Vec<usize
     route.layer(s);
     order.clear();
     order.extend(s.tracks.iter().enumerate().filter(|(_, t)| !is_aux(t)).map(|(i, _)| i));
+    // Phase 1 renders in layers: a track keyed from another renders after it (stable: track order
+    // within a layer, and no keys means one layer in track order, as before).
+    order.sort_by_key(|&i| route.depth(i));
     order.extend(route.order().iter().copied().filter(|&i| s.tracks.get(i).is_some_and(is_aux)));
 }
 
@@ -2654,6 +2671,9 @@ fn route_fingerprint(s: &Session) -> usize {
         t.mixer.sends.len().hash(&mut h);
         for snd in &t.mixer.sends {
             snd.as_ref().map(|x| &x.target).hash(&mut h);
+        }
+        for i in &t.mixer.inserts {
+            i.as_ref().and_then(|x| x.key).hash(&mut h);
         }
     }
     for b in &s.busses {
@@ -4781,6 +4801,56 @@ mod tests {
         fn set_input_silent(&mut self, silent: bool) {
             self.told.lock().unwrap().push(silent);
         }
+    }
+
+    /// A hosted effect that sleeps on silence and counts plain and keyed blocks.
+    struct Ducker {
+        plain: Arc<std::sync::atomic::AtomicUsize>,
+        keyed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Plugin for Ducker {
+        fn info(&self) -> &'static soundcraft_dsp::PluginInfo {
+            soundcraft_dsp::plugin_info("gain").unwrap()
+        }
+        fn prepare(&mut self, _: f32, _: usize, _: usize) {}
+        fn reset(&mut self) {}
+        fn set_param(&mut self, _: &str, _: f32) -> bool {
+            true
+        }
+        fn param(&self, _: &str) -> Option<f32> {
+            None
+        }
+        fn process(&mut self, _: &mut [Vec<f32>], _: usize) {
+            self.plain.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn process_with_key(&mut self, _: &mut [Vec<f32>], _: &[Vec<f32>], _: usize) {
+            self.keyed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn process_status(&self) -> ProcessStatus {
+            ProcessStatus::Sleep
+        }
+    }
+
+    #[test]
+    fn a_loud_key_wakes_a_sleeping_insert_whose_own_input_is_silent() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (plain, keyed) = (Arc::<std::sync::atomic::AtomicUsize>::default(), Arc::<std::sync::atomic::AtomicUsize>::default());
+        let mut slot = PluginSlot::new(Box::new(Ducker { plain: plain.clone(), keyed: keyed.clone() }), "clap:test.ducker".into(), 2, 0);
+        assert!(slot.suspendable);
+        let mut buf = vec![vec![0.0f32; 64]; 2];
+        let (silent, loud) = (vec![vec![0.0f32; 64]; 2], vec![vec![0.5f32; 64]; 2]);
+        let t = Transport::default();
+        // Silent main, silent key (or none): asleep.
+        assert!(!run_insert(&mut slot, &mut buf, None, 64, &t, false));
+        assert!(!run_insert(&mut slot, &mut buf, Some(&silent), 64, &t, false));
+        // Silent main, loud key: the ducker runs, and gets the key.
+        assert!(run_insert(&mut slot, &mut buf, Some(&loud), 64, &t, false));
+        assert_eq!((plain.load(Relaxed), keyed.load(Relaxed)), (0, 1));
+        // Loud main and no key: plain processing, as before keys existed.
+        buf.iter_mut().for_each(|c| c.fill(0.5));
+        assert!(run_insert(&mut slot, &mut buf, None, 64, &t, false));
+        assert_eq!((plain.load(Relaxed), keyed.load(Relaxed)), (1, 1));
     }
 
     #[test]

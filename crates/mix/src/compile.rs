@@ -106,6 +106,10 @@ struct Desc {
     /// identity (a reordered chain is a new structure).
     slots: Vec<((TrackId, usize), CellKind, String, usize, u16, usize, usize, u64)>,
     busses: Vec<(BusId, ChannelFormat)>,
+    /// The end (exclusive) of each phase-1 layer, in strip table order (see [`render_rows`]).
+    layers: Vec<u16>,
+    /// The keyed inserts: where each takes its key from.
+    keys: Vec<KeySpec>,
     main: Option<ChannelFormat>,
     /// The output paths the session routes to on this machine.
     sinks: Vec<SinkSpec>,
@@ -314,7 +318,13 @@ fn measure(s: &Session, l: &PlanLimits, block: usize, cap_of: &dyn Fn(&Track, us
 /// The strip index of each track in render order: live tracks other than auxes (processing
 /// order), every aux and folder (dependency order), then the rest in track order. Also the
 /// number of each of the first two groups.
-fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>) {
+/// A sidechain key edge the render honors: keyed track index, insert slot, source, pre-fader.
+type RawKey = (usize, usize, soundcraft_model::RouteNode, bool);
+
+/// The strip index of each track in render order (see below), the end of each phase-1 layer (a
+/// track keyed from another renders in a later layer than its source), and the key edges not cut.
+#[allow(clippy::type_complexity)]
+fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>, Vec<u16>, Vec<RawKey>) {
     let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
     let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
     let mut order = Vec::new();
@@ -328,7 +338,23 @@ fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>) {
     rows.extend(order.iter().copied().filter(|i| track(i).is_some_and(is_aux)));
     let aux_end = rows.len();
     rows.extend((0..s.tracks.len()).filter(|i| track(i).is_some_and(|t| !is_aux(t) && !live(t))));
-    (rows, phase1, aux_end, loops)
+    let mut layers = Vec::new();
+    for (k, &i) in rows.iter().enumerate().take(phase1) {
+        if rows.get(k + 1).filter(|_| k + 1 < phase1).is_none_or(|&n| route.depth(n) != route.depth(i)) {
+            layers.push(u16::try_from(k + 1).unwrap_or(u16::MAX));
+        }
+    }
+    let cut: Vec<soundcraft_model::RouteEdge> = route.dropped().copied().collect();
+    let keys = route
+        .edges()
+        .iter()
+        .filter(|e| !cut.contains(e))
+        .filter_map(|e| match (e.kind, e.to) {
+            (soundcraft_model::EdgeKind::Key { slot, pre_fader }, soundcraft_model::RouteNode::Track(to)) => Some((to, slot, e.from, pre_fader)),
+            _ => None,
+        })
+        .collect();
+    (rows, phase1, aux_end, loops, layers, keys)
 }
 
 impl PlanCompiler {
@@ -650,8 +676,24 @@ impl PlanCompiler {
         };
         let specs: HashMap<(TrackId, usize), InstanceSpec> =
             realtime_instance_specs(s).into_iter().filter(|x| !idle.contains(&x.track)).map(|x| ((x.track, x.slot), x)).collect();
-        let (rows, phase1, aux_end, loops) = render_rows(s);
-        let mut desc = Desc { main: Some(s.main_format()), ..Desc::default() };
+        let (rows, phase1, aux_end, loops, layers, raw_keys) = render_rows(s);
+        let mut desc = Desc { main: Some(s.main_format()), layers, ..Desc::default() };
+        let table = |ti: usize| rows.iter().position(|&r| r == ti).and_then(|r| u16::try_from(r).ok());
+        for (to, slot, from, pre) in raw_keys {
+            let (Some(t), Some(keyed)) = (s.tracks.get(to), table(to)) else { continue };
+            let from = match from {
+                soundcraft_model::RouteNode::Track(i) => table(i).map(KeyEnd::Strip),
+                soundcraft_model::RouteNode::Bus(b) => s.busses.get(b).map(|x| KeyEnd::Bus(x.id)),
+                soundcraft_model::RouteNode::Main => None,
+            };
+            let (Some(from), Ok(slot)) = (from, u16::try_from(slot)) else { continue };
+            // An inactive track is never rendered, so its keys (and keys from it) are not honored.
+            if usize::from(keyed) >= aux_end || matches!(from, KeyEnd::Strip(i) if usize::from(i) >= aux_end) {
+                continue;
+            }
+            let ch = u16::try_from(strip_channels(t, main_ch)).unwrap_or(u16::MAX);
+            desc.keys.push(KeySpec { keyed, id: t.id, slot, from, pre, ch });
+        }
         for (r, &ti) in rows.iter().enumerate() {
             let Some(t) = s.tracks.get(ti) else { continue };
             let ch = strip_channels(t, main_ch);
@@ -886,7 +928,14 @@ impl PlanCompiler {
         }
 
         // Strips and cells.
-        let mut tables = PlanTables { phase1, aux_end, main_fmt: s.main_format(), ..PlanTables::default() };
+        let mut tables = PlanTables {
+            phase1,
+            aux_end,
+            main_fmt: s.main_format(),
+            layers: desc.layers.clone().into_boxed_slice(),
+            keys: KeyBank::new(&desc.keys, block),
+            ..PlanTables::default()
+        };
         let mut cells: Vec<CellLoc> = Vec::new();
         let mut moves = Vec::new();
         let mut attach = Vec::new();
@@ -905,6 +954,7 @@ impl PlanCompiler {
             st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
             st.clipbuf = vec![vec![0.0; block]; ch];
             st.external = true;
+            st.key_pre = desc.keys.iter().any(|k| k.pre && k.from == KeyEnd::Strip(si as u16));
             // A strip that keeps its live lines gets placeholders: the move brings the lines.
             let line = || if keep { DelayLine::placeholder() } else { DelayLine::with_capacity(ch, cap, block) };
             st.tap = line();

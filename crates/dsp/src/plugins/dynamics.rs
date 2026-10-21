@@ -113,6 +113,41 @@ impl Compressor {
         self.lookahead = (ms_to_samples(self.p.v(9), sr).round() as usize).min(max);
     }
 
+    /// One block, detecting on `key` (aligned with `io`, same channel count) when given, else on
+    /// the input itself.
+    fn run(&mut self, io: &mut [Vec<f32>], key: Option<&[Vec<f32>]>, frames: usize) {
+        let ch = self.sc.len().min(io.len());
+        let frames = frames_in(io, frames, ch);
+        let hpf = self.p.on(6);
+        let la = self.lookahead;
+        let mut max_gr = 0.0f32;
+        for n in 0..frames {
+            let mut level = 0.0f32;
+            for c in 0..ch {
+                let x = key.unwrap_or(&*io).get(c).and_then(|b| b.get(n)).copied().unwrap_or(0.0);
+                let s = match self.sc.get_mut(c) {
+                    Some(f) if hpf => f.process_sample(x),
+                    _ => x,
+                };
+                if s.is_finite() {
+                    level = level.max(s.abs());
+                }
+            }
+            let gr = self.gain_for(level);
+            max_gr = max_gr.max(gr);
+            let g = db_to_gain(-gr) * self.makeup.next();
+            let m = self.mix.next();
+            for c in 0..ch {
+                let (Some(buf), Some(d)) = (io.get_mut(c), self.delay.get_mut(c)) else { continue };
+                let Some(x) = buf.get_mut(n) else { continue };
+                d.push(*x);
+                let dry = if la == 0 { *x } else { d.tap(la + 1) };
+                *x = dry * (1.0 - m) + dry * g * m;
+            }
+        }
+        self.gr_meter = max_gr;
+    }
+
     /// Processes one frame of gain computation from a sidechain level (linear).
     #[inline]
     fn gain_for(&mut self, level: f32) -> f32 {
@@ -157,36 +192,11 @@ impl Plugin for Compressor {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        let ch = self.sc.len().min(io.len());
-        let frames = frames_in(io, frames, ch);
-        let hpf = self.p.on(6);
-        let la = self.lookahead;
-        let mut max_gr = 0.0f32;
-        for n in 0..frames {
-            let mut level = 0.0f32;
-            for c in 0..ch {
-                let x = io.get(c).and_then(|b| b.get(n)).copied().unwrap_or(0.0);
-                let s = match self.sc.get_mut(c) {
-                    Some(f) if hpf => f.process_sample(x),
-                    _ => x,
-                };
-                if s.is_finite() {
-                    level = level.max(s.abs());
-                }
-            }
-            let gr = self.gain_for(level);
-            max_gr = max_gr.max(gr);
-            let g = db_to_gain(-gr) * self.makeup.next();
-            let m = self.mix.next();
-            for c in 0..ch {
-                let (Some(buf), Some(d)) = (io.get_mut(c), self.delay.get_mut(c)) else { continue };
-                let Some(x) = buf.get_mut(n) else { continue };
-                d.push(*x);
-                let dry = if la == 0 { *x } else { d.tap(la + 1) };
-                *x = dry * (1.0 - m) + dry * g * m;
-            }
-        }
-        self.gr_meter = max_gr;
+        self.run(io, None, frames);
+    }
+
+    fn process_with_key(&mut self, io: &mut [Vec<f32>], key: &[Vec<f32>], frames: usize) {
+        self.run(io, Some(key), frames);
     }
 
     fn latency(&self) -> usize {
@@ -266,6 +276,26 @@ impl ExpanderGate {
         self.env_rel = time_coef(5.0, self.sr);
     }
 
+    /// One block, detecting on `key` (aligned with `io`, same channel count) when given, else on
+    /// the input itself.
+    fn run(&mut self, io: &mut [Vec<f32>], key: Option<&[Vec<f32>]>, frames: usize) {
+        let ch = self.ch.min(io.len());
+        let frames = frames_in(io, frames, ch);
+        let mut max_gr = 0.0f32;
+        for n in 0..frames {
+            let level = key.unwrap_or(&*io).iter().take(ch).filter_map(|b| b.get(n)).fold(0.0f32, |m, v| m.max(v.abs()));
+            let gr = self.tick(level);
+            max_gr = max_gr.max(gr);
+            let g = db_to_gain(-gr);
+            for b in io.iter_mut().take(ch) {
+                if let Some(x) = b.get_mut(n) {
+                    *x *= g;
+                }
+            }
+        }
+        self.gr_meter = max_gr;
+    }
+
     /// Returns the gain reduction (dB ≥ 0) for one frame given the linked peak level.
     #[inline]
     pub(crate) fn tick(&mut self, level: f32) -> f32 {
@@ -308,21 +338,11 @@ impl Plugin for ExpanderGate {
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
-        let ch = self.ch.min(io.len());
-        let frames = frames_in(io, frames, ch);
-        let mut max_gr = 0.0f32;
-        for n in 0..frames {
-            let level = io.iter().take(ch).filter_map(|b| b.get(n)).fold(0.0f32, |m, v| m.max(v.abs()));
-            let gr = self.tick(level);
-            max_gr = max_gr.max(gr);
-            let g = db_to_gain(-gr);
-            for b in io.iter_mut().take(ch) {
-                if let Some(x) = b.get_mut(n) {
-                    *x *= g;
-                }
-            }
-        }
-        self.gr_meter = max_gr;
+        self.run(io, None, frames);
+    }
+
+    fn process_with_key(&mut self, io: &mut [Vec<f32>], key: &[Vec<f32>], frames: usize) {
+        self.run(io, Some(key), frames);
     }
 
     fn gain_reduction_db(&self) -> f32 {

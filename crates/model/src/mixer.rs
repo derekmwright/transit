@@ -1,6 +1,6 @@
 //! Per-track mixer state: inserts, sends, routing, fader, pan, mute/solo.
 
-use crate::{AutomationMode, BusId, SourceId};
+use crate::{AutomationMode, BusId, SourceId, TrackId};
 use std::collections::BTreeMap;
 
 pub const INSERT_SLOTS: usize = 10;
@@ -448,6 +448,34 @@ impl PartialEq for InsertUid {
     }
 }
 
+/// Where an insert's sidechain key comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum KeyFrom {
+    /// A track's signal. The track renders before the keyed one.
+    Track(TrackId),
+    /// What a bus has summed. Only a strip that renders after the bus fills (an aux or folder)
+    /// can hear it.
+    Bus(BusId),
+}
+
+/// Which point of the source strip the key is taken at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub enum Tap {
+    /// After the strip's inserts, before its fader.
+    Pre,
+    /// After the fader (a bus has no such choice: it is always post).
+    #[default]
+    Post,
+}
+
+/// A sidechain key: the signal an insert detects on in place of its own input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct KeySource {
+    pub from: KeyFrom,
+    #[serde(default)]
+    pub tap: Tap,
+}
+
 /// A plugin instance on an insert slot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Insert {
@@ -472,6 +500,10 @@ pub struct Insert {
     /// The session audio source a sample-playing instrument (the built-in Sampler) plays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<SourceId>,
+    /// The sidechain key this insert detects on (built-in compressor and gate); the key belongs
+    /// to the slot and moves with it. Hosted plug-ins ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<KeySource>,
 }
 
 fn yes() -> bool {
@@ -488,6 +520,7 @@ impl Insert {
             preset: String::from("<factory default>"),
             state: None,
             sample: None,
+            key: None,
             uid: InsertUid::default(),
         }
     }
@@ -779,5 +812,31 @@ mod tests {
         let back = Session::from_json(&v.to_string()).unwrap();
         let m = &back.track(t).unwrap().mixer;
         assert!(!m.record_arm && !m.input_monitor);
+    }
+
+    #[test]
+    fn a_key_round_trips_and_old_files_have_none() {
+        use crate::{ChannelFormat, Session, TrackKind};
+        let mut s = Session::default();
+        let kick = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let bass = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let key = KeySource { from: KeyFrom::Track(kick), tap: Tap::Pre };
+        let mut ins = Insert::new("compressor");
+        ins.key = Some(key);
+        s.track_mut(bass).unwrap().mixer.inserts[2] = Some(ins);
+        let json = s.to_json().unwrap();
+        let back = Session::from_json(&json).unwrap();
+        assert_eq!(back.track(bass).unwrap().mixer.inserts[2].as_ref().unwrap().key, Some(key));
+        // A build without keys reads the file: the extra field is ignored there (no
+        // `deny_unknown_fields`), and a key-less insert writes none.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let ins = &mut v["tracks"][1]["mixer"]["inserts"][2];
+        assert!(ins.as_object_mut().unwrap().remove("key").is_some());
+        let old = Session::from_json(&v.to_string()).unwrap();
+        assert_eq!(old.track(bass).unwrap().mixer.inserts[2].as_ref().unwrap().key, None);
+        assert!(!serde_json::to_string(&Insert::new("gain")).unwrap().contains("key"));
+        // A bus key, and a tap left out of the file, which means post.
+        let bus: KeySource = serde_json::from_str(r#"{"from":{"Bus":7}}"#).unwrap();
+        assert_eq!(bus, KeySource { from: KeyFrom::Bus(BusId(7)), tap: Tap::Post });
     }
 }

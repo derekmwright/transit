@@ -221,6 +221,13 @@ pub trait Plugin: Send {
     fn param(&self, id: &str) -> Option<f32>;
     /// In-place processing of `channels` planar buffers each `frames` long.
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
+    /// [`Plugin::process`] with a sidechain key: planar buffers of the signal to detect on, in
+    /// place of the plug-in's own input, aligned sample for sample with `io` and as many channels
+    /// (the mix maps the key onto the strip's channels). The default ignores the key, which is
+    /// what hosted plug-ins do until their hosts wire an auxiliary input.
+    fn process_with_key(&mut self, io: &mut [Vec<f32>], _key: &[Vec<f32>], frames: usize) {
+        self.process(io, frames);
+    }
     /// Processing latency in samples (for delay compensation).
     fn latency(&self) -> usize {
         0

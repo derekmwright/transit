@@ -107,6 +107,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("mix.insert_move", "Move Insert", [], None, "{track?, from, to}", has_selection, insert_move),
         cmd!("mix.insert_copy", "Copy Insert", [], None, "{track?, from, to}", has_selection, insert_copy),
         cmd!(
+            "mix.insert_key",
+            "Set Insert Key",
+            [],
+            None,
+            "{track?, slot, from: {track: id|name} | {bus: id|name} | null, tap?: pre|post} (sidechain key of a built-in compressor or gate; null clears)",
+            has_selection,
+            insert_key
+        ),
+        cmd!(
             "mix.send",
             "Assign Send",
             [],
@@ -469,6 +478,72 @@ fn insert_copy(e: &mut Engine, p: &Value) -> Result<Value> {
         return Err(bad("mix.insert_copy", "empty source slot, or no free slot at or after `to`"));
     }
     Ok(json!({"track": t, "from": from, "to": to}))
+}
+
+/// `mix.insert_key`: the sidechain key of the insert in `slot` (ADR 0015). One undo step; refuses a
+/// key from the track itself, from a missing track or bus, from a source that renders after the
+/// keyed track (a bus or aux into a track that is not an aux), and a key that closes a loop.
+fn insert_key(e: &mut Engine, p: &Value) -> Result<Value> {
+    use soundcraft_model::{KeyFrom, KeySource, Tap, TrackKind};
+    const CMD: &str = "mix.insert_key";
+    let (t, slot) = track_slot(e, p, CMD, INSERT_SLOTS)?;
+    let tap = match str_param(p, "tap") {
+        None | Some("post") => Tap::Post,
+        Some("pre") => Tap::Pre,
+        Some(other) => return Err(bad(CMD, format!("`tap` must be pre or post, not `{other}`"))),
+    };
+    let from = p.get("from").ok_or_else(|| bad(CMD, "`from` required: {track}, {bus} or null"))?;
+    let s = e.session();
+    let keyed = s.track(t).ok_or_else(|| bad(CMD, "no track"))?;
+    if keyed.mixer.inserts.get(slot).is_none_or(Option::is_none) {
+        return Err(bad(CMD, "empty slot"));
+    }
+    let key = if from.is_null() {
+        None
+    } else {
+        let aux = matches!(keyed.kind, TrackKind::Aux | TrackKind::Folder);
+        let id_of = |v: &Value| v.as_u64();
+        let from = if let Some(v) = from.get("track") {
+            let id = match (id_of(v), v.as_str()) {
+                (Some(n), _) => s.track(TrackId(n)).map(|x| x.id),
+                (_, Some(name)) => s.track_by_name(name).map(|x| x.id),
+                _ => None,
+            };
+            let src = id.and_then(|i| s.track(i)).ok_or_else(|| bad(CMD, format!("no track {v}")))?;
+            if src.id == t {
+                return Err(bad(CMD, "a track cannot key an insert from itself"));
+            }
+            if matches!(src.kind, TrackKind::Master | TrackKind::Vca) {
+                return Err(bad(CMD, format!("`{}` carries no audio to key from", src.name)));
+            }
+            if !aux && matches!(src.kind, TrackKind::Aux | TrackKind::Folder) {
+                return Err(bad(CMD, format!("`{}` renders after audio tracks; key it into an aux or folder track", src.name)));
+            }
+            KeyFrom::Track(src.id)
+        } else if let Some(v) = from.get("bus") {
+            let bus = match (id_of(v), v.as_str()) {
+                (Some(n), _) => s.busses.iter().find(|b| b.id.0 == n),
+                (_, Some(name)) => s.bus_by_name(name),
+                _ => None,
+            };
+            let bus = bus.ok_or_else(|| bad(CMD, format!("no bus {v}")))?;
+            if !aux {
+                return Err(bad(CMD, "a bus fills after audio tracks render; a bus key needs an aux or folder track"));
+            }
+            if tap == Tap::Pre {
+                return Err(bad(CMD, "a bus key is always post-fader"));
+            }
+            KeyFrom::Bus(bus.id)
+        } else {
+            return Err(bad(CMD, "`from` must be {track}, {bus} or null"));
+        };
+        Some(KeySource { from, tap })
+    };
+    super::track::refuse_loop(s, CMD, &[soundcraft_model::RouteChange::Key { track: t, slot, key }])?;
+    let ins =
+        e.session_mut().track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad(CMD, "empty slot"))?;
+    ins.key = key;
+    Ok(json!({"track": t, "slot": slot, "key": key}))
 }
 
 fn send(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -1186,5 +1261,71 @@ mod tests {
         assert!(back.busses.is_empty());
         assert!(back.tracks.iter().all(|t| t.mixer.sends.iter().flatten().all(|x| matches!(x.target, soundcraft_model::Route::None))));
         assert_eq!(back.track_by_name("FX 1").unwrap().mixer.input, soundcraft_model::Route::None);
+    }
+
+    #[test]
+    fn insert_key_sets_validates_and_moves_and_copies_with_its_insert() {
+        use soundcraft_model::{KeyFrom, KeySource, Route, Tap};
+        let mut e = Engine::default();
+        for name in ["Kick", "Bass"] {
+            e.execute("track.new", &json!({"name": name})).unwrap();
+        }
+        e.execute("track.new", &json!({"kind": "aux", "name": "Verb"})).unwrap();
+        e.execute("mix.new_bus", &json!({"name": "Drums"})).unwrap();
+        let (kick, bass, verb) = (e.session().tracks[0].id, e.session().tracks[1].id, e.session().tracks[2].id);
+        let drums = e.session().busses[0].id;
+        e.execute("mix.insert", &json!({"track": bass, "slot": 0, "plugin": "compressor"})).unwrap();
+        e.execute("mix.insert", &json!({"track": verb, "slot": 0, "plugin": "compressor"})).unwrap();
+        let key = |e: &Engine, t: usize, slot: usize| e.session().tracks[t].mixer.inserts[slot].as_ref().and_then(|i| i.key);
+        let steps = e.undo_history().len();
+
+        e.execute("mix.insert_key", &json!({"track": bass, "slot": 0, "from": {"track": "Kick"}, "tap": "pre"})).unwrap();
+        assert_eq!(key(&e, 1, 0), Some(KeySource { from: KeyFrom::Track(kick), tap: Tap::Pre }));
+        assert_eq!(e.undo_history().len(), steps + 1, "one undo step");
+        assert!(e.undo());
+        assert_eq!(key(&e, 1, 0), None);
+        e.execute("mix.insert_key", &json!({"track": bass, "slot": 0, "from": {"track": kick.0}})).unwrap();
+        assert_eq!(key(&e, 1, 0).map(|k| k.tap), Some(Tap::Post), "post is the default tap");
+
+        // The key travels with the insert on a move, and a copy keeps it.
+        e.execute("mix.insert_move", &json!({"track": bass, "from": 0, "to": 3})).unwrap();
+        assert_eq!((key(&e, 1, 0), key(&e, 1, 3).is_some()), (None, true));
+        e.execute("mix.insert_copy", &json!({"track": bass, "from": 3, "to": 5})).unwrap();
+        assert_eq!(key(&e, 1, 5), key(&e, 1, 3));
+        assert!(key(&e, 1, 5).is_some());
+
+        // A bus key goes into an aux; a bus fills after audio tracks, so an audio track cannot take one.
+        e.execute("mix.insert_key", &json!({"track": verb, "slot": 0, "from": {"bus": "Drums"}})).unwrap();
+        assert_eq!(key(&e, 2, 0).map(|k| k.from), Some(KeyFrom::Bus(drums)));
+        // Errors change nothing: empty slot, out of range, no source, itself, wrong kind of source, a loop.
+        let before = e.session().clone();
+        for p in [
+            json!({"track": bass, "slot": 1, "from": {"track": kick.0}}),
+            json!({"track": bass, "slot": 10, "from": {"track": kick.0}}),
+            json!({"track": bass, "slot": 3, "from": {"track": 12_345}}),
+            json!({"track": bass, "slot": 3, "from": {"bus": "Nope"}}),
+            json!({"track": bass, "slot": 3, "from": {"track": bass.0}}),
+            json!({"track": bass, "slot": 3, "from": {"track": verb.0}}),
+            json!({"track": bass, "slot": 3, "from": {"bus": "Drums"}}),
+            json!({"track": verb, "slot": 0, "from": {"bus": "Drums"}, "tap": "pre"}),
+            json!({"track": bass, "slot": 3}),
+            json!({"track": bass, "slot": 3, "from": {}}),
+            json!({"track": bass, "slot": 3, "from": {"track": kick.0}, "tap": "mid"}),
+        ] {
+            assert!(e.execute("mix.insert_key", &p).is_err(), "{p}");
+        }
+        e.execute("mix.insert", &json!({"track": kick, "slot": 0, "plugin": "compressor"})).unwrap();
+        let err = e.execute("mix.insert_key", &json!({"track": kick, "slot": 0, "from": {"track": bass.0}})).unwrap_err();
+        assert!(err.to_string().contains("loop"), "{err}");
+        // An aux that feeds the bus it takes a key from is a loop too.
+        e.execute("mix.insert_key", &json!({"track": verb, "slot": 0, "from": null})).unwrap();
+        e.session_mut().track_mut(verb).unwrap().mixer.output = Route::Bus(drums);
+        assert!(e.execute("mix.insert_key", &json!({"track": verb, "slot": 0, "from": {"bus": "Drums"}})).is_err());
+        assert_eq!(e.session().tracks[1], before.tracks[1]);
+
+        // Clearing: null.
+        e.session_mut().track_mut(verb).unwrap().mixer.output = Route::Main;
+        e.execute("mix.insert_key", &json!({"track": bass, "slot": 3, "from": null})).unwrap();
+        assert_eq!(key(&e, 1, 3), None);
     }
 }

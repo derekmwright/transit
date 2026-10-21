@@ -378,7 +378,7 @@ impl MixEngine {
         };
         let ActivePlan { session, tables, status, .. } = plan;
         let s: &Session = session;
-        let PlanTables { strips, phase1, aux_end, busses, main, main_fmt, main_meter, sinks, io, .. } = tables;
+        let PlanTables { strips, phase1, aux_end, layers, keys, busses, main, main_fmt, main_meter, sinks, io, .. } = tables;
         let (phase1, aux_end) = (*phase1, *aux_end);
         let main_fmt = *main_fmt;
         // A seek or loop wrap releases what the clips play; live sources keep sounding (F10).
@@ -425,11 +425,24 @@ impl MixEngine {
         // others stay in the table and go back to the control side with it.
         {
             let busses: &BusTable = busses;
-            run_strips(p1, !self.serial, |st| {
-                if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                    guarded(st, |st| process_strip(s, t, st, busses, &live_in, pos, frames, any_solo));
+            // One `run_strips` per layer: a strip keyed from another renders after it, and its key
+            // is copied from the finished source first. Without keys this is the one call.
+            let mut from = 0;
+            for end in layers.iter().map(|&e| usize::from(e)).chain(std::iter::once(p1.len())) {
+                let end = end.min(p1.len());
+                if end <= from {
+                    continue;
                 }
-            });
+                let (done, cur) = p1.split_at_mut(from);
+                keys.fill(from..end, |i| done.get(i), busses, frames);
+                let keys: &KeyBank = keys;
+                run_strips(cur.get_mut(..end - from).unwrap_or(&mut []), !self.serial, |st| {
+                    if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
+                        guarded(st, |st| process_strip(s, t, st, busses, &live_in, pos, frames, any_solo, keys));
+                    }
+                });
+                from = end;
+            }
         }
         if let Some(panic) = p1.iter_mut().find_map(|st| st.panic.take()) {
             std::panic::resume_unwind(panic);
@@ -491,9 +504,17 @@ impl MixEngine {
             exceeded(need, st);
         }
         // Phase 2: auxes in dependency order (they read busses).
-        for st in auxes.iter_mut() {
+        for k in 0..auxes.len() {
+            let (before, rest) = auxes.split_at_mut(k);
+            let Some(st) = rest.first_mut() else { continue };
             let Some(t) = track(st).filter(|t| live(t)) else { continue };
-            process_strip(s, t, st, &*busses, &live_in, pos, frames, any_solo);
+            let at = phase1.saturating_add(k);
+            let strip = |i: usize| match i.checked_sub(phase1) {
+                None => p1.get(i),
+                Some(j) => before.get(j).filter(|b| track(b).is_some_and(live)),
+            };
+            keys.fill(at..at + 1, strip, busses, frames);
+            process_strip(s, t, st, &*busses, &live_in, pos, frames, any_solo, keys);
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
             let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, sinks, law, main_arrival });

@@ -331,6 +331,34 @@ fn output_path_routes_allocate_nothing_when_added_moved_and_removed() {
 }
 
 #[test]
+fn sidechain_keys_allocate_nothing_when_added_changed_and_removed() {
+    use soundcraft_model::{Bus, BusId, KeyFrom, KeySource, Tap};
+    let (mut s, bass, _) = session_with_clip();
+    // The kick is declared after the bass, so the bass renders in a later layer.
+    let kick = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, None);
+    let bus = BusId(s.alloc());
+    s.busses.push(Bus { id: bus, name: "Drums".into(), format: ChannelFormat::Stereo });
+    s.track_mut(kick).unwrap().mixer.output = Route::Bus(bus);
+    let aux = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, None);
+    s.track_mut(aux).unwrap().mixer.input = Route::Bus(bus);
+    let mut rig = Rig::new(&s);
+    let key = |from, tap| Some(KeySource { from, tap });
+    s.track_mut(bass).unwrap().mixer.inserts[0] = Some(builtin("compressor"));
+    s.track_mut(aux).unwrap().mixer.inserts[0] = Some(builtin("expander_gate"));
+    no_cost("inserts without keys", &rig.edit(&s));
+    for (what, from, tap) in [("a post key", KeyFrom::Track(kick), Tap::Post), ("a pre key", KeyFrom::Track(kick), Tap::Pre)] {
+        s.track_mut(bass).unwrap().mixer.inserts[0].as_mut().unwrap().key = key(from, tap);
+        no_cost(what, &rig.edit(&s));
+    }
+    s.track_mut(aux).unwrap().mixer.inserts[0].as_mut().unwrap().key = key(KeyFrom::Bus(bus), Tap::Post);
+    no_cost("a bus key into an aux", &rig.edit(&s));
+    s.track_mut(bass).unwrap().mixer.inserts[0].as_mut().unwrap().key = None;
+    no_cost("removing a key", &rig.edit(&s));
+    s.track_mut(aux).unwrap().mixer.inserts[0].as_mut().unwrap().key = None;
+    no_cost("removing the bus key", &rig.edit(&s));
+}
+
+#[test]
 fn clip_effects_on_and_off_and_forty_chains_allocate_nothing() {
     let (mut s, t, first) = session_with_clip();
     let mut rig = Rig::new(&s);

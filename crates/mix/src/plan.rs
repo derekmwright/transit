@@ -11,7 +11,7 @@
 //!
 //! [`PlanCompiler`]: crate::PlanCompiler
 
-use super::{APPLIED_INLINE, BusTable, ChannelFormat, PluginSlot, SampleSource, Session, Sink, SourceAudio, Strip, StripMeter, TrackId};
+use super::{APPLIED_INLINE, BusTable, ChannelFormat, KeyBank, PluginSlot, SampleSource, Session, Sink, SourceAudio, Strip, StripMeter, TrackId};
 use soundcraft_dsp::Plugin;
 use soundcraft_model::IoMap;
 use std::sync::Arc;
@@ -161,6 +161,11 @@ pub(crate) struct PlanTables {
     pub(crate) strips: Vec<Strip>,
     pub(crate) phase1: usize,
     pub(crate) aux_end: usize,
+    /// The end (exclusive) of each layer of `..phase1`: a strip keyed from another renders in a
+    /// later layer than its source. One entry when no strip is keyed.
+    pub(crate) layers: Box<[u16]>,
+    /// The key buffers of the keyed inserts.
+    pub(crate) keys: KeyBank,
     /// Cell index → location: the strips first (cell `i` is strip `i`), then the slots.
     pub(crate) cells: Box<[CellLoc]>,
     /// Sorted by track id: the strip of each track.

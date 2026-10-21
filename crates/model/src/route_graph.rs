@@ -5,7 +5,10 @@
 //!
 //! - a track's output to a bus or to the main mix ([`EdgeKind::Output`]),
 //! - a track's send to a bus ([`EdgeKind::Send`], pre- or post-fader),
-//! - a bus to the aux or routing folder that reads it as its input ([`EdgeKind::Input`]).
+//! - a bus to the aux or routing folder that reads it as its input ([`EdgeKind::Input`]),
+//! - a strip or bus to a strip whose insert detects on it ([`EdgeKind::Key`], a sidechain key).
+//!   A key reaches a track other than an aux only from a track: busses and auxes render after the
+//!   audio tracks, so such a key is inert (no edge) and the insert keeps detecting on its own input.
 //!
 //! Master faders and VCA masters are not on the graph: a master processes the main mix in place
 //! and a VCA carries no audio. Folder membership does not route audio by itself; a routing folder
@@ -18,7 +21,7 @@
 //! (F05): a session loaded from an older file can still hold a loop, and every loop is broken
 //! deterministically, in time linear in the graph per round of cuts.
 
-use crate::{BusId, Route, Session, Track, TrackId, TrackKind};
+use crate::{BusId, KeyFrom, KeySource, Route, Session, Tap, Track, TrackId, TrackKind};
 
 /// A node of the routing graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,6 +43,9 @@ pub enum EdgeKind {
     Send { slot: usize, pre_fader: bool },
     /// The bus is the aux's (or folder's) input.
     Input,
+    /// The insert in this slot of the target track detects on the source (a sidechain key),
+    /// taken before the source's fader when `pre_fader`.
+    Key { slot: usize, pre_fader: bool },
 }
 
 /// One edge of the routing graph.
@@ -59,12 +65,17 @@ pub enum RouteChange {
     Input { track: TrackId, route: Route },
     /// `mix.send`: the track's send in `slot` targets `route` (`Route::None` clears it).
     Send { track: TrackId, slot: usize, route: Route },
+    /// `mix.insert_key`: the insert in `slot` of the track takes `key` (`None` clears it).
+    Key { track: TrackId, slot: usize, key: Option<KeySource> },
 }
 
 impl RouteChange {
     fn track(&self) -> TrackId {
         match self {
-            RouteChange::Output { track, .. } | RouteChange::Input { track, .. } | RouteChange::Send { track, .. } => *track,
+            RouteChange::Output { track, .. }
+            | RouteChange::Input { track, .. }
+            | RouteChange::Send { track, .. }
+            | RouteChange::Key { track, .. } => *track,
         }
     }
 }
@@ -202,7 +213,7 @@ impl RouteScratch {
     /// Makes room for `s`'s graph (allocates when it is larger than any seen before).
     pub fn reserve(&mut self, s: &Session) {
         let n = s.tracks.len() + s.busses.len() + 1;
-        let e: usize = s.tracks.iter().map(|t| t.mixer.sends.len().saturating_add(2)).sum();
+        let e: usize = s.tracks.iter().map(|t| t.mixer.sends.len().saturating_add(t.mixer.inserts.len()).saturating_add(2)).sum();
         hold(&mut self.bus_ids, s.busses.len());
         hold(&mut self.edges, e);
         hold(&mut self.from, e);
@@ -246,7 +257,7 @@ impl RouteScratch {
                 match c {
                     RouteChange::Output { route, .. } => output = route,
                     RouteChange::Input { route, .. } => input = route,
-                    RouteChange::Send { .. } => {}
+                    RouteChange::Send { .. } | RouteChange::Key { .. } => {}
                 }
             }
             if reads_bus(t)
@@ -274,6 +285,37 @@ impl RouteScratch {
                 let Some(to) = route_node(&self.bus_ids, target) else { continue };
                 let pre_fader = snd.as_ref().is_some_and(|x| x.pre_fader);
                 self.edges.push(RouteEdge { from: RouteNode::Track(i), to, kind: EdgeKind::Send { slot, pre_fader } });
+            }
+            for (slot, ins) in t.mixer.inserts.iter().enumerate() {
+                let mut key = ins.as_ref().and_then(|x| x.key);
+                for c in changes {
+                    if let RouteChange::Key { track, slot: k, key: new } = c
+                        && *track == t.id
+                        && *k == slot
+                    {
+                        key = *new;
+                    }
+                }
+                let Some(key) = key else { continue };
+                if let Some(from) = self.key_node(s, t, i, key.from) {
+                    self.edges.push(RouteEdge { from, to: RouteNode::Track(i), kind: EdgeKind::Key { slot, pre_fader: key.tap == Tap::Pre } });
+                }
+            }
+        }
+    }
+
+    /// The node an insert's key reaches track `i` from, `None` when the key is inert: a missing
+    /// source, the track itself, or a source that renders after `t` (see the module docs).
+    fn key_node(&self, s: &Session, t: &Track, i: usize, from: KeyFrom) -> Option<RouteNode> {
+        match from {
+            KeyFrom::Track(id) => {
+                let k = s.track_index(id).filter(|&k| k != i)?;
+                let src = s.tracks.get(k).filter(|x| on_graph(x))?;
+                (reads_bus(t) || !reads_bus(src)).then_some(RouteNode::Track(k))
+            }
+            KeyFrom::Bus(b) => {
+                let node = route_node(&self.bus_ids, &Route::Bus(b))?;
+                reads_bus(t).then_some(node)
             }
         }
     }
@@ -416,6 +458,19 @@ impl RouteScratch {
                 }
             }
             if !any {
+                // No bus input to cut: the loop runs through keys. Cut the keys into its first track.
+                for e in 0..self.edges.len() {
+                    let (u, v) = (self.from[e], self.to[e]);
+                    if self.cut[e] || self.comp[u] != self.comp[v] || !matches!(self.edges[e].kind, EdgeKind::Key { .. }) {
+                        continue;
+                    }
+                    if self.comp_min[self.comp[u]] == v {
+                        self.cut[e] = true;
+                        any = true;
+                    }
+                }
+            }
+            if !any {
                 break;
             }
         }
@@ -471,7 +526,8 @@ impl RouteScratch {
         self.dropped.clear();
         for e in 0..self.edges.len() {
             let (u, v) = (self.from[e], self.to[e]);
-            if u < self.tracks && v >= self.tracks && v < self.tracks + self.busses && self.pos[u] >= self.reader[v - self.tracks] {
+            let key_cut = self.cut[e] && matches!(self.edges[e].kind, EdgeKind::Key { .. });
+            if key_cut || (u < self.tracks && v >= self.tracks && v < self.tracks + self.busses && self.pos[u] >= self.reader[v - self.tracks]) {
                 self.dropped.push(e);
             }
         }
@@ -670,10 +726,8 @@ pub fn would_create_cycle_all(s: &Session, changes: &[RouteChange]) -> Option<Ve
     let before = RouteGraph::new(s);
     let after = RouteGraph::with_changes(s, changes);
     let changed: Vec<usize> = changes.iter().filter_map(|c| s.track_index(c.track())).collect();
-    let touches = |e: &RouteEdge| match (e.from, e.to) {
-        (RouteNode::Track(i), _) | (_, RouteNode::Track(i)) => changed.contains(&i),
-        _ => false,
-    };
+    // Either end: a key edge joins two tracks.
+    let touches = |e: &RouteEdge| [e.from, e.to].iter().any(|n| matches!(n, RouteNode::Track(i) if changed.contains(i)));
     let old: Vec<&RouteEdge> = before.edges().iter().filter(|e| touches(e)).collect();
     for (k, e) in after.edges().iter().enumerate() {
         // Only edges the changes add can close a new loop.
@@ -703,6 +757,8 @@ fn same_routing(a: &Session, b: &Session) -> bool {
                 && x.kind == y.kind
                 && x.mixer.input == y.mixer.input
                 && x.mixer.output == y.mixer.output
+                && x.mixer.inserts.len() == y.mixer.inserts.len()
+                && x.mixer.inserts.iter().zip(&y.mixer.inserts).all(|(p, q)| p.as_ref().map(|z| z.key) == q.as_ref().map(|z| z.key))
                 && x.mixer.sends.len() == y.mixer.sends.len()
                 && x.mixer.sends.iter().zip(&y.mixer.sends).all(|(p, q)| p.as_ref().map(|z| &z.target) == q.as_ref().map(|z| &z.target))
         })
@@ -754,7 +810,7 @@ pub fn new_cycle(before: &Session, after: &Session) -> Option<Vec<TrackId>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BusId, ChannelFormat, SendSlot, time::SampleRate};
+    use crate::{BusId, ChannelFormat, Insert, SendSlot, time::SampleRate};
 
     fn session() -> Session {
         Session::new("t", SampleRate::HZ_48000)
@@ -885,6 +941,82 @@ mod tests {
         set_output(&mut s, a, Route::Bus(ab));
         let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("T"));
         assert!(would_create_cycle(&s, &RouteChange::Output { track: t, route: Route::Bus(ab) }).is_none());
+    }
+
+    fn keyed(s: &mut Session, t: TrackId, slot: usize, from: KeyFrom) {
+        if let Some(t) = s.track_mut(t) {
+            let mut i = Insert::new("compressor");
+            i.key = Some(KeySource { from, tap: Tap::Post });
+            t.mixer.inserts[slot] = Some(i);
+        }
+    }
+
+    fn key_edges(s: &Session) -> Vec<RouteEdge> {
+        RouteGraph::new(s).edges().iter().filter(|e| matches!(e.kind, EdgeKind::Key { .. })).copied().collect()
+    }
+
+    #[test]
+    fn a_key_cycle_is_refused_at_edit_time() {
+        let mut s = session();
+        let a = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("A"));
+        let b = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("B"));
+        keyed(&mut s, a, 0, KeyFrom::Track(b));
+        keyed(&mut s, b, 0, KeyFrom::Track(b));
+        let back = Some(KeySource { from: KeyFrom::Track(a), tap: Tap::Pre });
+        let c = would_create_cycle(&s, &RouteChange::Key { track: b, slot: 0, key: back }).expect("A keyed from B, B keyed from A");
+        assert_eq!(names(&s, &c), ["B", "A"]);
+        assert!(would_create_cycle(&s, &RouteChange::Key { track: b, slot: 0, key: None }).is_none());
+        // An aux keyed from a bus it feeds.
+        let (x, _) = aux(&mut s, "X");
+        let out = s.add_bus("Out", ChannelFormat::Stereo);
+        set_output(&mut s, x, Route::Bus(out));
+        let from_out = Some(KeySource { from: KeyFrom::Bus(out), tap: Tap::Post });
+        assert_eq!(would_create_cycle(&s, &RouteChange::Key { track: x, slot: 0, key: from_out }), Some(vec![x]));
+        // The same bus is a fine key for an aux that does not feed it, and so is a track.
+        let (y, _) = aux(&mut s, "Y");
+        assert!(would_create_cycle(&s, &RouteChange::Key { track: y, slot: 0, key: from_out }).is_none());
+    }
+
+    #[test]
+    fn a_loaded_two_track_mutual_key_is_cut_deterministically() {
+        let mut s = session();
+        let a = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("A"));
+        let b = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("B"));
+        keyed(&mut s, a, 0, KeyFrom::Track(b));
+        keyed(&mut s, b, 3, KeyFrom::Track(a));
+        let loaded = Session::from_json(&s.to_json().expect("save")).expect("load");
+        let g = loaded.route_graph();
+        assert!(g.find_cycle().is_some(), "the loop is reported");
+        let l = g.layering();
+        // The key into the first track (A) is the one dropped.
+        assert_eq!(l.cut.len(), 1);
+        assert_eq!(l.cut[0].kind, EdgeKind::Key { slot: 0, pre_fader: false });
+        assert_eq!((l.depth[0], l.depth[1]), (0, 1), "A's key is cut, so B (keyed from A) renders after A");
+        assert_eq!(loaded.route_graph().layering(), l);
+        // Edge storage was sized for the inserts (no growth past `reserve`).
+        let mut scratch = RouteScratch::new();
+        scratch.reserve(&loaded);
+        scratch.layer(&loaded);
+        assert_eq!(scratch.dropped().count(), 1);
+    }
+
+    #[test]
+    fn keys_that_cannot_reach_their_strip_are_not_edges() {
+        let mut s = session();
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some("T"));
+        let (a, _) = aux(&mut s, "A");
+        let kb = s.add_bus("K", ChannelFormat::Stereo);
+        // An audio track renders before every aux and bus: neither can key it. Itself neither.
+        keyed(&mut s, t, 0, KeyFrom::Track(a));
+        keyed(&mut s, t, 1, KeyFrom::Bus(kb));
+        keyed(&mut s, t, 2, KeyFrom::Track(t));
+        keyed(&mut s, t, 3, KeyFrom::Track(TrackId(99_999)));
+        assert!(key_edges(&s).is_empty());
+        // An aux can be keyed by a track and a bus, which orders it after them.
+        keyed(&mut s, a, 0, KeyFrom::Track(t));
+        keyed(&mut s, a, 1, KeyFrom::Bus(kb));
+        assert_eq!(key_edges(&s).len(), 2);
+        assert_eq!(s.route_graph().layering().depth[s.track_index(a).expect("a")], 1);
     }
 
     /// 1,024 auxes, each feeding its own input (a self-loop) and sending to the one before.
