@@ -1,10 +1,11 @@
 # Format, lint, test and layer-check on Linux and Windows. rt.yml adds the realtime-crate matrix.
 name: CI
 
+# Runs only for release tags and on demand: GitHub Actions minutes are limited.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -2,11 +2,10 @@
 # linted and tested on every platform it has code for, with and without the portable fallback.
 name: Realtime (rt)
 
+# Runs only for release tags and on demand: GitHub Actions minutes are limited.
 on:
   push:
-    paths: ["crates/rt/**", "crates/mix/**", ".github/workflows/rt.yml"]
-  pull_request:
-    paths: ["crates/rt/**", "crates/mix/**", ".github/workflows/rt.yml"]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
