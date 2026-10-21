@@ -599,3 +599,28 @@ fn reopen_capture_preserves_confirmed_fault_state_without_aliasing_pending_docum
     assert_eq!(runtime.capture_states_for_reopen(&replacement).unwrap(), None);
     runtime.retire(ports);
 }
+
+#[test]
+fn editor_handles_follow_a_moved_insert() {
+    let (mut runtime, mut ports, value) = setup(PlanLimits::default());
+    let original = Arc::clone(runtime.requested_session());
+    let track = original.tracks.last().unwrap().id;
+    assert!(runtime.has_editor(track, 0));
+    let mut moved = (*original).clone();
+    assert!(moved.track_mut(track).unwrap().move_insert(0, 2));
+    let moved = Arc::new(moved);
+    runtime.update_session(Arc::clone(&moved)).unwrap();
+    let handles = &mut runtime.handles;
+    runtime.control.service(&mut |spec, generation| {
+        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch).unwrap();
+        handles.capture(
+            (spec.track, spec.slot, generation),
+            NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0xb2 }), refused_state: false },
+        )
+    });
+    adopt(&mut ports.plans);
+    runtime.service();
+    assert!(runtime.has_editor(track, 2), "moved insert's editor handle must be reachable at its new slot");
+    assert_eq!(runtime.capture_states(&moved).unwrap().first().map(|s| s.1), Some(2));
+    runtime.retire(ports);
+}

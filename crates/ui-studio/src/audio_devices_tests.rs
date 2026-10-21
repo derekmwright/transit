@@ -467,3 +467,22 @@ fn last_good_audio_child() {
     observe(&mut t, 32.0, 1000, 96_128, 0);
     assert_eq!(read(), saved, "a failed/silent replacement leaves last known good intact");
 }
+
+#[test]
+fn reorder_keeps_the_editor_wanted_until_the_plan_adopts() {
+    let mut t = T::new();
+    t.app.add_track("audio").unwrap();
+    let track = t.app.engine.session().tracks[0].id;
+    for p in ["gain", "saturator", "compressor"] {
+        t.app.add_device(track, p).unwrap();
+    }
+    t.app.want_editor((track, 2));
+    t.frames(2);
+    assert!(t.app.editors.iter().any(|w| w.opened));
+    // The native editor window belongs to the instance, which the player still binds to slot 2
+    // until the new plan is adopted (a few frames later).
+    t.app.reorder_device(track, 2, 0, false).unwrap();
+    assert_eq!(t.app.ui.plugin_windows, [(track, 0)]);
+    t.frames(1);
+    assert_eq!(t.app.ui.plugin_windows, [(track, 0)], "one frame after the drop the editor must still be wanted");
+}

@@ -196,6 +196,9 @@ struct EditorWanted {
     deadline: f64,
     next_try: f64,
     opened: bool,
+    /// After a reorder: the player binds the instance to its old slot until the new plan is
+    /// adopted, so "not open" is not yet "closed by the user" before this time.
+    settle_until: f64,
 }
 
 pub struct StudioApp {
@@ -535,7 +538,7 @@ impl StudioApp {
             return;
         }
         let now = self.last_frame.unwrap_or_default();
-        self.editors.push(EditorWanted { key, deadline: now + 30.0, next_try: now, opened: false });
+        self.editors.push(EditorWanted { key, deadline: now + 30.0, next_try: now, opened: false, settle_until: 0.0 });
     }
 
     /// Open the editors asked for once their plug-ins are loaded; forget the ones the user closed.
@@ -555,6 +558,10 @@ impl StudioApp {
             let open = p.editor_open(w.key.0, w.key.1);
             if open {
                 w.opened = true;
+                keep.push(w);
+                continue;
+            }
+            if w.opened && now < w.settle_until {
                 keep.push(w);
                 continue;
             }

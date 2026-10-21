@@ -13,7 +13,9 @@ struct Entry {
 
 #[derive(Default)]
 pub struct Handles {
-    entries: BTreeMap<SlotBinding, Entry>,
+    /// Keyed by (track, generation): the generation is the instance's identity and survives a
+    /// reorder, while the slot it sits at does not.
+    entries: BTreeMap<(TrackId, SlotGen), Entry>,
     active: BTreeMap<(TrackId, usize), SlotGen>,
     generation: PlanGeneration,
     main_thread: PhantomData<Rc<()>>,
@@ -34,12 +36,13 @@ impl Handles {
     /// Take every possibly-panicking handle before committing the entry. On a factory
     /// unwind, local resources die on main and there is no partial visible binding.
     pub fn capture(&mut self, binding: SlotBinding, mut made: NewInstance) -> Option<NewInstance> {
-        if self.entries.contains_key(&binding) {
+        let key = (binding.0, binding.2);
+        if self.entries.contains_key(&key) {
             return None;
         }
         let editor = made.plugin.editor();
         let state = made.plugin.state_reader();
-        self.entries.insert(binding, Entry { editor, state, refused: made.refused_state });
+        self.entries.insert(key, Entry { editor, state, refused: made.refused_state });
         Some(made)
     }
 
@@ -57,15 +60,12 @@ impl Handles {
 
     pub fn release(&mut self, bindings: impl IntoIterator<Item = SlotBinding>) {
         for binding in bindings {
-            if let Some(mut entry) = self.entries.remove(&binding)
+            if let Some(mut entry) = self.entries.remove(&(binding.0, binding.2))
                 && let Some(editor) = &mut entry.editor
             {
                 editor.close();
             }
-            let key = (binding.0, binding.1);
-            if self.active.get(&key) == Some(&binding.2) {
-                self.active.remove(&key);
-            }
+            self.active.retain(|&(track, _), generation| (track, *generation) != (binding.0, binding.2));
         }
     }
 
@@ -73,11 +73,12 @@ impl Handles {
         self.active.get(&(track, slot)).map(|generation| (track, slot, *generation))
     }
     fn entry(&self, track: TrackId, slot: usize) -> Option<&Entry> {
-        self.entries.get(&self.binding(track, slot)?)
+        let binding = self.binding(track, slot)?;
+        self.entries.get(&(binding.0, binding.2))
     }
     fn entry_mut(&mut self, track: TrackId, slot: usize) -> Option<&mut Entry> {
         let binding = self.binding(track, slot)?;
-        self.entries.get_mut(&binding)
+        self.entries.get_mut(&(binding.0, binding.2))
     }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.entry(track, slot).is_some_and(|entry| entry.editor.is_some())
@@ -120,7 +121,7 @@ impl Handles {
         self.active
             .iter()
             .filter_map(|(&(track, slot), &generation)| {
-                let entry = self.entries.get_mut(&(track, slot, generation))?;
+                let entry = self.entries.get_mut(&(track, generation))?;
                 if entry.refused {
                     return None;
                 }
@@ -131,7 +132,7 @@ impl Handles {
     pub fn idle(&mut self) -> Vec<EditorEdit> {
         let mut out = Vec::new();
         for (&(track, slot), &generation) in &self.active {
-            if let Some(entry) = self.entries.get_mut(&(track, slot, generation))
+            if let Some(entry) = self.entries.get_mut(&(track, generation))
                 && let Some(editor) = &mut entry.editor
             {
                 out.extend(editor.idle().into_iter().map(|(id, value)| (track, slot, id, value)));

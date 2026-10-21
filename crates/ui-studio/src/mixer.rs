@@ -691,6 +691,11 @@ impl StudioApp {
         let uids = |app: &Self| -> Vec<Option<u64>> {
             app.engine.session().track(t).map(|tr| tr.mixer.inserts.iter().map(|i| i.as_ref().map(|i| i.uid.get())).collect()).unwrap_or_default()
         };
+        if copy {
+            // The copy clones `Insert.state`, which only a capture refreshes: take the live
+            // state (editor tweaks included) first, as save does.
+            self.capture_plugin_states()?;
+        }
         let before = uids(self);
         let id = if copy { "mix.insert_copy" } else { "mix.insert_move" };
         let r = self.run(id, json!({"track": t.0, "from": from, "to": to}));
@@ -703,8 +708,13 @@ impl StudioApp {
             for k in &mut self.ui.plugin_windows {
                 *k = follow(*k);
             }
+            let settle = self.last_frame.unwrap_or_default() + 3.0;
             for e in &mut self.editors {
-                e.key = follow(e.key);
+                let key = follow(e.key);
+                if key != e.key {
+                    e.key = key;
+                    e.settle_until = settle;
+                }
             }
         }
         r

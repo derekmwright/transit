@@ -97,6 +97,19 @@ mod tests {
     }
 
     #[test]
+    fn copy_after_a_state_capture_carries_the_new_state() {
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({})).unwrap();
+        let t = e.session().tracks[0].id.0;
+        e.execute("mix.insert", &json!({"track": t, "plugin": "gain", "slot": 0})).unwrap();
+        let blob = b64::encode(b"live editor state");
+        e.execute("mix.insert_state", &json!({"track": t, "slot": 0, "state": blob})).unwrap();
+        e.execute("mix.insert_copy", &json!({"track": t, "from": 0, "to": 1})).unwrap();
+        let inserts = &e.session().tracks[0].mixer.inserts;
+        assert_eq!(inserts[1].as_ref().unwrap().state_bytes().unwrap(), b"live editor state");
+    }
+
+    #[test]
     fn hostile_params_are_errors() {
         let mut e = Engine::default();
         e.execute("track.new", &json!({})).unwrap();
