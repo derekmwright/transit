@@ -63,6 +63,47 @@ struct Counting {
     left: Samples,
 }
 
+/// Why the recording start at the end of a count-in did not happen. Travels to Main as a code in
+/// one atomic, so the audio thread allocates nothing to report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartFailure {
+    /// The device clock map was lost or went stale during the count-in.
+    Clock = 1,
+    /// The transport timeline refused the position.
+    Timeline = 2,
+    /// The start position was out of range.
+    Position = 3,
+}
+
+impl StartFailure {
+    fn of(result: ActionResult) -> Option<Self> {
+        match result {
+            ActionResult::RecordingClock(_) => Some(Self::Clock),
+            ActionResult::Timeline(_) => Some(Self::Timeline),
+            ActionResult::InvalidPosition => Some(Self::Position),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Clock),
+            2 => Some(Self::Timeline),
+            3 => Some(Self::Position),
+            _ => None,
+        }
+    }
+
+    /// Plain words for the status line.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Clock => "the audio device clock was lost during the count-in",
+            Self::Timeline => "the transport timeline refused the start position",
+            Self::Position => "the start position is out of range",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionResult {
     Applied,
@@ -278,6 +319,11 @@ impl Transport {
                     self.timeline.set_loop(epoch, looped.map(|r| (r.start, r.end)), engaged)?;
                     self.epoch = epoch;
                     self.looped = looped;
+                    if let Some(counting) = &mut self.count_in {
+                        // The loop in force when the count-in ends is the latest one, not the one
+                        // the Record command carried.
+                        counting.looped = looped;
+                    }
                     self.loop_engaged = engaged;
                     live.set_transport_epoch(soundcraft_mix::TransportEpoch(epoch));
                     Ok(())
@@ -591,7 +637,11 @@ impl Audio {
             // `record` asks for would only discard the block rendered below.
             self.transport.count_in = None;
             let mut live = self.plans.processing();
-            let _ = self.transport.record(counting.ticket, Some(counting.from), counting.end, counting.looped, &mut live);
+            let result = self.transport.record(counting.ticket, Some(counting.from), counting.end, counting.looped, &mut live);
+            if let Some(failure) = StartFailure::of(result) {
+                // `record` cancelled the ticket and left the transport parked: tell Main why.
+                self.shared.metro.start_failure.store(failure as u8, Ordering::Relaxed);
+            }
             self.transport.discard_pending = false;
             self.publish_count_in();
         }

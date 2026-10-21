@@ -28,14 +28,14 @@ pub mod telemetry;
 pub mod timeline_map;
 
 pub use devices::AudioConfig;
-pub use player::{ActionResult, CountIn, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice};
+pub use player::{ActionResult, CountIn, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice, StartFailure};
 
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
 use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{MAX_DEVICE_CHANNELS, Session, TrackId, TrackKind};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
@@ -106,11 +106,19 @@ struct Metro {
     count_in_left: AtomicI64,
     /// Length of the running count-in, in project samples.
     count_in_total: AtomicI64,
+    /// Why the recording start at the end of a count-in failed (a [`StartFailure`] code); 0 when it
+    /// did not. Main takes it with `swap`.
+    start_failure: AtomicU8,
 }
 
 impl Default for Metro {
     fn default() -> Self {
-        Self { gain: AtomicU32::new(1.0f32.to_bits()), count_in_left: AtomicI64::new(0), count_in_total: AtomicI64::new(0) }
+        Self {
+            gain: AtomicU32::new(1.0f32.to_bits()),
+            count_in_left: AtomicI64::new(0),
+            count_in_total: AtomicI64::new(0),
+            start_failure: AtomicU8::new(0),
+        }
     }
 }
 

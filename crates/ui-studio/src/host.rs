@@ -66,6 +66,9 @@ impl StudioApp {
         self.sim = None;
         self.sim_count_in = None;
         self.count_in_plan = None;
+        if self.status == "Count-in" || self.status == "Record pending" {
+            self.status.clear();
+        }
         self.engine.transport.playing = false;
         self.engine.transport.recording = false;
         // Adapted: the cursor stays where it was (Ableton), so Stop then Play starts the same
@@ -169,6 +172,7 @@ impl StudioApp {
                 return;
             };
             let (from, end, looped) = play.map_or((None, None, None), |(from, end, looped)| (Some(from), end, looped));
+            let _ = p.take_start_failure();
             let Some(sequence) = self.player_requests.result(&mut self.status, p.record_with_count_in(recorder, from, end, looped, count_in)) else {
                 self.finish_recording();
                 return;
@@ -765,6 +769,14 @@ impl StudioApp {
     pub(crate) fn handle_transport(&mut self, dt: f32) {
         self.push_metronome_level();
         // The count-in is over (or was cancelled): the status line says what happens next.
+        if let Some(failure) = self.player.as_ref().and_then(Player::take_start_failure)
+            && self.recording_active()
+        {
+            // The count-in ended but Record could not start: nothing is recording, so release the
+            // take and the recorder arm, and say why.
+            self.finish_recording();
+            self.status = format!("Recording could not start: {}", failure.reason());
+        }
         if self.status == "Count-in" && self.count_in_state().is_none() && self.sim_count_in.is_none() {
             self.status = if self.recording_active() { "Recording".into() } else { String::new() };
         }
@@ -815,7 +827,8 @@ impl StudioApp {
                     }
                 }
                 TransportRequest::Stop => {
-                    let was_stopped = !self.is_playing() && !self.engine.transport.recording;
+                    // Stop during a count-in only cancels it; the cursor stays where it was.
+                    let was_stopped = !self.is_playing() && !self.engine.transport.recording && self.count_in_state().is_none();
                     self.stop_play();
                     if was_stopped {
                         // First Stop keeps the play-start cursor and finishes the take. A second
@@ -829,7 +842,7 @@ impl StudioApp {
                 }
                 TransportRequest::Pause => self.stop_play(),
                 TransportRequest::TogglePlay => {
-                    if self.is_playing() || self.player_requests.play.is_some() {
+                    if self.is_playing() || self.player_requests.play.is_some() || self.count_in_state().is_some() {
                         self.stop_play();
                     } else {
                         self.play_from_cursor();
@@ -849,14 +862,23 @@ impl StudioApp {
                     self.engine.transport.position = at;
                 }
                 TransportRequest::PlaySelection => {
-                    let sel = self.engine.session().edit.selection;
-                    self.start_play(sel.start, Some(sel.end.max(sel.start + 1)), None);
+                    if self.count_in_state().is_some() {
+                        // Like Play: a count-in is cancelled, never turned into an unarmed play.
+                        self.stop_play();
+                    } else {
+                        let sel = self.engine.session().edit.selection;
+                        self.start_play(sel.start, Some(sel.end.max(sel.start + 1)), None);
+                    }
                 }
                 TransportRequest::HalfSpeed => {
-                    if let Some(p) = &self.player {
-                        p.set_speed(0.5);
+                    if self.count_in_state().is_some() {
+                        self.stop_play();
+                    } else {
+                        if let Some(p) = &self.player {
+                            p.set_speed(0.5);
+                        }
+                        self.play_from_cursor();
                     }
-                    self.play_from_cursor();
                 }
                 TransportRequest::Scrub(at) => self.engine.transport.position = at,
                 TransportRequest::AllNotesOff => {

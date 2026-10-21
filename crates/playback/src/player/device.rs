@@ -622,6 +622,17 @@ impl Player {
         let left = self.shared.metro.count_in_left.load(Ordering::Relaxed);
         (left > 0).then(|| (left, self.shared.metro.count_in_total.load(Ordering::Relaxed)))
     }
+    /// Why the recording start at the end of the last count-in failed, once; `None` when it did
+    /// not. The transport stays parked and nothing records.
+    pub fn take_start_failure(&self) -> Option<super::audio::StartFailure> {
+        super::audio::StartFailure::from_code(self.shared.metro.start_failure.swap(0, Ordering::Relaxed))
+    }
+    /// Report a failed count-in start as the audio thread would, for device-free tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn report_start_failure(&self, failure: super::audio::StartFailure) {
+        self.shared.metro.start_failure.store(failure as u8, Ordering::Relaxed);
+    }
     pub fn position(&self) -> Samples {
         self.shared.position.load(Ordering::Relaxed)
     }

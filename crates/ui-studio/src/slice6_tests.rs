@@ -520,6 +520,89 @@ fn stop_during_the_count_in_cancels_it_without_playing() {
     assert_eq!(t.app.cursor(), 10 * 48_000);
 }
 
+fn request(t: &mut T, request: soundcraft_engine::TransportRequest) {
+    t.app.engine.transport_requests.push(request);
+    t.app.handle_transport(0.0);
+}
+
+#[test]
+fn space_during_the_count_in_stops_it_without_a_take_and_space_again_plays_plainly() {
+    use soundcraft_engine::TransportRequest::TogglePlay;
+    let mut t = T::new();
+    t.app.ui.count_in = true;
+    t.app.ui.count_in_bars = 2;
+    t.app.set_cursor(10 * 48_000, None);
+    t.app.begin_pass(Vec::new());
+    assert!(t.app.count_in_state().is_some() && t.app.take_plan.is_some());
+    assert_eq!(t.app.status, "Count-in");
+    t.app.handle_transport(0.5);
+    request(&mut t, TogglePlay);
+    assert!(t.app.count_in_state().is_none());
+    assert!(!t.app.is_playing(), "Space during the count-in stops; it does not play unarmed");
+    assert!(t.app.take_plan.is_none() && !t.app.recording_active(), "no take, recorder released");
+    assert!(t.app.recorder.as_ref().is_none_or(|r| !r.has_pending_take()));
+    assert_ne!(t.app.status, "Recording");
+    assert_ne!(t.app.status, "Count-in");
+    t.app.handle_transport(5.0);
+    assert!(!t.app.is_playing() && t.app.take_plan.is_none());
+    assert_eq!(t.app.cursor(), 10 * 48_000);
+    // Space again is plain play.
+    request(&mut t, TogglePlay);
+    assert!(t.app.is_playing());
+    assert!(t.app.take_plan.is_none() && !t.app.recording_active());
+    t.app.stop_play();
+}
+
+#[test]
+fn half_speed_and_play_selection_during_the_count_in_cancel_it_too() {
+    use soundcraft_engine::TransportRequest::{HalfSpeed, PlaySelection};
+    for which in [HalfSpeed, PlaySelection] {
+        let mut t = T::new();
+        t.app.ui.count_in = true;
+        t.app.set_cursor(10 * 48_000, None);
+        t.app.begin_pass(Vec::new());
+        assert!(t.app.count_in_state().is_some());
+        let name = format!("{which:?}");
+        request(&mut t, which);
+        assert!(t.app.count_in_state().is_none() && !t.app.is_playing(), "{name}");
+        assert!(t.app.take_plan.is_none() && !t.app.recording_active(), "{name}");
+    }
+}
+
+#[test]
+fn the_first_stop_during_the_count_in_keeps_the_cursor_and_the_second_returns_to_start() {
+    use soundcraft_engine::TransportRequest::Stop;
+    let mut t = T::new();
+    t.app.ui.count_in = true;
+    t.app.set_cursor(10 * 48_000, None);
+    t.app.begin_pass(Vec::new());
+    assert!(t.app.count_in_state().is_some());
+    request(&mut t, Stop);
+    assert!(t.app.count_in_state().is_none() && t.app.take_plan.is_none());
+    assert_eq!(t.app.cursor(), 10 * 48_000, "the first Stop only cancels the count-in");
+    request(&mut t, Stop);
+    assert_eq!(t.app.cursor(), 0, "the second Stop returns to the start");
+}
+
+#[test]
+fn a_failed_start_after_the_count_in_releases_the_take_and_says_why() {
+    let engine = soundcraft_engine::Engine::default();
+    let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
+    let mut app = StudioApp::new(engine, Some(player), crate::Services::default());
+    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new() });
+    app.status = "Recording".into();
+    assert!(app.recording_active());
+    app.player.as_ref().unwrap().report_start_failure(soundcraft_playback::StartFailure::Clock);
+    app.handle_transport(0.0);
+    assert!(app.take_plan.is_none() && !app.recording_active());
+    assert!(app.status.starts_with("Recording could not start: "), "{}", app.status);
+    assert!(app.status.contains("clock"), "{}", app.status);
+    // Reported once.
+    app.status.clear();
+    app.handle_transport(0.0);
+    assert!(app.status.is_empty());
+}
+
 #[test]
 fn the_metronome_button_toggles_the_click_and_its_popup_sets_preferences_without_undo() {
     let mut t = T::new();

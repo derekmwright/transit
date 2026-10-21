@@ -1370,6 +1370,48 @@ fn a_cancelled_ticket_stops_the_count_in_from_starting_play() {
 }
 
 #[test]
+fn a_failed_start_at_the_end_of_the_count_in_is_reported_and_leaves_the_transport_parked() {
+    let (control, mut audio, shared, _start, reader) = counting(0, 1);
+    let mut out = vec![0.0f32; 480 * 2];
+    for _ in 0..20 {
+        fill(&mut audio, &mut out);
+    }
+    assert_eq!(shared.metro.start_failure.load(Ordering::Relaxed), 0);
+    // The clock map is lost during the count-in, and never comes back.
+    audio.transport.clock_map = None;
+    for _ in 0..300 {
+        fill(&mut audio, &mut out);
+    }
+    assert_eq!(reader.status(), start::Status::Cancelled);
+    assert!(!audio.transport.playing && !audio.transport.recording && audio.transport.count_in.is_none());
+    assert_eq!(shared.metro.start_failure.load(Ordering::Relaxed), StartFailure::Clock as u8);
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_loop_set_during_the_count_in_is_the_one_the_recording_starts_with() {
+    let (mut control, mut audio, _shared, _start, reader) = counting(0, 1);
+    let mut out = vec![0.0f32; 480 * 2];
+    for _ in 0..10 {
+        fill(&mut audio, &mut out);
+    }
+    control.send_action(Command::SetLoop(Some(Range { start: 0, end: 4_800 })), true).unwrap();
+    for call in 0..300 {
+        let now = audio.transport.timeline.next_output();
+        track_clock(&mut audio, 48_000, now);
+        fill(&mut audio, &mut out);
+        control.service(&mut make);
+        if matches!(reader.status(), start::Status::Started(_)) {
+            let _ = call;
+            break;
+        }
+    }
+    assert!(matches!(reader.status(), start::Status::Started(_)), "{:?}", reader.status());
+    assert_eq!(audio.transport.looped, Some(Range { start: 0, end: 4_800 }));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
 fn metronome_gain_scales_the_click_and_changing_it_allocates_nothing() {
     let peak_of_beat_two = |gain: f32| {
         let (control, mut audio, shared, _start, _reader) = counting(0, 1);
