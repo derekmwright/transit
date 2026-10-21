@@ -81,6 +81,8 @@ pub struct Layout {
     pub loop_strip: R4,
     pub timeline: R4,
     pub samples_per_px: f64,
+    /// The grid as the ruler corner reads it ("Grid: 1/16", "Adaptive 1/32", "Snap off").
+    pub grid_text: String,
     pub scroll: Samples,
     pub tracks: Vec<TrackRow>,
     pub clips: Vec<ClipRect>,
@@ -96,6 +98,8 @@ pub struct Layout {
 
 #[derive(Debug, Default)]
 pub struct ArrangeState {
+    /// Grid mode, triplets and snap (view state; not saved in the session).
+    pub grid: crate::grid::GridView,
     pub gesture: Option<Gesture>,
     /// The loop strip gesture in progress (the loop region itself lives in the session).
     pub loop_drag: Option<crate::loopbar::LoopDrag>,
@@ -122,6 +126,8 @@ pub(crate) struct Map {
     pub(crate) x0: f32,
     pub(crate) scroll: Samples,
     pub(crate) spp: f64,
+    /// The grid settings, so every consumer of a map snaps to the lines drawn.
+    pub(crate) grid: crate::grid::GridView,
 }
 
 impl Map {
@@ -192,9 +198,16 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let tl = Rect::from_min_max(pos2(full.min.x + hw, full.min.y + RULER_H), full.max);
     let corner = Rect::from_min_max(full.min, pos2(full.min.x + hw, full.min.y + RULER_H));
     let s = app.engine.session_arc();
-    let map = Map { x0: tl.min.x, scroll: s.edit.zoom.scroll, spp: s.edit.zoom.samples_per_px.max(0.01) };
+    let map = Map { x0: tl.min.x, scroll: s.edit.zoom.scroll, spp: s.edit.zoom.samples_per_px.max(0.01), grid: app.arrange.grid };
     let p = ui.painter();
     p.rect_filled(corner, 0.0, TOKENS.ruler);
+    p.with_clip_rect(corner).text(
+        pos2(corner.max.x - 8.0, corner.max.y - 9.0),
+        Align2::RIGHT_CENTER,
+        crate::grid::label(&s, map.spp, &map.grid),
+        FontId::proportional(11.0),
+        TOKENS.text_dim,
+    );
     p.rect_filled(list, 0.0, TOKENS.panel);
 
     // Rows.
@@ -210,6 +223,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         ruler: r4(ruler),
         timeline: r4(tl),
         samples_per_px: map.spp,
+        grid_text: crate::grid::label(&s, map.spp, &map.grid),
         scroll: map.scroll,
         transport: std::mem::take(&mut app.arrange.layout.transport),
         transport_icons: std::mem::take(&mut app.arrange.layout.transport_icons),
@@ -630,6 +644,9 @@ fn grid_and_ruler(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, 
     let every = [1, 2, 4, 8, 16, 32, 64, 128].into_iter().find(|n| bar_px * *n as f32 >= 40.0).unwrap_or(256);
     let gp = p.with_clip_rect(tl);
     let rp = p.with_clip_rect(ruler);
+    let ppt = crate::grid::px_per_tick(s, map.spp);
+    let step = crate::grid::ticks(ppt, crate::grid::bar_ticks(s), &map.grid);
+    let sub_step = crate::grid::sub_line_step(step, ppt, soundcraft_time::TICKS_PER_QUARTER);
     for bar in (first..).take(4000) {
         let x = map.x(bar_at(s, bar));
         if x > tl.max.x {
@@ -642,6 +659,22 @@ fn grid_and_ruler(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, 
                 let bx = map.x(s.tempo.samples_at_bar_beat(BarBeat { bar, beat: i64::from(b) + 1, tick: 0 }, s.sample_rate));
                 gp.line_segment([pos2(bx, tl.min.y), pos2(bx, tl.max.y)], Stroke::new(1.0, TOKENS.grid_beat));
                 rp.line_segment([pos2(bx, ruler.max.y - 5.0), pos2(bx, ruler.max.y)], Stroke::new(1.0, TOKENS.text_dim.gamma_multiply(0.5)));
+            }
+        }
+        // Sub-beat lines at the grid step, fainter than the beats; skipped where they would be
+        // denser than `MIN_DRAW_PX` (the snap still uses the step).
+        if let Some(step) = sub_step {
+            let (t0, t1) = (s.tempo.bar_start_tick(bar), s.tempo.bar_start_tick(bar + 1));
+            let beat = s.tempo.meter_at_tick(t0).ticks_per_beat().max(1);
+            // Multiples of the step from tick 0, as `snap` rounds to them.
+            for tick in ((t0 + step - 1).div_euclid(step) * step..t1).step_by(step as usize) {
+                if (tick - t0) % beat == 0 {
+                    continue;
+                }
+                let sx = map.x(s.tempo.tick_to_samples(tick, s.sample_rate));
+                if sx >= tl.min.x - 1.0 && sx <= tl.max.x {
+                    gp.line_segment([pos2(sx, tl.min.y), pos2(sx, tl.max.y)], Stroke::new(1.0, TOKENS.grid_sub));
+                }
             }
         }
         if (bar - 1) % every == 0 {
@@ -683,7 +716,7 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, g
     Some(match kind {
         DragKind::Move => {
             let s = app.engine.session();
-            let new_start = drop_start(start, dx, m.shift, |d| crate::automation::snap_delta(s, map.spp, start, d));
+            let new_start = drop_start(start, dx, m.shift, |d| crate::automation::snap_delta(s, map.spp, &map.grid, start, d));
             let row = geo.index_at(pos.y - tl.min.y + app.arrange.vscroll);
             let dest = row.and_then(|i| rows.get(i)).map(|t| t.id).filter(|t| app.holds_clips(*t)).unwrap_or(track);
             (clip, dest, new_start, new_start + (end - start), drag_copies(m))

@@ -87,7 +87,7 @@ pub(crate) fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, str
     let enabled = s.edit.loop_playback;
     // Edges land on the nearest grid line (the one automation uses); Shift drags freely.
     let free = ui.input(|i| i.modifiers.shift);
-    let snap = |at: Samples| if free { at.max(0) } else { crate::automation::snap(s, map.spp, at) };
+    let snap = |at: Samples| if free { at.max(0) } else { crate::automation::snap(s, map.spp, &map.grid, at) };
     let part_at = |x: f32| {
         if region.is_empty() { Part::Outside } else { hit(map.x(region.start), map.x(region.end), x, HANDLE) }
     };
@@ -208,8 +208,8 @@ mod tests {
     #[test]
     fn the_grid_snap_rounds_to_the_visible_grid_and_never_below_zero() {
         let sess = Session::default();
-        let a = crate::automation::snap(&sess, 100.0, 123_457);
-        assert_eq!(crate::automation::snap(&sess, 100.0, a), a, "snapping is idempotent");
-        assert_eq!(crate::automation::snap(&sess, 100.0, -400), 0);
+        let a = crate::automation::snap(&sess, 100.0, &crate::grid::GridView::default(), 123_457);
+        assert_eq!(crate::automation::snap(&sess, 100.0, &crate::grid::GridView::default(), a), a, "snapping is idempotent");
+        assert_eq!(crate::automation::snap(&sess, 100.0, &crate::grid::GridView::default(), -400), 0);
     }
 }

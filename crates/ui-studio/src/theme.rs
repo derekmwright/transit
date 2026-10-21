@@ -52,6 +52,8 @@ pub struct Tokens {
     pub line: Color32,
     pub grid_bar: Color32,
     pub grid_beat: Color32,
+    /// Sub-beat grid lines (1/8 and finer): fainter than a beat line.
+    pub grid_sub: Color32,
     pub text: Color32,
     pub text_dim: Color32,
     /// The one accent: selection, focus, active values. Same hue in both themes (darker in light
@@ -89,6 +91,7 @@ pub const DARK: Tokens = Tokens {
     line: Color32::from_rgb(0x14, 0x14, 0x16),
     grid_bar: Color32::from_rgb(0x38, 0x39, 0x3e),
     grid_beat: Color32::from_rgb(0x2a, 0x2b, 0x2f),
+    grid_sub: Color32::from_rgb(0x23, 0x24, 0x27),
     text: Color32::from_rgb(0xdc, 0xdd, 0xe0),
     // Lifted from 0x8c8e94 (slice 5) so secondary labels keep 4.5:1 on the raised panels.
     text_dim: Color32::from_rgb(0xb6, 0xb8, 0xbe),
@@ -120,6 +123,7 @@ pub const LIGHT: Tokens = Tokens {
     line: Color32::from_rgb(0xc9, 0xca, 0xcf),
     grid_bar: Color32::from_rgb(0xc6, 0xc7, 0xcc),
     grid_beat: Color32::from_rgb(0xe2, 0xe3, 0xe6),
+    grid_sub: Color32::from_rgb(0xed, 0xee, 0xf0),
     text: Color32::from_rgb(0x1c, 0x1d, 0x20),
     text_dim: Color32::from_rgb(0x50, 0x53, 0x5b),
     accent: Color32::from_rgb(0x18, 0x73, 0xb8),

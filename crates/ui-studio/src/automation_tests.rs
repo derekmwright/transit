@@ -248,7 +248,7 @@ fn double_click_adds_snapped_points_one_undo_step_each() {
     let s = t.app.engine.session_arc();
     let spp = s.edit.zoom.samples_per_px;
     for (at, v) in &pts {
-        assert_eq!(*at, snap(&s, spp, *at), "on the grid");
+        assert_eq!(*at, snap(&s, spp, &crate::grid::GridView::default(), *at), "on the grid");
         assert!((-30.0..0.0).contains(v), "half way up the fader law: {v}");
     }
     assert_eq!(t.app.engine.undo_label(), Some("Add Automation Breakpoint"));
@@ -286,7 +286,7 @@ fn dragging_a_point_moves_value_and_time_as_one_undo_step() {
     assert_eq!(pts.len(), 2, "moved, not copied");
     assert!(pts[0].0 > p.at);
     let s = t.app.engine.session_arc();
-    assert_eq!(pts[0].0, snap(&s, s.edit.zoom.samples_per_px, pts[0].0));
+    assert_eq!(pts[0].0, snap(&s, s.edit.zoom.samples_per_px, &crate::grid::GridView::default(), pts[0].0));
     assert!((pts[0].1 - p.value).abs() < 0.05);
     // It cannot pass its neighbour.
     let p = t.lane(a, "volume").points[0].clone();
@@ -597,7 +597,7 @@ fn vertical_drag_of_an_off_grid_point_keeps_its_time() {
     let pts = t.points(a, &AutoParam::Volume);
     let s = t.app.engine.session_arc();
     assert_ne!(pts[1].0, before_pts[1].0);
-    assert_eq!(pts[1].0, snap(&s, s.edit.zoom.samples_per_px, pts[1].0), "the moved time is snapped");
+    assert_eq!(pts[1].0, snap(&s, s.edit.zoom.samples_per_px, &crate::grid::GridView::default(), pts[1].0), "the moved time is snapped");
 }
 
 fn write_mode(t: &mut T) -> TrackId {

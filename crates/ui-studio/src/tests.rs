@@ -247,7 +247,11 @@ fn copy_rig() -> CopyRig {
     let lane2 = layout.tracks.iter().find(|r| r.id == t2.0).unwrap().lane;
     let beat = bar / 4;
     let s = app.engine.session();
-    assert_eq!(crate::automation::grid_ticks(s, layout.samples_per_px), soundcraft_time::TICKS_PER_QUARTER, "the visible grid is a beat");
+    assert_eq!(
+        crate::automation::grid_ticks(s, layout.samples_per_px, &app.arrange.grid),
+        soundcraft_time::TICKS_PER_QUARTER,
+        "the visible grid is a beat"
+    );
     CopyRig {
         app,
         ctx,
@@ -314,9 +318,9 @@ fn the_drag_snap_uses_the_same_grid_as_the_automation_snap() {
     let spp = r.app.arrange.layout.samples_per_px;
     for start in [0, 700] {
         for dx in [r.beat / 3, r.beat * 14 / 10, r.beat * 16 / 10, r.beat * 5] {
-            let landed = start + crate::automation::snap_delta(s, spp, start, dx);
+            let landed = start + crate::automation::snap_delta(s, spp, &r.app.arrange.grid, start, dx);
             if start == 0 {
-                assert_eq!(landed, crate::automation::snap(s, spp, dx), "start {start} dx {dx}");
+                assert_eq!(landed, crate::automation::snap(s, spp, &r.app.arrange.grid, dx), "start {start} dx {dx}");
             } else {
                 assert_eq!((landed - start) % r.beat, 0, "an off-grid start keeps its offset");
             }
@@ -2664,4 +2668,78 @@ fn the_bounce_dialog_cycle_range_is_the_cycle_range() {
     assert_eq!(bounce_range(&e), Range::new(100, 200), "looping on: the loop region");
     e.loop_playback = false;
     assert_eq!(bounce_range(&e), Range::new(10, 20), "looping off again");
+}
+
+fn grid_key(r: &mut CopyRig, name: &str) {
+    send_control(&mut r.app, "ui.key", json!({"key": name, "cmd": true}));
+    frames(&mut r.app, &r.ctx, 3, &mut r.time);
+}
+
+/// Ctrl-drag the rig's clip 1.4 beats onto the second track; where the copy starts (samples).
+fn drag_14_beats(r: &mut CopyRig) -> i64 {
+    let to = (r.grab.0 + 1.4 * r.px_per_beat, r.lane2_y);
+    drag(&mut r.app, r.grab, to, json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let at = clips_on(&r.app, r.t2)[0].1;
+    r.app.run("edit.undo", json!({})).unwrap();
+    at
+}
+
+#[test]
+fn ctrl_1_and_2_pin_the_grid_finer_and_wider_and_the_snap_follows() {
+    let mut r = copy_rig();
+    assert_eq!(r.app.arrange.layout.grid_text, "Adaptive 1/4");
+    grid_key(&mut r, "1");
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/8", "one finer than the beat in force");
+    let tol = r.beat / 20;
+    assert!((drag_14_beats(&mut r) - r.beat * 3 / 2).abs() <= tol, "1.4 beats snaps to 1.5 on a 1/8 grid");
+    grid_key(&mut r, "1");
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/16");
+    grid_key(&mut r, "2");
+    grid_key(&mut r, "2");
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/4");
+    assert!((drag_14_beats(&mut r) - r.beat).abs() <= tol, "1.4 beats snaps to 1 on a beat grid");
+    // A pinned grid ignores the zoom.
+    r.app.engine.execute("view.zoom_in", &json!({})).unwrap();
+    frames(&mut r.app, &r.ctx, 3, &mut r.time);
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/4");
+}
+
+#[test]
+fn ctrl_3_toggles_triplets() {
+    let mut r = copy_rig();
+    grid_key(&mut r, "1");
+    grid_key(&mut r, "3");
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/8T");
+    let s = r.app.engine.session();
+    assert_eq!(crate::automation::grid_ticks(s, r.app.arrange.layout.samples_per_px, &r.app.arrange.grid), soundcraft_time::TICKS_PER_QUARTER / 3);
+    grid_key(&mut r, "3");
+    assert_eq!(r.app.arrange.layout.grid_text, "Grid: 1/8");
+}
+
+#[test]
+fn ctrl_4_turns_the_snap_off_so_a_drag_lands_where_it_was_dropped() {
+    let mut r = copy_rig();
+    let tol = r.beat / 20;
+    grid_key(&mut r, "4");
+    assert_eq!(r.app.arrange.layout.grid_text, "Snap off");
+    assert!(!r.app.arrange.grid.snap_enabled);
+    let at = drag_14_beats(&mut r);
+    assert!((at - (1.4 * r.beat as f64) as i64).abs() <= tol * 2, "unsnapped: {at} vs {}", r.beat * 14 / 10);
+    grid_key(&mut r, "4");
+    assert_eq!(r.app.arrange.layout.grid_text, "Adaptive 1/4");
+    assert!((drag_14_beats(&mut r) - r.beat).abs() <= tol, "snapping is back");
+}
+
+#[test]
+fn snap_off_returns_the_input_unchanged_and_the_loop_strip_uses_the_grid() {
+    let r = copy_rig();
+    let s = r.app.engine.session();
+    let off = crate::grid::GridView { snap_enabled: false, ..Default::default() };
+    assert_eq!(crate::automation::snap(s, 100.0, &off, 123_457), 123_457);
+    assert_eq!(crate::automation::snap_delta(s, 100.0, &off, 700, 1_234), 1_234);
+    let fine = crate::grid::GridView { mode: crate::grid::GridMode::Fixed(30), ..Default::default() };
+    let a = crate::automation::snap(s, 100.0, &fine, 123_457);
+    assert_ne!(a, crate::automation::snap(s, 100.0, &Default::default(), 123_457), "the finer grid lands closer");
+    assert!((a - 123_457).abs() <= s.tempo.tick_to_samples(15, s.sample_rate) + 1);
 }

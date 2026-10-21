@@ -24,12 +24,13 @@
 use crate::StudioApp;
 use crate::arrange::{Map, R4, RowGeo, r4};
 use crate::fine::{self, Target};
+use crate::grid::GridView;
 use crate::mixer::{MenuItem, balance_of, db_to_k, k_to_db, pans_for};
 use crate::theme::{self, TOKENS};
 use egui::{Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use soundcraft_model::{AutoParam, AutomationMode, Route, Session, Track, TrackId};
-use soundcraft_time::{Samples, TICKS_PER_QUARTER as PPQ};
+use soundcraft_time::Samples;
 use std::collections::HashMap;
 
 /// A new lane's height, and the range a drag on its bottom edge keeps it in (points).
@@ -647,30 +648,35 @@ fn follow_touch(app: &mut StudioApp, ui: &Ui) {
     }
 }
 
-/// The visible grid step at this zoom, in ticks: the finest of 1/16, 1/8, 1/4 and a bar that is
-/// at least 12 points wide.
-pub fn grid_ticks(s: &Session, spp: f64) -> i64 {
-    let q = (s.tempo.tick_to_samples(PPQ, s.sample_rate) - s.tempo.tick_to_samples(0, s.sample_rate)) as f64;
-    let px_per_tick = q / PPQ as f64 / spp.max(1e-6);
-    [PPQ / 4, PPQ / 2, PPQ, PPQ * 4].into_iter().find(|g| *g as f64 * px_per_tick >= 12.0).unwrap_or(PPQ * 4)
+/// The grid step in force, in ticks: the arrangement's grid settings ([`crate::grid`]) at this
+/// zoom. The same step the arrangement draws its lines at.
+pub fn grid_ticks(s: &Session, spp: f64, g: &GridView) -> i64 {
+    crate::grid::ticks(crate::grid::px_per_tick(s, spp), crate::grid::bar_ticks(s), g)
 }
 
-/// `at` snapped to the visible grid.
-pub fn snap(s: &Session, spp: f64, at: Samples) -> Samples {
-    let g = grid_ticks(s, spp).max(1);
+/// `at` snapped to the grid (unchanged when snapping is off).
+pub fn snap(s: &Session, spp: f64, g: &GridView, at: Samples) -> Samples {
+    if !g.snap_enabled {
+        return at;
+    }
+    let step = grid_ticks(s, spp, g).max(1);
     let tick = s.tempo.samples_to_ticks(at.max(0), s.sample_rate);
-    let snapped = ((tick as f64 / g as f64).round() as i64).saturating_mul(g);
+    let snapped = ((tick as f64 / step as f64).round() as i64).saturating_mul(step);
     s.tempo.tick_to_samples(snapped.max(0), s.sample_rate)
 }
 
-/// A drag of `dx` samples from `start`, quantized to the visible grid as a delta (Logic's relative
-/// snap): a start on the grid lands on it, an off-grid start keeps its offset. Same grid as [`snap`].
-pub fn snap_delta(s: &Session, spp: f64, start: Samples, dx: Samples) -> Samples {
-    let g = grid_ticks(s, spp).max(1);
+/// A drag of `dx` samples from `start`, quantized to the grid as a delta (Logic's relative
+/// snap): a start on the grid lands on it, an off-grid start keeps its offset. Same grid as
+/// [`snap`]; unchanged when snapping is off.
+pub fn snap_delta(s: &Session, spp: f64, g: &GridView, start: Samples, dx: Samples) -> Samples {
+    if !g.snap_enabled {
+        return dx;
+    }
+    let step = grid_ticks(s, spp, g).max(1);
     let t0 = s.tempo.samples_to_ticks(start.max(0), s.sample_rate);
     let t1 = s.tempo.samples_to_ticks(start.saturating_add(dx).max(0), s.sample_rate);
-    let q = ((t1 - t0) as f64 / g as f64).round() as i64;
-    let to = s.tempo.tick_to_samples(t0.saturating_add(q.saturating_mul(g)).max(0), s.sample_rate);
+    let q = ((t1 - t0) as f64 / step as f64).round() as i64;
+    let to = s.tempo.tick_to_samples(t0.saturating_add(q.saturating_mul(step)).max(0), s.sample_rate);
     to - s.tempo.tick_to_samples(t0, s.sample_rate)
 }
 
@@ -900,7 +906,7 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
         } else if fine_drag {
             raw
         } else {
-            snap(s, map.spp, raw)
+            snap(s, map.spp, &map.grid, raw)
         };
         // The moving points stay between their fixed neighbors (moving past one would replace it).
         let dt = g.clamp_dt(want - g.orig_at);
@@ -978,7 +984,7 @@ fn lane_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, lane: &L
         && let Some(at_pos) = resp.interact_pointer_pos()
         && point_at(lane, t, map, ys, pts, at_pos).is_none()
     {
-        let at = snap(s, map.spp, map.at(at_pos.x));
+        let at = snap(s, map.spp, &map.grid, map.at(at_pos.x));
         let v = lane.denorm(t, ys.k(at_pos.y));
         let _ = app.add_point(t.id, &lid, at, v);
     }

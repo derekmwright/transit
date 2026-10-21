@@ -17,6 +17,7 @@ pub mod control;
 pub mod devices;
 pub mod fine;
 pub mod finish;
+pub mod grid;
 pub mod groups;
 pub mod host;
 pub mod icons;

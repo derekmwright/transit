@@ -113,6 +113,10 @@ pub enum Action {
     DialogConfirm,
     DialogCancel,
     ToggleAutomation,
+    GridNarrow,
+    GridWiden,
+    GridTriplet,
+    GridSnap,
     DeletePoints,
     DeselectPoints,
 }
@@ -244,6 +248,10 @@ pub const TABLE: &[Shortcut] = &[
         S::Arrangement,
         "Ableton (Automation Mode); here for the focused track. Logic's A shows all tracks' lanes.",
     ),
+    row(A::GridNarrow, "Narrow Grid", CMD, Key::Num1, S::Arrangement, "Ableton. Pins the grid one division finer than the one in force."),
+    row(A::GridWiden, "Widen Grid", CMD, Key::Num2, S::Arrangement, "Ableton. Pins the grid one division coarser."),
+    row(A::GridTriplet, "Triplet Grid", CMD, Key::Num3, S::Arrangement, "Ableton. A 1/8 triplet grid is a third of a beat."),
+    row(A::GridSnap, "Snap to Grid On / Off", CMD, Key::Num4, S::Arrangement, "Ableton. Shift still bypasses the snap for one drag."),
     // Mixer and device chain.
     row(A::ResetControl, "Reset Control Under Pointer", NONE, Key::Delete, S::Mixer, "Ableton (Delete resets a hovered control)."),
     row(A::ResetControl, "Reset Control Under Pointer", NONE, Key::Backspace, S::Mixer, "Same as Delete."),

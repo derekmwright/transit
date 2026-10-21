@@ -422,6 +422,19 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     if pressed(ctx, A::ZoomOut) {
         let _ = app.engine.execute("view.zoom_out", &json!({}));
     }
+    // The arrangement grid (view state): Ableton's Ctrl+1 narrow, Ctrl+2 widen, Ctrl+3 triplet, Ctrl+4 snap.
+    let (finer, wider) = (pressed(ctx, A::GridNarrow), pressed(ctx, A::GridWiden));
+    if finer || wider {
+        let s = app.engine.session();
+        let (ppt, bar) = (crate::grid::px_per_tick(s, app.arrange.layout.samples_per_px), crate::grid::bar_ticks(s));
+        crate::grid::step(&mut app.arrange.grid, ppt, bar, finer);
+    }
+    if pressed(ctx, A::GridTriplet) {
+        app.arrange.grid.triplet = !app.arrange.grid.triplet;
+    }
+    if pressed(ctx, A::GridSnap) {
+        app.arrange.grid.snap_enabled = !app.arrange.grid.snap_enabled;
+    }
 }
 
 /// The save-changes question.
