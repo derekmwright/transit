@@ -75,6 +75,11 @@ pub fn drag_range(grab: Grab, at: Samples, snap: impl Fn(Samples) -> Samples) ->
     Range { start: r.start.max(0), end: r.end.max(0) }
 }
 
+/// Remove the loop region (an empty pair clears it); one undo step.
+pub(crate) fn clear(app: &mut StudioApp) {
+    let _ = app.run("transport.loop", json!({"start": 0, "end": 0}));
+}
+
 /// Draw the strip and take its input.
 pub(crate) fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, strip: Rect) {
     let resp = ui.interact(strip, ui.id().with("loop_strip"), Sense::click_and_drag());
@@ -86,7 +91,7 @@ pub(crate) fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, str
     let part_at = |x: f32| {
         if region.is_empty() { Part::Outside } else { hit(map.x(region.start), map.x(region.end), x, HANDLE) }
     };
-    if resp.drag_started()
+    if resp.drag_started_by(egui::PointerButton::Primary)
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
     {
         let at = map.at(press.x);
@@ -117,6 +122,14 @@ pub(crate) fn strip(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, str
     if resp.double_clicked() {
         let _ = app.run("options.loop_playback", json!({"value": !enabled}));
     }
+    resp.context_menu(|ui| {
+        let item = ui.add_enabled(!region.is_empty(), egui::Button::new("Clear loop"));
+        app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Clear loop".into(), String::new(), item.rect));
+        if item.clicked() {
+            clear(app);
+            ui.close();
+        }
+    });
     if let Some(pos) = resp.hover_pos().filter(|_| app.arrange.loop_drag.is_none()) {
         match part_at(pos.x) {
             Part::Left | Part::Right => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),

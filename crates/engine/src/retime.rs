@@ -126,7 +126,7 @@ pub fn move_material(s: &mut Session, at: &dyn Fn(Samples) -> Samples) -> Result
         *k = at(*k);
     }
     s.key_signatures.sort_by_key(|k| k.0);
-    for r in [&mut s.edit.selection, &mut s.edit.timeline_selection] {
+    for r in [&mut s.edit.selection, &mut s.edit.timeline_selection, &mut s.edit.loop_range] {
         *r = Range::new(at(r.start), at(r.end));
     }
     Ok(())
@@ -210,6 +210,7 @@ pub fn restore_material(s: &mut Session, base: &Session) {
     s.key_signatures.clone_from(&base.key_signatures);
     s.edit.selection = base.edit.selection;
     s.edit.timeline_selection = base.edit.timeline_selection;
+    s.edit.loop_range = base.edit.loop_range;
 }
 
 /// Whether two documents hold the same tempo map and the same material a retime moves, so a
@@ -220,6 +221,7 @@ pub fn same_material(a: &Session, b: &Session) -> bool {
         && a.key_signatures == b.key_signatures
         && a.edit.selection == b.edit.selection
         && a.edit.timeline_selection == b.edit.timeline_selection
+        && a.edit.loop_range == b.edit.loop_range
         && a.tracks.len() == b.tracks.len()
         && a.tracks.iter().zip(&b.tracks).all(|(x, y)| {
             x.id == y.id

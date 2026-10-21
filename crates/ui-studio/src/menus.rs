@@ -216,6 +216,13 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                             ui.close();
                         }
                     }
+                    let has_loop = !app.engine.session().edit.loop_range.is_empty();
+                    let b = ui.add_enabled(has_loop, menu_button("Clear Loop"));
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Clear Loop".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        crate::loopbar::clear(app);
+                        ui.close();
+                    }
                     ui.separator();
                     // Slice 6: a preference, not the document.
                     let on = app.ui.count_in;

@@ -36,10 +36,16 @@ pub struct Rename {
     keys: (bool, bool),
 }
 
+/// The range the dialog's "Cycle range" / "Selection" choice bounces: the cycle range while looping
+/// is on (the loop region, else the selection), otherwise the selection.
+pub fn bounce_range(edit: &soundcraft_model::EditState) -> soundcraft_time::Range {
+    if edit.loop_playback { edit.cycle_range() } else { edit.selection }
+}
+
 /// File > Bounce: which part of the song.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum BounceRange {
-    /// The selection, which is also the cycle range in this UI (plan 06, L6).
+    /// The selection, or the cycle range while looping is on ([`bounce_range`]).
     Selection,
     Whole,
 }
@@ -354,7 +360,7 @@ impl StudioApp {
             return;
         }
         let s = self.engine.session();
-        let range = if s.edit.selection.is_empty() { BounceRange::Whole } else { BounceRange::Selection };
+        let range = if bounce_range(&s.edit).is_empty() { BounceRange::Whole } else { BounceRange::Selection };
         let name = format!("{}.wav", soundcraft_engine::io::sanitize_name(&s.name));
         let dir =
             self.engine.path.as_ref().and_then(|p| std::path::Path::new(p).parent().map(std::path::Path::to_path_buf)).unwrap_or_else(default_dir);
@@ -374,7 +380,7 @@ impl StudioApp {
         let Some(f) = self.finish.bounce_form.clone() else { return Err("no bounce form".into()) };
         let s = self.engine.session();
         let (start, end) = match f.range {
-            BounceRange::Selection if !s.edit.selection.is_empty() => (s.edit.selection.start, s.edit.selection.end),
+            BounceRange::Selection if !bounce_range(&s.edit).is_empty() => (bounce_range(&s.edit).start, bounce_range(&s.edit).end),
             BounceRange::Selection => {
                 self.status = "Nothing is selected: pick a range, or bounce the whole song.".into();
                 return Err(self.status.clone());
@@ -622,7 +628,7 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
         ui.set_width(420.0);
         ui.spacing_mut().item_spacing = vec2(crate::theme::SPACE, crate::theme::SPACE);
         ui.label(egui::RichText::new("Bounce").strong().size(15.0));
-        let sel = s.edit.selection;
+        let sel = bounce_range(&s.edit);
         let sel_text = if sel.is_empty() {
             "Selection (none)".to_string()
         } else {

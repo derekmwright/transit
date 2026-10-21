@@ -647,3 +647,13 @@ fn a_tempo_drag_during_an_automation_pass_still_converts_from_the_gestures_start
     assert_eq!((clips, marks, keys), (before.0, before.2, before.3));
     assert_eq!(autos.iter().flatten().copied().collect::<Vec<_>>(), vec![1_000]);
 }
+
+#[test]
+fn the_loop_range_stays_on_its_bars_through_a_tempo_change() {
+    let (mut e, _, _) = midi_at_bar_5();
+    run(&mut e, "transport.loop", json!({"start": bar(3), "end": bar(7), "enabled": true}));
+    run(&mut e, "event.tempo", json!({"bpm": 140, "at": 0}));
+    let s = e.session();
+    on_bar(s, s.edit.loop_range.start, 3);
+    on_bar(s, s.edit.loop_range.end, 7);
+}

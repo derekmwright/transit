@@ -2631,3 +2631,36 @@ fn shift_dragging_the_loop_strip_does_not_snap() {
     assert!((s - 2 * b).abs() < 1100 && (e - (6 * b + 20 * 1024)).abs() < 1100, "{s} {e}");
     assert_ne!(e % b, 0, "off the grid");
 }
+
+#[test]
+fn right_clicking_the_loop_strip_offers_clear_loop_in_one_undo_step() {
+    let (mut app, ctx, mut time) = loop_app();
+    let b = beat(&app);
+    app.run("transport.loop", json!({"start": 4 * b, "end": 8 * b, "enabled": true})).unwrap();
+    frames(&mut app, &ctx, 3, &mut time);
+    let steps = undo_len(&mut app);
+    let at = strip_at(&app, 6 * b, 0.0);
+    right_click(&mut app, at);
+    frames(&mut app, &ctx, 6, &mut time);
+    let item = app.arrange.menu.iter().find(|m| m.label == "Clear loop").cloned().expect("the strip menu offers Clear loop");
+    click(&mut app, mid(item.rect));
+    frames(&mut app, &ctx, 6, &mut time);
+    assert_eq!(loop_range(&app), (0, 0), "region cleared");
+    assert_eq!(undo_len(&mut app), steps + 1, "one undo step");
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(loop_range(&app), (4 * b, 8 * b));
+}
+
+#[test]
+fn the_bounce_dialog_cycle_range_is_the_cycle_range() {
+    use crate::finish::bounce_range;
+    use soundcraft_time::Range;
+    let mut e = soundcraft_model::EditState { selection: Range::new(10, 20), ..Default::default() };
+    assert_eq!(bounce_range(&e), Range::new(10, 20), "looping off: the selection");
+    e.loop_playback = true;
+    assert_eq!(bounce_range(&e), Range::new(10, 20), "looping on, no loop region: the selection");
+    e.loop_range = Range::new(100, 200);
+    assert_eq!(bounce_range(&e), Range::new(100, 200), "looping on: the loop region");
+    e.loop_playback = false;
+    assert_eq!(bounce_range(&e), Range::new(10, 20), "looping off again");
+}
