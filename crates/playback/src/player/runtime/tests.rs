@@ -649,3 +649,153 @@ fn a_path_table_edit_is_a_plan_on_the_same_engine_and_the_callback_allocates_not
     assert_eq!(ports.plans.engine().active().target, engine, "same device generation: no reopen");
     runtime.retire(ports);
 }
+
+/// A factory standing in for a heavy third-party plug-in: it counts its calls and takes `delay`.
+fn slow_factory(delay: std::time::Duration, made: &Arc<AtomicUsize>) -> impl FnMut(&soundcraft_mix::InstanceSpec) -> Option<NewInstance> {
+    let made = Arc::clone(made);
+    move |spec| {
+        made.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(delay);
+        soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)
+    }
+}
+
+fn synth_session(with_instrument: bool) -> (Arc<Session>, soundcraft_model::TrackId) {
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some("keys"));
+    if with_instrument {
+        session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    }
+    (Arc::new(session), track)
+}
+
+fn energy(plans: &plan_bridge::Audio) -> f32 {
+    plans.output().iter().flatten().map(|s| s * s).sum()
+}
+
+/// Plays a note for a few blocks and returns the output energy.
+fn play(plans: &mut plan_bridge::Audio, track: soundcraft_model::TrackId) -> f32 {
+    plans.live_note(track, 60, 100);
+    let mut total = 0.0;
+    for _ in 0..8 {
+        plans.render(0, 64);
+        total += energy(plans);
+    }
+    total
+}
+
+#[test]
+fn a_slow_instance_is_announced_a_frame_before_it_is_made_and_the_plan_waits_for_it() {
+    let (before, track) = synth_session(false);
+    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(before, None, target(), PlanLimits::default()).unwrap();
+    runtime.service();
+    adopt(&mut ports.plans);
+    runtime.service();
+    let first = ports.plans.engine().active().generation;
+
+    // Same track id: the second session adds only the instrument.
+    let mut edited = (**runtime.requested_session()).clone();
+    edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    let edited = Arc::new(edited);
+    runtime.update_session(Arc::clone(&edited)).unwrap();
+
+    let made = Arc::new(AtomicUsize::new(0));
+    let mut create = slow_factory(std::time::Duration::from_millis(500), &made);
+    let slot = soundcraft_mix::INSTRUMENT_SLOT;
+    let third_party = |id: &str| id == "subtractive_synth";
+
+    // Frame 1: announced, nothing made, nothing compiled, and the slot reads as loading.
+    let started = std::time::Instant::now();
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    assert!(started.elapsed() < std::time::Duration::from_millis(100), "the announcing frame does not wait for the plug-in");
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    assert!(runtime.loading(track, slot) && runtime.any_loading());
+    assert!(runtime.control.sessions.published.is_none(), "the request waits uncompiled");
+    assert_eq!(runtime.requested_state().1, RequestState::Preparing);
+
+    // The slot is silent, not garbage, while it loads: the active plan has no instrument.
+    assert_eq!(play(&mut ports.plans, track), 0.0);
+    assert_eq!(ports.plans.engine().active().generation, first);
+
+    // Frame 2: made (once), compiled in the same call.
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+    assert_eq!(made.load(Ordering::SeqCst), 1);
+    assert!(!runtime.loading(track, slot) && !runtime.any_loading());
+    assert!(runtime.control.sessions.published.is_some(), "the plan took the instance and was published");
+
+    // Bound: it sounds. Making it again for the compile would be a second call.
+    adopt(&mut ports.plans);
+    assert!(play(&mut ports.plans, track) > 0.0, "the instrument sounds once its plan is adopted");
+    assert_eq!(made.load(Ordering::SeqCst), 1, "the compile used the staged instance");
+    runtime.retire(ports);
+}
+
+#[test]
+fn the_audio_callback_keeps_its_budget_while_an_instance_is_made() {
+    let (before, track) = synth_session(false);
+    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(before, None, target(), PlanLimits::default()).unwrap();
+    runtime.service();
+    adopt(&mut ports.plans);
+    runtime.service();
+    let mut edited = (**runtime.requested_session()).clone();
+    edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    runtime.update_session(Arc::new(edited)).unwrap();
+
+    let made = Arc::new(AtomicUsize::new(0));
+    let mut create = slow_factory(std::time::Duration::from_millis(500), &made);
+    let third_party = |id: &str| id == "subtractive_synth";
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+
+    // 512 frames at 48 kHz is a 10.7 ms budget. The audio thread renders while the control
+    // thread sits in the 500 ms factory; no lock is shared between them.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let audio = {
+        let stop = Arc::clone(&stop);
+        let mut plans = ports.plans;
+        std::thread::spawn(move || {
+            let (mut blocks, mut worst) = (0u32, std::time::Duration::ZERO);
+            while !stop.load(Ordering::Acquire) {
+                let t = std::time::Instant::now();
+                plans.service(&mut plan_bridge::callback_scope(), true);
+                plans.render(0, 512);
+                worst = worst.max(t.elapsed());
+                blocks += 1;
+                std::thread::sleep(std::time::Duration::from_micros(2_000));
+            }
+            (blocks, worst, plans)
+        })
+    };
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    stop.store(true, Ordering::Release);
+    let (blocks, worst, plans) = audio.join().unwrap();
+    assert!(blocks > 50, "the callback ran {blocks} blocks during the 500 ms creation");
+    assert!(worst < std::time::Duration::from_millis(10), "worst block {worst:?} against a 10.7 ms budget");
+    ports.plans = plans;
+    runtime.retire(ports);
+}
+
+#[test]
+fn a_request_that_no_longer_wants_a_staged_instance_drops_it() {
+    let (before, track) = synth_session(false);
+    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(before, None, target(), PlanLimits::default()).unwrap();
+    runtime.service();
+    adopt(&mut ports.plans);
+    runtime.service();
+    let base = Arc::clone(runtime.requested_session());
+    let mut edited = (*base).clone();
+    edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    runtime.update_session(Arc::new(edited)).unwrap();
+    let made = Arc::new(AtomicUsize::new(0));
+    let mut create = slow_factory(std::time::Duration::ZERO, &made);
+    let third_party = |id: &str| id == "subtractive_synth";
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    assert!(runtime.loading(track, soundcraft_mix::INSTRUMENT_SLOT));
+    // Undo before it is made: nothing is created and nothing is left loading.
+    runtime.update_session(base).unwrap();
+    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    assert!(!runtime.any_loading());
+    assert_eq!(made.load(Ordering::SeqCst), 0);
+    runtime.retire(ports);
+}

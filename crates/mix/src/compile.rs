@@ -426,6 +426,20 @@ impl PlanCompiler {
         self.faulted.is_some()
     }
 
+    /// Whether a plan for `spec` takes its instance from the active plan or the pool (or leaves a
+    /// slot the factory already failed for absent) instead of calling the factory. The control
+    /// thread uses it to create the other instances ahead of the compile, one per frame. It does
+    /// not know the strip layout, so a slot that moves for layout reasons is still made by the
+    /// factory, inline.
+    #[must_use]
+    pub fn reuses(&self, spec: &InstanceSpec) -> bool {
+        let same = |o: &ShadowSlot| o.spec.id == spec.id && o.spec.uid == spec.uid && o.spec.ch == spec.ch;
+        let key = (spec.track, spec.slot);
+        self.active.slots.get(&key).is_some_and(same)
+            || (spec.uid != 0 && self.active.slots.iter().any(|(k, o)| k.0 == spec.track && o.kind == CellKind::Insert && same(o)))
+            || self.pool.iter().any(|p| p.key == key && p.spec == *spec)
+    }
+
     /// Every instance of the confirmed active plan, sorted. After a torn reclaim
     /// ([`PlanCompiler::faulted`]), exactly the instances the faulted engine still owns (what
     /// [`MixEngine::into_retired`] will hand back): never one [`PlanCompiler::take_released`] reported.

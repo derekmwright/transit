@@ -550,6 +550,15 @@ impl Player {
     pub fn capture_states_for_reopen(&self, expected: &Arc<Session>) -> Result<Option<PluginStates>, PlayerError> {
         self.owner()?.capture_states_for_reopen(expected)
     }
+    /// Whether this slot's plug-in is still being made (the slot plays silence until it is in a
+    /// plan). The UI shows "Loading…" for it.
+    pub fn loading(&self, track: TrackId, slot: usize) -> bool {
+        self.owner().is_ok_and(|owner| owner.loading(track, slot))
+    }
+    /// Whether any plug-in is still being made; the frame loop comes back soon while true.
+    pub fn any_loading(&self) -> bool {
+        self.owner().is_ok_and(|owner| owner.any_loading())
+    }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.owner().is_ok_and(|owner| owner.has_editor(track, slot))
     }
@@ -770,11 +779,13 @@ where
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
             crate::mark_audio_thread();
             let started = telemetry::Timer::start();
+            let creating_before = soundcraft_mix::creating_instance();
             let frames = data.len() / channels;
             clock.cpal.output(frames, info, clock.origin.now_ns());
             fault.beats.fetch_add(1, Ordering::Relaxed);
             output.fill(data);
-            output.output.timing.record(&fault.telemetry, frames, rate, started.elapsed());
+            let creating = creating_before || soundcraft_mix::creating_instance();
+            output.output.timing.record_overlap(&fault.telemetry, frames, rate, started.elapsed(), creating);
         },
         error,
         None,

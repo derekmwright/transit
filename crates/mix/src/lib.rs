@@ -226,6 +226,32 @@ pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
     out
 }
 
+/// Instances being made by [`create_instance`] right now (any thread).
+static CREATING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct CreatingGuard;
+
+impl CreatingGuard {
+    fn enter() -> Self {
+        CREATING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        CreatingGuard
+    }
+}
+
+impl Drop for CreatingGuard {
+    fn drop(&mut self) {
+        CREATING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Whether a plugin instance is being created now ([`create_instance`] is running). One relaxed
+/// atomic load: the audio callback reads it to tell a callback that overlapped a creation (module
+/// load, `initialize`, state restore, all on the control thread) from one that did not.
+#[must_use]
+pub fn creating_instance() -> bool {
+    CREATING.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// A plugin made by [`create_instance`].
 pub struct NewInstance {
     pub plugin: Box<dyn Plugin>,
@@ -236,6 +262,7 @@ pub struct NewInstance {
 /// Creates a plugin (built-in or hosted), restores `state` (if any) and prepares it. Expensive
 /// for third-party plugins: in realtime use, call it on the control thread.
 pub fn create_instance(id: &str, state: Option<&[u8]>, sample_rate: f32, max_block: usize, ch: usize) -> Option<NewInstance> {
+    let _creating = CreatingGuard::enter();
     let mut plugin = create_plugin(id)?;
     let refused_state = state.is_some_and(|st| !plugin.load_state(st));
     if refused_state {

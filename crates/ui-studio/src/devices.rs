@@ -348,6 +348,9 @@ fn card(
         (_, Some("au")) => "Audio Unit".into(),
         _ => app.builtin_plugins().iter().find(|p| p.id == plugin).map_or("Built-in".into(), |p| format!("Built-in · {}", p.category)),
     };
+    // The plug-in is still being made (a heavy library can take seconds): say so until it is bound.
+    let loading = app.player.as_ref().is_some_and(|pl| pl.loading(t, slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT)));
+    let kind = if loading { LOADING.to_string() } else { kind };
     pc.text(pos2(r.min.x + 8.0, title.max.y + 12.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.0), TOKENS.text_dim);
     if c.bypass {
         pc.text(pos2(r.min.x + 8.0, title.max.y + 28.0), Align2::LEFT_CENTER, "Bypassed", FontId::proportional(10.0), TOKENS.mute);
@@ -397,18 +400,26 @@ fn card(
     }
     // Open editor: the plug-in's own window, through the same path as `ui.set {plugin_windows}`.
     let key_slot = slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
-    let enabled = app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
+    let enabled = !loading && app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
     pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
-    let label = if open { "Close editor" } else { "Open editor" };
+    let label = if loading {
+        LOADING
+    } else if open {
+        "Close editor"
+    } else {
+        "Open editor"
+    };
     let ink = if enabled { TOKENS.text } else { TOKENS.text_dim.gamma_multiply(0.6) };
     let font = FontId::proportional(10.5);
     let w = pc.layout_no_wrap(label.into(), font.clone(), ink).size().x + 12.0 + 4.0;
     let x0 = eb.center().x - w / 2.0;
     crate::icons::paint(&pc, pos2(x0 + 6.0, eb.center().y), Icon::OpenEditor, 12.0, ink);
     pc.text(pos2(x0 + 16.0, eb.center().y), Align2::LEFT_CENTER, label, font, ink);
-    let tip = if !enabled {
+    let tip = if loading {
+        "The plug-in is still loading; its editor opens when it is ready"
+    } else if !enabled {
         "No editor window (built-in, or no audio device)"
     } else if open {
         "Close the plug-in's window"
@@ -423,6 +434,9 @@ fn card(
     c.editor_enabled = enabled;
     c
 }
+
+/// What a device card and an insert slot say while the plug-in is being made.
+pub(crate) const LOADING: &str = "Loading…";
 
 /// What an insert's key dropdown reads: "Key: None", or "Key: Kick (post)" naming the source
 /// track or bus and the tap (a bus key is always post-fader).

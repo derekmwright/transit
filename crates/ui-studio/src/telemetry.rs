@@ -99,6 +99,7 @@ pub fn detail_rows(t: &CallbackTelemetry) -> Vec<String> {
     rows.extend([
         format!("Peak callback load (since open): {}", load_text(t.max_load_ppm)),
         format!("Over-budget callbacks (nominal): {}", t.over_budget_callbacks),
+        format!("Over-budget callbacks while a plug-in was loading: {}", t.over_budget_while_creating),
         format!("Callbacks: {}", t.callbacks),
         format!("Timed callbacks: {}", t.timed_callbacks),
         format!("Callbacks without a timing: {}", t.callbacks.saturating_sub(t.timed_callbacks)),

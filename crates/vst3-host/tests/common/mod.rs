@@ -6,6 +6,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 /// Builds the fixture once and returns a folder containing `Fixture.vst3`.
+#[allow(dead_code)]
 pub fn fixture_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| install(&[], "vst3-fixture-target", "vst3-fixture-install", 3))
@@ -17,6 +18,14 @@ pub fn fixture_dir() -> &'static Path {
 pub fn sidechain_fixture_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| install(&["--features", "sidechain"], "vst3-sidechain-fixture-target", "vst3-sidechain-fixture-install", 2))
+}
+
+/// Builds the fixture with its `slow-create` feature once (its synth takes 500 ms to create) and
+/// returns a folder containing `Fixture.vst3` with all of the fixture's plug-ins.
+#[allow(dead_code)]
+pub fn slow_fixture_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| install(&["--features", "slow-create"], "vst3-slow-fixture-target", "vst3-slow-fixture-install", 3))
 }
 
 fn install(features: &[&str], target_dir: &str, install_dir: &str, plugins: usize) -> PathBuf {

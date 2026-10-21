@@ -346,16 +346,20 @@ fn track_slot(e: &Engine, p: &Value, cmd: &str, max: usize) -> Result<(TrackId, 
 
 fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.insert", "`plugin` required"))?.to_string();
-    let info = super::clap::plugin_info(&plugin).ok_or_else(|| bad("mix.insert", format!("unknown plugin `{plugin}`")))?;
+    let named = p.get("params").and_then(Value::as_object);
+    let (plugin_id, _, info) =
+        super::clap::plugin_head(&plugin, named.is_some()).ok_or_else(|| bad("mix.insert", format!("unknown plugin `{plugin}`")))?;
     let t = tracks_required(e, "mix.insert", p)?.first().copied().ok_or_else(|| bad("mix.insert", "no track"))?;
     let explicit = slot_of(p, "slot", INSERT_SLOTS);
     let s = e.session_mut();
     let tr = s.track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
     let slot =
         explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
-    let mut ins = Insert::new(info.id);
-    fill_default_params(&mut ins, info);
-    if let Some(obj) = p.get("params").and_then(Value::as_object) {
+    let mut ins = Insert::new(plugin_id.as_str());
+    if let Some(info) = info {
+        fill_default_params(&mut ins, info);
+    }
+    if let (Some(obj), Some(info)) = (named, info) {
         for (k, v) in obj {
             let Some(pi) = info.params.iter().find(|x| x.id == k) else {
                 return Err(bad("mix.insert", format!("`{plugin}` has no parameter `{k}`")));
@@ -367,7 +371,7 @@ fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     if let Some(sl) = tr.mixer.inserts.get_mut(slot) {
         *sl = Some(ins);
     }
-    Ok(json!({"track": t, "slot": slot, "plugin": info.id}))
+    Ok(json!({"track": t, "slot": slot, "plugin": plugin_id}))
 }
 
 fn insert_remove(e: &mut Engine, p: &Value) -> Result<Value> {

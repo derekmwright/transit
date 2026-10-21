@@ -43,6 +43,11 @@ pub struct CallbackTelemetry {
     /// Work time strictly exceeded frames / device rate; zero-size/unknown-rate blocks excluded.
     /// A throughput diagnostic, not a count of missed hardware deadlines or xruns.
     pub over_budget_callbacks: u64,
+    /// Over-budget callbacks that overlapped a plug-in creation on the control thread (module
+    /// load, `initialize`, state restore). Nonzero means the stall coincided with a load, which
+    /// points at the process (a vendor lock, memory pressure, CPU contention), not at a lock of
+    /// ours: the callback takes none. A subset of `over_budget_callbacks`.
+    pub over_budget_while_creating: u64,
     /// Exclusive bins with inclusive upper limits [`DURATION_LIMITS_NS`], followed by overflow.
     pub duration_histogram: [u64; 16],
     /// CPAL error callbacks of all kinds. These are not necessarily xruns.
@@ -69,6 +74,7 @@ pub(crate) struct Counters {
     max_duration_ns: AtomicU64,
     max_load_ppm: AtomicU64,
     over_budget_callbacks: AtomicU64,
+    over_budget_while_creating: AtomicU64,
     duration_histogram: [AtomicU64; 16],
     pub backend_errors: AtomicU64,
     pub device_lost_errors: AtomicU64,
@@ -87,6 +93,7 @@ impl Counters {
             max_duration_ns: self.max_duration_ns.load(Ordering::Relaxed),
             max_load_ppm: self.max_load_ppm.load(Ordering::Relaxed),
             over_budget_callbacks: self.over_budget_callbacks.load(Ordering::Relaxed),
+            over_budget_while_creating: self.over_budget_while_creating.load(Ordering::Relaxed),
             duration_histogram: std::array::from_fn(|i| self.duration_histogram[i].load(Ordering::Relaxed)),
             backend_errors: self.backend_errors.load(Ordering::Relaxed),
             device_lost_errors: self.device_lost_errors.load(Ordering::Relaxed),
@@ -110,6 +117,11 @@ pub(crate) struct Accumulator(CallbackTelemetry);
 
 impl Accumulator {
     pub fn record(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>) {
+        self.record_overlap(counters, frames, rate, elapsed, false);
+    }
+
+    /// Like [`Self::record`]; `creating` says a plug-in creation was running during the callback.
+    pub fn record_overlap(&mut self, counters: &Counters, frames: usize, rate: u32, elapsed: Option<Duration>, creating: bool) {
         let s = &mut self.0;
         s.callbacks = s.callbacks.saturating_add(1);
         s.frames = s.frames.saturating_add(frames as u64);
@@ -131,12 +143,14 @@ impl Accumulator {
                 let load = (used * 1_000_000 / budget).min(u128::from(u64::MAX)) as u64;
                 s.max_load_ppm = s.max_load_ppm.max(load);
                 s.over_budget_callbacks = s.over_budget_callbacks.saturating_add(u64::from(used > budget));
+                s.over_budget_while_creating = s.over_budget_while_creating.saturating_add(u64::from(used > budget && creating));
             }
             counters.timed_callbacks.store(s.timed_callbacks, Ordering::Relaxed);
             counters.total_duration_ns.store(s.total_duration_ns, Ordering::Relaxed);
             counters.max_duration_ns.store(s.max_duration_ns, Ordering::Relaxed);
             counters.max_load_ppm.store(s.max_load_ppm, Ordering::Relaxed);
             counters.over_budget_callbacks.store(s.over_budget_callbacks, Ordering::Relaxed);
+            counters.over_budget_while_creating.store(s.over_budget_while_creating, Ordering::Relaxed);
         }
         counters.frames.store(s.frames, Ordering::Relaxed);
         counters.callbacks.store(s.callbacks, Ordering::Relaxed);

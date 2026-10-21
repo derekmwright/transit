@@ -141,6 +141,9 @@ pub struct SessionControl {
     notices: VecDeque<SessionNotice>,
     credits: usize,
     faulted: bool,
+    /// Set by the handle owner while it creates the instances the next plan needs, one per
+    /// frame: the latest request stays uncompiled (and the active plan keeps playing).
+    hold: bool,
     main_thread: PhantomData<Rc<()>>,
 }
 
@@ -159,6 +162,7 @@ pub fn session_pair(target: RenderTarget, limits: PlanLimits) -> (SessionControl
             notices: VecDeque::with_capacity(SESSION_REQUESTS),
             credits: SESSION_REQUESTS,
             faulted: false,
+            hold: false,
             main_thread: PhantomData,
         },
         audio,
@@ -211,7 +215,7 @@ impl SessionControl {
             }
             return;
         }
-        if !self.bridge.can_prepare() {
+        if !self.bridge.can_prepare() || self.hold {
             return;
         }
         let Some(request) = self.latest.take() else { return };

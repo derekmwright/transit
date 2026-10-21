@@ -18,5 +18,7 @@ vst3 = "0.3"
 [features]
 # Builds a binary that lists only the sidechain plug-ins (ADR 0015 slice c, see src/lib.rs).
 sidechain = []
+# Fixture Synth takes 500 ms to create, like a plug-in with a heavy library (backlog 12).
+slow-create = []
 
 [workspace]

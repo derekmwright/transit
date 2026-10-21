@@ -675,8 +675,10 @@ impl StudioApp {
         // Autosave only runs on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
         let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty();
+        // A plug-in being made is created one frame after it is announced; come back for it.
+        let loading = self.player.as_ref().is_some_and(Player::any_loading);
         ctx.request_repaint_after_secs(
-            if editors || plugin_requests || self.player_requests.pending() { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt),
+            if editors || plugin_requests || loading || self.player_requests.pending() { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt),
         );
         self.player_requests.show_error(&mut self.status);
         control::collect_screenshots(self, ctx);

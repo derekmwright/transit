@@ -419,6 +419,10 @@ impl Control {
     pub fn active(&self) -> PlanGeneration {
         self.compiler.active()
     }
+    /// Whether a plan for `spec` would not call the factory for it (see [`PlanCompiler::reuses`]).
+    pub(super) fn reuses(&self, spec: &InstanceSpec) -> bool {
+        self.compiler.reuses(spec)
+    }
     pub(super) fn can_prepare(&self) -> bool {
         self.port.credits() != 0
     }

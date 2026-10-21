@@ -309,6 +309,12 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn binding(&self, track: TrackId, slot: usize) -> Option<SlotBinding> {
         self.handles.binding(track, slot)
     }
+    pub fn loading(&self, track: TrackId, slot: usize) -> bool {
+        self.handles.loading(track, slot)
+    }
+    pub fn any_loading(&self) -> bool {
+        self.handles.any_loading()
+    }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.handles.has_editor(track, slot)
     }

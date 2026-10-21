@@ -2,6 +2,7 @@
 use super::*;
 use crate::{EditorEdit, PluginStates};
 use soundcraft_dsp::{PluginEditor, PluginStateReader};
+use soundcraft_mix::InstanceSpec;
 use soundcraft_model::TrackId;
 use std::collections::BTreeMap;
 
@@ -13,8 +14,25 @@ struct Entry {
     key_input: bool,
 }
 
+/// Where a third-party instance the next plan needs is on its way to being made.
+enum Stage {
+    /// Seen in the latest request; not yet announced to the UI.
+    Queued,
+    /// Announced for a frame (the UI shows it as loading); made on the next service.
+    Announced,
+    /// Made (or refused: `None`), waiting for the compile to take it.
+    Ready(Option<NewInstance>),
+}
+
+struct Staged {
+    spec: InstanceSpec,
+    stage: Stage,
+}
+
 #[derive(Default)]
 pub struct Handles {
+    /// Third-party instances made ahead of the compile, one per service call (see [`Handles::stage`]).
+    staged: Vec<Staged>,
     /// Keyed by (track, generation): the generation is the instance's identity and survives a
     /// reorder, while the slot it sits at does not.
     entries: BTreeMap<(TrackId, SlotGen), Entry>,
@@ -27,12 +45,98 @@ impl Handles {
     /// Normal Player preparation: all factory/handle calls run on the owner thread.
     pub fn service<T: Copy, R: Copy>(&mut self, control: &mut Control<T, R>) {
         let target = control.sessions.target;
+        self.service_with(control, &soundcraft_mix::is_third_party, &mut |spec| {
+            soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), target.sample_rate as f32, target.max_block as usize, spec.ch)
+        });
+    }
+
+    /// [`Self::service`] with the factory and the choice of what is made a frame ahead supplied
+    /// (the tests have no plug-in hosts to load).
+    pub(super) fn service_with<T: Copy, R: Copy>(
+        &mut self,
+        control: &mut Control<T, R>,
+        deferred: &dyn Fn(&str) -> bool,
+        create: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
+    ) {
+        control.sessions.reclaim(false);
+        control.sessions.hold = self.stage(&mut control.sessions, deferred, create);
         control.service(&mut |spec, generation| {
-            let made =
-                soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), target.sample_rate as f32, target.max_block as usize, spec.ch)?;
+            let ready = self.staged.iter().position(|st| st.spec == *spec && matches!(st.stage, Stage::Ready(_)));
+            let made = match ready.map(|i| self.staged.swap_remove(i).stage) {
+                Some(Stage::Ready(made)) => made,
+                _ => create(spec),
+            }?;
             self.capture((spec.track, spec.slot, generation), made)
         });
         self.refresh(&mut control.sessions);
+    }
+
+    /// Makes the third-party instances the latest request needs before it is compiled, so the
+    /// compile finds them and the control thread never sits in a factory with the UI unpainted:
+    /// the first call only announces them ([`Self::loading`] turns true and the frame is
+    /// painted), each later call makes one, and the request compiles in the call that made the
+    /// last. The active plan keeps playing meanwhile and has no strip or slot for the new
+    /// instance, which is silence. True while the request has to wait.
+    ///
+    /// Creation is one SDK call on the main thread (VST3 `createInstance` and `initialize`), so a
+    /// single instance still blocks this thread for as long as the plug-in takes; what changes is
+    /// that nothing else is queued behind it in the same frame and the UI has said why.
+    fn stage(
+        &mut self,
+        sessions: &mut SessionControl,
+        deferred: &dyn Fn(&str) -> bool,
+        create: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
+    ) -> bool {
+        // With a plan in flight the compiler's view is not current; wait for its return.
+        let wanted: Vec<InstanceSpec> = match &sessions.latest {
+            Some(request) if !sessions.faulted() && sessions.bridge.can_prepare() => {
+                let all = sessions.restore.is_some();
+                soundcraft_mix::realtime_instance_specs(&request.session)
+                    .into_iter()
+                    .filter(|spec| deferred(&spec.id) && (all || !sessions.bridge.reuses(spec)))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        // What no request asks for any more dies here, on main.
+        self.staged.retain(|st| wanted.contains(&st.spec));
+        for spec in wanted {
+            if !self.staged.iter().any(|st| st.spec == spec) {
+                self.staged.push(Staged { spec, stage: Stage::Queued });
+            }
+        }
+        if self.staged.iter().any(|st| matches!(st.stage, Stage::Queued)) {
+            for st in &mut self.staged {
+                if matches!(st.stage, Stage::Queued) {
+                    st.stage = Stage::Announced;
+                }
+            }
+            return true;
+        }
+        if let Some(st) = self.staged.iter_mut().find(|st| matches!(st.stage, Stage::Announced)) {
+            // A factory unwind is a session fault, as when the compile makes the instance.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create(&st.spec))) {
+                Ok(made) => st.stage = Stage::Ready(made),
+                Err(payload) => {
+                    st.stage = Stage::Ready(None);
+                    sessions.fault();
+                    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+                        std::mem::forget(secondary);
+                    }
+                }
+            }
+        }
+        self.staged.iter().any(|st| !matches!(st.stage, Stage::Ready(_)))
+    }
+
+    /// Whether the instance for this slot is announced or being made, and not yet in a plan.
+    pub fn loading(&self, track: TrackId, slot: usize) -> bool {
+        self.staged.iter().any(|st| st.spec.track == track && st.spec.slot == slot && !matches!(st.stage, Stage::Ready(_)))
+    }
+
+    /// Whether any instance is waiting to be made.
+    pub fn any_loading(&self) -> bool {
+        self.staged.iter().any(|st| !matches!(st.stage, Stage::Ready(_)))
     }
 
     /// Take every possibly-panicking handle before committing the entry. On a factory

@@ -42,8 +42,9 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
         ));
     }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.instrument", "`plugin` required"))?;
-    let info = super::clap::plugin_info(plugin).ok_or_else(|| bad("mix.instrument", format!("unknown plugin `{plugin}`")))?;
-    if !info.is_instrument {
+    let (plugin_id, is_instrument, info) =
+        super::clap::plugin_head(plugin, p.get("params").is_some()).ok_or_else(|| bad("mix.instrument", format!("unknown plugin `{plugin}`")))?;
+    if !is_instrument {
         return Err(bad("mix.instrument", format!("`{plugin}` is not an instrument")));
     }
     let t = tracks_required(e, "mix.instrument", p)?.first().copied().ok_or_else(|| bad("mix.instrument", "no track"))?;
@@ -54,21 +55,24 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
     let mut values = Vec::new();
     if let Some(v) = p.get("params") {
         let obj = v.as_object().ok_or_else(|| bad("mix.instrument", "`params` must be an object"))?;
+        let info = info.ok_or_else(|| bad("mix.instrument", format!("`{plugin}` has no parameter list")))?;
         for (k, v) in obj {
             let pi = info.params.iter().find(|pi| pi.id == k).ok_or_else(|| bad("mix.instrument", format!("`{plugin}` has no parameter `{k}`")))?;
             let x = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad("mix.instrument", format!("`{k}` must be a number")))?;
             values.push((k.clone(), pi.clamp(x as f32)));
         }
     }
-    let mut ins = Insert::new(info.id);
-    fill_default_params(&mut ins, info);
+    let mut ins = Insert::new(plugin_id.as_str());
+    if let Some(info) = info {
+        fill_default_params(&mut ins, info);
+    }
     for (k, v) in values {
         ins.params.insert(k, v);
     }
     if let Some(tr) = e.session_mut().track_mut(t) {
         tr.instrument = Some(ins);
     }
-    Ok(json!({"track": t, "plugin": info.id}))
+    Ok(json!({"track": t, "plugin": plugin_id}))
 }
 
 fn set_instrument_param(e: &mut Engine, p: &Value) -> Result<Value> {

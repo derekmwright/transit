@@ -1566,10 +1566,12 @@ fn inserts_block(
         let resp = ui.interact(rr.intersect(clip), ui.id().with(("insert", id.0, *slot)), Sense::click());
         p.rect_filled(rr, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
         let text_r = rr.shrink2(vec2(4.0, 0.0));
+        let loading = app.player.as_ref().is_some_and(|pl| pl.loading(id, *slot));
+        let shown = if loading { format!("{name} ({})", crate::devices::LOADING) } else { name.clone() };
         p.with_clip_rect(text_r.intersect(clip)).text(
             text_r.left_center(),
             Align2::LEFT_CENTER,
-            &name,
+            &shown,
             FontId::proportional(10.5),
             if ins.bypass { TOKENS.text_dim } else { TOKENS.text },
         );

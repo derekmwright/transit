@@ -1301,6 +1301,11 @@ impl IPluginFactoryTrait for Factory {
     unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
         set_up_late_state();
         let cid = unsafe { *(cid as *const TUID) };
+        // A heavy library: the synth takes half a second to make (the other classes do not).
+        #[cfg(feature = "slow-create")]
+        if cid == SYNTH_CID {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         let unknown = if cid == GAIN_CID {
             ComWrapper::new(GainProcessor {
                 gain: AtomicU64::new(0.25f64.to_bits()),
