@@ -9,6 +9,7 @@ WASAPI backend.
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
 | wasapi | WASAPI | Speakers (2- Focusrite USB Audio) | default | 480 fr / 10.000 ms | 48000 | 0.407 / 1.034 / 1.665 | 0/63 | 0.00 | 3.1 / 5.0 | 247.568 / 248.599 / 249.523 (37 of 40) | 11883 / 11933 / 11977 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
 | cpal | WASAPI | Speakers (2- Focusrite USB Audio) | default | 480 fr / 10.000 ms (blocks 480 to 1056) | 48000 | 0.399 / 0.995 / 1.507 | 0/25 | 0.00 | 1.2 / 2.4 | 248.448 / 248.862 / 258.440 (12 of 12) | 11926 / 11945 / 12405 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+| cpal | ASIO | Focusrite USB ASIO | default | 256 fr / 5.333 ms | 48000 | 0.666 / 5.318 / 5.321 | 0/0 | 0.00 | 1.0 / 1.4 | 22.576 / 23.251 / 29.238 (20 of 20) | 1084 / 1116 / 1403 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | same cable, the driver's own 256-frame buffer |
 
 calibration: round trip 10525 frames (219.271 ms) +-138 frames (2.875 ms), 37 of 40 clicks paired
 
@@ -17,7 +18,10 @@ calibration: round trip 10525 frames (219.271 ms) +-138 frames (2.875 ms), 37 of
 The two backends agree within 1 ms on the host-time round trip (248.6 ms and 248.9 ms medians), so the
 roughly 248 ms is the shared-mode path through the Focusrite driver on this machine, not the backend.
 In the native stamps' own time the round trip is 10525 frames (219.3 ms) with a spread of 138 frames
-(2.9 ms), 37 of 40 clicks paired. For reference, ASIO at 256 frames is what the owner tracks through.
+(2.9 ms), 37 of 40 clicks paired. The third row is the same cable through the interface's ASIO driver at
+its own 256-frame buffer: 23.3 ms median, 20 of 20 clicks, no xruns. So the interface and its driver reach
+tracking latency; it is the Windows shared-mode path (the audio engine plus the driver's WDM buffering)
+that costs about 225 ms on this device, and exclusive mode (ADR 0016 slice e) is the way around it.
 Both runs report input xruns on an idle machine (63 in the native run, 25 in the cpal run, with 0
 output xruns); the cause is not identified (known issue K24).
 
