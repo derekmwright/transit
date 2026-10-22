@@ -97,8 +97,10 @@ The native WASAPI backend stamps its streams as `Measured` only for a device pai
 round trip was measured in the stamps' own time (ADR 0016 slice d; method in
 `../contributing/knowledge/clocks.md`). With the output cabled to an input of the same interface,
 close the app and run, from the repository root, once per rate and buffer size the app uses
-(`--period` and `--rate` are part of the calibration's key, and `--in-device` is the string the
-app's Paired input holds):
+(`--period` and `--rate` are part of the calibration's key; the record matches when `--in-device`
+names the app's Paired input, or, with Paired input on Automatic, the input the app pairs
+automatically with that output, compared without regard to case; a run that names no input
+matches Automatic only if the record names none):
 
 ```
 cargo run -p audio-bench --features native-wasapi --release -- --backend wasapi --loopback --out-device "<Scarlett out>" --in-device "<Scarlett in>" --settings "%APPDATA%\transit\ui.json"

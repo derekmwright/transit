@@ -613,8 +613,8 @@ fn the_calibration_line_reports_the_measured_pair_or_the_command_that_measures_i
         share_device: true,
         ..Default::default()
     };
-    assert_eq!(calibration_line(&saved, out, 48_000, "ui.json"), "measured 480 frames \u{b1}25 (2026-10-21) \u{b7} shared");
-    let unmeasured = calibration_line(&saved, out, 96_000, "C:/Users/me/transit/ui.json");
+    assert_eq!(calibration_line(&saved, out, None, 48_000, "ui.json"), "measured 480 frames \u{b1}25 (2026-10-21) \u{b7} shared");
+    let unmeasured = calibration_line(&saved, out, None, 96_000, "C:/Users/me/transit/ui.json");
     assert_eq!(
         unmeasured,
         format!(
@@ -624,19 +624,27 @@ fn the_calibration_line_reports_the_measured_pair_or_the_command_that_measures_i
     );
     // Exclusive is the default: its calibration is another key, and its command measures exclusive.
     let exclusive = AudioConfig { share_device: false, ..saved.clone() };
-    let line = calibration_line(&exclusive, out, 48_000, "ui.json");
+    let line = calibration_line(&exclusive, out, None, 48_000, "ui.json");
     assert!(line.starts_with("not calibrated \u{b7} exclusive: run audio-bench --backend wasapi --loopback"), "{line}");
     assert!(line.contains("--mode exclusive "), "{line}");
+    // Paired input on Automatic: a record that named the input the pairing resolved to applies.
+    let automatic = AudioConfig { input_pairing: None, ..saved.clone() };
+    assert!(calibration_line(&automatic, out, None, 48_000, "ui.json").starts_with("not calibrated"));
+    assert!(calibration_line(&automatic, out, Some("Line (Other)"), 48_000, "ui.json").starts_with("not calibrated"));
+    assert_eq!(
+        calibration_line(&automatic, out, Some(&SCARLETT_IN.to_uppercase()), 48_000, "ui.json"),
+        "measured 480 frames \u{b1}25 (2026-10-21) \u{b7} shared"
+    );
     let measured = soundcraft_playback::LoopbackCalibration {
         mode: "exclusive".into(),
         round_trip_frames: 960,
         ..calibration(out, Some(SCARLETT_IN), 48_000, 128)
     };
     let both = AudioConfig { calibrations: vec![calibration(out, Some(SCARLETT_IN), 48_000, 128), measured], ..exclusive };
-    assert_eq!(calibration_line(&both, out, 48_000, "ui.json"), "measured 960 frames \u{b1}25 (2026-10-21) \u{b7} exclusive");
+    assert_eq!(calibration_line(&both, out, None, 48_000, "ui.json"), "measured 960 frames \u{b1}25 (2026-10-21) \u{b7} exclusive");
     let other_period = AudioConfig { buffer_size: Some(64), share_device: true, ..both };
     assert!(
-        calibration_line(&other_period, out, 48_000, "ui.json").starts_with("not calibrated \u{b7} shared: run "),
+        calibration_line(&other_period, out, None, 48_000, "ui.json").starts_with("not calibrated \u{b7} shared: run "),
         "a calibration is for one buffer size"
     );
 }
@@ -942,14 +950,38 @@ fn the_window_shows_the_backend_loop_lines_under_the_open_lines_from_a_scripted_
     let lines: Vec<String> = t.layout()["opened"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert!(lines[0].starts_with("Output open"));
-    assert_eq!(lines[1], "Backend: wakes 1200, late p95 90 µs, max 90 µs; service p95 100 µs, max 100 µs; skipped 2, timeouts 0; min padding 96");
+    assert_eq!(lines[1], "Backend: wakes -, late p95 90 µs, max 90 µs; service p95 100 µs, max 100 µs; skipped 2, timeouts 0; min padding 96");
     assert!(lines[2].starts_with("Input open"));
     assert_eq!(
-        lines[3], "Backend: wakes 800, late p95 5 µs, max 5 µs; service p95 0 µs, max 0 µs; skipped 0, timeouts 1; max packets 3",
+        lines[3], "Backend: wakes -, late p95 5 µs, max 5 µs; service p95 0 µs, max 0 µs; skipped 0, timeouts 1; max packets 3",
         "the capture line ends with the most packets of a wake"
     );
+    // Two samples a second apart give a rate, not a raw counter.
+    t.time += 1.0;
+    let (mut output, mut input) = (output, input);
+    output.wakes += 100;
+    input.wakes += 99;
+    t.app.audio_devices.injected_backend = Some((Some(output), Some(input)));
+    t.frames(1);
+    let lines: Vec<String> = t.layout()["opened"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    // The first sample was taken at the window's first frame, so the span is a little over a second.
+    assert!(lines[1].contains("wakes 6") || lines[1].contains("wakes 7") || lines[1].contains("wakes 8"), "{lines:?}");
+    assert!(lines[1].starts_with("Backend: wakes ") && lines[1].contains("/s, late p95"), "a rate, not a counter: {lines:?}");
+    assert!(lines[3].starts_with("Backend: wakes ") && lines[3].contains("/s, late p95"), "{lines:?}");
     t.app.audio_devices.injected_backend = None;
     t.frames(3);
     let plain = t.layout()["opened"].as_array().unwrap().len();
     assert_eq!(plain, 2, "no snapshot, no backend lines");
+}
+
+#[test]
+fn a_wake_rate_is_the_counter_delta_over_the_time_delta() {
+    use crate::audio_devices::WakeRate;
+    let mut w = WakeRate::default();
+    assert_eq!(w.update(10.0, 1_000), None, "one sample is no rate");
+    assert_eq!(w.update(10.1, 1_010), None, "too soon: still no rate");
+    assert_eq!(w.update(11.0, 1_100), Some(100));
+    assert_eq!(w.update(11.1, 1_110), Some(100), "too soon: the previous rate stays");
+    assert_eq!(w.update(13.0, 1_300), Some(100), "200 wakes over 2 s");
+    assert_eq!(w.update(14.0, 5), None, "a counter that went down is a new stream");
 }

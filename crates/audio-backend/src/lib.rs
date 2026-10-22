@@ -384,11 +384,16 @@ impl StreamStats {
     /// own prefix): wakes, lateness and service percentiles, skips and timeouts, then the minimum
     /// padding (render) or the most packets of a wake (`capture`), and the faults when there were any.
     pub fn line(&self, capture: bool) -> String {
+        self.line_with_wakes(capture, &self.wakes.to_string())
+    }
+
+    /// [`Self::line`] with `wakes` as the text of the wake figure (a total, or a rate).
+    pub fn line_with_wakes(&self, capture: bool, wakes: &str) -> String {
         let tail = if capture { format!("max packets {}", self.max_packets_per_wake) } else { format!("min padding {}", self.min_padding_frames) };
         let faults = if self.faults > 0 { format!("; faults {}", self.faults) } else { String::new() };
         format!(
             "wakes {}, late p95 {} µs, max {} µs; service p95 {} µs, max {} µs; skipped {}, timeouts {}; {tail}{faults}",
-            self.wakes,
+            wakes,
             self.wake_late_p95_us(),
             self.max_wake_late_us,
             self.service_p95_us(),
@@ -500,6 +505,11 @@ pub trait Backend {
     /// The input format `endpoint` offers at `rate` (else its default), for the I/O map and a
     /// duplex open.
     fn capture_format(&self, endpoint: &Endpoint, rate: Option<u32>) -> Result<Format, String>;
+    /// The name of the capture endpoint paired with `render` (the user's pairing, else the same
+    /// container), where the backend pairs endpoints; a loopback calibration of that input applies.
+    fn paired_input_name(&self, _render: &Endpoint) -> Option<String> {
+        None
+    }
     /// Open a render stream, not started. The adapter owns the sample-format fan-out.
     fn open_render(
         &self,

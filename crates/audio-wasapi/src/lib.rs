@@ -173,6 +173,10 @@ impl ab::Backend for WasapiBackend {
         Ok(ab::Format { rate: rate.unwrap_or(info.mix.rate), ..info.mix.format() })
     }
 
+    fn paired_input_name(&self, render: &ab::Endpoint) -> Option<String> {
+        self.paired_input(render).ok().map(|info| info.name)
+    }
+
     fn open_render(
         &self,
         endpoint: &ab::Endpoint,

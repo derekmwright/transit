@@ -115,7 +115,9 @@ pub const MODE_EXCLUSIVE: &str = "exclusive";
 pub struct LoopbackCalibration {
     /// The output device name, as the backend lists it.
     pub device: String,
-    /// The paired input as the user named it (`input_pairing`); `None` pairs by container id.
+    /// The paired input: the endpoint name the run named (`audio-bench --in-device`), or `None`
+    /// when it named none. It matches a config's pairing by [`input_matches`]: the same name
+    /// (case-insensitive), both unnamed, or an automatic pairing that resolved to this endpoint.
     pub input: Option<String>,
     /// How the device was opened ([`MODE_SHARED`] or [`MODE_EXCLUSIVE`]).
     pub mode: String,
@@ -135,7 +137,7 @@ impl LoopbackCalibration {
     /// Whether `other` measured the same device pair under the same conditions.
     pub fn same_key(&self, other: &Self) -> bool {
         self.device.eq_ignore_ascii_case(&other.device)
-            && self.input == other.input
+            && self.input.as_deref().map(str::to_lowercase) == other.input.as_deref().map(str::to_lowercase)
             && self.mode == other.mode
             && self.rate == other.rate
             && self.period == other.period
@@ -151,33 +153,59 @@ impl LoopbackCalibration {
     }
 }
 
+/// Whether a calibration whose run named `recorded` measured the pair a config pairs as `pairing`:
+/// both unnamed, both naming the same endpoint (case-insensitive), or an automatic pairing
+/// (`pairing` is `None`) that resolved to the endpoint `recorded` names (`resolved`).
+pub fn input_matches(recorded: Option<&str>, pairing: Option<&str>, resolved: Option<&str>) -> bool {
+    match (recorded, pairing) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (Some(a), None) => resolved.is_some_and(|r| a.eq_ignore_ascii_case(r)),
+        (None, Some(_)) => false,
+    }
+}
+
 impl AudioConfig {
     /// The saved calibration of the pair opened on output `device` in `mode` ([`MODE_SHARED`] or
     /// [`MODE_EXCLUSIVE`]) at `rate` and the requested `period` (0 is the driver's default), under
     /// this config's paired input.
     pub fn find_calibration(&self, device: &str, mode: &str, rate: u32, period: u32) -> Option<&LoopbackCalibration> {
-        let want = LoopbackCalibration {
-            device: device.to_owned(),
-            input: self.input_pairing.clone(),
-            mode: mode.to_owned(),
-            rate,
-            period,
-            round_trip_frames: 0,
-            spread_frames: 0,
-            measured_at: String::new(),
-        };
-        self.calibrations.iter().find(|c| c.same_key(&want))
+        self.find_calibration_paired(device, None, mode, rate, period)
+    }
+
+    /// [`Self::find_calibration`] when the automatic pairing is known to resolve to the input
+    /// `paired_input` (see [`input_matches`]).
+    pub fn find_calibration_paired(
+        &self,
+        device: &str,
+        paired_input: Option<&str>,
+        mode: &str,
+        rate: u32,
+        period: u32,
+    ) -> Option<&LoopbackCalibration> {
+        self.calibrations.iter().find(|c| {
+            c.device.eq_ignore_ascii_case(device)
+                && input_matches(c.input.as_deref(), self.input_pairing.as_deref(), paired_input)
+                && c.mode == mode
+                && c.rate == rate
+                && c.period == period
+        })
     }
 
     /// The calibration for the pair opened on output `device` with `request`; `None` when no saved
     /// calibration has exactly that key.
-    pub fn calibration_for(&self, device: &str, request: &transit_audio_backend::OpenRequest) -> Option<transit_audio_backend::Calibration> {
+    pub fn calibration_for(
+        &self,
+        device: &str,
+        paired_input: Option<&str>,
+        request: &transit_audio_backend::OpenRequest,
+    ) -> Option<transit_audio_backend::Calibration> {
         let mode = match request.mode {
             transit_audio_backend::Mode::Shared => MODE_SHARED,
             transit_audio_backend::Mode::Exclusive => MODE_EXCLUSIVE,
             _ => return None,
         };
-        self.find_calibration(device, mode, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
+        self.find_calibration_paired(device, paired_input, mode, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
     }
 }
 
@@ -450,17 +478,37 @@ mod tests {
         use transit_audio_backend::Period;
         let cal = sample_calibration();
         let cfg = AudioConfig { input_pairing: cal.input.clone(), calibrations: vec![cal.clone()], ..Default::default() };
-        let found = cfg.calibration_for("speakers (scarlett 2i2)", &request(48_000, Period::Frames(128))).expect("the key matches");
+        let found = cfg.calibration_for("speakers (scarlett 2i2)", None, &request(48_000, Period::Frames(128))).expect("the key matches");
         assert_eq!((found.round_trip_ns, found.uncertainty_ns), (10_000_000, 520_833));
         let device = "Speakers (Scarlett 2i2)";
-        assert!(cfg.calibration_for(device, &request(44_100, Period::Frames(128))).is_none(), "another rate");
-        assert!(cfg.calibration_for(device, &request(48_000, Period::Frames(64))).is_none(), "another period");
-        assert!(cfg.calibration_for(device, &request(48_000, Period::Default)).is_none(), "the default period is not 128");
-        assert!(cfg.calibration_for("Headphones", &request(48_000, Period::Frames(128))).is_none(), "another device");
+        assert!(cfg.calibration_for(device, None, &request(44_100, Period::Frames(128))).is_none(), "another rate");
+        assert!(cfg.calibration_for(device, None, &request(48_000, Period::Frames(64))).is_none(), "another period");
+        assert!(cfg.calibration_for(device, None, &request(48_000, Period::Default)).is_none(), "the default period is not 128");
+        assert!(cfg.calibration_for("Headphones", None, &request(48_000, Period::Frames(128))).is_none(), "another device");
         let other_input = AudioConfig { input_pairing: Some("Mic".into()), ..cfg.clone() };
-        assert!(other_input.calibration_for(device, &request(48_000, Period::Frames(128))).is_none(), "another input");
+        assert!(other_input.calibration_for(device, None, &request(48_000, Period::Frames(128))).is_none(), "another input");
         let unpaired = AudioConfig { input_pairing: None, ..cfg };
-        assert!(unpaired.calibration_for(device, &request(48_000, Period::Frames(128))).is_none(), "container-id pairing is its own key");
+        assert!(unpaired.calibration_for(device, None, &request(48_000, Period::Frames(128))).is_none(), "container-id pairing is its own key");
+    }
+
+    #[test]
+    fn a_calibration_matches_the_pairing_by_name_or_by_the_resolved_automatic_input() {
+        use transit_audio_backend::Period;
+        let req = request(48_000, Period::Frames(128));
+        let device = "Speakers (Scarlett 2i2)";
+        let named = LoopbackCalibration { input: Some("Microphone (Model 12)".into()), ..sample_calibration() };
+        let unnamed = LoopbackCalibration { input: None, ..sample_calibration() };
+        let with = |cal: &LoopbackCalibration, pairing: Option<&str>| AudioConfig {
+            input_pairing: pairing.map(str::to_owned),
+            calibrations: vec![cal.clone()],
+            ..Default::default()
+        };
+        assert!(with(&unnamed, None).calibration_for(device, None, &req).is_some(), "both unnamed");
+        assert!(with(&named, Some("microphone (model 12)")).calibration_for(device, None, &req).is_some(), "the same name, any case");
+        assert!(with(&named, None).calibration_for(device, Some("MICROPHONE (Model 12)"), &req).is_some(), "automatic resolved to the named input");
+        assert!(with(&named, None).calibration_for(device, Some("Line (Other)"), &req).is_none(), "automatic resolved to another input");
+        assert!(with(&named, None).calibration_for(device, None, &req).is_none(), "automatic with nothing resolved");
+        assert!(with(&unnamed, Some("Mic")).calibration_for(device, Some("Mic"), &req).is_none(), "a named pairing never matches an unnamed run");
     }
 
     #[test]
@@ -509,11 +557,11 @@ mod tests {
         let cfg = AudioConfig { input_pairing: shared.input.clone(), calibrations: vec![shared, exclusive], ..Default::default() };
         let device = "Speakers (Scarlett 2i2)";
         let mut req = request(48_000, Period::Frames(128));
-        assert_eq!(cfg.calibration_for(device, &req).unwrap().round_trip_ns, 10_000_000, "shared request, shared calibration");
+        assert_eq!(cfg.calibration_for(device, None, &req).unwrap().round_trip_ns, 10_000_000, "shared request, shared calibration");
         req.mode = Mode::Exclusive;
-        assert_eq!(cfg.calibration_for(device, &req).unwrap().round_trip_ns, 20_000_000, "exclusive request, exclusive calibration");
+        assert_eq!(cfg.calibration_for(device, None, &req).unwrap().round_trip_ns, 20_000_000, "exclusive request, exclusive calibration");
         let only_shared = AudioConfig { calibrations: vec![sample_calibration()], ..cfg };
-        assert!(only_shared.calibration_for(device, &req).is_none(), "a shared calibration never applies to an exclusive open");
+        assert!(only_shared.calibration_for(device, None, &req).is_none(), "a shared calibration never applies to an exclusive open");
     }
 
     #[test]

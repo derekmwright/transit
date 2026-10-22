@@ -130,8 +130,10 @@ pub fn detail_rows(t: &CallbackTelemetry) -> Vec<String> {
 }
 
 /// The Audio Devices line for the device loop of a native stream (see [`StreamStats::line`]).
-pub fn backend_line(s: &StreamStats, capture: bool) -> String {
-    format!("Backend: {}", s.line(capture))
+/// `wakes_per_second` is the rate over the last panel samples; `None` until there are two.
+pub fn backend_line(s: &StreamStats, capture: bool, wakes_per_second: Option<u64>) -> String {
+    let wakes = wakes_per_second.map_or_else(|| "-".to_owned(), |rate| format!("{rate}/s"));
+    format!("Backend: {}", s.line_with_wakes(capture, &wakes))
 }
 
 /// The host shown in the load readout: the audio system, starred when the native backend serves it

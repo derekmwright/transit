@@ -90,6 +90,9 @@ pub struct Player {
     #[cfg(not(target_arch = "wasm32"))]
     silent_stop: Arc<AtomicBool>,
     pub device_name: String,
+    /// The name of the capture endpoint the backend paired with the open output (the user's
+    /// pairing, else the shared container); `None` when the backend does not pair.
+    pub paired_input: Option<String>,
     /// The audio system (cpal host) of the open device: "ASIO", "WASAPI", ...; empty for the silent clock.
     pub device_system: String,
     /// The open device is served by the native WASAPI backend (ADR 0016), not cpal.
@@ -193,6 +196,7 @@ impl Player {
             #[cfg(not(target_arch = "wasm32"))]
             silent_stop: Arc::new(AtomicBool::new(false)),
             device_name: "No audio device (silent)".into(),
+            paired_input: None,
             device_system: String::new(),
             native_backend: false,
             device_exclusive: false,
@@ -342,6 +346,7 @@ impl Player {
         let (endpoint, system, name) = (&plan.endpoint, backend.system().to_owned(), plan.endpoint.name.clone());
         let first = plan.attempts.first().ok_or("no usable output stream")?;
         let duplex = backend.capture_with_render(endpoint);
+        let paired = if duplex { backend.paired_input_name(endpoint) } else { None };
         // Every output the stream opened, and the duplex device's inputs, get default paths; the
         // app replaces them with this machine's saved table (`set_io`).
         let inputs = if duplex { backend.capture_format(endpoint, Some(first.format.rate)).map_or(0, |format| format.channels) } else { 0 };
@@ -358,7 +363,7 @@ impl Player {
             if step.default_period {
                 request.period = ab::Period::Default;
             }
-            request.calibration = if duplex { cfg.calibration_for(&name, &request) } else { None };
+            request.calibration = if duplex { cfg.calibration_for(&name, paired.as_deref(), &request) } else { None };
             let (rate, channels) = (request.format.rate, request.format.channels);
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
@@ -410,6 +415,7 @@ impl Player {
             }
             log::info!("audio output opened with {} channels (asked for {})", achieved.format.channels, wide);
             player.device_name = name.clone();
+            player.paired_input.clone_from(&paired);
             player.device_system = system.clone();
             player.device_channels = achieved.format.channels;
             player.device_buffer = achieved.period.frames();

@@ -107,6 +107,40 @@ pub struct AudioDevicesState {
     /// render the Backend lines without a native backend.
     #[cfg(test)]
     pub(crate) injected_backend: Option<(Option<soundcraft_playback::telemetry::StreamStats>, Option<soundcraft_playback::telemetry::StreamStats>)>,
+    /// The wake counters sampled at the last panel refreshes (output, input), for the rates.
+    wake_rates: (WakeRate, WakeRate),
+}
+
+/// The device loop's wake counter at the last sample, and the rate it gave.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct WakeRate {
+    sample: Option<(f64, u64)>,
+    rate: Option<u64>,
+}
+
+impl WakeRate {
+    /// The shortest span between samples a rate is computed over, in seconds; a refresh sooner
+    /// than that shows the previous rate.
+    const MIN_SPAN: f64 = 0.5;
+
+    /// Take the counter `wakes` read at UI time `now` (seconds); returns the wakes per second
+    /// since the previous sample, `None` until there are two. A counter that went down is a new
+    /// stream: start over.
+    pub(crate) fn update(&mut self, now: f64, wakes: u64) -> Option<u64> {
+        match self.sample {
+            Some((at, before)) if wakes >= before && now > at => {
+                if now - at >= Self::MIN_SPAN {
+                    self.rate = Some(((wakes - before) as f64 / (now - at)).round() as u64);
+                    self.sample = Some((now, wakes));
+                }
+            }
+            _ => {
+                self.rate = None;
+                self.sample = Some((now, wakes));
+            }
+        }
+        self.rate
+    }
 }
 
 impl AudioDevicesState {
@@ -458,18 +492,20 @@ pub fn share_hint(shared: bool) -> &'static str {
 /// The Calibration line under the Paired input: the saved loopback of this exact pair, rate,
 /// buffer and mode (the checkbox's: shared or exclusive), or the command that measures it
 /// (`device` is the output's name, `settings` the `ui.json` to merge into; close the app before
-/// running it).
-pub fn calibration_line(cfg: &AudioConfig, device: &str, rate: u32, settings: &str) -> String {
+/// running it). `paired_input` is the input the automatic pairing resolved to (the open Player's,
+/// else the open recorder's), `None` when none is open for `device`: a record naming it matches an
+/// automatic pairing (see [`devices::input_matches`]).
+pub fn calibration_line(cfg: &AudioConfig, device: &str, paired_input: Option<&str>, rate: u32, settings: &str) -> String {
     let period = cfg.buffer_size.unwrap_or(0);
     let mode = if cfg.share_device { devices::MODE_SHARED } else { devices::MODE_EXCLUSIVE };
-    if let Some(c) = cfg.find_calibration(device, mode, rate, period) {
+    if let Some(c) = cfg.find_calibration_paired(device, paired_input, mode, rate, period) {
         return format!("measured {} frames \u{b1}{} ({}) \u{b7} {mode}", c.round_trip_frames, c.spread_frames, c.measured_at);
     }
     let mut command = format!("audio-bench --backend wasapi --loopback --out-device \"{device}\"");
     if !cfg.share_device {
         command.push_str(" --mode exclusive");
     }
-    if let Some(input) = &cfg.input_pairing {
+    if let Some(input) = cfg.input_pairing.as_deref().or(paired_input) {
         command.push_str(&format!(" --in-device \"{input}\""));
     }
     if period != 0 {
@@ -662,7 +698,10 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     label(ui, "Calibration");
                     let rate = draft.sample_rate.or(app.player.as_ref().map(|p| p.device_rate)).unwrap_or(48_000);
                     let device = dev.map(|d| d.name.as_str()).or(app.player.as_ref().map(|p| p.device_name.as_str())).unwrap_or_default();
-                    let line = calibration_line(&draft, device, rate, &settings_path(app));
+                    let open_pair =
+                        app.player.as_ref().filter(|p| p.device_name.eq_ignore_ascii_case(device)).and_then(|p| p.paired_input.as_deref());
+                    let paired = open_pair.or_else(|| app.recorder.as_ref().map(|r| r.device_name.as_str()));
+                    let line = calibration_line(&draft, device, paired, rate, &settings_path(app));
                     ui.label(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5));
                     lay.calibration = Some(line);
                     ui.end_row();
@@ -683,7 +722,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 ui.end_row();
             });
             ui.add_space(SPACE);
-            lay.opened = opened_lines(app);
+            lay.opened = opened_lines(app, ui.input(|i| i.time));
             for line in &lay.opened {
                 ui.label(egui::RichText::new(line).color(TOKENS.text_dim).size(11.5));
             }
@@ -785,7 +824,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
 }
 
 /// What is open now: the output with its rate, channels and buffer, and the input.
-fn opened_lines(app: &StudioApp) -> Vec<String> {
+fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
     let mut lines = Vec::new();
     match &app.player {
         Some(p) => {
@@ -799,12 +838,17 @@ fn opened_lines(app: &StudioApp) -> Vec<String> {
     let input = app.recorder.as_ref().and_then(|r| r.backend_stats());
     #[cfg(test)]
     let (output, input) = app.audio_devices.injected_backend.unwrap_or((output, input));
-    lines.extend(output.map(|s| crate::telemetry::backend_line(&s, false)));
+    let (mut out_rate, mut in_rate) = app.audio_devices.wake_rates;
+    let output_rate = output.and_then(|s| out_rate.update(now, s.wakes));
+    let input_rate = input.and_then(|s| in_rate.update(now, s.wakes));
+    let keep = |present: bool, rate: WakeRate| if present { rate } else { WakeRate::default() };
+    app.audio_devices.wake_rates = (keep(output.is_some(), out_rate), keep(input.is_some(), in_rate));
+    lines.extend(output.map(|s| crate::telemetry::backend_line(&s, false, output_rate)));
     lines.push(match &app.recorder {
         Some(r) => format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels),
         None => "Input open: none yet (it opens when a track is armed or monitored)".into(),
     });
-    lines.extend(input.map(|s| crate::telemetry::backend_line(&s, true)));
+    lines.extend(input.map(|s| crate::telemetry::backend_line(&s, true, input_rate)));
     lines
 }
 
