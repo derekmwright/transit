@@ -31,6 +31,7 @@ pub mod metronome;
 mod midi_input;
 pub mod mixer;
 pub mod plugin_scan;
+pub mod recent;
 pub mod shortcuts;
 pub mod telemetry;
 pub mod tempo_edit;
@@ -60,6 +61,9 @@ pub struct UiState {
     pub audio: soundcraft_playback::AudioConfig,
     /// This machine's I/O paths, one table per audio system plus device (ADR 0015).
     pub io_maps: Vec<soundcraft_model::IoMap>,
+    /// File > Open Recent: sessions last opened or saved here, most recent first (at most 10).
+    /// A per-machine preference; never part of the document or its undo history.
+    pub recent_files: Vec<recent::RecentFile>,
     /// The user's own VST3 and CLAP folders.
     pub plugin_dirs: plugin_scan::PluginDirs,
     /// Plug-in editors to have open, as (track, slot); the instrument is
@@ -140,6 +144,7 @@ impl Default for UiState {
         UiState {
             audio: soundcraft_playback::AudioConfig::default(),
             io_maps: Vec::new(),
+            recent_files: Vec::new(),
             plugin_dirs: plugin_scan::PluginDirs::default(),
             plugin_windows: Vec::new(),
             track_height: 46.0,
@@ -306,6 +311,8 @@ pub struct StudioApp {
     pub auto: automation::AutoState,
     /// Audio › Audio Devices: the window, its draft choices and the device listing.
     pub audio_devices: audio_devices::AudioDevicesState,
+    /// The Open Recent entries as last drawn (empty while the submenu is closed).
+    pub recent_menu: Vec<recent::RecentItemLayout>,
 }
 
 impl StudioApp {
@@ -370,6 +377,7 @@ impl StudioApp {
             finish: finish::FinishState::default(),
             auto: automation::AutoState::default(),
             audio_devices: audio_devices::AudioDevicesState::default(),
+            recent_menu: Vec::new(),
         }
     }
 
@@ -470,6 +478,9 @@ impl StudioApp {
                 }
                 if replacing || (id.starts_with("session.save") && !self.engine.is_dirty()) {
                     self.release_autosave(false);
+                }
+                if matches!(id, "session.open" | "session.save" | "session.save_as") {
+                    self.note_recent();
                 }
                 if id == "app.quit" {
                     self.quit_requested = true;
@@ -861,6 +872,7 @@ impl StudioApp {
             "finish": self.finish.inspect(),
             "automation": self.auto.layout,
             "audio_devices": self.audio_devices.layout,
+            "recent_menu": self.recent_menu,
             "theme": if theme::current() == egui::Theme::Light { "light" } else { "dark" },
         })
     }
@@ -876,6 +888,8 @@ mod browser_tests;
 mod groups_tests;
 #[cfg(test)]
 mod keys_tests;
+#[cfg(test)]
+mod recent_tests;
 #[cfg(test)]
 mod slice5_tests;
 #[cfg(test)]

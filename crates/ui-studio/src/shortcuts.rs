@@ -80,6 +80,7 @@ pub enum Action {
     Cycle,
     New,
     Open,
+    OpenRecent,
     Save,
     SaveAs,
     Undo,
@@ -203,6 +204,7 @@ pub const TABLE: &[Shortcut] = &[
     // File.
     row(A::New, "New", CMD, Key::N, S::Global, "All DAWs."),
     row(A::Open, "Open…", CMD, Key::O, S::Global, "All DAWs."),
+    row(A::OpenRecent, "Open Most Recent", CMD_SHIFT, Key::O, S::Global, "Ours. Opens the first Open Recent entry."),
     row(A::SaveAs, "Save As…", CMD_SHIFT, Key::S, S::Global, "All DAWs. Checked before Save."),
     row(A::Save, "Save", CMD, Key::S, S::Global, "All DAWs."),
     row(A::Bounce, "Bounce…", CMD_SHIFT, Key::R, S::Global, "Ableton (Export Audio/Video). Checked before Rename."),

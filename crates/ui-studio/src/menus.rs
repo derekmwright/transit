@@ -44,6 +44,7 @@ impl StudioApp {
 
 pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
     app.arrange.bar_menu.clear();
+    app.recent_menu.clear();
     egui::Panel::top("menu_bar")
         .exact_size(24.0)
         .frame(egui::Frame::NONE.fill(TOKENS.panel).inner_margin(egui::Margin::symmetric(crate::theme::SPACE as i8, 2)))
@@ -58,6 +59,7 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ui.close();
                         app.open_dialog();
                     }
+                    crate::recent::menu(app, ui);
                     if ui.button("Save").clicked() {
                         ui.close();
                         app.save();
@@ -374,6 +376,9 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if pressed(ctx, A::Save) {
         app.save();
+    }
+    if pressed(ctx, A::OpenRecent) {
+        app.open_most_recent();
     }
     if pressed(ctx, A::Open) {
         app.open_dialog();

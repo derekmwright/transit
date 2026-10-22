@@ -133,6 +133,22 @@ mod tests {
     }
 
     #[test]
+    fn recent_files_round_trip_through_ui_json_and_old_files_load_without_them() {
+        let dir = std::env::temp_dir().join(format!("transit-recent-files-{}", std::process::id()));
+        let path = dir.join("ui.json");
+        let mut ui = soundcraft_ui_studio::UiState::default();
+        ui.remember_recent(Path::new("/music/a.scraft"), 100);
+        ui.remember_recent(Path::new("/music/b.scraft"), 200);
+        save_ui(&path, &ui).unwrap();
+        assert_eq!(load_ui(&path).unwrap().unwrap().recent_files, ui.recent_files);
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("recent_files");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(load_ui(&path).unwrap().unwrap().recent_files.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!("transit-ui-prefs-{}", std::process::id()));
         let path = dir.join("ui.json");

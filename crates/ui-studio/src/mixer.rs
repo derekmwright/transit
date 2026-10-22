@@ -314,7 +314,7 @@ pub fn balance_of(pan: &[f32]) -> f32 {
     }
 }
 
-fn r4(r: Rect) -> R4 {
+pub(crate) fn r4(r: Rect) -> R4 {
     [r.min.x, r.min.y, r.max.x, r.max.y]
 }
 
