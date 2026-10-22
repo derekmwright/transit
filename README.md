@@ -6,6 +6,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/derekmwright/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/derekmwright/transit/actions/workflows/ci.yml/badge.svg"></a>
+</p>
+
 A desktop DAW built on the [SoundCraft](https://github.com/storytold/soundcraft) engine, with
 Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
@@ -17,9 +21,6 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 > Releases are frequent, and each lists its
 > [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
 > help right now: see [How to help](#how-to-help).
-
-[![CI](https://github.com/derekmwright/transit/actions/workflows/ci.yml/badge.svg)](https://github.com/derekmwright/transit/actions/workflows/ci.yml)
-Every pull request and push to `main` is checked with clippy, tests and the layer rules on Windows, Linux and macOS, plus the web build and the ASIO and native WASAPI features. Hardware tests are never CI gates.
 
 ![Arrangement view](docs/images/transit-arrange.png)
 
@@ -147,6 +148,10 @@ Expect rough edges and breaking changes to the session format. Back up anything 
 
 You need a Rust toolchain at 1.90 or newer (`rust-version` in `Cargo.toml`). On Linux, install
 `libasound2-dev` and `pkg-config` first.
+
+Every pull request and push to `main` is checked with clippy, tests and the layer rules on Windows,
+Linux and macOS, plus the web build and the ASIO and native WASAPI features. Hardware tests are
+never CI gates.
 
 ```sh
 cargo build -p transit --release
