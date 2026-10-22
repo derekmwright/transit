@@ -88,6 +88,9 @@ jobs:
           } else {
             "- Audio is WASAPI only; this build has no ASIO support (an ASIO build is published beside it)."
           }
+          $notice = if ("${{ matrix.asio }}" -eq "true") {
+            "`n" + 'ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.'
+          } else { "" }
           @"
           transit for Windows (pre-alpha)
 
@@ -95,6 +98,7 @@ jobs:
           - The program is unsigned. If SmartScreen blocks it, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
           - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
+          $notice
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
           Compress-Archive -Path $d -DestinationPath "$d.zip"
       - name: Package (macOS, Linux)
