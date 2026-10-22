@@ -93,6 +93,10 @@ impl Default for Metro {
     }
 }
 
+/// What the status line says when a driver asked to be reset ([`OutputTrouble::ResetRequested`],
+/// and the input's [`record::Trouble::Device`] for the same request).
+pub const RESET_REQUESTED_TEXT: &str = "ASIO driver asked for a reset; reopen the device";
+
 /// What stopped the audio output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputTrouble {
@@ -102,6 +106,9 @@ pub enum OutputTrouble {
     Gone,
     /// The device stopped asking for audio while playing.
     Stalled,
+    /// The driver asked to be reopened (ASIO `kAsioResetRequest`, or its rate changed under the
+    /// stream); the output is silent until the device is reopened.
+    ResetRequested,
 }
 
 /// How the audio output is doing, for the UI.
@@ -111,6 +118,8 @@ struct Fault {
     /// A block panicked: output stays silent from then on.
     failed: AtomicBool,
     gone: AtomicBool,
+    /// The driver asked for a reset (set with `gone`, which silences the output).
+    reset: AtomicBool,
     /// Blocks so far, to tell a device that stopped asking for audio.
     beats: std::sync::atomic::AtomicU64,
     /// The UI has been told.
@@ -122,6 +131,8 @@ impl Fault {
     fn trouble(&self, stalled: bool) -> Option<OutputTrouble> {
         let trouble = if self.failed.load(Ordering::Relaxed) {
             OutputTrouble::Bug
+        } else if self.reset.load(Ordering::Relaxed) {
+            OutputTrouble::ResetRequested
         } else if self.gone.load(Ordering::Relaxed) {
             OutputTrouble::Gone
         } else if stalled {
@@ -135,7 +146,8 @@ impl Fault {
 
 /// The input a player opened with its output (`Backend::capture_with_render`).
 enum HeldInput {
-    /// None: the input opens on demand ([`record::Recorder::open_with`]).
+    /// None: the input opens on demand, through the backend that serves the output
+    /// ([`player::Player::open_input`]).
     No,
     /// The input, while the player holds it (`None` while the UI has it).
     Held(Option<record::Recorder>),

@@ -222,7 +222,7 @@ fn the_backend_selector_is_offered_only_with_the_feature_on_the_wasapi_system() 
     let compiled = soundcraft_playback::devices::NATIVE_WASAPI_COMPILED;
     assert_eq!(has_control(&t, "backend"), compiled, "WASAPI is the default system of the fake devices");
     t.pick("system", "ASIO");
-    assert!(!has_control(&t, "backend"), "no backend choice on ASIO");
+    assert_eq!(has_control(&t, "backend"), soundcraft_playback::devices::NATIVE_ASIO_COMPILED, "ASIO has a choice only with native ASIO built");
     t.pick("system", "WASAPI");
     assert_eq!(has_control(&t, "backend"), compiled);
     if compiled {
@@ -233,6 +233,89 @@ fn the_backend_selector_is_offered_only_with_the_feature_on_the_wasapi_system() 
         assert_eq!(t.reopened().last().map(|c| c.backend), Some(Backend::NativeWasapi), "changing the backend reopens the device");
         assert_eq!(t.app.ui.audio.backend, Backend::NativeWasapi);
     }
+}
+
+const MODEL12: &str = "Model Mixer ASIO Driver";
+
+/// Fake devices with the ASIO system as the native backend lists it: two drivers by registry name,
+/// the Model 12 probed at 12 in / 10 out, and one driver that failed to load.
+fn asio_devices() -> Value {
+    json!({"systems": [
+        {"name": "WASAPI", "is_default": true, "outputs": [{"name": "Speakers (Realtek)", "is_default": true}], "inputs": []},
+        {"name": "ASIO",
+         "outputs": [{"name": MODEL12, "max_channels": 10, "is_default": true}, {"name": "Focusrite USB ASIO", "max_channels": 2}],
+         "inputs": [{"name": MODEL12, "max_channels": 12, "is_default": true}, {"name": "Focusrite USB ASIO", "max_channels": 2}],
+         "diagnostics": ["Old Interface ASIO: init failed: No device connected"]}
+    ]})
+}
+
+#[test]
+fn the_asio_system_lists_its_drivers_and_says_which_failed_to_load() {
+    let mut t = T::new();
+    t.control("audio.fake_devices", asio_devices()).unwrap();
+    t.open_window();
+    assert!(t.layout()["diagnostics"].as_array().unwrap().is_empty(), "WASAPI has none");
+    t.pick("system", "ASIO");
+    assert_eq!(t.layout()["diagnostics"], json!(["Not loaded: Old Interface ASIO: init failed: No device connected"]));
+    t.click(mid(t.control_rect("output")));
+    let outputs: Vec<String> =
+        t.layout()["items"].as_array().unwrap().iter().filter(|i| i["value"] == "output").map(|i| i["label"].as_str().unwrap().to_string()).collect();
+    assert_eq!(outputs, ["System default".to_string(), format!("{MODEL12} · 10 ch"), "Focusrite USB ASIO · 2 ch".to_string()]);
+}
+
+#[test]
+fn native_asio_is_chosen_on_the_asio_system_with_its_calibration_line_and_driver_settings() {
+    let mut t = T::new();
+    t.control("audio.fake_devices", asio_devices()).unwrap();
+    t.open_window();
+    t.pick("system", "ASIO");
+    if !soundcraft_playback::devices::NATIVE_ASIO_COMPILED {
+        assert!(!has_control(&t, "backend"));
+        return;
+    }
+    t.click(mid(t.control_rect("backend")));
+    let offered: Vec<String> = t.layout()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["value"] == "backend")
+        .map(|i| i["label"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(offered, ["Auto", "cpal", Backend::NativeAsio.label()], "ASIO offers its own native backend, not WASAPI's");
+    t.click(mid(T::rect(&t.layout()["items"], Some(Backend::NativeAsio.label()), "backend")));
+    assert_eq!(t.app.audio_devices.draft.backend, Backend::NativeAsio);
+    assert!(!has_control(&t, "paired_input") && !has_control(&t, "share_device"), "no pairing and no sharing choice on ASIO");
+    let line = t.layout()["calibration"].as_str().unwrap().to_string();
+    assert!(line.starts_with("not calibrated \u{b7} asio: the driver's own latency figures"), "{line}");
+    assert!(!has_control(&t, "panel"), "nothing runs on ASIO yet");
+    t.pick("output", &format!("{MODEL12} · 10 ch"));
+    t.click(mid(t.control_rect("apply")));
+    let applied = t.reopened().last().cloned().unwrap();
+    assert_eq!((applied.backend, applied.system.as_deref(), applied.output.as_deref()), (Backend::NativeAsio, Some("ASIO"), Some(MODEL12)));
+    let panel = T::rect(&t.layout()["controls"], Some(crate::audio_devices::DRIVER_SETTINGS), "panel");
+    t.click(mid(panel));
+    assert_eq!(t.app.audio_devices.panel_opened.as_deref(), Some(MODEL12), "Driver settings opens the running driver's panel");
+    // Back on WASAPI the ASIO choice does not carry over.
+    t.pick("system", "WASAPI");
+    assert_eq!(t.app.audio_devices.draft.backend, Backend::Auto);
+}
+
+#[test]
+fn the_open_lines_and_the_load_readout_say_what_a_native_stream_reported() {
+    use crate::audio_devices::achieved_detail;
+    use crate::telemetry::native_host_name;
+    assert_eq!(native_host_name("ASIO", true, false), "ASIO*", "native ASIO has one mode");
+    assert_eq!(native_host_name("ASIO", false, false), "ASIO", "cpal's ASIO host is unstarred");
+    assert_eq!(native_host_name("WASAPI", true, true), "WASAPI* exclusive");
+    assert_eq!(native_host_name("WASAPI", true, false), "WASAPI* shared");
+    // The sample format as the backend names it (`SampleFormat::I24`), lowercased.
+    #[derive(Debug)]
+    enum Sample {
+        I24,
+    }
+    let detail = achieved_detail(Some(Sample::I24), Some(std::time::Duration::from_micros(15_760)), "out");
+    assert_eq!(detail, " · i24 · 15.8 ms out");
+    assert_eq!(achieved_detail(None::<Sample>, None, "in"), "");
 }
 
 #[test]
@@ -570,6 +653,31 @@ mod io_paths {
         t.click(mid(item(&t, "io_channel:Out 3-4", "4")));
         assert_eq!(t.app.engine.io_revision(), revision + 1);
         assert!(t.app.status.contains("1 to 16"), "{}", t.app.status);
+    }
+
+    #[test]
+    fn the_channel_picker_lists_every_channel_of_a_12_in_10_out_driver_by_its_name() {
+        use crate::audio_devices_io::{ChannelNames, channel_text};
+        let mut t = T::new();
+        t.app.engine.set_io_map(IoMap::for_device("ASIO", "Model Mixer ASIO Driver", 12, 10));
+        let names = |prefix: &str, n: u16| (1..=n).map(|c| format!("{prefix} {c}")).collect();
+        t.app.audio_devices.fake_channel_names = Some(ChannelNames { outputs: names("OUT", 10), inputs: names("IN", 12) });
+        t.open_window();
+        assert_eq!((t.layout()["io"]["inputs"].clone(), t.layout()["io"]["outputs"].clone()), (json!(12), json!(10)));
+        t.click(mid(item(&t, "io_channels:In 1", "Channels")));
+        let picks: Vec<String> = t.layout()["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["value"] == "io_channel:In 1")
+            .map(|c| c["label"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(picks, (1..=12).map(|c| format!("IN {c}")).collect::<Vec<_>>(), "every input, by the driver's name");
+        t.click(mid(item(&t, "io_channels:Out 1-2", "Channels")));
+        t.click(mid(item(&t, "io_channel:Out 1-2", "OUT 8")));
+        assert_eq!(t.app.engine.io_map().path("Out 1-2").unwrap().channels, [0, 1, 7], "a named channel is a channel like any other");
+        assert_eq!(channel_text(0, &["Mic/Line".into()]), "1 Mic/Line");
+        assert_eq!(channel_text(2, &[]), "3", "unnamed channels keep their number");
     }
 
     #[test]

@@ -32,10 +32,13 @@ pub enum Backend {
     /// The native WASAPI backend (shared mode by default, exclusive on request; ADR 0016). Used only on the WASAPI system
     /// of a build with the `native-wasapi` feature; otherwise, or if it fails to open, cpal.
     NativeWasapi,
+    /// The native ASIO backend (`transit-audio-asio`, draft ADR 0016 amendment). Used only on the ASIO system of a
+    /// 64-bit Windows build with the `native-asio` feature; otherwise, or if it fails to open, cpal.
+    NativeAsio,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 3] = [Backend::Auto, Backend::Cpal, Backend::NativeWasapi];
+    pub const ALL: [Backend; 4] = [Backend::Auto, Backend::Cpal, Backend::NativeWasapi, Backend::NativeAsio];
 
     /// The label of the Audio Devices selector.
     pub const fn label(self) -> &'static str {
@@ -43,28 +46,67 @@ impl Backend {
             Backend::Auto => "Auto",
             Backend::Cpal => "cpal",
             Backend::NativeWasapi => "Native WASAPI (experimental)",
+            Backend::NativeAsio => "Native ASIO (experimental)",
+        }
+    }
+
+    /// The choices the Backend selector offers on `system`: Auto, cpal, and the native backend of
+    /// that system where this build has it.
+    pub fn offered(system: Option<&str>) -> Vec<Backend> {
+        Self::ALL.into_iter().filter(|b| !b.is_native() || b.native_on(system)).collect()
+    }
+
+    /// Whether this is one of the native backends.
+    pub const fn is_native(self) -> bool {
+        matches!(self, Backend::NativeWasapi | Backend::NativeAsio)
+    }
+
+    /// Whether this choice opens a native backend on `system` in this build.
+    pub fn native_on(self, system: Option<&str>) -> bool {
+        match self {
+            Backend::NativeWasapi => native_wasapi_offered(system),
+            Backend::NativeAsio => native_asio_offered(system),
+            Backend::Auto | Backend::Cpal => false,
         }
     }
 }
 
 /// Whether this build can open the native WASAPI backend (Windows with the `native-wasapi` feature).
 pub const NATIVE_WASAPI_COMPILED: bool = cfg!(all(windows, feature = "native-wasapi"));
+/// Whether this build can open the native ASIO backend (64-bit Windows with the `native-asio` feature).
+pub const NATIVE_ASIO_COMPILED: bool = cfg!(all(windows, target_pointer_width = "64", feature = "native-asio"));
 
 /// Whether `system` (the choice's audio system; `None` is the platform default) is WASAPI.
 pub fn is_wasapi_system(system: Option<&str>) -> bool {
     system.map_or(cfg!(windows), |s| s.eq_ignore_ascii_case("WASAPI"))
 }
 
-/// Whether the Backend selector applies: the feature is compiled in and the system is WASAPI.
+/// Whether `system` is ASIO (never the default system).
+pub fn is_asio_system(system: Option<&str>) -> bool {
+    system.is_some_and(|s| s.eq_ignore_ascii_case(ASIO_SYSTEM))
+}
+
+/// Whether the native WASAPI choice applies: the feature is compiled in and the system is WASAPI.
 pub fn native_wasapi_offered(system: Option<&str>) -> bool {
     NATIVE_WASAPI_COMPILED && is_wasapi_system(system)
+}
+
+/// Whether the native ASIO choice applies: the feature is compiled in and the system is ASIO.
+pub fn native_asio_offered(system: Option<&str>) -> bool {
+    NATIVE_ASIO_COMPILED && is_asio_system(system)
+}
+
+/// Whether the Backend selector is shown for `system`: a native backend can serve it in this build.
+pub fn native_offered(system: Option<&str>) -> bool {
+    native_wasapi_offered(system) || native_asio_offered(system)
 }
 
 /// The user's audio device choice. Every field is optional: `None` means "the system default".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    /// Which backend opens the device on the WASAPI system (`Auto` is cpal in this slice).
+    /// Which backend opens the device: a native one where it serves the chosen system (WASAPI or
+    /// ASIO, see [`Backend::native_on`]), else cpal (`Auto` is cpal).
     pub backend: Backend,
     /// Audio system (cpal host name: "WASAPI", "ASIO", "CoreAudio", "ALSA", "JACK", ...).
     pub system: Option<String>,
@@ -79,7 +121,7 @@ pub struct AudioConfig {
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
     /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`). Only the
-    /// native WASAPI backend applies one, and only on an exact key match.
+    /// native backends apply one, and only on an exact key match.
     pub calibrations: Vec<LoopbackCalibration>,
     /// The native WASAPI backend opens the device shared (through the Windows mixer), which is its
     /// default; false asks for exclusive mode (ADR 0016, amendment 2 of 2026-10-22). Missing in a
@@ -107,6 +149,22 @@ impl Default for AudioConfig {
 pub const MODE_SHARED: &str = "shared";
 /// The `mode` key of an exclusive-mode calibration (`audio-bench --mode exclusive`).
 pub const MODE_EXCLUSIVE: &str = "exclusive";
+/// The `mode` key of a calibration of a native ASIO driver (its device is the driver's registry
+/// name; ASIO has one mode).
+pub const MODE_ASIO: &str = "asio";
+
+/// The `mode` key a stream of `system` opened in `mode` is calibrated under: [`MODE_ASIO`] on ASIO,
+/// else the WASAPI mode; `None` for a mode no calibration names.
+pub fn calibration_mode(system: &str, mode: transit_audio_backend::Mode) -> Option<&'static str> {
+    if system.eq_ignore_ascii_case(ASIO_SYSTEM) {
+        return Some(MODE_ASIO);
+    }
+    match mode {
+        transit_audio_backend::Mode::Shared => Some(MODE_SHARED),
+        transit_audio_backend::Mode::Exclusive => Some(MODE_EXCLUSIVE),
+        _ => None,
+    }
+}
 
 /// One measured loopback of an output/input pair. The key is `(device, input, mode, rate,
 /// period)`; a calibration applies to a stream pair only when every part of the key is equal,
@@ -119,7 +177,7 @@ pub struct LoopbackCalibration {
     /// when it named none. It matches a config's pairing by [`input_matches`]: the same name
     /// (case-insensitive), both unnamed, or an automatic pairing that resolved to this endpoint.
     pub input: Option<String>,
-    /// How the device was opened ([`MODE_SHARED`] or [`MODE_EXCLUSIVE`]).
+    /// How the device was opened ([`MODE_SHARED`], [`MODE_EXCLUSIVE`] or [`MODE_ASIO`]).
     pub mode: String,
     pub rate: u32,
     /// The requested period in frames; 0 is the driver's default.
@@ -192,19 +250,17 @@ impl AudioConfig {
         })
     }
 
-    /// The calibration for the pair opened on output `device` with `request`; `None` when no saved
-    /// calibration has exactly that key.
+    /// The calibration for the pair opened on output `device` of audio system `system` with
+    /// `request` (the mode key is [`calibration_mode`]'s); `None` when no saved calibration has
+    /// exactly that key.
     pub fn calibration_for(
         &self,
+        system: &str,
         device: &str,
         paired_input: Option<&str>,
         request: &transit_audio_backend::OpenRequest,
     ) -> Option<transit_audio_backend::Calibration> {
-        let mode = match request.mode {
-            transit_audio_backend::Mode::Shared => MODE_SHARED,
-            transit_audio_backend::Mode::Exclusive => MODE_EXCLUSIVE,
-            _ => return None,
-        };
+        let mode = calibration_mode(system, request.mode)?;
         self.find_calibration_paired(device, paired_input, mode, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
     }
 }
@@ -237,6 +293,9 @@ pub struct AudioSystem {
     pub is_default: bool,
     pub outputs: Vec<DeviceInfo>,
     pub inputs: Vec<DeviceInfo>,
+    /// Devices of the system that could not be listed, with why ("<driver>: <problem>"): the
+    /// native ASIO backend's per-driver diagnostics. Empty for cpal's systems.
+    pub diagnostics: Vec<String>,
 }
 
 #[allow(deprecated)]
@@ -276,12 +335,31 @@ pub fn asio_control_panel() -> Result<(), String> {
     soundcraft_asio_panel::open_control_panel()
 }
 
+/// Opens the control panel ("Driver settings") of the ASIO driver `driver` through the native
+/// backend: the call runs on its host thread, from a thread of its own, and the receiver gets the
+/// result when the panel closes. Drivers do not reliably report what changed there: reopen the
+/// device afterwards. Fails at once in a build without the native ASIO backend.
+pub fn native_asio_control_panel(driver: &str) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+    #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+    return crate::backend::native::asio_control_panel(driver);
+    #[cfg(not(all(windows, target_pointer_width = "64", feature = "native-asio")))]
+    {
+        let _ = driver;
+        Err("this build has no native ASIO backend".into())
+    }
+}
+
 /// Every audio system on this machine with its devices. Enumerating can take a moment (some
-/// systems probe each device): call it when the settings window opens, not every frame.
+/// systems probe each device): call it when the settings window opens, not every frame. In a build
+/// with the native ASIO backend, the ASIO system is listed through that backend's
+/// `Backend::endpoints` (each driver probed in turn, ASIO allowing one loaded driver), not cpal's
+/// ASIO host, whichever backend then opens it: the driver names are the same registry names.
 pub fn audio_systems() -> Vec<AudioSystem> {
     let default_id = cpal::default_host().id();
-    cpal::available_hosts()
+    #[cfg_attr(not(all(windows, target_pointer_width = "64", feature = "native-asio")), allow(unused_mut))]
+    let mut systems: Vec<AudioSystem> = cpal::available_hosts()
         .into_iter()
+        .filter(|id| !(NATIVE_ASIO_COMPILED && id.name() == ASIO_SYSTEM))
         .filter_map(|id| {
             let host = shared_host(id)?;
             let def_out = host.default_output_device().as_ref().and_then(device_name);
@@ -295,16 +373,19 @@ pub fn audio_systems() -> Vec<AudioSystem> {
                 add_unlisted(&mut outputs, &installed);
                 add_unlisted(&mut inputs, &installed);
             }
-            Some(AudioSystem { name: id.name().to_string(), is_default: id == default_id, outputs, inputs })
+            Some(AudioSystem { name: id.name().to_string(), is_default: id == default_id, outputs, inputs, diagnostics: Vec::new() })
         })
-        .collect()
+        .collect();
+    #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+    systems.push(crate::backend::native::asio_system());
+    systems
 }
 
 /// Adds the installed ASIO drivers cpal could not list. cpal loads each driver to describe it, and
 /// the SDK cannot load one while another is open: without this, only the open driver showed and
 /// switching to another meant going through a different audio system first. Like REAPER, every
 /// installed driver is offered; one that turns out to be absent falls back to the default.
-fn add_unlisted(list: &mut Vec<DeviceInfo>, installed: &[String]) {
+pub(crate) fn add_unlisted(list: &mut Vec<DeviceInfo>, installed: &[String]) {
     for name in installed {
         if !list.iter().any(|d| &d.name == name) {
             list.push(DeviceInfo {
@@ -478,17 +559,20 @@ mod tests {
         use transit_audio_backend::Period;
         let cal = sample_calibration();
         let cfg = AudioConfig { input_pairing: cal.input.clone(), calibrations: vec![cal.clone()], ..Default::default() };
-        let found = cfg.calibration_for("speakers (scarlett 2i2)", None, &request(48_000, Period::Frames(128))).expect("the key matches");
+        let found = cfg.calibration_for("WASAPI", "speakers (scarlett 2i2)", None, &request(48_000, Period::Frames(128))).expect("the key matches");
         assert_eq!((found.round_trip_ns, found.uncertainty_ns), (10_000_000, 520_833));
         let device = "Speakers (Scarlett 2i2)";
-        assert!(cfg.calibration_for(device, None, &request(44_100, Period::Frames(128))).is_none(), "another rate");
-        assert!(cfg.calibration_for(device, None, &request(48_000, Period::Frames(64))).is_none(), "another period");
-        assert!(cfg.calibration_for(device, None, &request(48_000, Period::Default)).is_none(), "the default period is not 128");
-        assert!(cfg.calibration_for("Headphones", None, &request(48_000, Period::Frames(128))).is_none(), "another device");
+        assert!(cfg.calibration_for("WASAPI", device, None, &request(44_100, Period::Frames(128))).is_none(), "another rate");
+        assert!(cfg.calibration_for("WASAPI", device, None, &request(48_000, Period::Frames(64))).is_none(), "another period");
+        assert!(cfg.calibration_for("WASAPI", device, None, &request(48_000, Period::Default)).is_none(), "the default period is not 128");
+        assert!(cfg.calibration_for("WASAPI", "Headphones", None, &request(48_000, Period::Frames(128))).is_none(), "another device");
         let other_input = AudioConfig { input_pairing: Some("Mic".into()), ..cfg.clone() };
-        assert!(other_input.calibration_for(device, None, &request(48_000, Period::Frames(128))).is_none(), "another input");
+        assert!(other_input.calibration_for("WASAPI", device, None, &request(48_000, Period::Frames(128))).is_none(), "another input");
         let unpaired = AudioConfig { input_pairing: None, ..cfg };
-        assert!(unpaired.calibration_for(device, None, &request(48_000, Period::Frames(128))).is_none(), "container-id pairing is its own key");
+        assert!(
+            unpaired.calibration_for("WASAPI", device, None, &request(48_000, Period::Frames(128))).is_none(),
+            "container-id pairing is its own key"
+        );
     }
 
     #[test]
@@ -503,12 +587,18 @@ mod tests {
             calibrations: vec![cal.clone()],
             ..Default::default()
         };
-        assert!(with(&unnamed, None).calibration_for(device, None, &req).is_some(), "both unnamed");
-        assert!(with(&named, Some("microphone (model 12)")).calibration_for(device, None, &req).is_some(), "the same name, any case");
-        assert!(with(&named, None).calibration_for(device, Some("MICROPHONE (Model 12)"), &req).is_some(), "automatic resolved to the named input");
-        assert!(with(&named, None).calibration_for(device, Some("Line (Other)"), &req).is_none(), "automatic resolved to another input");
-        assert!(with(&named, None).calibration_for(device, None, &req).is_none(), "automatic with nothing resolved");
-        assert!(with(&unnamed, Some("Mic")).calibration_for(device, Some("Mic"), &req).is_none(), "a named pairing never matches an unnamed run");
+        assert!(with(&unnamed, None).calibration_for("WASAPI", device, None, &req).is_some(), "both unnamed");
+        assert!(with(&named, Some("microphone (model 12)")).calibration_for("WASAPI", device, None, &req).is_some(), "the same name, any case");
+        assert!(
+            with(&named, None).calibration_for("WASAPI", device, Some("MICROPHONE (Model 12)"), &req).is_some(),
+            "automatic resolved to the named input"
+        );
+        assert!(with(&named, None).calibration_for("WASAPI", device, Some("Line (Other)"), &req).is_none(), "automatic resolved to another input");
+        assert!(with(&named, None).calibration_for("WASAPI", device, None, &req).is_none(), "automatic with nothing resolved");
+        assert!(
+            with(&unnamed, Some("Mic")).calibration_for("WASAPI", device, Some("Mic"), &req).is_none(),
+            "a named pairing never matches an unnamed run"
+        );
     }
 
     #[test]
@@ -557,11 +647,41 @@ mod tests {
         let cfg = AudioConfig { input_pairing: shared.input.clone(), calibrations: vec![shared, exclusive], ..Default::default() };
         let device = "Speakers (Scarlett 2i2)";
         let mut req = request(48_000, Period::Frames(128));
-        assert_eq!(cfg.calibration_for(device, None, &req).unwrap().round_trip_ns, 10_000_000, "shared request, shared calibration");
+        assert_eq!(cfg.calibration_for("WASAPI", device, None, &req).unwrap().round_trip_ns, 10_000_000, "shared request, shared calibration");
         req.mode = Mode::Exclusive;
-        assert_eq!(cfg.calibration_for(device, None, &req).unwrap().round_trip_ns, 20_000_000, "exclusive request, exclusive calibration");
+        assert_eq!(cfg.calibration_for("WASAPI", device, None, &req).unwrap().round_trip_ns, 20_000_000, "exclusive request, exclusive calibration");
         let only_shared = AudioConfig { calibrations: vec![sample_calibration()], ..cfg };
-        assert!(only_shared.calibration_for(device, None, &req).is_none(), "a shared calibration never applies to an exclusive open");
+        assert!(only_shared.calibration_for("WASAPI", device, None, &req).is_none(), "a shared calibration never applies to an exclusive open");
+    }
+
+    #[test]
+    fn each_system_offers_only_its_own_native_backend() {
+        use Backend::*;
+        let native = |list: Vec<Backend>| list.into_iter().filter(|b| b.is_native()).collect::<Vec<_>>();
+        assert_eq!(native(Backend::offered(Some("ASIO"))), if NATIVE_ASIO_COMPILED { vec![NativeAsio] } else { vec![] });
+        assert_eq!(native(Backend::offered(Some("WASAPI"))), if NATIVE_WASAPI_COMPILED { vec![NativeWasapi] } else { vec![] });
+        assert!(native(Backend::offered(Some("CoreAudio"))).is_empty());
+        assert!(Backend::offered(Some("ASIO")).starts_with(&[Auto, Cpal]));
+        assert!(!NativeAsio.native_on(Some("WASAPI")) && !NativeWasapi.native_on(Some("ASIO")) && !Cpal.native_on(Some("ASIO")));
+        assert!(!is_asio_system(None), "the default system is never ASIO");
+        assert_eq!(native_offered(Some("asio")), NATIVE_ASIO_COMPILED, "system names compare without case");
+        let saved = AudioConfig { backend: NativeAsio, system: Some("ASIO".into()), ..Default::default() };
+        let text = serde_json::to_string(&saved).unwrap();
+        assert!(text.contains("\"native_asio\""), "{text}");
+        assert_eq!(serde_json::from_str::<AudioConfig>(&text).unwrap(), saved);
+    }
+
+    #[test]
+    fn an_asio_calibration_is_keyed_asio_whatever_the_request_mode() {
+        use transit_audio_backend::{Mode, Period};
+        assert_eq!(calibration_mode("ASIO", Mode::Shared), Some(MODE_ASIO));
+        assert_eq!(calibration_mode("WASAPI", Mode::Exclusive), Some(MODE_EXCLUSIVE));
+        let asio =
+            LoopbackCalibration { device: "Focusrite USB ASIO".into(), input: None, mode: MODE_ASIO.into(), period: 64, ..sample_calibration() };
+        let cfg = AudioConfig { calibrations: vec![asio], ..Default::default() };
+        let req = request(48_000, Period::Frames(64));
+        assert!(cfg.calibration_for("ASIO", "Focusrite USB ASIO", None, &req).is_some(), "the driver name and mode asio");
+        assert!(cfg.calibration_for("WASAPI", "Focusrite USB ASIO", None, &req).is_none(), "a WASAPI open never takes it");
     }
 
     #[test]

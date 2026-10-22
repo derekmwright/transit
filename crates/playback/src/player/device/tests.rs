@@ -613,7 +613,7 @@ fn any_other_exclusive_error_and_any_shared_error_fall_back_to_cpal() {
         let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &native, &fallback).unwrap();
         assert_eq!((native.opens().len(), fallback.opens().len()), (1, 1), "{error}");
         assert!(!player.native_backend);
-        assert_eq!(player.backend_note, Some(native_fallback_note(&error.to_string())));
+        assert_eq!(player.backend_note, Some(NativeKind::Wasapi.fallback_note(&error.to_string())));
     }
 }
 
@@ -672,6 +672,68 @@ fn hardware_player_opens_native_wasapi() {
     assert!(telemetry.frames > 0, "no callbacks in two seconds");
     assert_eq!((telemetry.backend_errors, telemetry.device_lost_errors), (0, 0));
     drop(player);
+}
+
+/// Opens `driver` through the whole Player path with the native ASIO backend, takes the duplex input
+/// as the recorder does, runs two seconds and checks both streams' counts. Run with
+/// `cargo test -p soundcraft-playback --features native-asio --lib -- --ignored hardware_player_opens_native_asio --nocapture --test-threads 1`.
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+fn player_on_native_asio(driver: &str, rate: u32, buffer: Option<u32>) -> (u16, usize) {
+    let cfg = AudioConfig {
+        backend: crate::Backend::NativeAsio,
+        system: Some("ASIO".into()),
+        output: Some(driver.into()),
+        sample_rate: Some(rate),
+        buffer_size: buffer,
+        ..Default::default()
+    };
+    let player = Player::with_config(Arc::new(Session::default()), &cfg);
+    println!(
+        "{driver}: device {:?} system {:?} rate {} buffer {:?} channels {} latency {:?} sample {:?} native {} note {:?}",
+        player.device_name,
+        player.device_system,
+        player.device_rate,
+        player.device_buffer,
+        player.device_channels,
+        player.output_latency,
+        player.output_sample,
+        player.native_backend,
+        player.backend_note
+    );
+    println!("{driver}: outputs {:?}; inputs {:?}", player.output_channel_names, player.input_channel_names);
+    assert!(!player.silent, "the device did not open: {:?}", player.initial_error());
+    assert!(player.native_backend && player.device_system == "ASIO", "the native backend did not serve the device: {:?}", player.backend_note);
+    let recorder = player.open_input(&cfg).expect("the duplex input is held");
+    println!(
+        "{driver}: input {} ch at {} Hz, buffer {:?}, latency {:?}",
+        recorder.channels, recorder.sample_rate, recorder.buffer_frames, recorder.latency
+    );
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let telemetry = player.callback_telemetry();
+    let input = recorder.backend_stats().expect("input counters");
+    println!("{driver}: {telemetry:?}");
+    println!("{driver}: input {}", input.line(true));
+    assert!(telemetry.frames > u64::from(rate), "fewer than a second of output frames in two seconds");
+    assert!(input.wakes > 0, "the capture callback never ran");
+    assert_eq!((telemetry.backend_errors, telemetry.device_lost_errors), (0, 0));
+    let shape = (player.device_channels, recorder.channels);
+    drop(recorder);
+    drop(player);
+    shape
+}
+
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+#[test]
+#[ignore = "opens the Focusrite ASIO driver through the Player for two seconds"]
+fn hardware_player_opens_native_asio_on_the_scarlett() {
+    assert_eq!(player_on_native_asio("Focusrite USB ASIO", 48_000, Some(64)), (2, 2));
+}
+
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+#[test]
+#[ignore = "opens the Model 12 ASIO driver through the Player for two seconds"]
+fn hardware_player_opens_native_asio_on_the_model12() {
+    assert_eq!(player_on_native_asio("Model Mixer ASIO Driver", 44_100, None), (10, 12));
 }
 
 /// The duplex open of the native path on the scripted backend: the output and the paired input are
@@ -936,4 +998,137 @@ fn a_measurement_is_refused_without_a_live_input_or_on_an_unknown_channel_and_si
     // A return that carries nothing: no click is found.
     let (_player, result) = loopback_player(300, &[0], &[1], 700);
     assert!(result.unwrap_err().contains("0 of"), "silence on the return");
+}
+
+/// A TASCAM Model 12 as the native ASIO backend presents it: one duplex driver with 12 inputs and
+/// 10 outputs, packed 24-bit, its channels named by `getChannelInfo`, reporting its latency.
+fn model12() -> ab::fake::FakeBackend {
+    let names = |prefix: &str, n: u16| (1..=n).map(|c| format!("{prefix} {c}")).collect();
+    ab::fake::FakeBackend::new(ab::Format::new(48_000, 10, ab::SampleFormat::I24))
+        .named("ASIO", "Model Mixer ASIO Driver")
+        .with_capture(12, true)
+        .with_channel_names(names("Analog In", 12), names("Analog Out", 10))
+        .with_latency(std::time::Duration::from_micros(15_760))
+}
+
+fn asio_config() -> AudioConfig {
+    // Exclusive is asked for: ASIO has no such mode, so it must be ignored, not stepped down from.
+    AudioConfig { backend: crate::Backend::NativeAsio, system: Some("ASIO".into()), share_device: false, ..Default::default() }
+}
+
+fn open_asio(fake: &ab::fake::FakeBackend, cfg: &AudioConfig) -> Player {
+    Player::open_native(Arc::new(Session::default()), cfg, Box::new(fake.clone()), &fake_factory(false), NativeKind::Asio).unwrap()
+}
+
+#[test]
+fn a_native_asio_driver_opens_every_channel_capture_first_in_its_one_mode() {
+    let fake = model12();
+    let calibration = crate::LoopbackCalibration {
+        device: "Model Mixer ASIO Driver".into(),
+        input: None,
+        mode: crate::devices::MODE_ASIO.into(),
+        rate: 48_000,
+        period: 0,
+        round_trip_frames: 1_059,
+        spread_frames: 2,
+        measured_at: "2026-10-22".into(),
+    };
+    let cfg = AudioConfig { calibrations: vec![calibration], ..asio_config() };
+    let player = open_asio(&fake, &cfg);
+    assert!(player.native_backend && !player.silent && player.backend_note.is_none());
+    assert_eq!(
+        modes(&fake),
+        [(ab::Direction::Input, ab::Mode::Shared, ab::Period::Default), (ab::Direction::Output, ab::Mode::Shared, ab::Period::Default)],
+        "both directions open before either starts, capture first, as planned (no exclusive step)"
+    );
+    assert!(fake.opens().iter().all(|(_, request)| request.calibration.is_some()), "a calibration keyed `asio` reaches both streams");
+    assert!(fake.running(ab::Direction::Input) && fake.running(ab::Direction::Output));
+    assert_eq!((player.device_system.as_str(), player.device_name.as_str(), player.device_channels), ("ASIO", "Model Mixer ASIO Driver", 10));
+    assert!(!player.device_exclusive, "ASIO is never reported as WASAPI exclusive");
+    assert_eq!((player.output_latency, player.output_sample), (Some(std::time::Duration::from_micros(15_760)), Some(ab::SampleFormat::I24)));
+    let io = player.io_map();
+    assert_eq!((io.system.as_str(), io.device.as_str(), io.inputs, io.outputs), ("ASIO", "Model Mixer ASIO Driver", 12, 10));
+    assert!(io.path("Out 9-10").is_some() && io.path("In 12").is_some() && io.path("In 11-12").is_some(), "every channel has a path");
+    assert_eq!((player.output_channel_names.len(), player.input_channel_names.len()), (10, 12));
+    assert_eq!((player.output_channel_names[9].as_str(), player.input_channel_names[11].as_str()), ("Analog Out 10", "Analog In 12"));
+    let recorder = player.open_input(&cfg).expect("the duplex input is held for the recorder");
+    assert_eq!((recorder.channels, recorder.sample_rate, recorder.latency), (12, 48_000, Some(std::time::Duration::from_micros(15_760))));
+    assert_eq!(fake.opens().len(), 2, "taking the held input opens nothing");
+}
+
+/// The ADR 0015 hardware-insert measurement on the Model 12's last channels: the click leaves on
+/// output 9 only and comes back on input 11 a known number of frames later.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_hardware_insert_is_measured_through_the_model12s_last_channels() {
+    use ab::fake::{SliceSink, SliceSource};
+    const BLOCK: usize = 256;
+    const DELAY: usize = 1_059;
+    let fake = model12();
+    let cfg = asio_config();
+    let player = open_asio(&fake, &cfg);
+    let recorder = player.open_input(&cfg).unwrap();
+    player.set_input(Arc::clone(&recorder.monitor)).unwrap();
+    let format = ab::Format::new(48_000, 12, ab::SampleFormat::F32);
+    let (mut output, mut input) = (vec![0.0f32; BLOCK * 10], vec![0.0f32; BLOCK * 12]);
+    for _ in 0..4 {
+        assert!(fake.pump_render(BLOCK, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 10 }));
+        player.service().unwrap();
+    }
+    recorder.monitor.clear_monitor();
+    let (mut sent, mut elsewhere) = (Vec::<f32>::new(), 0.0f32);
+    let mut result = Err("no result".to_string());
+    for i in 0..700 {
+        if i == 20 {
+            player.start_hardware_probe(&[8], &[10]).unwrap_or_else(|e| panic!("{e}"));
+        }
+        input.fill(0.0);
+        for f in 0..BLOCK {
+            input[f * 12 + 10] = (i * BLOCK + f).checked_sub(DELAY).and_then(|k| sent.get(k)).copied().unwrap_or(0.0);
+        }
+        assert!(fake.pump_capture(BLOCK, ab::Stamp::INVALID, format, &mut SliceSource { data: &input, channels: 12 }));
+        assert!(fake.pump_render(BLOCK, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 10 }));
+        for frame in output.chunks(10) {
+            sent.push(frame[8]);
+            elsewhere = frame.iter().enumerate().filter(|(c, _)| *c != 8).fold(elsewhere, |m, (_, x)| m.max(x.abs()));
+        }
+        player.service().unwrap();
+        if let Some(r) = player.hardware_probe_result() {
+            result = r.map_err(|e| e.to_string());
+            break;
+        }
+    }
+    let measured = result.unwrap_or_else(|e| panic!("{e}"));
+    assert!(measured.round_trip_frames.abs_diff(DELAY as u32) <= 1, "{measured:?}");
+    assert_eq!(elsewhere, 0.0, "the click played on output 9 only");
+    assert!(player.start_hardware_probe(&[10], &[0]).unwrap_err().contains("channel"), "output 11 does not exist on a 10-output driver");
+}
+
+#[test]
+fn a_driver_reset_request_stops_the_output_and_says_so_once() {
+    let fake = model12();
+    let cfg = asio_config();
+    let player = open_asio(&fake, &cfg);
+    let mut recorder = player.open_input(&cfg).unwrap();
+    assert!(fake.inject_error(ab::Direction::Output, ab::StreamError::ResetRequested));
+    assert!(!player.is_playing());
+    assert_eq!(player.trouble(), Some(OutputTrouble::ResetRequested));
+    assert_eq!(player.trouble(), None, "said once");
+    assert_eq!(player.callback_telemetry().device_lost_errors, 0, "a reset is not a lost device");
+    assert!(fake.inject_error(ab::Direction::Input, ab::StreamError::ResetRequested));
+    assert_eq!(recorder.trouble(), Some(crate::record::Trouble::Device(crate::RESET_REQUESTED_TEXT.into())));
+}
+
+#[test]
+fn an_input_opened_on_demand_goes_through_the_native_backend_that_serves_the_output() {
+    // Inputs that do not open with the output (native WASAPI without a pairing).
+    let native = fake_factory(false).with_capture(2, false);
+    let fallback = fake_factory(false);
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).unwrap();
+    assert_eq!(modes(&native), [(ab::Direction::Output, ab::Mode::Shared, ab::Period::Default)]);
+    let recorder = player.open_input(&AudioConfig::default()).expect("the native backend's input opens");
+    assert_eq!(native.opens().last().map(|(direction, _)| *direction), Some(ab::Direction::Input));
+    assert!(native.running(ab::Direction::Input), "started");
+    assert!(fallback.opens().is_empty(), "cpal was not asked");
+    assert_eq!((recorder.device_name.as_str(), recorder.channels), ("Fake device", 2));
 }

@@ -163,9 +163,38 @@ fn dim(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(egui::RichText::new(text.into()).color(TOKENS.text_dim).size(11.5));
 }
 
+/// The names the open device gives its channels (ASIO `getChannelInfo`), in channel order; empty
+/// where the backend does not report them.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelNames {
+    pub outputs: Vec<String>,
+    pub inputs: Vec<String>,
+}
+
+impl ChannelNames {
+    fn of(&self, direction: IoDirection) -> &[String] {
+        match direction {
+            IoDirection::Output => &self.outputs,
+            IoDirection::Input => &self.inputs,
+        }
+    }
+}
+
+/// How the channel picker shows device channel `c` (0-based): its 1-based number, with the
+/// device's name for it where there is one ("Analog In 12" as it is when it already ends in the
+/// number, "1 Mic/Line" otherwise).
+pub fn channel_text(c: u16, names: &[String]) -> String {
+    let number = (c + 1).to_string();
+    match names.get(usize::from(c)).map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        Some(name) if name.rsplit(' ').next() == Some(number.as_str()) => name.to_string(),
+        Some(name) => format!("{number} {name}"),
+        None => number,
+    }
+}
+
 /// The section. Returns the edit the user made this frame, if any; controls are listed in `items`
-/// (label shown, value the control) for `ui.inspect` and tests.
-pub fn section(ui: &mut egui::Ui, io: &IoMap, wasapi: bool, ed: &mut IoEditor, items: &mut Vec<MenuItem>) -> Option<IoEdit> {
+/// (label shown, value the control) for `ui.inspect` and tests. `names` labels the channels.
+pub fn section(ui: &mut egui::Ui, io: &IoMap, wasapi: bool, names: &ChannelNames, ed: &mut IoEditor, items: &mut Vec<MenuItem>) -> Option<IoEdit> {
     let mut edit = None;
     ui.separator();
     ui.label(egui::RichText::new("I/O paths").strong());
@@ -213,8 +242,9 @@ pub fn section(ui: &mut egui::Ui, io: &IoMap, wasapi: bool, ed: &mut IoEditor, i
             ui.horizontal_wrapped(|ui| {
                 dim(ui, format!("{} channels (1 to {MAX_PATH_WIDTH}):", p.name));
                 for c in 0..opened {
-                    let b = ui.selectable_label(p.channels.contains(&c), format!("{}", c + 1));
-                    items.push(MenuItem::at(ui, format!("{}", c + 1), format!("io_channel:{}", p.name), b.rect));
+                    let text = channel_text(c, names.of(direction));
+                    let b = ui.selectable_label(p.channels.contains(&c), &text);
+                    items.push(MenuItem::at(ui, text, format!("io_channel:{}", p.name), b.rect));
                     if b.clicked() {
                         edit = Some(IoEdit::SetChannels { name: p.name.clone(), channels: toggled(&p.channels, c) });
                     }

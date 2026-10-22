@@ -136,14 +136,20 @@ pub fn backend_line(s: &StreamStats, capture: bool, wakes_per_second: Option<u64
     format!("Backend: {}", s.line_with_wakes(capture, &wakes))
 }
 
-/// The host shown in the load readout: the audio system, starred when the native backend serves it
-/// (`WASAPI*`; see `docs/contributing/knowledge/clocks.md`), with the mode it opened in
-/// (`WASAPI* exclusive`, `WASAPI* shared`).
+/// The host shown in the load readout: the audio system, starred when a native backend serves it
+/// (see `docs/contributing/knowledge/clocks.md`): native WASAPI with the mode it opened in
+/// (`WASAPI* exclusive`, `WASAPI* shared`), native ASIO as `ASIO*` (it has one mode); cpal's
+/// systems unstarred (`ASIO`, `WASAPI`).
 pub(crate) fn host_name(player: &soundcraft_playback::Player) -> String {
-    if player.native_backend {
-        format!("{}* {}", player.device_system, if player.device_exclusive { "exclusive" } else { "shared" })
-    } else {
-        player.device_system.clone()
+    native_host_name(&player.device_system, player.native_backend, player.device_exclusive)
+}
+
+/// [`host_name`] from its parts.
+pub(crate) fn native_host_name(system: &str, native: bool, exclusive: bool) -> String {
+    match (native, soundcraft_playback::devices::is_asio_system(Some(system))) {
+        (false, _) => system.to_owned(),
+        (true, true) => format!("{system}*"),
+        (true, false) => format!("{system}* {}", if exclusive { "exclusive" } else { "shared" }),
     }
 }
 

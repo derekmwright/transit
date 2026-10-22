@@ -2,6 +2,7 @@
 //! belong to this creating-thread owner; the device borrows its anchored audio state.
 use super::audio::{ActionResult, Audio, Command, CountIn};
 use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
+use crate::backend::native::NativeKind;
 use crate::record::start::Status;
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
@@ -95,8 +96,19 @@ pub struct Player {
     pub paired_input: Option<String>,
     /// The audio system (cpal host) of the open device: "ASIO", "WASAPI", ...; empty for the silent clock.
     pub device_system: String,
-    /// The open device is served by the native WASAPI backend (ADR 0016), not cpal.
+    /// The open device is served by a native backend (WASAPI or ASIO, ADR 0016 and its draft ASIO
+    /// amendment), not cpal; `device_system` says which.
     pub native_backend: bool,
+    /// The native backend that serves the device, kept for the input when it opens on demand.
+    native_factory: Option<Box<dyn ab::BackendFactory>>,
+    /// The output stream's latency as the backend reported it at open (ASIO: `getLatencies`).
+    pub output_latency: Option<std::time::Duration>,
+    /// The device sample format the output stream converts to.
+    pub output_sample: Option<ab::SampleFormat>,
+    /// The names of the open device's output and input channels, in channel order, where the
+    /// backend reports them (ASIO `getChannelInfo`); empty otherwise.
+    pub output_channel_names: Vec<String>,
+    pub input_channel_names: Vec<String>,
     /// The open device was opened in WASAPI exclusive mode (native backend only; false when the
     /// user asked to share the device or the open fell back to shared).
     pub device_exclusive: bool,
@@ -199,6 +211,11 @@ impl Player {
             paired_input: None,
             device_system: String::new(),
             native_backend: false,
+            native_factory: None,
+            output_latency: None,
+            output_sample: None,
+            output_channel_names: Vec::new(),
+            input_channel_names: Vec::new(),
             device_exclusive: false,
             backend_note: None,
             device_rate: rate,
@@ -281,33 +298,52 @@ impl Player {
     }
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
-        #[cfg(all(windows, feature = "native-wasapi"))]
-        if cfg.backend == crate::Backend::NativeWasapi && crate::devices::is_wasapi_system(cfg.system.as_deref()) {
-            let native = transit_audio_wasapi::WasapiFactory { input_pairing: cfg.input_pairing.clone() };
-            return Self::open_native_or_cpal(session, cfg, &native, &crate::backend::cpal::CpalFactory);
+        if let Some((native, kind)) = crate::backend::native::factory_for(cfg) {
+            return Self::open_native(session, cfg, native, &crate::backend::cpal::CpalFactory, kind);
         }
         Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
     }
 
-    /// The native WASAPI backend; when it cannot open (before `start()` succeeded) the cpal backend
-    /// opens the same choices and the Player says why. The failed attempt's streams are dropped
-    /// here, on the control thread: dropping a native stream joins its thread (see
-    /// `transit-audio-wasapi`'s `RenderStream`) and must never happen on a callback thread.
-    #[cfg(any(test, all(windows, feature = "native-wasapi")))]
+    /// [`Self::open_native`] for native WASAPI with a scripted backend (tests).
+    #[cfg(test)]
     fn open_native_or_cpal(
         session: Arc<Session>,
         cfg: &AudioConfig,
-        native: &dyn ab::BackendFactory,
+        native: &ab::fake::FakeBackend,
         fallback: &dyn ab::BackendFactory,
     ) -> Result<Self, String> {
-        // Shared unless the user asked for exclusive control of the device; each step down the ladder
-        // (`exclusive_fallback`) reopens the whole device, before any stream has started.
-        let mut step = OpenStep { mode: Some(if cfg.share_device { ab::Mode::Shared } else { ab::Mode::Exclusive }), default_period: false };
+        Self::open_native(session, cfg, Box::new(native.clone()), fallback, NativeKind::Wasapi)
+    }
+
+    /// A native backend (WASAPI or ASIO, through the same [`Self::open_stepped`] ladder); when it
+    /// cannot open (before `start()` succeeded) the cpal backend opens the same choices and the
+    /// Player says why. WASAPI starts shared or exclusive as the user chose and steps down the
+    /// exclusive-mode ladder; ASIO has one mode (the driver's), so it opens as planned and has no
+    /// step. The failed attempt's streams are dropped here, on the control thread: dropping a
+    /// native stream joins its thread or waits for the driver's host thread (see
+    /// `transit-audio-wasapi`'s `RenderStream`, `transit-audio-asio`'s `AsioStream`) and must never
+    /// happen on a callback thread.
+    fn open_native(
+        session: Arc<Session>,
+        cfg: &AudioConfig,
+        native: Box<dyn ab::BackendFactory>,
+        fallback: &dyn ab::BackendFactory,
+        kind: NativeKind,
+    ) -> Result<Self, String> {
+        // WASAPI: shared unless the user asked for exclusive control of the device; each step down
+        // the ladder (`exclusive_fallback`) reopens the whole device, before any stream has started.
+        let mut step = match kind {
+            NativeKind::Wasapi => {
+                OpenStep { mode: Some(if cfg.share_device { ab::Mode::Shared } else { ab::Mode::Exclusive }), default_period: false }
+            }
+            NativeKind::Asio => OpenStep::PLANNED,
+        };
         let mut notes: Vec<String> = Vec::new();
         loop {
-            match Self::open_stepped(Arc::clone(&session), cfg, native, step) {
+            match Self::open_stepped(Arc::clone(&session), cfg, &*native, step) {
                 Ok(mut player) => {
                     player.native_backend = true;
+                    player.native_factory = Some(native);
                     player.backend_note = (!notes.is_empty()).then(|| notes.join("; "));
                     return Ok(player);
                 }
@@ -319,9 +355,9 @@ impl Player {
                         continue;
                     }
                     let reason = failure.text;
-                    log::warn!("native WASAPI did not open ({reason}); using the cpal backend");
+                    log::warn!("{} did not open ({reason}); using the cpal backend", kind.label());
                     let mut player = Self::open_with(session, cfg, fallback)?;
-                    player.backend_note = Some(native_fallback_note(&reason));
+                    player.backend_note = Some(kind.fallback_note(&reason));
                     return Ok(player);
                 }
             }
@@ -337,6 +373,14 @@ impl Player {
 
     /// [`Self::open_with`] with `step` applied to every planned request; the failure keeps the
     /// backend's own error for the exclusive-mode ladder.
+    ///
+    /// **Open order.** For a duplex backend (`capture_with_render`: cpal's and the native ASIO
+    /// driver, one set of buffers for both directions) both streams are opened before either
+    /// starts: the input is built first ([`record::Recorder::build_on`], `open_capture`), then the
+    /// output (`open_render`), then the input starts, then the output. That is the ASIO open-order
+    /// rule of `transit-audio-asio` (`createBuffers` once for both directions, the driver started
+    /// by the first `start`) and the order cpal's ASIO host needs; native WASAPI pairs two
+    /// endpoints the same way. Recording later takes the held input without touching the streams.
     fn open_stepped(session: Arc<Session>, cfg: &AudioConfig, factory: &dyn ab::BackendFactory, step: OpenStep) -> Result<Self, OpenFailure> {
         let want_ch = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
         let backend = factory.backend(cfg.system.as_deref()).ok_or_else(|| "no audio system".to_string())?;
@@ -363,7 +407,7 @@ impl Player {
             if step.default_period {
                 request.period = ab::Period::Default;
             }
-            request.calibration = if duplex { cfg.calibration_for(&name, paired.as_deref(), &request) } else { None };
+            request.calibration = if duplex { cfg.calibration_for(&system, &name, paired.as_deref(), &request) } else { None };
             let (rate, channels) = (request.format.rate, request.format.channels);
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
@@ -419,6 +463,10 @@ impl Player {
             player.device_system = system.clone();
             player.device_channels = achieved.format.channels;
             player.device_buffer = achieved.period.frames();
+            player.output_latency = achieved.latency;
+            player.output_sample = Some(achieved.format.sample);
+            player.output_channel_names = backend.channel_names(endpoint, ab::Direction::Output);
+            player.input_channel_names = if duplex { backend.channel_names(endpoint, ab::Direction::Input) } else { Vec::new() };
             player.device_exclusive = request.mode == ab::Mode::Exclusive;
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
@@ -1003,7 +1051,15 @@ impl Player {
                 // The session's rate first: Windows resets an endpoint's default format when it
                 // re-enumerates, and the recorder must not silently run at another rate.
                 let config = AudioConfig { sample_rate: Some(self.device_rate), ..config.clone() };
-                let recorder = record::Recorder::open_with(&config)?;
+                // Through the backend that serves the output (issue #3): a native output's input
+                // is the native backend's too, falling back to cpal only if it cannot open.
+                let recorder = match &self.native_factory {
+                    Some(native) => record::Recorder::open_through(&config, &**native).or_else(|error| {
+                        log::warn!("the native backend's input did not open ({error}); using the cpal backend");
+                        record::Recorder::open_with(&config)
+                    })?,
+                    None => record::Recorder::open_with(&config)?,
+                };
                 check_input_rate(recorder.sample_rate, self.device_rate)?;
                 Ok(recorder)
             }
@@ -1057,7 +1113,6 @@ impl OpenStep {
 struct OpenFailure {
     text: String,
     /// Read by the native backend's ladder only.
-    #[cfg_attr(not(any(test, all(windows, feature = "native-wasapi"))), allow(dead_code))]
     error: Option<ab::OpenError>,
 }
 
@@ -1092,12 +1147,6 @@ fn exclusive_fallback(step: OpenStep, cfg: &AudioConfig, error: &ab::OpenError) 
         ab::OpenError::ExclusiveDisallowed(_) => Some((shared, "Exclusive mode is turned off for this device in Windows; opened shared".to_owned())),
         _ => None,
     }
-}
-
-/// What the Player says when the native backend did not open and cpal did.
-#[cfg(any(test, all(windows, feature = "native-wasapi")))]
-pub(crate) fn native_fallback_note(reason: &str) -> String {
-    format!("Native WASAPI failed: {reason}; using the cpal backend")
 }
 
 impl Drop for Player {
@@ -1282,7 +1331,13 @@ fn error_callback(
 ) -> impl FnMut(ab::StreamError) + Send + 'static {
     move |error| {
         crate::mark_audio_thread();
-        let gone = matches!(error, ab::StreamError::DeviceNotAvailable);
+        // A driver's reset request (ASIO) stops the output like a lost device, but is said as
+        // itself: the device is reopened by the user (the full reopen is ASIO slice d).
+        let reset = matches!(error, ab::StreamError::ResetRequested);
+        if reset {
+            fault.reset.store(true, Ordering::Release);
+        }
+        let gone = reset || matches!(error, ab::StreamError::DeviceNotAvailable);
         if gone {
             if let Some(signal) = &signal {
                 signal.fault();
@@ -1290,7 +1345,7 @@ fn error_callback(
             fault.gone.store(true, Ordering::Release);
             shared.playing.store(false, Ordering::Release);
         }
-        fault.telemetry.error(gone);
+        fault.telemetry.error(matches!(error, ab::StreamError::DeviceNotAvailable));
     }
 }
 

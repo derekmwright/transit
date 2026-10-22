@@ -14,6 +14,8 @@ workspace = true
 asio = ["soundcraft-playback/asio"]
 # The native WASAPI backend (ADR 0016): the "Native WASAPI (experimental)" choice in Audio Devices.
 native-wasapi = ["soundcraft-playback/native-wasapi"]
+# The native ASIO backend (no SDK): the "Native ASIO (experimental)" choice when Audio system is ASIO.
+native-asio = ["soundcraft-playback/native-asio"]
 
 [dependencies]
 soundcraft-engine.workspace = true

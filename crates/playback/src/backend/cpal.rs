@@ -627,6 +627,13 @@ pub fn release_asio_device_cache() {
     *ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
+/// Whether cpal's ASIO host holds a driver for an open device (the native ASIO listing must not
+/// load a second driver beside it).
+#[cfg_attr(not(all(windows, target_pointer_width = "64", feature = "native-asio")), allow(dead_code))]
+pub(crate) fn asio_device_held() -> bool {
+    ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+}
+
 /// The named output (or input) device of `host`, else its default device.
 ///
 /// On ASIO the input of the open driver is taken from the output's own `cpal::Device`. cpal keeps

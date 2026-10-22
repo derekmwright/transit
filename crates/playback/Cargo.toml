@@ -35,6 +35,10 @@ cpal = { workspace = true, features = ["audio_thread_priority"] }
 # The native WASAPI backend (ADR 0016), behind the `native-wasapi` feature.
 transit-audio-wasapi = { workspace = true, optional = true }
 
+[target.'cfg(all(windows, target_pointer_width = "64"))'.dependencies]
+# The native ASIO backend (draft ADR 0016 amendment), behind the `native-asio` feature.
+transit-audio-asio = { workspace = true, optional = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 cpal = { workspace = true, features = ["wasm-bindgen"] }
 
@@ -44,6 +48,10 @@ test-hooks = []
 # The native WASAPI render backend (ADR 0016 slice c): the "Native WASAPI (experimental)" choice in
 # Audio Devices. Off by default; without it the choice is not offered and `Backend::NativeWasapi` opens cpal.
 native-wasapi = ["dep:transit-audio-wasapi"]
+# The native ASIO backend (no Steinberg SDK, no LLVM): the "Native ASIO (experimental)" choice in
+# Audio Devices on the ASIO system. Off by default; without it the choice is not offered and
+# `Backend::NativeAsio` opens cpal.
+native-asio = ["dep:transit-audio-asio"]
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
 # (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p transit --features asio`.
 asio = ["cpal/asio", "soundcraft-asio-panel/asio"]

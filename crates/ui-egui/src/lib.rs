@@ -1060,6 +1060,9 @@ impl SoundApp {
                 (format!("“{name}” was disconnected"), "Plug it back in, then use Reconnect audio device in Setup ▸ Playback Engine.")
             }
             OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup ▸ Playback Engine."),
+            OutputTrouble::ResetRequested => {
+                (soundcraft_playback::RESET_REQUESTED_TEXT.to_string(), "Use Reconnect audio device in Setup ▸ Playback Engine.")
+            }
         };
         let (recording, playing) = (self.recording_active(), self.engine.transport.playing);
         if recording || playing {

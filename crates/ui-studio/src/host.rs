@@ -732,6 +732,9 @@ impl StudioApp {
             OutputTrouble::Bug => ("the audio engine hit an internal error (see the log)".to_string(), "Use Audio › Reconnect Device, or restart."),
             OutputTrouble::Gone => (format!("“{name}” was disconnected"), "Plug it back in, then use Audio › Reconnect Device."),
             OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Audio › Reconnect Device."),
+            // The driver's settings moved under the stream (a buffer size or rate changed in its
+            // panel): the output is silent until the device is reopened.
+            OutputTrouble::ResetRequested => (soundcraft_playback::RESET_REQUESTED_TEXT.to_string(), "Use Audio › Reconnect Device."),
         };
         let (recording, playing) = (self.recording_active(), self.engine.transport.playing);
         if recording || playing {

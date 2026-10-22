@@ -34,6 +34,8 @@ const RING_SECONDS: usize = 4;
 const STALL: Duration = Duration::from_secs(2);
 const GONE: u8 = 1;
 const BROKEN: u8 = 2;
+/// The driver asked for a reset (ASIO): the input is reopened with the device.
+const RESET: u8 = 3;
 const ARMED: u64 = 1;
 const CAPTURING: u64 = 2;
 const CAPTURE_FLAGS: u64 = ARMED | CAPTURING;
@@ -218,6 +220,11 @@ pub struct Recorder {
     pub device_name: String,
     pub sample_rate: u32,
     pub channels: usize,
+    /// What the input stream opened with, as the backend reported it: the buffer in frames, the
+    /// latency (ASIO: `getLatencies`) and the device sample format (None where not reported).
+    pub buffer_frames: Option<u32>,
+    pub latency: Option<Duration>,
+    pub sample_format: Option<ab::SampleFormat>,
     /// The take writer, and what each track's take holds so far.
     writer: Option<(std::thread::JoinHandle<Takes>, Vec<(TrackId, Arc<Mutex<LiveTake>>)>)>,
     /// The callback count last seen, and since when.
@@ -258,9 +265,12 @@ fn capture_callbacks(
     let error = move |e: ab::StreamError| {
         // Possibly the audio thread (see `crate::mark_audio_thread`).
         crate::mark_audio_thread();
-        if matches!(e, ab::StreamError::DeviceNotAvailable) {
-            let _ = errors.fault.compare_exchange(0, GONE, Ordering::Relaxed, Ordering::Relaxed);
-        }
+        let fault = match e {
+            ab::StreamError::DeviceNotAvailable => GONE,
+            ab::StreamError::ResetRequested => RESET,
+            ab::StreamError::Other => return,
+        };
+        let _ = errors.fault.compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
     };
     (Box::new(capture), Box::new(error))
 }
@@ -289,7 +299,7 @@ impl Recorder {
         Recorder::open_through(audio, &crate::backend::cpal::CpalFactory)
     }
 
-    fn open_through(audio: &crate::AudioConfig, factory: &dyn ab::BackendFactory) -> Result<Recorder, String> {
+    pub(crate) fn open_through(audio: &crate::AudioConfig, factory: &dyn ab::BackendFactory) -> Result<Recorder, String> {
         let backend = factory.backend(audio.system.as_deref()).ok_or("no audio system")?;
         let plan = backend.plan_capture(&ab::InputWish { device: audio.input.clone(), rate: audio.sample_rate, period: audio.buffer_size })?;
         // The chosen buffer size first; if the device refuses it, its default.
@@ -352,7 +362,7 @@ impl Recorder {
         let (callback_clock, clock) = crate::device_clock::stream_clock(crate::device_clock::Direction::Input, format.rate)
             .map_err(|error| ab::OpenError::Other(error.into()))?;
         let (capture, on_error) = capture_callbacks(&shared, &monitor, callback_clock, progress);
-        let (stream, _) = backend.open_capture(endpoint, request, capture, on_error)?;
+        let (stream, achieved) = backend.open_capture(endpoint, request, capture, on_error)?;
         let clock = crate::device_clock::MaintainedClock::start(clock)
             .map_err(|error| {
                 log::warn!("input clock maintenance unavailable: {error}");
@@ -368,6 +378,9 @@ impl Recorder {
             device_name: endpoint.name.clone(),
             sample_rate: format.rate,
             channels,
+            buffer_frames: achieved.period.frames(),
+            latency: achieved.latency,
+            sample_format: Some(achieved.format.sample),
             writer: None,
             seen,
         })
@@ -393,6 +406,9 @@ impl Recorder {
             device_name: name.into(),
             sample_rate: 48_000,
             channels: 1,
+            buffer_frames: None,
+            latency: None,
+            sample_format: None,
             writer: None,
             seen: (0, Instant::now()),
         }
@@ -504,6 +520,7 @@ impl Recorder {
         match self.shared.fault.load(Ordering::Relaxed) {
             GONE => return Some(Trouble::Device(format!("“{name}” was disconnected"))),
             BROKEN => return Some(Trouble::Device("the audio input hit an internal error (see the log)".into())),
+            RESET => return Some(Trouble::Device(crate::RESET_REQUESTED_TEXT.into())),
             _ => {}
         }
         let beats = self.shared.beats.load(Ordering::Relaxed);
@@ -1043,6 +1060,9 @@ mod tests {
             device_name: "Mic In".into(),
             sample_rate: 48_000,
             channels: 1,
+            buffer_frames: None,
+            latency: None,
+            sample_format: None,
             writer: None,
             seen: (0, Instant::now()),
         }

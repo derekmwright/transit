@@ -36,7 +36,8 @@ pub struct AudioDevicesLayout {
     /// The audio systems listed.
     pub systems: Vec<String>,
     /// The controls: label is the text shown, value the control (`system`, `output`, `input`,
-    /// `backend` (only where offered), `paired_input` (native backend only), `rate`, `buffer`, `apply`, `reconnect`, `rescan`, `panel`).
+    /// `backend` (only where offered), `paired_input` (native WASAPI only), `rate`, `buffer`, `apply`, `reconnect`, `rescan`,
+    /// `panel` (cpal ASIO's "Driver Control Panel" or native ASIO's "Driver settings")).
     pub controls: Vec<MenuItem>,
     /// The entries of the open list: label is the text shown, value the control it belongs to.
     pub items: Vec<MenuItem>,
@@ -46,8 +47,11 @@ pub struct AudioDevicesLayout {
     pub notes: Vec<String>,
     /// The path table the I/O section showed (the engine's, read this frame).
     pub io: Option<soundcraft_model::IoMap>,
-    /// The Calibration line under the Paired input (only under the native backend).
+    /// The Calibration line (only under a native backend: under the Paired input for WASAPI).
     pub calibration: Option<String>,
+    /// The drivers of the chosen system that failed to load, as said under the Output list
+    /// (native ASIO's per-driver diagnostics).
+    pub diagnostics: Vec<String>,
     /// The Hardware inserts subsection as drawn.
     pub hardware: crate::audio_devices_io::HardwareLayout,
 }
@@ -109,6 +113,12 @@ pub struct AudioDevicesState {
     pub(crate) injected_backend: Option<(Option<soundcraft_playback::telemetry::StreamStats>, Option<soundcraft_playback::telemetry::StreamStats>)>,
     /// The wake counters sampled at the last panel refreshes (output, input), for the rates.
     wake_rates: (WakeRate, WakeRate),
+    /// A native ASIO driver's settings panel that is open; its result arrives when it closes.
+    panel: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// The driver whose settings the window's "Driver settings" opened with fake devices (tests).
+    pub(crate) panel_opened: Option<String>,
+    /// Channel names standing in for the open device's (tests without a player).
+    pub(crate) fake_channel_names: Option<crate::audio_devices_io::ChannelNames>,
 }
 
 /// The device loop's wake counter at the last sample, and the rate it gave.
@@ -435,10 +445,59 @@ impl StudioApp {
         let cfg = self.audio_devices.fake.as_ref().and_then(|f| f.connection.as_ref()).map_or(&self.ui.audio, |p| &p.config);
         self.opened().output.is_some() && cfg.system.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(devices::ASIO_SYSTEM))
     }
+
+    /// The ASIO driver the native backend has open, if it serves the running device (with fake
+    /// devices: the running configuration chose it and this build has it).
+    fn running_native_asio(&self) -> Option<String> {
+        if !self.running_asio() {
+            return None;
+        }
+        if let Some(f) = &self.audio_devices.fake
+            && let Some(p) = &f.connection
+        {
+            return (p.config.backend.native_on(p.config.system.as_deref())).then(|| f.output_for(&p.config)).flatten();
+        }
+        self.player.as_ref().filter(|p| p.native_backend && devices::is_asio_system(Some(&p.device_system))).map(|p| p.device_name.clone())
+    }
+
+    /// Opens the settings panel of the native ASIO driver that runs (the window's "Driver
+    /// settings"): on the backend's host thread, from a thread of its own, so a modal panel does
+    /// not hold the UI; the result is said when it closes.
+    fn open_native_asio_panel(&mut self, driver: &str) {
+        if self.audio_devices.fake.is_some() {
+            self.audio_devices.panel_opened = Some(driver.to_owned());
+            return;
+        }
+        match devices::native_asio_control_panel(driver) {
+            Ok(rx) => {
+                self.audio_devices.panel = Some(rx);
+                self.status = format!("“{driver}” driver settings are open. Reconnect after changing the buffer size or the rate.");
+            }
+            Err(e) => self.status = format!("ASIO driver settings: {e}"),
+        }
+    }
+
+    /// Says how the driver settings panel ended, once it has.
+    fn poll_native_asio_panel(&mut self) {
+        let Some(rx) = &self.audio_devices.panel else { return };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.audio_devices.panel = None;
+                self.status = "ASIO driver settings closed. If you changed the buffer size or the rate, use Reconnect.".into();
+            }
+            Ok(Err(e)) => {
+                self.audio_devices.panel = None;
+                self.status = format!("ASIO driver settings: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.audio_devices.panel = None,
+        }
+    }
 }
 
 /// Say once what the saved choices did not get: the output at startup, the input when it opens.
 fn check(app: &mut StudioApp) {
+    app.poll_native_asio_panel();
     if !app.audio_devices.startup_checked && app.player.is_some() {
         app.audio_devices.startup_checked = true;
         let mut notes = fallback_notes(&app.ui.audio, None, &app.opened());
@@ -467,6 +526,8 @@ fn check(app: &mut StudioApp) {
 
 /// The "no choice" entry of the Paired input list.
 pub const PAIRED_AUTOMATIC: &str = "Automatic (same device)";
+/// The button that opens the running native ASIO driver's own settings panel.
+pub const DRIVER_SETTINGS: &str = "Driver settings";
 
 /// The `ui.json` the running app saves to, as `audio-bench --settings` should name it.
 fn settings_path(app: &StudioApp) -> String {
@@ -513,6 +574,21 @@ pub fn calibration_line(cfg: &AudioConfig, device: &str, paired_input: Option<&s
     }
     command.push_str(&format!(" --rate {rate} --settings \"{settings}\""));
     format!("not calibrated \u{b7} {mode}: run {command} (with this app closed)")
+}
+
+/// The Calibration line under the native ASIO backend: a saved loopback of this driver (its
+/// registry name), rate and buffer under the mode key `asio`, else the driver's own figures. The
+/// bench writes no ASIO calibration yet: the Focusrite driver's `getLatencies` over-reports (known
+/// issue K30), so the stamps carry the driver's figures and a placement can be off by it.
+pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, rate: u32) -> String {
+    let period = cfg.buffer_size.unwrap_or(0);
+    let mode = devices::MODE_ASIO;
+    if let Some(c) = cfg.find_calibration(driver, mode, rate, period) {
+        return format!("measured {} frames \u{b1}{} ({}) \u{b7} {mode}", c.round_trip_frames, c.spread_frames, c.measured_at);
+    }
+    format!(
+        "not calibrated \u{b7} {mode}: the driver's own latency figures are used (no loopback calibration over native ASIO yet, see known issue K30)"
+    )
 }
 
 /// The bench command inside a "not calibrated" [`calibration_line`] (`None` for a measured one).
@@ -569,12 +645,13 @@ fn choose_or<T: Clone + PartialEq>(
     (r.inner.response.rect, text)
 }
 
-/// The Backend selector: Auto, cpal, Native WASAPI (experimental). Returns the combo's rect and text.
-fn choose_backend(ui: &mut egui::Ui, enabled: bool, value: &mut Backend, items: &mut Vec<MenuItem>) -> (egui::Rect, String) {
+/// The Backend selector: Auto, cpal, and the native backend of the system (`options`). Returns the
+/// combo's rect and text.
+fn choose_backend(ui: &mut egui::Ui, enabled: bool, value: &mut Backend, options: &[Backend], items: &mut Vec<MenuItem>) -> (egui::Rect, String) {
     let text = value.label().to_string();
     let r = ui.add_enabled_ui(enabled, |ui| {
         egui::ComboBox::from_id_salt(("audio_devices", "backend")).selected_text(&text).width(360.0).show_ui(ui, |ui| {
-            for option in Backend::ALL {
+            for option in options.iter().copied() {
                 let b = crate::menus::check_button(ui, *value == option, option.label());
                 items.push(MenuItem::at(ui, option.label().into(), "backend".into(), b.rect));
                 if b.clicked() {
@@ -610,6 +687,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let recording = app.recording_active();
     let audio_on = app.player.is_some() || app.audio_devices.fake.is_some();
     let (mut apply, mut reconnect, mut rescan, mut panel) = (false, false, false, false);
+    let mut native_panel: Option<String> = None;
     // The path table is the engine's, read again every frame; one edit at most per frame.
     let io = app.engine.io_map().clone();
     let wasapi = crate::audio_devices_io::is_wasapi(&if io.system.is_empty() {
@@ -617,6 +695,14 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     } else {
         io.system.clone()
     });
+    // The open device's own channel names, for the table of the device that is open.
+    let channel_names = app
+        .player
+        .as_ref()
+        .filter(|p| !p.silent && p.device_name == io.device)
+        .map(|p| crate::audio_devices_io::ChannelNames { outputs: p.output_channel_names.clone(), inputs: p.input_channel_names.clone() })
+        .or_else(|| app.audio_devices.fake_channel_names.clone())
+        .unwrap_or_default();
     let mut editor = std::mem::take(&mut app.audio_devices.io_editor);
     let mut io_edit = None;
     let mut io_items = Vec::new();
@@ -643,19 +729,24 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let before = draft.system.clone();
                 let (rect, text) = choose(ui, "system", audio_on, &mut draft.system, &names, &mut lay.items);
                 if draft.system != before {
-                    // Devices belong to their system.
+                    // Devices belong to their system, and so does a native backend.
                     (draft.output, draft.input, draft.input_pairing) = (None, None, None);
+                    if draft.backend.is_native() && !draft.backend.native_on(draft.system.as_deref()) {
+                        draft.backend = Backend::Auto;
+                    }
                 }
                 controls.push((text, "system", rect));
                 ui.end_row();
 
-                // Offered only where it can apply: a build with the feature, on the WASAPI system.
-                if devices::native_wasapi_offered(draft.system.as_deref()) {
+                // Offered only where it can apply: a build with the native backend of this system
+                // (WASAPI or ASIO).
+                if devices::native_offered(draft.system.as_deref()) {
                     label(ui, "Backend");
-                    let (rect, text) = choose_backend(ui, audio_on, &mut draft.backend, &mut lay.items);
+                    let options = Backend::offered(draft.system.as_deref());
+                    let (rect, text) = choose_backend(ui, audio_on, &mut draft.backend, &options, &mut lay.items);
                     controls.push((text, "backend", rect));
                     ui.end_row();
-                    if draft.backend == Backend::NativeWasapi {
+                    if draft.backend == Backend::NativeWasapi && devices::native_wasapi_offered(draft.system.as_deref()) {
                         ui.label("");
                         let mut exclusive = !draft.share_device;
                         let b = ui.add_enabled(audio_on, egui::Checkbox::new(&mut exclusive, SHARE_LABEL));
@@ -674,6 +765,15 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let (rect, text) = choose(ui, "output", audio_on, &mut draft.output, &outs, &mut lay.items);
                 controls.push((text, "output", rect));
                 ui.end_row();
+                // The drivers that failed to load are said under the list, with why.
+                for problem in sys.map(|s| s.diagnostics.as_slice()).unwrap_or_default() {
+                    ui.label("");
+                    let line = format!("Not loaded: {problem}");
+                    let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.0)).wrap());
+                    controls.push((line.clone(), "diagnostic", shown.rect));
+                    lay.diagnostics.push(line);
+                    ui.end_row();
+                }
 
                 // The chosen output (the system's default output otherwise): its rates and buffers
                 // are offered, and its name keys a calibration.
@@ -682,6 +782,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     named.or_else(|| s.outputs.iter().find(|d| d.is_default))
                 });
                 let native = devices::native_wasapi_offered(draft.system.as_deref()) && draft.backend == Backend::NativeWasapi;
+                let native_asio = devices::native_asio_offered(draft.system.as_deref()) && draft.backend == Backend::NativeAsio;
                 label(ui, "Input");
                 let ins: Vec<(String, String)> =
                     sys.map(|s| s.inputs.iter().map(|d| (d.name.clone(), device_label(d))).collect()).unwrap_or_default();
@@ -722,6 +823,18 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                             controls.push(("Copy".into(), "calibration_copy", copy.rect));
                         }
                     });
+                    lay.calibration = Some(line);
+                    ui.end_row();
+                }
+                // Native ASIO: the input is the driver's own, so there is no pairing; a calibration
+                // is the driver's (mode `asio`).
+                if native_asio {
+                    label(ui, "Calibration");
+                    let rate = draft.sample_rate.or(app.player.as_ref().map(|p| p.device_rate)).unwrap_or(48_000);
+                    let driver = dev.map(|d| d.name.as_str()).or(app.player.as_ref().map(|p| p.device_name.as_str())).unwrap_or_default();
+                    let line = asio_calibration_line(&draft, driver, rate);
+                    let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5)).wrap());
+                    controls.push((line.clone(), "calibration_text", shown.rect));
                     lay.calibration = Some(line);
                     ui.end_row();
                 }
@@ -771,7 +884,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
             if recording {
                 ui.label(egui::RichText::new(REFUSED_RECORDING).color(TOKENS.record).size(11.5));
             }
-            io_edit = crate::audio_devices_io::section(ui, &io, wasapi, &mut editor, &mut io_items);
+            io_edit = crate::audio_devices_io::section(ui, &io, wasapi, &channel_names, &mut editor, &mut io_items);
             (hw_action, hw_layout) = crate::audio_devices_io::hardware_section(ui, &io, rate, blocker, progress, &mut editor, &mut io_items);
             ui.add_space(SPACE);
             ui.horizontal(|ui| {
@@ -784,7 +897,13 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let b = ui.add_enabled(audio_on, egui::Button::new("Rescan Devices"));
                 controls.push(("Rescan Devices".into(), "rescan", b.rect));
                 rescan = b.clicked();
-                if app.running_asio() && (devices::ASIO_CONTROL_PANEL || app.audio_devices.fake.is_some()) {
+                if let Some(driver) = app.running_native_asio() {
+                    let b = ui.add_enabled(app.audio_devices.panel.is_none(), egui::Button::new(DRIVER_SETTINGS));
+                    controls.push((DRIVER_SETTINGS.into(), "panel", b.rect));
+                    if b.on_hover_text("The open ASIO driver's own settings (buffer size, clock). Reconnect afterwards.").clicked() {
+                        native_panel = Some(driver);
+                    }
+                } else if app.running_asio() && (devices::ASIO_CONTROL_PANEL || app.audio_devices.fake.is_some()) {
                     let b = ui.button("Driver Control Panel");
                     controls.push(("Driver Control Panel".into(), "panel", b.rect));
                     panel = b.on_hover_text("The open ASIO driver's own settings. Reconnect afterwards.").clicked();
@@ -844,6 +963,9 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     {
         app.status = format!("ASIO control panel: {e}");
     }
+    if let Some(driver) = native_panel {
+        app.open_native_asio_panel(&driver);
+    }
     if !open {
         app.cancel_measure("");
         app.audio_devices.open = false;
@@ -854,10 +976,16 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
 /// What is open now: the output with its rate, channels and buffer, and the input.
 fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
     let mut lines = Vec::new();
+    // A native backend reports what it opened: the device sample format and its latency figure.
+    let native = app.player.as_ref().is_some_and(|p| p.native_backend);
     match &app.player {
         Some(p) => {
             let buffer = p.device_buffer.map_or("default buffer".to_string(), |b| format!("{b}-sample buffer"));
-            let host = if p.native_backend { format!(" · {}", crate::telemetry::host_name(p)) } else { String::new() };
+            let host = if p.native_backend {
+                format!(" · {}{}", crate::telemetry::host_name(p), achieved_detail(p.output_sample, p.output_latency, "out"))
+            } else {
+                String::new()
+            };
             lines.push(format!("Output open: {} · {} Hz · {} ch · {buffer}{host}", p.device_name, p.device_rate, p.device_channels));
         }
         None => lines.push("Output open: none".into()),
@@ -873,6 +1001,11 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
     app.audio_devices.wake_rates = (keep(output.is_some(), out_rate), keep(input.is_some(), in_rate));
     lines.extend(output.map(|s| crate::telemetry::backend_line(&s, false, output_rate)));
     lines.push(match &app.recorder {
+        Some(r) if native => {
+            let buffer = r.buffer_frames.map_or(String::new(), |b| format!(" · {b}-sample buffer"));
+            let detail = achieved_detail(r.sample_format, r.latency, "in");
+            format!("Input open: {} · {} Hz · {} ch{buffer}{detail}", r.device_name, r.sample_rate, r.channels)
+        }
         Some(r) => format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels),
         None => "Input open: none yet (it opens when a track is armed or monitored)".into(),
     });
@@ -880,9 +1013,22 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
     lines
 }
 
-/// `audio.fake_devices {systems: [{name, is_default?, outputs: [...], inputs: [...]}]}`: stand-in
-/// devices for screenshot runs and tests (each device `{name, is_default?, max_channels?,
-/// sample_rates?}`); `{systems: null}` removes them.
+/// What a native stream reported at open, for its "open" line: " · i24 · 15.8 ms out" (each part
+/// only where reported). `direction` is "out" or "in".
+pub fn achieved_detail(sample: Option<impl std::fmt::Debug>, latency: Option<std::time::Duration>, direction: &str) -> String {
+    let mut detail = String::new();
+    if let Some(sample) = sample {
+        detail.push_str(&format!(" · {}", format!("{sample:?}").to_lowercase()));
+    }
+    if let Some(latency) = latency {
+        detail.push_str(&format!(" · {:.1} ms {direction}", latency.as_secs_f64() * 1000.0));
+    }
+    detail
+}
+
+/// `audio.fake_devices {systems: [{name, is_default?, outputs: [...], inputs: [...], diagnostics?: [...]}]}`:
+/// stand-in devices for screenshot runs and tests (each device `{name, is_default?, max_channels?,
+/// sample_rates?}`, each diagnostic a "<driver>: <problem>" text); `{systems: null}` removes them.
 pub fn fake_from_json(p: &serde_json::Value) -> Result<Option<FakeDevices>, String> {
     use serde_json::Value;
     let Some(list) = p.get("systems") else { return Err("audio.fake_devices needs systems".into()) };
@@ -922,6 +1068,11 @@ pub fn fake_from_json(p: &serde_json::Value) -> Result<Option<FakeDevices>, Stri
                 is_default: flag(s, "is_default"),
                 outputs: devs(s, "outputs")?,
                 inputs: devs(s, "inputs")?,
+                diagnostics: s
+                    .get("diagnostics")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|d| d.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
