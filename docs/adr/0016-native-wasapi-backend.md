@@ -2,7 +2,7 @@
 
 - **Status:** accepted 2026-10-21 (direction from the project owner; refutation review round 1 resolved); implementation after ADR 0015 slice (c)
 - **Date:** 2026-10-21
-- **Implementation:** slices (a) 0ef51ae, (b) 51e79d6, (c) 799049d+3c3257f, (d) ea803b7+8f25586 landed and was verified on hardware on 2026-10-22; (e) exclusive/raw and (f) default remain. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
+- **Implementation:** slices (a) 0ef51ae, (b) 51e79d6, (c) 799049d+3c3257f, (d) ea803b7+8f25586 landed and was verified on hardware on 2026-10-22; (e) part 1 (exclusive-mode render and capture in the backend: 2f135af, d03d1e4) landed, and part 2 (the app: exclusive by default, the share checkbox, the fallback ladder, calibration keyed by mode) is this commit; (f) default remains. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
 - **Reopen when:** the benchmark harness (slice b) shows CPAL-shared already within the gate margin of ASIO on both reference interfaces (measured by the method in section 5, so this cannot fire before slice b); or the native shared low-latency path cannot beat CPAL-shared on the Scarlett 2i2 and the TASCAM Model 12 after slice (c); or `IAudioClock2` device positions prove no better a clock than QPC arrival on the reference drivers (slice d gate fails); or upstream CPAL gains exclusive mode, `IAudioClient3` and device-position timestamps.
 
 ## Context
@@ -92,6 +92,19 @@ Gate: the Model 12 opens its full channel count in exclusive mode with the same 
 **(f) Native becomes the Windows default; cpal fallback stays.**
 Gate: a week of the project owner's daily use on both interfaces without a fallback event or harness regression; the release's harness table committed; a documented one-line switch back (`AudioConfig.backend = Cpal`). ASIO stays an option and the baseline.
 
+### Amendment 2026-10-22: exclusive is the default
+
+The project owner decided that when the native backend is selected, exclusive mode is the default and the Audio Devices panel offers a checkbox, "Share the device with other apps" (`AudioConfig.share_device`, default false), to open shared instead. This reverses the "Exclusive mode as the default" alternative below, and replaces "opt-in per device" in section 2. The panel says what each state means (exclusive: lowest latency the driver allows, other apps are silenced while transit runs; shared: Windows mixes other apps, higher latency), and the active mode shows on the Calibration line, in the opened-device line and in the load readout (`WASAPI* exclusive`, `WASAPI* shared`). A calibration is keyed by mode as well as rate and period, so a shared measurement never applies to an exclusive open.
+
+Measured the same day on a Focusrite Scarlett 2i2: round trip shared 248 ms, exclusive 223 ms, ASIO 23 ms (the latency is inside that driver's WASAPI path), and exclusive is stable there only at the driver's default period (480 frames); below it the driver drops events. The Model 12 measurement is pending. Because a default must degrade gracefully and never silently, an exclusive open that fails before `start()` (the section 1.3 rule: a running stream is never reopened) steps down this ladder, each step logged once and shown once on the status line, through the same path as the cpal fallback message:
+
+1. A period the driver refuses (`OpenError::Other` naming the period): retry exclusive at `Period::Default`. "Exclusive mode could not use <n> frames; using the device period".
+2. `OpenError::InUse` (another app holds the device): retry shared. "Exclusive mode unavailable: another app holds the device; opened shared (higher latency)".
+3. `OpenError::ExclusiveDisallowed` (the endpoint's "Allow applications to take exclusive control" is cleared): retry shared. "Exclusive mode is turned off for this device in Windows; opened shared".
+4. Any other error: the existing cpal fallback, "Native WASAPI failed: ...; using the cpal backend".
+
+A duplex open keeps both streams in one mode: if the exclusive input fails with an error the ladder answers, the whole open is redone at the next step, so an exclusive output never sits beside a shared input. When the user already asked to share the device there is no ladder; an error goes straight to step 4.
+
 ## Consequences
 
 - One more `unsafe`-bearing crate and a `windows` dependency; the review burden is bounded by the quoted-unsafe pass and by the crate being small and Windows-only.
@@ -105,7 +118,7 @@ Gate: a week of the project owner's daily use on both interfaces without a fallb
 - **Keep patching CPAL upstream.** Rejected: slow, shared-only by design, and the minimal-diff rule forbids the redesign this needs.
 - **The `wasapi-rs` crate.** Rejected as the foundation: its `unsafe` and COM lifetime handling would sit outside the quoted-unsafe review, and `IAudioClient3` and device-position access are thin. It stays a reference for reviewers.
 - **ASIO only on Windows.** Rejected: needs Steinberg's SDK and agreement (pending), one driver per process, no coexistence, nothing for interfaces without ASIO.
-- **Exclusive mode as the default.** Rejected: it silences every other app and fails when the device is busy; it is a per-device opt-in.
+- **Exclusive mode as the default.** Rejected: it silences every other app and fails when the device is busy; it is a per-device opt-in. Reversed by the 2026-10-22 amendment above: the owner chose exclusive as the default with a share checkbox and a fallback ladder.
 - **Build the backend before the harness.** Rejected by the project owner's requirement: without a baseline, "better than CPAL" is an opinion.
 
 ## Related
