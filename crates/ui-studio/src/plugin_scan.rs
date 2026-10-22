@@ -24,7 +24,6 @@ pub fn start(dirs: &PluginDirs, settings_dir: Option<&Path>, scanner: Option<Pat
         soundcraft_vst3_host::set_cache_file(Some(dir.join("plugins-vst3.json")));
         soundcraft_clap_host::set_cache_file(Some(dir.join("plugins-clap.json")));
         STARTED.store(true, std::sync::atomic::Ordering::Release);
-        STARTED.store(true, std::sync::atomic::Ordering::Release);
         soundcraft_vst3_host::scan_in_background();
         soundcraft_clap_host::scan_in_background();
     }
@@ -118,4 +117,22 @@ pub fn progress() -> Option<ScanProgress> {
     let (format, (i, n, file)) = at;
     let folder = file.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Some(ScanProgress { format, index: (i + 1).min(n), total: n, folder })
+}
+
+/// Common view of a cached hosted plug-in; reading it never starts a scan.
+pub(crate) struct CachedPlugin {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+    pub instrument: bool,
+}
+
+pub(crate) fn cached_vst3() -> Option<Vec<CachedPlugin>> {
+    soundcraft_vst3_host::cached()
+        .map(|list| list.into_iter().map(|d| CachedPlugin { id: d.id, name: d.name, vendor: d.vendor, instrument: d.is_instrument }).collect())
+}
+
+pub(crate) fn cached_clap() -> Option<Vec<CachedPlugin>> {
+    soundcraft_clap_host::cached()
+        .map(|list| list.into_iter().map(|d| CachedPlugin { id: d.id, name: d.name, vendor: d.vendor, instrument: d.is_instrument }).collect())
 }

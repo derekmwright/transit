@@ -1425,11 +1425,8 @@ fn catalog(app: &mut StudioApp) -> Vec<PluginItem> {
         .into_iter()
         .map(|e| PluginItem { id: e.id, name: e.name, vendor: "Built-in".into(), format: "Built-in", instrument: e.instrument, category: e.category })
         .collect();
-    for (format, list) in [
-        ("VST3", soundcraft_vst3_host::cached().map(|l| l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect::<Vec<_>>())),
-        ("CLAP", soundcraft_clap_host::cached().map(|l| l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect::<Vec<_>>())),
-    ] {
-        for (id, name, vendor, instrument) in list.unwrap_or_default() {
+    for (format, list) in [("VST3", crate::plugin_scan::cached_vst3()), ("CLAP", crate::plugin_scan::cached_clap())] {
+        for crate::plugin_scan::CachedPlugin { id, name, vendor, instrument } in list.unwrap_or_default() {
             let vendor = if vendor.trim().is_empty() { "Other".to_string() } else { vendor };
             items.push(PluginItem { id, name, vendor, format, instrument, category: String::new() });
         }

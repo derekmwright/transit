@@ -106,11 +106,11 @@ impl StudioApp {
             return n;
         }
         if hosted(id) {
-            let found = soundcraft_vst3_host::cached()
+            let found = crate::plugin_scan::cached_vst3()
                 .into_iter()
                 .flatten()
                 .map(|d| (d.id, d.name))
-                .chain(soundcraft_clap_host::cached().into_iter().flatten().map(|d| (d.id, d.name)))
+                .chain(crate::plugin_scan::cached_clap().into_iter().flatten().map(|d| (d.id, d.name)))
                 .find(|(i, _)| i == id)
                 .map(|(_, n)| n);
             if let Some(n) = &found {
@@ -674,15 +674,16 @@ pub(crate) const FILTER_OVER: usize = 15;
 impl StudioApp {
     /// The instruments to offer, read from `engine.plugins` and the scan caches (never a scan).
     pub fn instrument_lists(&mut self) -> InstrumentLists {
-        let hosted = |list: Vec<(String, String, String, bool)>| -> Vec<HostedEntry> {
-            let mut v: Vec<HostedEntry> = list.into_iter().filter(|d| d.3).map(|(id, name, vendor, _)| HostedEntry { id, name, vendor }).collect();
+        let hosted = |list: Vec<crate::plugin_scan::CachedPlugin>| -> Vec<HostedEntry> {
+            let mut v: Vec<HostedEntry> =
+                list.into_iter().filter(|d| d.instrument).map(|d| HostedEntry { id: d.id, name: d.name, vendor: d.vendor }).collect();
             v.sort_by_key(|e| (e.vendor.to_lowercase(), e.name.to_lowercase()));
             v
         };
         InstrumentLists {
             builtin: self.builtin_plugins().into_iter().filter(|p| p.instrument).collect(),
-            vst3: soundcraft_vst3_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
-            clap: soundcraft_clap_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+            vst3: crate::plugin_scan::cached_vst3().map(hosted),
+            clap: crate::plugin_scan::cached_clap().map(hosted),
         }
     }
 }
@@ -691,15 +692,16 @@ impl StudioApp {
     /// The effects to offer in a "+" menu: the same lists as [`Self::instrument_lists`] but with
     /// the non-instruments (hosted names come from `cached()`, never a scan).
     pub fn effect_lists(&mut self) -> InstrumentLists {
-        let hosted = |list: Vec<(String, String, String, bool)>| -> Vec<HostedEntry> {
-            let mut v: Vec<HostedEntry> = list.into_iter().filter(|d| !d.3).map(|(id, name, vendor, _)| HostedEntry { id, name, vendor }).collect();
+        let hosted = |list: Vec<crate::plugin_scan::CachedPlugin>| -> Vec<HostedEntry> {
+            let mut v: Vec<HostedEntry> =
+                list.into_iter().filter(|d| !d.instrument).map(|d| HostedEntry { id: d.id, name: d.name, vendor: d.vendor }).collect();
             v.sort_by_key(|e| (e.vendor.to_lowercase(), e.name.to_lowercase()));
             v
         };
         InstrumentLists {
             builtin: self.builtin_plugins().into_iter().filter(|p| !p.instrument).collect(),
-            vst3: soundcraft_vst3_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
-            clap: soundcraft_clap_host::cached().map(|l| hosted(l.into_iter().map(|d| (d.id, d.name, d.vendor, d.is_instrument)).collect())),
+            vst3: crate::plugin_scan::cached_vst3().map(hosted),
+            clap: crate::plugin_scan::cached_clap().map(hosted),
         }
     }
 }
