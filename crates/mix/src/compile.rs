@@ -597,6 +597,9 @@ impl PlanCompiler {
         if session.sample_rate.hz() != self.target.sample_rate {
             return Err(CompileError::TargetMismatch { compiler: self.target });
         }
+        // A frozen track plays its render: no instrument or inserts to instance (the plan's session
+        // is the one the mix plays).
+        let session = session.with_frozen_audio();
         let block = self.target.block();
         // Every count, and the bytes with the smallest delay lines (a lower bound), before anything
         // is allocated: walking the route graph below allocates its scratch.
@@ -606,7 +609,11 @@ impl PlanCompiler {
         };
         measure(&session, &self.limits, block, &least, &|_, _| 0)?;
         // Path-based (F05): the slowest path into any summing point bounds every edge's delay.
-        let need = path_need(&session, &|t: &Track| if mode == CompileMode::Update { self.active.track_latency(t.id) } else { 0 });
+        let need = path_need(&session, &|t: &Track| match &t.freeze {
+            Some(f) => f.latency as usize,
+            None if mode == CompileMode::Update => self.active.track_latency(t.id),
+            None => 0,
+        });
         let sized = |me: &Self, hints: bool| {
             let cap_of = |t: &Track, ch: usize| match me.strip_cap(t, ch, need, hints, mode) {
                 (_, true) => 0,
@@ -936,7 +943,7 @@ impl PlanCompiler {
                 let l = ps
                     .iter()
                     .filter(|p| matches!(p.kind, CellKind::Insert | CellKind::Instrument))
-                    .fold(0usize, |a, p| a.saturating_add(latency_of(p, self)));
+                    .fold(t.freeze.as_ref().map_or(0, |f| f.latency as usize), |a, p| a.saturating_add(latency_of(p, self)));
                 Some((t.id, l))
             })
             .collect();

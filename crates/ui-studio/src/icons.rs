@@ -39,10 +39,12 @@ pub enum Icon {
     File,
     /// A warning (Lucide triangle-alert): audio backend trouble in the telemetry readout.
     Warning,
+    /// Lucide snowflake: Freeze on the track header.
+    Snowflake,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 22] = [
+    pub const ALL: [Icon; 23] = [
         Icon::Rewind,
         Icon::Stop,
         Icon::Play,
@@ -65,6 +67,7 @@ impl Icon {
         Icon::FileAudio,
         Icon::File,
         Icon::Warning,
+        Icon::Snowflake,
     ];
 
     /// The Lucide name (the file under `assets/icons/`), plus `-filled` for filled variants.
@@ -92,6 +95,7 @@ impl Icon {
             Icon::FileAudio => "file-audio",
             Icon::File => "file",
             Icon::Warning => "triangle-alert",
+            Icon::Snowflake => "snowflake",
         }
     }
 
@@ -118,6 +122,7 @@ impl Icon {
             Icon::FileAudio => include_bytes!("../assets/icons/file-audio.svg"),
             Icon::File => include_bytes!("../assets/icons/file.svg"),
             Icon::Warning => include_bytes!("../assets/icons/triangle-alert.svg"),
+            Icon::Snowflake => include_bytes!("../assets/icons/snowflake.svg"),
         }
     }
 

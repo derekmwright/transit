@@ -458,6 +458,28 @@ impl StudioApp {
         Ok(r)
     }
 
+    /// Track > Freeze / Unfreeze (`track.freeze`, `track.unfreeze`): one undo step each.
+    pub fn toggle_freeze(&mut self, t: TrackId) -> Result<Value, String> {
+        let name = self.track_name(t);
+        let frozen = self.engine.session().track(t).is_some_and(|x| x.freeze.is_some());
+        if frozen {
+            let r = self.run("track.unfreeze", json!({"tracks": [t.0]}))?;
+            self.status = format!("Unfroze {name}: its plug-ins are back");
+            return Ok(r);
+        }
+        let r = self.run("track.freeze", json!({"tracks": [t.0]}))?;
+        self.status = format!("Froze {name} to audio: its plug-ins are off (Unfreeze to edit)");
+        Ok(r)
+    }
+
+    /// Track > Flatten (`track.flatten`): the track becomes audio, the instrument and inserts go.
+    pub fn flatten_track(&mut self, t: TrackId) -> Result<Value, String> {
+        let name = self.track_name(t);
+        let r = self.run("track.flatten", json!({"tracks": [t.0]}))?;
+        self.status = format!("Flattened {name} to audio; its instrument and inserts are removed (Undo restores them)");
+        Ok(r)
+    }
+
     // ---- Undo history ----
 
     /// Undo until `keep` steps of the history remain done (a click in Edit > Undo History).

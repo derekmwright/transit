@@ -281,6 +281,27 @@ fn card(
     r: Rect,
     menu: &mut Vec<MenuItem>,
 ) -> DeviceCard {
+    let mut c = card_body(app, ui, p, lane, t, slot, ins, r, menu);
+    // A frozen track plays its render: the card is greyed, its plug-in is off.
+    if app.engine.session().track(t).is_some_and(|x| x.freeze.is_some()) {
+        p.with_clip_rect(lane).rect_filled(r, crate::theme::RADIUS, TOKENS.bg.gamma_multiply(0.6));
+        c.frozen = true;
+    }
+    c
+}
+
+#[allow(clippy::too_many_arguments)]
+fn card_body(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    lane: Rect,
+    t: TrackId,
+    slot: Option<usize>,
+    ins: Option<&Insert>,
+    r: Rect,
+    menu: &mut Vec<MenuItem>,
+) -> DeviceCard {
     let pc = p.with_clip_rect(lane);
     let on = ins.is_some_and(|i| !i.bypass);
     pc.rect_filled(r, crate::theme::RADIUS, TOKENS.panel_raised);

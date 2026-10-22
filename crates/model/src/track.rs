@@ -1,6 +1,6 @@
 //! Tracks and playlists.
 
-use crate::{AutoParam, AutomationLane, ChannelFormat, Clip, ClipId, Mixer, TrackId};
+use crate::{AutoParam, AutomationLane, ChannelFormat, Clip, ClipId, Insert, Mixer, SourceId, TrackId};
 use soundcraft_time::{Range, Samples};
 
 /// Track types (Track › New).
@@ -204,6 +204,38 @@ impl Playlist {
     }
 }
 
+/// A track rendered to audio (Track > Freeze): the post-insert, pre-fader output over `start` for
+/// `length` samples, kept in the source pool. The instrument, inserts and clips stay in the track.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Frozen {
+    pub source: SourceId,
+    /// Where the render starts on the timeline, latency removed (as a bounce has it).
+    pub start: Samples,
+    pub length: Samples,
+    /// [`Track::freeze_hash`] of the track when it was rendered.
+    pub hash: u64,
+    /// The engine's edit revision at the render (informational).
+    #[serde(default)]
+    pub revision: u64,
+    /// The latency in samples of the chain the render replaces: the frozen track reports it, so
+    /// delay compensation stays what it was live.
+    #[serde(default)]
+    pub latency: u32,
+}
+
+/// What a frozen render depends on: an edit to any of it makes the render stale.
+#[derive(PartialEq, serde::Serialize)]
+struct FreezeInputs<'a> {
+    kind: TrackKind,
+    format: ChannelFormat,
+    ticks_timebase: bool,
+    elastic: &'a Option<String>,
+    clips: &'a [Clip],
+    instrument: &'a Option<Insert>,
+    inserts: &'a [Option<Insert>],
+    plugin_lanes: Vec<&'a AutomationLane>,
+}
+
 /// A track.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Track {
@@ -226,8 +258,10 @@ pub struct Track {
     pub hidden: bool,
     #[serde(default)]
     pub inactive: bool,
-    #[serde(default)]
-    pub frozen: bool,
+    /// The track rendered to audio: while set, the mix plays the render instead of the instrument
+    /// and inserts, which make no instances and keep their settings (see [`Frozen`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freeze: Option<Frozen>,
     #[serde(default)]
     pub comments: String,
     /// Folder that contains this track.
@@ -279,7 +313,7 @@ impl Track {
             view: view.into(),
             hidden: false,
             inactive: false,
-            frozen: false,
+            freeze: None,
             comments: String::new(),
             folder: None,
             folder_open: true,
@@ -292,6 +326,33 @@ impl Track {
 
     pub fn channels(&self) -> usize {
         self.format.channels()
+    }
+
+    fn freeze_inputs(&self) -> FreezeInputs<'_> {
+        FreezeInputs {
+            kind: self.kind,
+            format: self.format,
+            ticks_timebase: self.ticks_timebase,
+            elastic: &self.elastic,
+            clips: self.clips(),
+            instrument: &self.instrument,
+            inserts: &self.mixer.inserts,
+            plugin_lanes: self.automation.iter().filter(|l| matches!(l.param, AutoParam::Plugin { .. })).collect(),
+        }
+    }
+
+    /// Whether `other` has the same material as this track: the same clips, instrument, inserts
+    /// and plug-in automation. Fader, pan, sends and other automation are not material.
+    #[must_use]
+    pub fn same_freeze_inputs(&self, other: &Track) -> bool {
+        self.freeze_inputs() == other.freeze_inputs()
+    }
+
+    /// A hash (FNV-1a) of the material a freeze renders; see [`Track::same_freeze_inputs`].
+    #[must_use]
+    pub fn freeze_hash(&self) -> u64 {
+        let bytes = serde_json::to_vec(&self.freeze_inputs()).unwrap_or_default();
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
     }
 
     pub fn playlist(&self) -> Option<&Playlist> {

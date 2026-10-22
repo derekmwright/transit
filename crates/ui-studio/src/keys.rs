@@ -895,6 +895,12 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     // The clip: a separator, a swatch in the track color, then its name (not a tab).
     let (track_name, color) = app.engine.session().track(cv.track).map(|t| (t.name.clone(), t.color)).unwrap_or_default();
     let title = if cv.name.is_empty() || cv.name == track_name { track_name } else { format!("{track_name} · {}", cv.name) };
+    // A frozen track plays its render: its notes are read-only (edits are refused) until unfrozen.
+    let title = if app.engine.session().track(cv.track).is_some_and(|t| t.freeze.is_some()) {
+        format!("{title} · Frozen (unfreeze to edit)")
+    } else {
+        title
+    };
     let p = ui.painter();
     p.line_segment([pos2(x + 8.0, r.min.y + 7.0), pos2(x + 8.0, r.max.y - 7.0)], Stroke::new(1.0, TOKENS.line));
     p.rect_filled(Rect::from_center_size(pos2(x + 22.0, r.center().y), vec2(8.0, 8.0)), crate::theme::RADIUS_SM, theme::rgb(color));

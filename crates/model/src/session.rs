@@ -422,6 +422,44 @@ impl Session {
         self.markers.iter().find(|m| m.id == id)
     }
 
+    /// The render `t` plays in place of its instrument and inserts, if it is frozen and the render
+    /// is in the pool (a frozen track whose audio is missing plays live).
+    #[must_use]
+    pub fn frozen_audio<'a>(&self, t: &'a Track) -> Option<&'a crate::Frozen> {
+        t.freeze.as_ref().filter(|f| f.length > 0 && self.pool.contains(f.source))
+    }
+
+    /// The session as the mix plays it: each frozen track has become an audio track of its
+    /// render, with no instrument, inserts or plug-in automation, and the same index, fader, pan,
+    /// sends and other automation. `self` when no track is frozen. (A track whose freeze lost its
+    /// render plays live.)
+    #[must_use]
+    pub fn with_frozen_audio(self: &std::sync::Arc<Self>) -> std::sync::Arc<Session> {
+        if !self.tracks.iter().any(|t| t.freeze.is_some()) {
+            return std::sync::Arc::clone(self);
+        }
+        let mut s = (**self).clone();
+        for i in 0..s.tracks.len() {
+            let Some(t) = s.tracks.get_mut(i) else { continue };
+            // A freeze whose render is missing plays live.
+            let Some(f) = self.tracks.get(i).and_then(|t| self.frozen_audio(t)).cloned() else {
+                t.freeze = None;
+                continue;
+            };
+            let id = ClipId((1 << 60) | t.id.0);
+            // The render is aligned to the timeline; the chain it replaces delayed its output by its
+            // latency, which the frozen track still reports, so the render plays that much later.
+            let clip = Clip::audio(id, t.name.clone(), f.source, 0, f.start.saturating_add(Samples::from(f.latency)), f.length);
+            t.playlists = vec![crate::Playlist { name: t.name.clone(), clips: vec![clip] }];
+            t.active_playlist = 0;
+            t.kind = TrackKind::Audio;
+            t.instrument = None;
+            t.mixer.inserts.clear();
+            t.automation.retain(|l| !matches!(l.param, crate::AutoParam::Plugin { .. }));
+        }
+        std::sync::Arc::new(s)
+    }
+
     /// Find a clip anywhere (active playlists).
     pub fn find_clip(&self, id: ClipId) -> Option<(TrackId, &Clip)> {
         self.tracks.iter().find_map(|t| t.clips().iter().find(|c| c.id == id).map(|c| (t.id, c)))

@@ -70,7 +70,7 @@ fn header_keys_freeze_silence_and_show_automation() {
     let at = |x: f32, y: f32| pos2(row[0] + x, row[1] + y);
 
     click(&mut h, at(23.5, 65.5));
-    assert!(kick(&h).frozen);
+    assert!(kick(&h).freeze.is_some());
 
     click(&mut h, at(46.5, 65.5));
     let off = h.get_by_label("off").rect().center();

@@ -17,6 +17,7 @@ mod edit_more;
 mod event;
 mod event_more;
 mod file;
+mod freeze;
 mod health;
 mod instrument;
 mod midi;
@@ -103,6 +104,8 @@ macro_rules! cmd {
     ($id:literal, $($t:tt)*) => { $crate::cmd!(@spec true, true, false; $id, $($t)*) };
 }
 
+pub(crate) use freeze::edits_frozen;
+
 pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: OnceLock<Vec<CommandSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
@@ -112,6 +115,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(edit_more::specs());
         v.extend(view::specs());
         v.extend(track::specs());
+        v.extend(freeze::specs());
         v.extend(clip::specs());
         v.extend(event::specs());
         v.extend(mix::specs());

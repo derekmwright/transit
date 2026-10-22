@@ -61,6 +61,9 @@ pub struct TrackRow {
     /// Slice 7: the A toggle (show the track's automation lanes) and whether they are shown.
     pub automation: R4,
     pub automation_shown: bool,
+    /// The track is frozen: its lane is tinted cold; the snowflake button unfreezes it.
+    pub frozen: bool,
+    pub freeze_button: R4,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -245,6 +248,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
             folder: crate::groups::parent_of(&s, t).map(|f| f.0),
             depth: crate::groups::depth(&s, t),
             collapsed: t.is_folder() && app.collapsed(t.id),
+            frozen: t.freeze.is_some(),
             ..TrackRow::default()
         };
         if header.max.y >= list.min.y && header.min.y <= list.max.y {
@@ -254,6 +258,10 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         let lane_fill = if i % 2 == 0 { TOKENS.lane } else { TOKENS.lane_alt };
         let row_rect = Rect::from_min_max(lane.min, pos2(lane.max.x, y0 + geo.heights[i]));
         ui.painter().with_clip_rect(tl).rect_filled(row_rect, 0.0, lane_fill);
+        if row.frozen {
+            // A frozen lane reads cold: the accent, faint, over the lane.
+            ui.painter().with_clip_rect(tl).rect_filled(row_rect, 0.0, TOKENS.accent.gamma_multiply(0.12));
+        }
         layout.tracks.push(row);
     }
     // Add Track buttons below the rows.
@@ -421,6 +429,25 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     if resp.double_clicked() {
         let _ = app.run("mix.volume", json!({"tracks": [t.id.0], "db": 0.0}));
     }
+    // Freeze: the snowflake left of the volume readout (Unfreeze when frozen).
+    if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
+        let frozen = t.freeze.is_some();
+        let b = Rect::from_min_size(pos2(vol.min.x - 24.0, r.min.y + 22.0), vec2(19.0, 16.0));
+        let resp = ui.interact(b.intersect(list), ui.id().with(("freeze", t.id.0)), Sense::click());
+        let fill = if frozen {
+            TOKENS.accent
+        } else if resp.hovered() {
+            TOKENS.button_hover
+        } else {
+            TOKENS.button
+        };
+        p.rect_filled(b, crate::theme::RADIUS_SM, fill);
+        crate::icons::paint(&p, b.center(), crate::icons::Icon::Snowflake, 13.0, if frozen { theme::text_on(TOKENS.accent) } else { TOKENS.text });
+        if resp.on_hover_text(if frozen { "Unfreeze" } else { "Freeze: render to audio and turn the plug-ins off" }).clicked() {
+            let _ = app.toggle_freeze(t.id);
+        }
+        row.freeze_button = r4(b);
+    }
     // Meter: a thin bar at the right edge.
     if let Some(d) = app.meters.get(&t.id) {
         let lvl = d.level[0].max(d.level[1]).clamp(0.0, 1.0);
@@ -553,6 +580,22 @@ fn track_menu(app: &mut StudioApp, ui: &mut Ui, id: TrackId, kind: TrackKind, ha
     }
     if kind == TrackKind::Audio {
         width_item(app, ui, id);
+    }
+    if matches!(kind, TrackKind::Audio | TrackKind::Instrument) {
+        let frozen = app.engine.session().track(id).is_some_and(|t| t.freeze.is_some());
+        let label = if frozen { "Unfreeze" } else { "Freeze" };
+        let b = ui.button(label);
+        app.arrange.menu.push(crate::mixer::MenuItem::at(ui, label.into(), String::new(), b.rect));
+        if b.clicked() {
+            let _ = app.toggle_freeze(id);
+            ui.close();
+        }
+        let b = ui.button("Flatten");
+        app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Flatten".into(), String::new(), b.rect));
+        if b.clicked() {
+            let _ = app.flatten_track(id);
+            ui.close();
+        }
     }
     if kind != TrackKind::Master {
         crate::groups::menu_items(app, ui, Some(id));

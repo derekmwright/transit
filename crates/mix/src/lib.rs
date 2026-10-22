@@ -170,12 +170,13 @@ pub fn instance_specs(s: &Session) -> Vec<InstanceSpec> {
 /// Every plugin instance a realtime engine takes from its host: each insert and instrument, built-in or third-party, and each clip-effect module
 /// (an EQ or compressor per clip, [`clip_fx_slot`]) of an audio track, with the channel count
 /// a plan prepares it for. Only third-party plugins carry a state to restore.
-/// Inactive and master tracks are included (they have strips).
+/// Inactive and master tracks are included (they have strips); frozen tracks are not (they play
+/// their render, [`Session::with_frozen_audio`]).
 pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
     let main_ch = main_channels(s);
     let state = |ins: &soundcraft_model::Insert| if is_third_party(&ins.plugin) { ins.state_bytes() } else { None };
     let mut out = Vec::new();
-    for t in &s.tracks {
+    for t in s.tracks.iter().filter(|t| s.frozen_audio(t).is_none()) {
         let ch = strip_channels(t, main_ch);
         let mut seen: Vec<u64> = Vec::new();
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
@@ -1308,7 +1309,8 @@ fn process_strip(
     }
     let mut gr = 0.0f32;
     // A latent instrument delays its track like an insert does (G8).
-    let mut latency = strip.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
+    // A frozen track reports the latency of the chain its render replaces.
+    let mut latency = frozen_latency(t).saturating_add(strip.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency()));
     strip.key_in.iter_mut().for_each(|k| k.ran = false);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
@@ -2312,8 +2314,13 @@ impl SampleSource for PoolSample {
 }
 
 /// Record insert latency without processing audio, so this block can compensate for it.
+/// The latency in samples a frozen track reports (0 for any other).
+fn frozen_latency(t: &Track) -> usize {
+    t.freeze.as_ref().map_or(0, |f| f.latency as usize)
+}
+
 fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
-    let mut latency = 0usize;
+    let mut latency = frozen_latency(t);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         // As `process_strip`: a failed insert is skipped, so its latency no longer counts.
@@ -2733,6 +2740,11 @@ pub fn render_bus(s: &Session, bus: BusId, range: Range, block: usize) -> Vec<Ve
 }
 
 fn render_in_memory(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Vec<Vec<f32>> {
+    render_in_memory_timed(s, bus, range, block).0
+}
+
+/// [`render_in_memory`] and the mix's latency in samples that the render removed.
+fn render_in_memory_timed(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> (Vec<Vec<f32>>, usize) {
     let nch = source_channels(s, bus);
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / nch.max(1));
     let mut out: Vec<Vec<f32>> = (0..nch).map(|_| Vec::with_capacity(len)).collect();
@@ -2742,7 +2754,7 @@ fn render_in_memory(s: &Session, bus: Option<BusId>, range: Range, block: usize)
             o.extend_from_slice(c.get(..n).unwrap_or_default());
         }
     }
-    out
+    (out, render.latency)
 }
 
 /// Channels of the main mix, or of `bus` (none for an unknown bus).
@@ -2923,6 +2935,12 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
 
 /// Render one track through its inserts (pre-fader) — Commit / Freeze.
 pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> {
+    render_track_pre_fader_timed(s, track, range).0
+}
+
+/// [`render_track_pre_fader`], and the latency in samples of the track's instrument and inserts
+/// (what delay compensation holds the track back by; the render has it removed).
+pub fn render_track_pre_fader_timed(s: &Session, track: TrackId, range: Range) -> (Vec<Vec<f32>>, usize) {
     let mut solo = s.clone();
     // Multichannel tracks render into a main mix of their own format (straight through).
     let fmt = s.track(track).map_or(ChannelFormat::Stereo, |t| if t.channels() > 2 { t.format } else { ChannelFormat::Stereo });
@@ -2944,7 +2962,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
             t.inactive = true;
         }
     }
-    let mut out = render_range(&solo, range, 1024);
+    let (mut out, latency) = render_in_memory_timed(&solo, None, range, 1024);
     // Mono tracks: fold back to one channel (undo the centre pan law).
     if s.track(track).is_some_and(|t| t.channels() == 1)
         && let Some(l) = out.first().cloned()
@@ -2952,7 +2970,7 @@ pub fn render_track_pre_fader(s: &Session, track: TrackId, range: Range) -> Vec<
         let g = std::f32::consts::SQRT_2;
         out = vec![l.iter().map(|x| x * g).collect()];
     }
-    out
+    (out, latency)
 }
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).

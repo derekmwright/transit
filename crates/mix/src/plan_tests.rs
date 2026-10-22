@@ -1554,3 +1554,66 @@ fn an_inactive_tracks_plugins_are_made_by_a_live_compile_but_not_an_offline_one(
     s.track_mut(b).unwrap().mixer.mute = true;
     assert_eq!(instances_made(live().skipping_inactive_instances(), &s), 3);
 }
+
+/// Track `a` (a latent insert) and `b` both play the burst; `a` may be frozen on the burst itself,
+/// which stands in for the render of `a` (the insert only reports latency, it does not change audio).
+fn frozen_pair(freeze_latency: Option<u32>, render: SourceId) -> (Session, TrackId, TrackId) {
+    let (mut s, a, b) = audio_session();
+    s.edit.delay_compensation = true;
+    let id = s.new_clip_id();
+    s.track_mut(b).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "y", SourceId(1), 0, 0, 48_000));
+    s.track_mut(a).unwrap().mixer.inserts[0] = Some(Insert::new("clap:test.latent"));
+    if let Some(latency) = freeze_latency {
+        let t = s.track_mut(a).unwrap();
+        // The test insert reports latency without delaying audio, so its render starts that much
+        // before the timeline for the frozen track to play where the live one does.
+        let start = -i64::from(latency);
+        t.freeze = Some(soundcraft_model::Frozen { source: render, start, length: 48_000, hash: t.freeze_hash(), revision: 0, latency });
+    }
+    (s, a, b)
+}
+
+fn frozen_run(s: &Session) -> (Vec<f32>, usize) {
+    let mut rig = Rig::new();
+    rig.log.latency.store(500, Ordering::Relaxed);
+    assert_eq!(rig.publish(s), Adoption::Adopted);
+    let out = rig.render(8);
+    (out, rig.log.made.load(Ordering::Relaxed))
+}
+
+#[test]
+fn a_frozen_track_makes_no_instances_plays_its_render_and_keeps_its_latency() {
+    let (live, a, _) = frozen_pair(None, SourceId(1));
+    let (live_out, live_made) = frozen_run(&live);
+    assert_eq!(live_made, 1, "the latent insert is made live");
+    // Frozen with the live chain's latency: the same mix, sample for sample, with no instance.
+    let (frozen, _, _) = frozen_pair(Some(500), SourceId(1));
+    let (frozen_out, made) = frozen_run(&frozen);
+    assert_eq!(made, 0, "a frozen track makes no instances");
+    // The host stages instances from the same list, so it makes none either.
+    assert!(realtime_instance_specs(&frozen).is_empty() && !realtime_instance_specs(&live).is_empty());
+    assert_eq!(frozen_out, live_out, "delay compensation is what it was live");
+    assert!(frozen_out.iter().any(|x| x.abs() > 0.1));
+    // Without the latency the other track would no longer be held back to meet it.
+    let (unaligned, _, _) = frozen_pair(Some(0), SourceId(1));
+    assert_ne!(frozen_run(&unaligned).0, live_out);
+    // The insert's settings stay in the session.
+    assert!(frozen.track(a).unwrap().mixer.inserts[0].is_some());
+    // A freeze whose render is missing plays live.
+    let (missing, _, _) = frozen_pair(Some(500), SourceId(99));
+    let (missing_out, made) = frozen_run(&missing);
+    assert_eq!((made, missing_out), (1, live_out));
+}
+
+#[test]
+fn the_session_as_played_replaces_a_frozen_track_by_its_render() {
+    let (s, a, b) = frozen_pair(Some(500), SourceId(1));
+    let s = Arc::new(s);
+    let played = s.with_frozen_audio();
+    let t = played.track(a).unwrap();
+    assert!(t.mixer.inserts.iter().all(Option::is_none) && t.instrument.is_none());
+    assert_eq!(t.clips().len(), 1);
+    assert_eq!(played.track(b), s.track(b), "other tracks are untouched");
+    let none = Arc::new(audio_session().0);
+    assert!(Arc::ptr_eq(&none, &none.with_frozen_audio()), "nothing frozen: the same session");
+}

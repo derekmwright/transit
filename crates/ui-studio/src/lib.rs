@@ -446,7 +446,10 @@ impl StudioApp {
         if finish::refuses(self, id) {
             return Err(self.status.clone());
         }
-        if id.starts_with("session.save") || id.starts_with("file.bounce") || matches!(id, "track.bounce" | "track.commit") {
+        if id.starts_with("session.save")
+            || id.starts_with("file.bounce")
+            || matches!(id, "track.bounce" | "track.commit" | "track.freeze" | "track.flatten")
+        {
             // Third-party plugins keep state the session can't see: store it first.
             self.capture_plugin_states()?;
         }

@@ -85,13 +85,6 @@ pub fn specs() -> Vec<CommandSpec> {
         )),
         cmd!("track.pin", "Pin Track", [], None, "{tracks?}", has_selection, |e, p| flag(e, p, "track.pin", |t, v| t.pinned = v, |t| t.pinned)),
         cmd!("track.move", "Move Track", [], None, "{track, to: index}", has_tracks, move_track),
-        cmd!("track.freeze", "Freeze", ["Track"], None, "{tracks?}", has_selection, |e, p| flag(
-            e,
-            p,
-            "track.freeze",
-            |t, v| t.frozen = v,
-            |t| t.frozen
-        )),
         cmd!("track.commit", "Commit...", ["Track"], Some("Alt+Shift+C"), "{tracks?}", has_selection, commit),
         cmd!("track.bounce", "Bounce...", ["Track"], Some("Cmd+Alt+Shift+B"), "{tracks?}", has_selection, commit),
         cmd!("track.bypass_inserts", "All", ["Track", "Bypass Inserts"], None, "{tracks?, bypass?: bool}", has_selection, bypass_inserts),

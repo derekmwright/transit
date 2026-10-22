@@ -210,6 +210,8 @@ pub struct DeviceCard {
     pub key_button: R4,
     /// What the key dropdown reads, e.g. "Key: Kick (post)" or "Key: None".
     pub key_label: String,
+    /// The track is frozen: the card is greyed and its plug-in is off.
+    pub frozen: bool,
 }
 
 /// Last frame's device chain geometry.

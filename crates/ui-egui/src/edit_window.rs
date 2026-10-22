@@ -1078,13 +1078,14 @@ fn track_header(app: &mut SoundApp, ui: &mut Ui, track: &Track, head: Rect, sele
         if matches!(track.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux) {
             let r = at(17.0, 57.0, 13.0, 17.0);
             let resp = ui.interact(r, ui.id().with(("freeze", id.0)), Sense::click());
-            raised_key(ui.painter(), r, if track.frozen { t.slot_bypassed } else { t.slot_face }, resp.hovered());
+            let frozen = track.freeze.is_some();
+            raised_key(ui.painter(), r, if frozen { t.slot_bypassed } else { t.slot_face }, resp.hovered());
             for a in [0.0f32, 60.0, 120.0] {
                 let d = vec2(a.to_radians().sin(), a.to_radians().cos()) * 3.5;
                 ui.painter().line_segment([r.center() - d, r.center() + d], Stroke::new(1.5, t.text));
             }
-            if resp.on_hover_text(if track.frozen { "Unfreeze" } else { "Freeze" }).clicked() {
-                let _ = app.run("track.freeze", json!({"tracks": [id.0]}));
+            if resp.on_hover_text(if frozen { "Unfreeze" } else { "Freeze" }).clicked() {
+                let _ = app.run(if frozen { "track.unfreeze" } else { "track.freeze" }, json!({"tracks": [id.0]}));
             }
         }
         if !matches!(track.kind, TrackKind::Master | TrackKind::Vca | TrackKind::Folder) {
@@ -1410,7 +1411,7 @@ fn view_menu(app: &mut SoundApp, ui: &mut Ui, track: &Track) {
 
 pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
     let tid = id.0;
-    let items: [(&str, &str); 10] = [
+    let items: [(&str, &str); 12] = [
         ("Rename...", "ui.rename_track"),
         ("Duplicate...", "track.duplicate"),
         ("Make Inactive", "track.make_inactive"),
@@ -1419,6 +1420,8 @@ pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         ("Split into Mono", "track.split_into_mono"),
         ("Commit...", "track.commit"),
         ("Freeze", "track.freeze"),
+        ("Unfreeze", "track.unfreeze"),
+        ("Flatten", "track.flatten"),
         ("Move to New Folder...", "track.move_to_new_folder"),
         ("Group...", "track.group"),
     ];

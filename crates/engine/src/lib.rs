@@ -52,6 +52,8 @@ pub enum EngineError {
     Unsupported(String),
     #[error("internal error in `{0}`: {1}")]
     Internal(String, String),
+    #[error("Track is frozen; unfreeze to edit")]
+    TrackFrozen,
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -442,6 +444,13 @@ impl Engine {
                     ))),
                     None => Ok(Ok(v)),
                 }
+            }
+            other => other,
+        };
+        // A frozen track plays its render: no command may change what was rendered.
+        let result = match result {
+            Ok(Ok(_)) if !Arc::ptr_eq(&before, &self.doc) && Arc::ptr_eq(&saved, &self.saved) && cmd::edits_frozen(&before, &self.doc) => {
+                Ok(Err(EngineError::TrackFrozen))
             }
             other => other,
         };

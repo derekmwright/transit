@@ -976,3 +976,53 @@ impl T {
         self.app.inspect(&self.ctx)["dialog"].as_str().unwrap_or("").to_string()
     }
 }
+
+// ---- Freeze ----
+
+#[test]
+fn the_snowflake_freezes_with_one_command_and_a_frozen_track_shows_cold_and_refuses_edits() {
+    let mut t = T::new();
+    let (tr, _) = t.midi_clip();
+    t.app.run("mix.insert", json!({"track": tr.0, "slot": 0, "plugin": "gain"})).unwrap();
+    t.app.focus(tr);
+    t.frames(6);
+    assert!(!t.row(tr).frozen && !t.app.mixer.devices.cards.is_empty());
+    assert!(t.app.mixer.devices.cards.iter().all(|c| !c.frozen));
+    let before = t.undo_len();
+    t.click(mid(t.row(tr).freeze_button));
+    assert!(t.app.engine.session().track(tr).unwrap().freeze.is_some(), "{}", t.app.status);
+    assert_eq!(t.undo_len(), before + 1, "one command, one undo step");
+    assert!(t.app.status.starts_with("Froze"), "{}", t.app.status);
+    t.frames(6);
+    assert!(t.row(tr).frozen, "the lane is tinted cold");
+    assert!(t.app.mixer.devices.cards.iter().all(|c| c.frozen), "the device cards are greyed");
+
+    // Editing what was rendered is refused, and the status line says why.
+    assert!(t.app.run("mix.insert_bypass", json!({"track": tr.0, "slot": 0})).is_err());
+    assert_eq!(t.app.status, "Track is frozen; unfreeze to edit");
+    assert_eq!(t.undo_len(), before + 1);
+    // The fader is not material.
+    t.app.run("mix.volume", json!({"tracks": [tr.0], "db": -3.0})).unwrap();
+
+    t.click(mid(t.row(tr).freeze_button));
+    assert!(t.app.engine.session().track(tr).unwrap().freeze.is_none());
+    t.frames(6);
+    assert!(!t.row(tr).frozen && t.app.mixer.devices.cards.iter().all(|c| !c.frozen));
+}
+
+#[test]
+fn flatten_turns_the_track_to_audio_in_one_undo_step() {
+    let mut t = T::new();
+    let (tr, _) = t.midi_clip();
+    t.app.run("mix.insert", json!({"track": tr.0, "slot": 0, "plugin": "gain"})).unwrap();
+    let before = t.undo_len();
+    t.app.flatten_track(tr).unwrap();
+    let s = t.app.engine.session();
+    assert_eq!(s.track(tr).unwrap().kind, soundcraft_model::TrackKind::Audio);
+    assert!(s.track(tr).unwrap().mixer.inserts.iter().all(Option::is_none));
+    assert_eq!(t.undo_len(), before + 1);
+    assert!(t.app.status.starts_with("Flattened"), "{}", t.app.status);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.app.engine.session().track(tr).unwrap().kind, soundcraft_model::TrackKind::Instrument);
+    assert!(t.app.engine.session().track(tr).unwrap().mixer.inserts[0].is_some());
+}
