@@ -41,8 +41,8 @@ jobs:
       - run: cargo xtask assets
       # Check production host code without the integration tests' self-dev feature activation.
       - run: cargo check --locked -p soundcraft-clap-host -p soundcraft-vst3-host --lib
-      - run: cargo clippy --locked --workspace --all-targets --features transit/native-wasapi -- -D warnings
-      - run: cargo test --locked --workspace --features transit/native-wasapi
+      - run: cargo clippy --locked --workspace --all-targets --features transit/native-wasapi,transit/native-asio -- -D warnings
+      - run: cargo test --locked --workspace --features transit/native-wasapi,transit/native-asio
 
   # ASIO needs Steinberg's SDK, which asio-sys downloads during the build (or ASIO_SDK_URL supplies).
   # A failed download must not block a merge, so this job reports without gating.

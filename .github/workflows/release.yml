@@ -3,8 +3,8 @@
 # (docs/releasing.md). macOS ships transit.app on a DMG (packaging/macos/package.sh),
 # ad-hoc signed unless the optional signing secrets are set (docs/releasing.md), plus a tarball with
 # the bare binary and the bench harness. Windows ships two zips and two MSIs (packaging/windows/transit.wxs):
-# transit-<ver>-windows-x86_64-asio (ASIO + native WASAPI) and transit-<ver>-windows-x86_64 (WASAPI
-# only, the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
+# transit-<ver>-windows-x86_64-asio (native WASAPI, native ASIO and cpal ASIO) and
+# transit-<ver>-windows-x86_64 (native WASAPI and native ASIO, no cpal ASIO; the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
 # the project owner handles; see docs/building.md. Every archive also carries the audio-bench
 # harness and BENCH-README.txt so testers can measure their interfaces without building.
 name: Release
@@ -33,8 +33,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x86_64-asio, os: windows-latest, asio: true, features: "--features transit/asio,transit/native-wasapi,audio-bench/asio,audio-bench/native-wasapi" }
-          - { name: windows-x86_64, os: windows-latest, asio: false, features: "--features audio-bench/native-wasapi" }
+          - { name: windows-x86_64-asio, os: windows-latest, asio: true, features: "--features transit/asio,transit/native-wasapi,transit/native-asio,audio-bench/asio,audio-bench/native-wasapi,audio-bench/native-asio" }
+          - { name: windows-x86_64, os: windows-latest, asio: false, features: "--features transit/native-wasapi,transit/native-asio,audio-bench/native-wasapi,audio-bench/native-asio" }
           - { name: macos-arm64, os: macos-14 }
           - { name: linux-x86_64, os: ubuntu-22.04 }
     steps:
@@ -115,9 +115,9 @@ jobs:
           New-Item -ItemType Directory $d | Out-Null
           Copy-Item target/release/transit.exe, target/release/audio-bench.exe, LICENSE-MIT, LICENSE-APACHE, NOTICE $d
           $audio = if ("${{ matrix.asio }}" -eq "true") {
-            "- Audio: ASIO and native WASAPI are included, plus the standard WASAPI host."
+            "- Audio: native WASAPI, native ASIO (experimental) and ASIO through the cpal host are included, plus the standard WASAPI host."
           } else {
-            "- Audio is WASAPI only; this build has no ASIO support (an ASIO build is published beside it)."
+            "- Audio: native WASAPI and native ASIO (experimental) are included, plus the standard WASAPI host. This build has no ASIO through the cpal host (a build with it is published beside this one)."
           }
           $notice = if ("${{ matrix.asio }}" -eq "true") {
             "`n" + 'ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.'
@@ -265,8 +265,8 @@ jobs:
             Windows: the `.msi` installs transit and `audio-bench.exe` to Program Files (per-machine, needs administrator approval), with a Start Menu shortcut and the `.transit` and `.transitz` file associations; the `.zip` is the portable form. Both are unsigned unless these notes say signed: SmartScreen will warn, so click "More info", then "Run anyway".
 
             Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
-            - windows-x86_64-asio: `audio-bench.exe` with ASIO, native WASAPI and cpal WASAPI.
-            - windows-x86_64: `audio-bench.exe` with native WASAPI and cpal WASAPI.
+            - windows-x86_64-asio: transit with native WASAPI, native ASIO (experimental) and cpal ASIO; `audio-bench.exe` with the same three plus cpal WASAPI.
+            - windows-x86_64: transit with native WASAPI and native ASIO (experimental), no cpal ASIO; `audio-bench.exe` with native WASAPI, native ASIO and cpal WASAPI.
             - macos-arm64: `audio-bench` (cpal, Core Audio), in the tarball only, not in the DMG.
             - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false

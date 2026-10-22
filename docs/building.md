@@ -164,4 +164,5 @@ redistribute an ASIO-enabled binary, you must first sign Steinberg's ASIO SDK Li
 (free; signed and emailed to Steinberg) and show this notice: "ASIO is a trademark of Steinberg
 Media Technologies GmbH, registered in Europe and other countries." Distributing the ASIO-enabled
 release build is subject to Steinberg's ASIO SDK license, which the project owner handles; the
-release workflow also publishes a WASAPI-only build as a fallback.
+release workflow also publishes a fallback build without cpal ASIO (it still carries native WASAPI and native
+ASIO).

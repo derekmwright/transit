@@ -2,25 +2,28 @@
 
 Releases are tag-driven. `.github/workflows/release.yml` does the building.
 
-1. Bump `version` in `apps/transit/Cargo.toml` (for example `0.1.0-alpha.2`) and commit it.
-2. Tag the commit `vX.Y.Z` or `vX.Y.Z-pre` (for example `v0.1.0-alpha.2`) and push the tag:
+1. Bump `[workspace.package] version` in the root `Cargo.toml` (for example `0.2.0-alpha.1`; the app and
+   every crate inherit it), refresh `Cargo.lock` with `cargo metadata`, commit, push, and wait for CI to be green.
+2. Tag that commit `vX.Y.Z` or `vX.Y.Z-pre` (for example `v0.2.0-alpha.1`) and push the tag:
 
    ```sh
-   git tag v0.1.0-alpha.2
-   git push origin v0.1.0-alpha.2
+   git tag v0.2.0-alpha.1
+   git push origin v0.2.0-alpha.1
    ```
 
 3. `release.yml` builds four archives and attaches them to a GitHub pre-release for the tag:
    - Windows x86_64 (two builds, each a `.msi` installer and a portable `.zip`): `windows-x86_64-asio`
-     (ASIO and native WASAPI; see below) and `windows-x86_64` (WASAPI only, the fallback). Unsigned
-     unless the Windows signing secrets below are set. SmartScreen may ask for "More info", then "Run anyway".
+     (native WASAPI, native ASIO and cpal ASIO; see below) and `windows-x86_64` (native WASAPI and native
+     ASIO, no cpal ASIO; the fallback). Unsigned unless the
+     Windows signing secrets below are set. SmartScreen may ask for "More info", then "Run anyway".
    - macOS arm64: `transit-<version>-macos-aarch64.dmg` (`transit.app` with a drag-to-Applications
      window, built by `packaging/macos/package.sh`) and a `macos-arm64` tarball with the bare binary
      and `audio-bench`. Ad-hoc signed and not notarized unless the signing secrets below are set.
      If macOS blocks the app, run `xattr -dr com.apple.quarantine /Applications/transit.app` or
      right-click it and choose Open.
    - Linux x86_64.
-4. Check the pre-release page, edit the notes, and publish it when the archives look right.
+4. Check the pre-release page and publish it when the archives look right. The workflow body is generic:
+   paste or replace it after publication with `gh release edit <tag> --notes-file <file>`.
 
 ## macOS signing and notarization (optional)
 
@@ -51,7 +54,7 @@ An MSI version is numeric `major.minor.build`, so the tag `v0.2.0` becomes `0.2.
 tag such as `v0.1.0-alpha.1` becomes `0.1.0` (the suffix is dropped; the workflow fails if the result
 is not three numeric fields). The full version is kept in the installer's comments (Apps and
 features) and in `HKLM\Software\transit\Version`. Same-version upgrades are allowed, so successive
-pre-releases of one `X.Y.Z` replace each other. The ASIO and WASAPI-only MSIs share one product, so
+pre-releases of one `X.Y.Z` replace each other. The two Windows MSIs share one product, so
 installing one replaces the other.
 
 With both repository secrets set, `packaging/windows/sign.ps1` signs `transit.exe`, `audio-bench.exe`
@@ -75,8 +78,8 @@ The `windows-x86_64-asio` zip is built with the cpal ASIO feature (`--features t
 job needs the Steinberg ASIO SDK. By default `asio-sys` downloads it from steinberg.net during the
 build, using the LLVM preinstalled on `windows-latest`. To use an SDK zip the owner hosts instead, set
 the optional repository secret `ASIO_SDK_URL` to its URL; the workflow unpacks it and sets
-`CPAL_ASIO_DIR`. The native ASIO backend needs none of this and will replace the cpal path once the
-app uses it.
+`CPAL_ASIO_DIR`. The native ASIO backend (`transit/native-asio`) needs none of this and is in both Windows zips; it will
+replace the cpal path.
 
 Distributing an ASIO-enabled binary is subject to Steinberg's ASIO SDK license, which the owner
 handles. The zip carries the required notice in `README-WINDOWS.txt`: "ASIO is a trademark of Steinberg Media
