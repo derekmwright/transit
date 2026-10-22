@@ -3,7 +3,7 @@
 //! through [`crate::com::Driver`]; nothing here is `unsafe`.
 
 use crate::abi;
-use crate::com::Driver;
+use crate::com::{ChannelCount, Driver};
 use transit_audio_backend as ab;
 use windows_core::GUID;
 
@@ -245,13 +245,14 @@ pub fn parse_guid(text: &str) -> Option<GUID> {
 /// Queries a loaded, initialized driver: channels and buffer sizes are required, the rest is
 /// reported where the driver answers. Runs on the host thread.
 pub(crate) fn query(name: &str, driver: &mut Driver) -> Result<DriverInfo, ab::OpenError> {
-    let (inputs, outputs) = driver.channels().map_err(|code| asio_error(name, "getChannels", code))?;
+    let count = driver.channels().map_err(|code| asio_error(name, "getChannels", code))?;
+    let (inputs, outputs) = (count.inputs(), count.outputs());
     let buffer = driver.buffer_size().map_err(|code| asio_error(name, "getBufferSize", code))?;
     let rates = PROBE_RATES.into_iter().filter(|rate| driver.can_sample_rate(f64::from(*rate)).is_ok()).collect();
     let current_rate = driver.sample_rate().ok();
     let latencies = driver.latencies().ok().map(|(i, o)| (i.max(0) as u32, o.max(0) as u32));
-    let input_type = direction_type(driver, inputs, true);
-    let output_type = direction_type(driver, outputs, false);
+    let input_type = direction_type(driver, count, true);
+    let output_type = direction_type(driver, count, false);
     let clamp = |n: i32| u16::try_from(n.max(0)).unwrap_or(u16::MAX);
     Ok(DriverInfo {
         name: name.to_owned(),
@@ -268,10 +269,11 @@ pub(crate) fn query(name: &str, driver: &mut Driver) -> Result<DriverInfo, ab::O
     })
 }
 
-fn direction_type(driver: &mut Driver, channels: i32, input: bool) -> DirectionType {
+fn direction_type(driver: &mut Driver, count: ChannelCount, input: bool) -> DirectionType {
     let mut types: Vec<SampleType> = Vec::new();
-    for channel in 0..channels.max(0) {
-        match driver.channel_info(channel, input) {
+    for index in count.first(input, usize::MAX) {
+        let channel = index.channel();
+        match driver.channel_info(index) {
             Ok(info) => {
                 let t = SampleType::from_code(info.type_);
                 if !types.contains(&t) {

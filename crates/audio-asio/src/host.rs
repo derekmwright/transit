@@ -18,11 +18,24 @@
 //! caller's request fails after the timeout instead of hanging, later requests fail at once while
 //! the thread is still blocked, and a load whose caller gave up is undone when the call finally
 //! returns.
+//!
+//! Messages are pumped between requests, not during a driver call. A driver whose `init`,
+//! `createBuffers` or `controlPanel` waits for one of its own threads that `SendMessage`s to the
+//! `sysRef` window (cross-thread, so the message is only delivered when this thread pumps) cannot
+//! be served until the call returns: the caller's request times out (no hang of the caller), and
+//! the sent message is dispatched as soon as the driver call returns. Running those calls on
+//! another thread while this one pumps would break the SDK's rule that every call is made on the
+//! thread that called `init`, so that limitation is kept and tested
+//! (`a_driver_that_sends_to_sys_ref_from_its_own_thread_*`); drivers normally `PostMessage`.
+//!
+//! Streaming: the driver's buffers, callback state and `start`/`stop` belong to its
+//! [`Session`], held by the loaded driver (see [`crate::session`] for the open-order rule).
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use crate::com::{Driver, Event, MessageWindow, StaGuard};
 use crate::driver::{self, BufferSize, DriverEntry, DriverInfo, asio_error};
+use crate::session::{Callback, Opened, Session};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,12 +82,17 @@ impl Drop for SlotGuard {
     }
 }
 
-/// The loaded driver. Field order matters: the driver is released before the slot is freed.
+/// The loaded driver. Field order matters: a session is torn down explicitly (`HostState::release`)
+/// before the driver is released, and the driver is released before the slot is freed.
 struct Loaded {
     entry: DriverEntry,
+    /// What the driver reported at load.
+    info: DriverInfo,
+    /// The streams of the driver, when any were opened.
+    session: Option<Session>,
+    /// Whether a [`crate::Loaded`] handle holds the driver (it stays loaded while either holds it).
+    handle: bool,
     driver: Driver,
-    /// Whether `createBuffers` succeeded (never in slice a); `unload` then stops and disposes.
-    buffers_created: bool,
     _slot: SlotGuard,
 }
 
@@ -84,6 +102,8 @@ pub(crate) struct HostState {
     slot: Slot,
     sys_ref: *mut c_void,
     loaded: Option<Loaded>,
+    /// The host's wake event, which `kAsioLatenciesChanged` sets so the thread refetches.
+    wake: Arc<Event>,
 }
 
 impl HostState {
@@ -95,13 +115,35 @@ impl HostState {
         self.loaded.as_ref().map(|l| l.entry.name.clone())
     }
 
-    /// Loads and initializes `entry` (no buffers) and queries it.
+    /// Loads and initializes `entry` (no buffers) and queries it, for a [`crate::Loaded`] handle.
+    /// The driver of a running stream session is shared with the handle.
     pub(crate) fn load(&mut self, entry: &DriverEntry) -> Result<DriverInfo, ab::OpenError> {
+        if let Some(loaded) = self.loaded.as_mut()
+            && loaded.entry.name == entry.name
+            && !loaded.handle
+            && loaded.session.is_some()
+        {
+            loaded.handle = true;
+            return driver::query(&entry.name, &mut loaded.driver);
+        }
+        let info = self.load_driver(entry)?;
+        if let Some(loaded) = self.loaded.as_mut() {
+            loaded.handle = true;
+        }
+        Ok(info)
+    }
+
+    fn in_use(open: &str, entry: &DriverEntry) -> ab::OpenError {
+        ab::OpenError::InUse(format!(
+            "ASIO driver \"{open}\" is already open; ASIO allows one driver per process, so \"{}\" cannot open until it is closed",
+            entry.name
+        ))
+    }
+
+    /// Loads and initializes `entry`, held by nothing yet.
+    fn load_driver(&mut self, entry: &DriverEntry) -> Result<DriverInfo, ab::OpenError> {
         if let Some(open) = self.loaded_name() {
-            return Err(ab::OpenError::InUse(format!(
-                "ASIO driver \"{open}\" is already open; ASIO allows one driver per process, so \"{}\" cannot open until it is closed",
-                entry.name
-            )));
+            return Err(Self::in_use(&open, entry));
         }
         let guard = self.slot.claim(&entry.name).map_err(|held| {
             ab::OpenError::InUse(format!(
@@ -117,7 +159,7 @@ impl HostState {
             return Err(ab::OpenError::DeviceNotAvailable(format!("ASIO driver \"{}\": init failed{detail}", entry.name)));
         }
         let info = driver::query(&entry.name, &mut driver)?;
-        self.loaded = Some(Loaded { entry: entry.clone(), driver, buffers_created: false, _slot: guard });
+        self.loaded = Some(Loaded { entry: entry.clone(), info: info.clone(), session: None, handle: false, driver, _slot: guard });
         Ok(info)
     }
 
@@ -133,28 +175,115 @@ impl HostState {
         Ok(info)
     }
 
-    /// Releases the loaded driver `name` (stopping and disposing buffers first if any existed).
+    /// The handle of the loaded driver `name` lets go; the driver is released unless a stream
+    /// session still uses it.
     pub(crate) fn unload(&mut self, name: &str) -> Result<(), ab::OpenError> {
-        match self.loaded_name() {
-            Some(open) if open == name => {
-                self.release();
+        match self.loaded.as_mut() {
+            Some(loaded) if loaded.entry.name == name => {
+                loaded.handle = false;
+                if loaded.session.is_none() {
+                    self.release();
+                }
                 Ok(())
             }
             _ => Err(not_open(name)),
         }
     }
 
+    /// Releases the loaded driver: its session first (stop, disposeBuffers, callback state freed),
+    /// then the object.
     fn release(&mut self) {
         if let Some(mut loaded) = self.loaded.take() {
-            if loaded.buffers_created {
-                if let Err(code) = loaded.driver.stop() {
-                    log::warn!("{}", asio_error(&loaded.entry.name, "stop", code));
-                }
-                if let Err(code) = loaded.driver.dispose_buffers() {
-                    log::warn!("{}", asio_error(&loaded.entry.name, "disposeBuffers", code));
-                }
+            if let Some(session) = loaded.session.take() {
+                session.teardown(&loaded.entry.name, &mut loaded.driver);
             }
             drop(loaded);
+        }
+    }
+
+    /// Opens a stream of `entry`: loads the driver if needed, then opens its session or attaches
+    /// the stream to it.
+    pub(crate) fn open_stream(
+        &mut self,
+        entry: &DriverEntry,
+        request: &ab::OpenRequest,
+        callback: Callback,
+        error: ab::ErrorCallback,
+    ) -> Result<Opened, ab::OpenError> {
+        match self.loaded_name() {
+            None => {
+                self.load_driver(entry)?;
+            }
+            Some(open) if open == entry.name => {}
+            Some(open) => return Err(Self::in_use(&open, entry)),
+        }
+        let wake = Arc::clone(&self.wake);
+        let Some(loaded) = self.loaded.as_mut() else { return Err(not_open(&entry.name)) };
+        let Loaded { entry: open, info, session, driver, .. } = &mut *loaded;
+        let result = match session.as_mut() {
+            Some(session) => session.attach(&open.name, driver, info, request, callback, error),
+            None => Session::open(&open.name, driver, info, wake, request, callback, error).map(|(s, opened)| {
+                *session = Some(s);
+                opened
+            }),
+        };
+        if result.is_err() && loaded.session.is_none() && !loaded.handle {
+            self.release();
+        }
+        result
+    }
+
+    /// The session of `name` with `generation`, with its driver.
+    fn session(&mut self, name: &str, generation: u64) -> Result<(&mut Session, &mut Driver), ab::OpenError> {
+        match self.loaded.as_mut() {
+            Some(Loaded { entry, session: Some(session), driver, .. }) if entry.name == name && session.generation() == generation => {
+                Ok((session, driver))
+            }
+            _ => Err(ab::OpenError::Other(format!("ASIO driver \"{name}\": the stream's session has ended; open it again"))),
+        }
+    }
+
+    pub(crate) fn start_stream(&mut self, name: &str, generation: u64, direction: ab::Direction, pair: (u64, i64)) -> Result<(), ab::OpenError> {
+        let (session, driver) = self.session(name, generation)?;
+        session.start(name, driver, direction, pair)
+    }
+
+    pub(crate) fn stop_stream(&mut self, name: &str, generation: u64, direction: ab::Direction) -> Result<(), ab::OpenError> {
+        let (session, driver) = self.session(name, generation)?;
+        session.stop(name, driver, direction);
+        Ok(())
+    }
+
+    /// The stream of `direction` is gone; the session ends with its last stream.
+    pub(crate) fn detach_stream(&mut self, name: &str, generation: u64, direction: ab::Direction) -> Result<(), ab::OpenError> {
+        let (session, driver) = self.session(name, generation)?;
+        if session.detach(name, driver, direction) {
+            self.end_session();
+        }
+        Ok(())
+    }
+
+    /// Tears down a session whose streams are all gone (a stream whose open answer was abandoned).
+    fn sweep(&mut self) {
+        if self.loaded.as_ref().and_then(|l| l.session.as_ref()).is_some_and(Session::abandoned) {
+            self.end_session();
+        }
+    }
+
+    fn end_session(&mut self) {
+        let Some(loaded) = self.loaded.as_mut() else { return };
+        if let Some(session) = loaded.session.take() {
+            session.teardown(&loaded.entry.name, &mut loaded.driver);
+        }
+        if !loaded.handle {
+            self.release();
+        }
+    }
+
+    /// Work between requests: a latency refetch the driver asked for.
+    fn tend(&mut self) {
+        if let Some(Loaded { entry, session: Some(session), driver, .. }) = self.loaded.as_mut() {
+            session.tend(&entry.name, driver);
         }
     }
 
@@ -216,6 +345,11 @@ pub(crate) struct Host {
 impl Host {
     /// Starts the host thread: STA, message window, then the request loop.
     pub(crate) fn spawn(loader: Box<dyn Loader>, slot: Slot, timeout: Duration) -> Result<Self, ab::OpenError> {
+        Self::spawn_after(loader, slot, timeout, Duration::ZERO)
+    }
+
+    /// [`Host::spawn`] with the thread pausing `delay` before it starts (tests of the start timeout).
+    fn spawn_after(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, delay: Duration) -> Result<Self, ab::OpenError> {
         let (tx, rx) = mpsc::channel::<Envelope>();
         let (started_tx, started_rx) = mpsc::channel();
         let (exited_tx, exited) = mpsc::channel();
@@ -225,7 +359,10 @@ impl Host {
         let thread = std::thread::Builder::new()
             .name("transit-asio-host".into())
             .spawn(move || {
-                run(loader, slot, &rx, &thread_wake, &thread_shared, &started_tx);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                run(loader, slot, &rx, thread_wake, &thread_shared, &started_tx);
                 let _ = exited_tx.send(());
             })
             .map_err(|e| ab::OpenError::Other(format!("could not start the ASIO host thread: {e}")))?;
@@ -235,7 +372,14 @@ impl Host {
                 let _ = thread.join();
                 return Err(e);
             }
-            Err(_) => return Err(ab::OpenError::Other("the ASIO host thread did not start".into())),
+            Err(_) => {
+                // The thread may still start late: tell it to end and wake it, so it does not sleep
+                // in its wait forever with a window and an apartment nobody will use.
+                shared.quit.store(true, Ordering::Release);
+                drop(tx);
+                wake.set();
+                return Err(ab::OpenError::Other("the ASIO host thread did not start".into()));
+            }
         }
         Ok(Self { tx: Some(tx), wake, shared, timeout, exited: Mutex::new(exited), thread: Some(thread) })
     }
@@ -317,7 +461,14 @@ impl Drop for Host {
     }
 }
 
-fn run(loader: Box<dyn Loader>, slot: Slot, jobs: &Receiver<Envelope>, wake: &Event, shared: &Shared, started: &Sender<Result<(), ab::OpenError>>) {
+fn run(
+    loader: Box<dyn Loader>,
+    slot: Slot,
+    jobs: &Receiver<Envelope>,
+    wake: Arc<Event>,
+    shared: &Shared,
+    started: &Sender<Result<(), ab::OpenError>>,
+) {
     let com = match StaGuard::new() {
         Ok(com) => com,
         Err(e) => {
@@ -333,7 +484,7 @@ fn run(loader: Box<dyn Loader>, slot: Slot, jobs: &Receiver<Envelope>, wake: &Ev
             return;
         }
     };
-    let mut state = HostState { loader, slot, sys_ref: window.sys_ref(), loaded: None };
+    let mut state = HostState { loader, slot, sys_ref: window.sys_ref(), loaded: None, wake: Arc::clone(&wake) };
     let _ = started.send(Ok(()));
     'serve: loop {
         loop {
@@ -346,6 +497,7 @@ fn run(loader: Box<dyn Loader>, slot: Slot, jobs: &Receiver<Envelope>, wake: &Ev
         if shared.quit.load(Ordering::Acquire) {
             break;
         }
+        state.tend();
         wake.pump_and_wait();
     }
     state.release();
@@ -363,6 +515,8 @@ fn serve(state: &mut HostState, job: Job, label: String, shared: &Shared) {
         if now.is_some() && now != before {
             log::warn!("ASIO: {label} finished after its caller gave up; unloading {}", now.unwrap_or_default());
             state.release();
+        } else {
+            state.sweep();
         }
     }
     *shared.busy.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -496,6 +650,84 @@ mod tests {
         let err = host.call("probe", move |s| s.probe(&broken)).unwrap_err();
         assert!(matches!(&err, ab::OpenError::Other(t) if t.contains("getChannels") && t.contains("ASE_HWMalfunction")), "{err:?}");
         assert_eq!(observed.live.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_host_that_starts_after_the_spawn_timeout_ends_instead_of_sleeping_forever() {
+        let (loader, observed) = FakeLoader::new(Vec::new());
+        let err = Host::spawn_after(Box::new(loader), Slot::default(), Duration::from_millis(100), Duration::from_millis(400)).err();
+        assert!(matches!(&err, Some(ab::OpenError::Other(t)) if t.contains("did not start")), "{err:?}");
+        // The late thread starts, finds the request channel closed and the event set, and exits,
+        // dropping the loader (the only other holder of `observed`).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&observed) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(Arc::strong_count(&observed), 1, "the late host thread exited");
+    }
+
+    #[test]
+    fn init_is_read_by_its_low_byte() {
+        assert!(crate::com::init_succeeded(abi::ASIO_TRUE));
+        assert!(!crate::com::init_succeeded(abi::ASIO_FALSE));
+        assert!(!crate::com::init_succeeded(0x5a5a_5a00), "a C++ bool false with garbage above AL");
+        assert!(crate::com::init_succeeded(0x5a5a_5a01), "a C++ bool true with garbage above AL");
+        let mut liar = FakeSpec::new("Liar", 2, 2, abi::ASIOST_INT32_LSB);
+        liar.init_raw = Some(0x1234_5600);
+        let mut honest = FakeSpec::new("Bool", 2, 2, abi::ASIOST_INT32_LSB);
+        honest.init_raw = Some(0x7fff_ff01);
+        let (a, b) = (entry("Liar", 20), entry("Bool", 21));
+        let (host, observed) = host(vec![(a.clone(), liar), (b.clone(), honest)], Slot::default(), Duration::from_secs(10));
+        let err = host.call("load Liar", move |s| s.load(&a)).unwrap_err();
+        assert!(matches!(err, ab::OpenError::DeviceNotAvailable(_)), "{err:?}");
+        host.call("load Bool", move |s| s.load(&b)).expect("a true low byte is a success");
+        host.call("unload", |s| s.unload("Bool")).expect("unloads");
+        assert_eq!(observed.live.load(Ordering::Acquire), 0);
+    }
+
+    /// The `sysRef` window `init` got.
+    fn sys_ref(observed: &crate::com::fake::Observed) -> usize {
+        *observed.sys_refs.lock().unwrap().last().expect("init ran")
+    }
+
+    #[test]
+    fn a_driver_that_sends_to_sys_ref_from_its_own_thread_is_served_while_the_host_is_idle() {
+        let a = entry("Poster", 22);
+        let (host, observed) =
+            host(vec![(a.clone(), FakeSpec::new("Poster", 2, 2, abi::ASIOST_INT32_LSB))], Slot::default(), Duration::from_secs(10));
+        host.call("load", move |s| s.load(&a)).expect("loads");
+        let window = sys_ref(&observed);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            crate::com::fake::send_null(window);
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the idle host pumped the sent message");
+        host.call("unload", |s| s.unload("Poster")).expect("unloads");
+    }
+
+    #[test]
+    fn a_driver_that_sends_to_sys_ref_from_its_own_thread_during_init_times_out_the_caller_not_the_process() {
+        // The documented limitation: no pumping inside a driver call. The caller gets an error at
+        // the timeout, the sent message is dispatched once `init` returns, and the host recovers.
+        let mut spec = FakeSpec::new("Sender", 2, 2, abi::ASIOST_INT32_LSB);
+        spec.init_sends = Some(Duration::from_millis(800));
+        let a = entry("Sender", 23);
+        let (host, observed) = host(vec![(a.clone(), spec)], Slot::default(), Duration::from_millis(200));
+        let started = Instant::now();
+        let e = a.clone();
+        let err = host.call("load Sender", move |s| s.load(&e)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(700), "the caller did not wait for the driver: {:?}", started.elapsed());
+        assert!(matches!(&err, ab::OpenError::Other(t) if t.contains("did not answer")), "{err:?}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (host.is_stuck() || !observed.sent.load(Ordering::SeqCst)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(observed.sent.load(Ordering::SeqCst), "the SendMessage completed once the host pumped again");
+        assert!(!host.is_stuck());
+        assert_eq!(observed.live.load(Ordering::Acquire), 0, "the abandoned load was undone");
+        drop(a);
+        host.call("list", |s| s.list()).expect("the host serves again");
     }
 
     #[test]

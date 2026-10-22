@@ -1,15 +1,23 @@
-//! The COM, registry and Win32 calls of the backend and the calls through the `IASIO` vtable: the
-//! only `unsafe` in the crate (with its test double, [`fake`], in the same file).
+//! The COM, registry and Win32 calls of the backend and the calls through the `IASIO` vtable (with
+//! its test double, [`fake`], in the same file). The only other `unsafe` of the crate is in
+//! [`crate::callback`]: the driver's callbacks and the buffers they touch.
 //!
 //! Threading rule: a [`Driver`] is created, initialized, called and released on one thread, the
 //! ASIO host thread of [`crate::host`], which initialized COM as a single-threaded apartment. The
 //! drivers register `ThreadingModel=Apartment`, so their objects belong to the creating STA, and
 //! the ASIO SDK requires every `IASIO` call on the thread that called `init`. `Driver` holds a raw
-//! pointer and is therefore neither `Send` nor `Sync`: the compiler keeps it on that thread.
+//! pointer and is therefore neither `Send` nor `Sync`: the compiler keeps it on that thread. The two
+//! exceptions the SDK makes for the buffer-switch callback, `outputReady` and `getSamplePosition`
+//! (called from inside `bufferSwitch` on the driver's own thread), go through [`CallbackDriver`].
+//!
+//! Preconditions are types: [`ChannelIndex`] comes only from the [`ChannelCount`] `getChannels`
+//! reported, [`Buffers`] only from a successful `createBuffers` (and `disposeBuffers` consumes it),
+//! and [`Running`] only from a successful `start` (and `stop` gives the [`Buffers`] back), so the
+//! wrapper cannot start without buffers, stop without a start, or dispose while running.
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use crate::abi::{self, AsioChannelInfo, IAsio, IAsioVtbl};
+use crate::abi::{self, AsioBufferInfo, AsioChannelInfo, AsioSamples, AsioTimeStamp, IAsio, IAsioVtbl};
 use crate::driver::{BufferSize, DriverEntry, parse_guid};
 use crate::host::Loader;
 use std::ffi::c_void;
@@ -66,13 +74,13 @@ impl Driver {
         unsafe { &*(*self.this()).vtbl }
     }
 
-    /// `IASIO::init(sysHandle)`: true on `ASIOTrue`.
+    /// `IASIO::init(sysHandle)`: true on `ASIOTrue`. See [`init_succeeded`] for how the result is read.
     pub(crate) fn init(&mut self, sys_ref: *mut c_void) -> bool {
         let init = self.vtbl().init;
         // SAFETY: `init(void *sysHandle)` on the thread that created the object (the STA host
         // thread). `sys_ref` is the host's message-only window, which outlives every driver the
         // host loads (the window is destroyed after the last driver is released).
-        unsafe { init(self.this(), sys_ref) != abi::ASIO_FALSE }
+        init_succeeded(unsafe { init(self.this(), sys_ref) })
     }
 
     /// `getDriverName`, through a buffer larger than the SDK's 32 bytes.
@@ -101,13 +109,13 @@ impl Driver {
         abi::c_string(&text)
     }
 
-    pub(crate) fn channels(&mut self) -> Result<(i32, i32), i32> {
+    pub(crate) fn channels(&mut self) -> Result<ChannelCount, i32> {
         let (mut inputs, mut outputs) = (0, 0);
         let get = self.vtbl().getChannels;
         // SAFETY: `getChannels(long *, long *)` writes one `long` through each pointer; both are
         // locals that outlive the call. Host thread, after a successful `init`.
         check(unsafe { get(self.this(), &mut inputs, &mut outputs) })?;
-        Ok((inputs, outputs))
+        Ok(ChannelCount { inputs: inputs.max(0), outputs: outputs.max(0) })
     }
 
     pub(crate) fn latencies(&mut self) -> Result<(i32, i32), i32> {
@@ -151,12 +159,13 @@ impl Driver {
         check(unsafe { set(self.this(), rate) })
     }
 
-    pub(crate) fn channel_info(&mut self, channel: i32, input: bool) -> Result<AsioChannelInfo, i32> {
-        let mut info = AsioChannelInfo::query(channel, input);
+    pub(crate) fn channel_info(&mut self, channel: ChannelIndex) -> Result<AsioChannelInfo, i32> {
+        let mut info = AsioChannelInfo::query(channel.channel, channel.input);
         let get = self.vtbl().getChannelInfo;
         // SAFETY: `getChannelInfo(ASIOChannelInfo *)` reads `channel` and `isInput` and fills the
         // rest of the 52-byte structure (layout asserted in `abi`); the local outlives the call.
-        // Host thread, after a successful `init`, with `channel` below the `getChannels` count.
+        // Host thread, after a successful `init`; `channel` is a `ChannelIndex`, below the count
+        // `getChannels` reported.
         check(unsafe { get(self.this(), &mut info) })?;
         Ok(info)
     }
@@ -168,17 +177,168 @@ impl Driver {
         check(unsafe { panel(self.this()) })
     }
 
-    pub(crate) fn stop(&mut self) -> Result<(), i32> {
-        let stop = self.vtbl().stop;
-        // SAFETY: `stop()` takes no pointers. Host thread. Only called when buffers exist.
-        check(unsafe { stop(self.this()) })
+    /// `createBuffers` for `channels` at `frames` per buffer, with the process-wide callback table
+    /// of [`crate::callback`]. Returns the token of the buffers and each channel's two buffer
+    /// addresses, in the order of `channels`.
+    pub(crate) fn create_buffers(&mut self, channels: &[ChannelIndex], frames: i32) -> Result<(Buffers, Vec<[usize; 2]>), i32> {
+        let mut infos: Vec<AsioBufferInfo> = channels
+            .iter()
+            .map(|c| AsioBufferInfo { isInput: c.input as abi::AsioBool, channelNum: c.channel, buffers: [std::ptr::null_mut(); 2] })
+            .collect();
+        let count = i32::try_from(infos.len()).map_err(|_| abi::ASE_INVALID_PARAMETER)?;
+        let create = self.vtbl().createBuffers;
+        // SAFETY: `createBuffers(ASIOBufferInfo *, long, long, ASIOCallbacks *)` on the host thread
+        // after a successful `init`, with no buffers outstanding (the caller holds no `Buffers`
+        // token: `Session` disposes before it creates again). `infos` holds `count` 24-byte entries
+        // (layout asserted in `abi`) that the driver fills with two buffer pointers each and does not
+        // keep. The callback table is a static in writable memory that lives for the process
+        // ("the callbacks must stay valid until ASIODisposeBuffers"); every channel number is a
+        // `ChannelIndex`, below the count `getChannels` reported.
+        check(unsafe { create(self.this(), infos.as_mut_ptr(), count, frames, crate::callback::table()) })?;
+        let pointers = infos.iter().map(|i| [i.buffers[0] as usize, i.buffers[1] as usize]).collect();
+        Ok((Buffers { _private: () }, pointers))
     }
 
-    pub(crate) fn dispose_buffers(&mut self) -> Result<(), i32> {
+    /// `start`: the driver begins calling `bufferSwitch` on its own thread.
+    pub(crate) fn start(&mut self, buffers: Buffers) -> Result<Running, (Buffers, i32)> {
+        let start = self.vtbl().start;
+        // SAFETY: `start()` takes no pointers. Host thread; the `Buffers` token proves
+        // `createBuffers` succeeded and `disposeBuffers` has not run.
+        match check(unsafe { start(self.this()) }) {
+            Ok(()) => Ok(Running(buffers)),
+            Err(code) => Err((buffers, code)),
+        }
+    }
+
+    /// `stop`: after it returns no `bufferSwitch` runs ("no further callbacks after ASIOStop"). The
+    /// buffers come back whether or not the driver reported an error.
+    pub(crate) fn stop(&mut self, running: Running) -> (Buffers, Result<(), i32>) {
+        let stop = self.vtbl().stop;
+        // SAFETY: `stop()` takes no pointers. Host thread; the `Running` token proves a successful
+        // `start` with buffers in place.
+        let result = check(unsafe { stop(self.this()) });
+        (running.0, result)
+    }
+
+    /// `disposeBuffers`: the buffer pointers of `createBuffers` are invalid afterwards.
+    pub(crate) fn dispose_buffers(&mut self, buffers: Buffers) -> Result<(), i32> {
+        let Buffers { _private: () } = buffers;
         let dispose = self.vtbl().disposeBuffers;
-        // SAFETY: `disposeBuffers()` takes no pointers; called after `stop` and only when
-        // `createBuffers` succeeded ("buffers are valid until ASIODisposeBuffers"). Host thread.
+        // SAFETY: `disposeBuffers()` takes no pointers. Host thread; the `Buffers` token proves the
+        // buffers exist and, not being inside a `Running`, that the driver is stopped.
         check(unsafe { dispose(self.this()) })
+    }
+
+    /// `outputReady` asked once after `createBuffers`: true when the driver supports it (`ASE_OK`;
+    /// drivers without it answer `ASE_NotPresent`).
+    pub(crate) fn supports_output_ready(&mut self, _buffers: &Buffers) -> bool {
+        let ready = self.vtbl().outputReady;
+        // SAFETY: `outputReady()` takes no pointers. Host thread, with buffers created and the
+        // driver not started, which is where cpal and the SDK sample host probe it.
+        check(unsafe { ready(self.this()) }).is_ok()
+    }
+
+    /// The raw object for the two calls the buffer-switch callback makes on the driver's thread.
+    pub(crate) fn callback_driver(&self) -> CallbackDriver {
+        CallbackDriver(self.obj)
+    }
+}
+
+/// Reads the `ASIOBool` `init` returns by its low byte. `asio.h` declares `typedef long ASIOBool`
+/// with `ASIOFalse = 0` and `ASIOTrue = 1`, so a conforming driver's answer is 0 or 1 and its low
+/// byte is the whole value. Some old drivers implement `init` returning a C++ `bool`, which sets
+/// only `AL` and leaves the upper bytes of `EAX` undefined; reading the whole `long` (`!= 0`) would
+/// then call a failed `init` a success. The low byte reads both kinds correctly. (No conforming
+/// driver returns a true value with a zero low byte: `ASIOTrue` is 1.)
+pub(crate) fn init_succeeded(value: abi::AsioBool) -> bool {
+    value & 0xff != 0
+}
+
+/// What `getChannels` reported. The only maker of [`ChannelIndex`]es, each below its count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChannelCount {
+    inputs: i32,
+    outputs: i32,
+}
+
+impl ChannelCount {
+    pub(crate) fn inputs(self) -> i32 {
+        self.inputs
+    }
+
+    pub(crate) fn outputs(self) -> i32 {
+        self.outputs
+    }
+
+    /// The first `n` channels of one direction (fewer when the driver has fewer).
+    pub(crate) fn first(self, input: bool, n: usize) -> impl Iterator<Item = ChannelIndex> {
+        let count = if input { self.inputs } else { self.outputs };
+        (0..count).take(n).map(move |channel| ChannelIndex { channel, input })
+    }
+}
+
+/// A channel number below the count `getChannels` reported, with its direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChannelIndex {
+    channel: i32,
+    input: bool,
+}
+
+impl ChannelIndex {
+    pub(crate) fn channel(self) -> i32 {
+        self.channel
+    }
+}
+
+/// Proof that `createBuffers` succeeded and `disposeBuffers` has not run. Not `Clone`.
+#[derive(Debug)]
+pub(crate) struct Buffers {
+    _private: (),
+}
+
+/// Proof that `start` succeeded and `stop` has not run; holds the [`Buffers`].
+#[derive(Debug)]
+pub(crate) struct Running(Buffers);
+
+/// The driver object as the buffer-switch callback uses it on the driver's thread: `outputReady`
+/// after the output buffers are filled, and `getSamplePosition` on the `bufferSwitch` path (the SDK
+/// sample host makes both calls from inside `bufferSwitch`). It does not own a reference: the
+/// session that holds it is torn down (stop, disposeBuffers, callback state freed) before the
+/// [`Driver`] releases the object.
+pub(crate) struct CallbackDriver(NonNull<IAsio>);
+
+// SAFETY: the pointer is used only for `outputReady` and `getSamplePosition`, which the SDK has the
+// host call from the driver's own callback thread (not the STA that created the object), and only
+// while the object is alive (see the type documentation). No COM marshaling is involved: these are
+// direct calls through the vtable.
+unsafe impl Send for CallbackDriver {}
+// SAFETY: as above; the callback state serializes the callback thread's calls.
+unsafe impl Sync for CallbackDriver {}
+
+impl CallbackDriver {
+    fn vtbl(&self) -> &IAsioVtbl {
+        // SAFETY: the object is alive while a callback can run (type documentation), and a COM
+        // object's vtable pointer is valid and unchanged for its lifetime.
+        unsafe { &*(*self.0.as_ptr()).vtbl }
+    }
+
+    /// `outputReady()`, from inside the buffer switch.
+    pub(crate) fn output_ready(&self) {
+        let ready = self.vtbl().outputReady;
+        // SAFETY: `outputReady()` takes no pointers; called from inside `bufferSwitch` after the
+        // output buffers of this half were written, which is the SDK's rule for it.
+        let _ = unsafe { ready(self.0.as_ptr()) };
+    }
+
+    /// `getSamplePosition`: the position and the driver's system time in ns, from inside the buffer
+    /// switch, or `None` when the driver reports an error.
+    pub(crate) fn sample_position(&self) -> Option<(u64, u64)> {
+        let (mut position, mut stamp) = (AsioSamples::default(), AsioTimeStamp::default());
+        let get = self.vtbl().getSamplePosition;
+        // SAFETY: `getSamplePosition(ASIOSamples *, ASIOTimeStamp *)` writes one 8-byte structure
+        // through each local pointer; called from inside `bufferSwitch` as the SDK sample host does.
+        check(unsafe { get(self.0.as_ptr(), &mut position, &mut stamp) }).ok()?;
+        Some((position.value(), stamp.value()))
     }
 }
 
@@ -332,8 +492,11 @@ impl Event {
             }
         }
         // SAFETY: waits on one live event handle (a slice that outlives the call) or any input
-        // for this thread's queue; INFINITE is safe because a request or shutdown always sets the
-        // event.
+        // for this thread's queue. INFINITE cannot strand the thread: every caller sets the event
+        // after queuing a request, and both ways the host ends (`Host::drop` and a `Host::spawn`
+        // that timed out waiting for the start) set `quit` and drop the request sender before
+        // setting it, so the loop wakes, sees the sender gone and exits. An auto-reset event set
+        // before the wait begins stays signaled until the wait consumes it.
         let _ = unsafe { MsgWaitForMultipleObjects(Some(&[self.0]), false, INFINITE, QS_ALLINPUT) };
     }
 }
@@ -463,9 +626,11 @@ impl Loader for ComLoader {
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use crate::driver::SampleType;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread::ThreadId;
+    use std::time::Duration;
 
     /// A latch a fake `init` waits on.
     #[derive(Default)]
@@ -501,10 +666,17 @@ pub(crate) mod fake {
         pub current_rate: f64,
         pub latencies: (i32, i32),
         pub init_ok: bool,
+        /// The raw value `init` returns, overriding `init_ok` (a C++ `bool` driver's garbage).
+        pub init_raw: Option<i32>,
         pub init_message: String,
         pub init_gate: Option<Arc<Gate>>,
+        /// `init` sends `WM_NULL` to `sysRef` from a thread of its own and waits this long for it.
+        pub init_sends: Option<Duration>,
         pub channels_error: Option<i32>,
         pub panel_error: Option<i32>,
+        pub create_error: Option<i32>,
+        pub start_error: Option<i32>,
+        pub output_ready: bool,
     }
 
     impl FakeSpec {
@@ -520,12 +692,26 @@ pub(crate) mod fake {
                 current_rate: 48_000.0,
                 latencies: (300, 400),
                 init_ok: true,
+                init_raw: None,
                 init_message: String::new(),
                 init_gate: None,
+                init_sends: None,
                 channels_error: None,
                 panel_error: None,
+                create_error: None,
+                start_error: None,
+                output_ready: true,
             }
         }
+    }
+
+    /// One channel's two buffers as `createBuffers` handed them out (addresses of leaked boxes).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct FakeBuffer {
+        pub input: bool,
+        pub channel: i32,
+        pub addresses: [usize; 2],
+        pub bytes: usize,
     }
 
     /// What tests observe across all fake objects of one loader.
@@ -538,6 +724,53 @@ pub(crate) mod fake {
         pub panels: AtomicUsize,
         pub threads: Mutex<Vec<ThreadId>>,
         pub sys_refs: Mutex<Vec<usize>>,
+        /// The streaming calls, in order, with their thread.
+        pub calls: Mutex<Vec<(&'static str, ThreadId)>>,
+        pub buffers: Mutex<Vec<FakeBuffer>>,
+        pub output_ready: AtomicUsize,
+        /// What `getSamplePosition` answers (`u64::MAX`: `ASE_SPNotAdvancing`) and its system time.
+        pub position: AtomicU64,
+        pub system_time: AtomicU64,
+        /// Set when the `init_sends` thread's `SendMessage` returned.
+        pub sent: Arc<AtomicBool>,
+        /// Frames `getLatencies` adds to both of the spec's figures (a driver whose latency moved).
+        pub extra_latency: AtomicU64,
+    }
+
+    impl Observed {
+        fn call(&self, name: &'static str) {
+            self.calls.lock().unwrap().push((name, std::thread::current().id()));
+        }
+
+        /// The names of the streaming calls so far.
+        pub(crate) fn call_names(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().iter().map(|(n, _)| *n).collect()
+        }
+
+        fn buffer(&self, input: bool, channel: i32) -> FakeBuffer {
+            *self.buffers.lock().unwrap().iter().find(|b| b.input == input && b.channel == channel).expect("a created buffer")
+        }
+
+        /// Writes `bytes` into input `channel`'s buffer `half`, as the hardware would.
+        pub(crate) fn write_input(&self, channel: i32, half: usize, bytes: &[u8]) {
+            let b = self.buffer(true, channel);
+            assert_eq!(bytes.len(), b.bytes);
+            // SAFETY: a live buffer of `b.bytes` bytes from `create_buffers` (freed only by
+            // `dispose_buffers`); the test thread is the only one touching it now.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.addresses[half] as *mut u8, b.bytes) };
+        }
+
+        /// The created input channels and their buffer length.
+        pub(crate) fn inputs(&self) -> Vec<(i32, usize)> {
+            self.buffers.lock().unwrap().iter().filter(|b| b.input).map(|b| (b.channel, b.bytes)).collect()
+        }
+
+        /// Output `channel`'s buffer `half`, as the hardware would play it.
+        pub(crate) fn read_output(&self, channel: i32, half: usize) -> Vec<u8> {
+            let b = self.buffer(false, channel);
+            // SAFETY: as in `write_input`.
+            unsafe { std::slice::from_raw_parts(b.addresses[half] as *const u8, b.bytes) }.to_vec()
+        }
     }
 
     #[repr(C)]
@@ -549,17 +782,27 @@ pub(crate) mod fake {
         observed: Arc<Observed>,
     }
 
-    /// The fake object behind `this`.
+    /// The fake object behind `this`, recording the calling thread (a control call).
     ///
     /// # Safety
     ///
     /// `this` came from [`create`] and has not been released for the last time.
     unsafe fn object<'a>(this: *mut IAsio) -> &'a FakeObject {
-        // SAFETY: the caller's contract: `this` is a live `Box<FakeObject>` whose first field is
-        // the vtable pointer, so the `IAsio` pointer is the object pointer.
-        let obj = unsafe { &*this.cast::<FakeObject>() };
+        // SAFETY: the caller's contract.
+        let obj = unsafe { object_quiet(this) };
         obj.observed.threads.lock().unwrap().push(std::thread::current().id());
         obj
+    }
+
+    /// The fake object behind `this`, for the calls the callback makes on the driver's thread.
+    ///
+    /// # Safety
+    ///
+    /// As for [`object`].
+    unsafe fn object_quiet<'a>(this: *mut IAsio) -> &'a FakeObject {
+        // SAFETY: the caller's contract: `this` is a live `Box<FakeObject>` whose first field is
+        // the vtable pointer, so the `IAsio` pointer is the object pointer.
+        unsafe { &*this.cast::<FakeObject>() }
     }
 
     unsafe extern "C" fn query_interface(_this: *mut IAsio, _riid: *const [u8; 16], object: *mut *mut c_void) -> i32 {
@@ -591,7 +834,18 @@ pub(crate) mod fake {
         if let Some(gate) = &obj.spec.init_gate {
             gate.wait();
         }
-        i32::from(obj.spec.init_ok)
+        if let Some(wait) = obj.spec.init_sends {
+            // A driver whose worker thread `SendMessage`s to `sysRef` while `init` waits for it.
+            let (window, sent) = (sys as usize, Arc::clone(&obj.observed.sent));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                send_null(window);
+                sent.store(true, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(wait);
+        }
+        obj.spec.init_raw.unwrap_or(i32::from(obj.spec.init_ok))
     }
     unsafe extern "C" fn get_driver_name(this: *mut IAsio, name: *mut u8) {
         // SAFETY: called through a live object's vtable.
@@ -618,9 +872,6 @@ pub(crate) mod fake {
             *text.add(n) = 0;
         }
     }
-    unsafe extern "C" fn ok(_this: *mut IAsio) -> i32 {
-        abi::ASE_OK
-    }
     unsafe extern "C" fn get_channels(this: *mut IAsio, inputs: *mut i32, outputs: *mut i32) -> i32 {
         // SAFETY: called through a live object's vtable.
         let obj = unsafe { object(this) };
@@ -638,8 +889,10 @@ pub(crate) mod fake {
         // SAFETY: called through a live object's vtable; valid out-pointers by the SDK contract.
         unsafe {
             let obj = object(this);
-            *input = obj.spec.latencies.0;
-            *output = obj.spec.latencies.1;
+            obj.observed.call("getLatencies");
+            let extra = obj.observed.extra_latency.load(Ordering::SeqCst) as i32;
+            *input = obj.spec.latencies.0 + extra;
+            *output = obj.spec.latencies.1 + extra;
         }
         abi::ASE_OK
     }
@@ -681,8 +934,20 @@ pub(crate) mod fake {
     unsafe extern "C" fn set_clock_source(_this: *mut IAsio, _reference: i32) -> i32 {
         abi::ASE_OK
     }
-    unsafe extern "C" fn get_sample_position(_this: *mut IAsio, _position: *mut abi::AsioSamples, _stamp: *mut abi::AsioTimeStamp) -> i32 {
-        abi::ASE_SP_NOT_ADVANCING
+    unsafe extern "C" fn get_sample_position(this: *mut IAsio, position: *mut abi::AsioSamples, stamp: *mut abi::AsioTimeStamp) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        let obj = unsafe { object_quiet(this) };
+        obj.observed.call("getSamplePosition");
+        let at = obj.observed.position.load(Ordering::SeqCst);
+        if at == u64::MAX {
+            return abi::ASE_SP_NOT_ADVANCING;
+        }
+        // SAFETY: valid out-pointers by the SDK contract.
+        unsafe {
+            *position = abi::AsioSamples::from_value(at);
+            *stamp = abi::AsioTimeStamp::from_value(obj.observed.system_time.load(Ordering::SeqCst));
+        }
+        abi::ASE_OK
     }
     unsafe extern "C" fn get_channel_info(this: *mut IAsio, info: *mut AsioChannelInfo) -> i32 {
         // SAFETY: called through a live object's vtable; `info` is valid by the SDK contract.
@@ -701,8 +966,67 @@ pub(crate) mod fake {
         }
         abi::ASE_OK
     }
-    unsafe extern "C" fn create_buffers(_this: *mut IAsio, _i: *mut abi::AsioBufferInfo, _c: i32, _f: i32, _cb: *mut abi::AsioCallbacks) -> i32 {
-        abi::ASE_INVALID_MODE
+    unsafe extern "C" fn create_buffers(
+        this: *mut IAsio,
+        infos: *mut abi::AsioBufferInfo,
+        count: i32,
+        frames: i32,
+        cb: *mut abi::AsioCallbacks,
+    ) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        let obj = unsafe { object(this) };
+        obj.observed.call("createBuffers");
+        if let Some(code) = obj.spec.create_error {
+            return code;
+        }
+        assert!(!cb.is_null(), "createBuffers gets the callback table");
+        assert!(obj.observed.buffers.lock().unwrap().is_empty(), "createBuffers twice without disposeBuffers");
+        // SAFETY: the SDK contract: `infos` holds `count` entries the driver fills.
+        let infos = unsafe { std::slice::from_raw_parts_mut(infos, usize::try_from(count).unwrap()) };
+        for info in infos {
+            let input = info.isInput != 0;
+            let (channels, sample) = if input { (obj.spec.inputs, obj.spec.input_type) } else { (obj.spec.outputs, obj.spec.output_type) };
+            if info.channelNum < 0 || info.channelNum >= channels {
+                return abi::ASE_INVALID_PARAMETER;
+            }
+            let width = crate::convert::Wire::of(SampleType::from_code(sample)).map_or(4, crate::convert::Wire::bytes);
+            let bytes = usize::try_from(frames).unwrap() * width;
+            // Drivers hand buffers over uninitialized: garbage, so silence must be written.
+            let addresses = [0, 1].map(|_| Box::into_raw(vec![0xEEu8; bytes].into_boxed_slice()).cast::<u8>() as usize);
+            info.buffers = addresses.map(|a| a as *mut c_void);
+            obj.observed.buffers.lock().unwrap().push(FakeBuffer { input, channel: info.channelNum, addresses, bytes });
+        }
+        abi::ASE_OK
+    }
+    unsafe extern "C" fn dispose_buffers(this: *mut IAsio) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        let obj = unsafe { object(this) };
+        obj.observed.call("disposeBuffers");
+        for b in obj.observed.buffers.lock().unwrap().drain(..) {
+            for address in b.addresses {
+                // SAFETY: each came from `Box::into_raw` of a `bytes`-long boxed slice in
+                // `create_buffers` and is freed once, here.
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(address as *mut u8, b.bytes)) });
+            }
+        }
+        abi::ASE_OK
+    }
+    unsafe extern "C" fn start(this: *mut IAsio) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        let obj = unsafe { object(this) };
+        obj.observed.call("start");
+        obj.spec.start_error.unwrap_or(abi::ASE_OK)
+    }
+    unsafe extern "C" fn stop(this: *mut IAsio) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        unsafe { object(this) }.observed.call("stop");
+        abi::ASE_OK
+    }
+    unsafe extern "C" fn output_ready(this: *mut IAsio) -> i32 {
+        // SAFETY: called through a live object's vtable.
+        let obj = unsafe { object_quiet(this) };
+        obj.observed.output_ready.fetch_add(1, Ordering::SeqCst);
+        if obj.spec.output_ready { abi::ASE_OK } else { abi::ASE_NOT_PRESENT }
     }
     unsafe extern "C" fn control_panel(this: *mut IAsio) -> i32 {
         // SAFETY: called through a live object's vtable.
@@ -722,8 +1046,8 @@ pub(crate) mod fake {
         getDriverName: get_driver_name,
         getDriverVersion: get_driver_version,
         getErrorMessage: get_error_message,
-        start: ok,
-        stop: ok,
+        start,
+        stop,
         getChannels: get_channels,
         getLatencies: get_latencies,
         getBufferSize: get_buffer_size,
@@ -735,10 +1059,10 @@ pub(crate) mod fake {
         getSamplePosition: get_sample_position,
         getChannelInfo: get_channel_info,
         createBuffers: create_buffers,
-        disposeBuffers: ok,
+        disposeBuffers: dispose_buffers,
         controlPanel: control_panel,
         future,
-        outputReady: ok,
+        outputReady: output_ready,
     };
 
     /// A new fake driver object with one reference.
@@ -764,6 +1088,8 @@ pub(crate) mod fake {
     impl FakeLoader {
         pub(crate) fn new(drivers: Vec<(DriverEntry, FakeSpec)>) -> (Self, Arc<Observed>) {
             let observed = Arc::new(Observed::default());
+            // The callback-thread calls record into this without allocating (the allocation test).
+            observed.calls.lock().unwrap().reserve(4096);
             (Self { drivers, create_fails: Vec::new(), observed: Arc::clone(&observed) }, observed)
         }
     }
@@ -779,6 +1105,14 @@ pub(crate) mod fake {
             let (_, spec) = self.drivers.iter().find(|(e, _)| e.name == entry.name).expect("a fake driver of that name");
             Ok(create(spec.clone(), &self.observed))
         }
+    }
+
+    /// `SendMessageW(window, WM_NULL)` from the calling thread; returns when the window's thread
+    /// dispatched it.
+    pub(crate) fn send_null(window: usize) {
+        // SAFETY: `SendMessageW` to a window handle (a stale one fails cleanly); `WM_NULL` carries
+        // no pointers.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SendMessageW(HWND(window as *mut c_void), 0, None, None) };
     }
 
     /// A registry entry for a fake driver.
@@ -812,16 +1146,19 @@ mod tests {
         assert_eq!(driver.driver_name(), "Fake ASIO");
         assert_eq!(driver.driver_version(), 7);
         assert_eq!(driver.error_message(), "no hardware");
-        assert_eq!(driver.channels(), Ok((12, 10)));
+        let count = driver.channels().expect("channels");
+        assert_eq!((count.inputs(), count.outputs()), (12, 10));
         assert_eq!(driver.latencies(), Ok((300, 400)));
         assert_eq!(driver.buffer_size(), Ok(BufferSize { min: 32, max: 2048, preferred: 256, granularity: -1 }));
         assert_eq!(driver.can_sample_rate(48_000.0), Ok(()));
         assert_eq!(driver.can_sample_rate(96_000.0), Err(abi::ASE_NO_CLOCK));
         assert_eq!(driver.set_sample_rate(44_100.0), Ok(()));
         assert_eq!(driver.sample_rate(), Ok(44_100.0));
-        let info = driver.channel_info(11, true).expect("channel 11 in");
-        assert_eq!(info.type_, abi::ASIOST_INT24_LSB);
-        assert_eq!(driver.channel_info(10, false).err(), Some(abi::ASE_INVALID_PARAMETER));
+        let last_in = count.first(true, usize::MAX).last().expect("channel 11 in");
+        assert_eq!(last_in.channel(), 11);
+        assert_eq!(driver.channel_info(last_in).expect("channel 11 in").type_, abi::ASIOST_INT24_LSB);
+        assert_eq!(count.first(false, usize::MAX).count(), 10, "no index past the count can be made");
+        assert_eq!(count.first(false, 3).map(|c| c.channel()).collect::<Vec<_>>(), [0, 1, 2]);
         assert_eq!(driver.control_panel(), Ok(()));
         assert_eq!(observed.sys_refs.lock().unwrap().as_slice(), &[0x1234]);
         assert_eq!(observed.live.load(Ordering::Acquire), 1);

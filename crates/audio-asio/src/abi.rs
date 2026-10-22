@@ -30,6 +30,7 @@ use std::mem::{offset_of, size_of};
 pub type AsioLong = i32;
 /// `ASIOBool`: `long`, `ASIOFalse` = 0, `ASIOTrue` = 1.
 pub type AsioBool = i32;
+pub const ASIO_TRUE: AsioBool = 1;
 /// `ASIOError`: `long`.
 pub type AsioErrorCode = i32;
 /// `ASIOSampleRate` on Windows (`IEEE754_64FLOAT`).
@@ -76,6 +77,29 @@ pub const ASIOST_DSD_INT8_LSB1: AsioSampleTypeCode = 32;
 pub const ASIOST_DSD_INT8_MSB1: AsioSampleTypeCode = 33;
 pub const ASIOST_DSD_INT8_NER8: AsioSampleTypeCode = 40;
 
+// `asioMessage` selectors (`asio.h`, `enum { kAsioSelectorSupported = 1, ... }`).
+/// `value` is a selector; answer 1 when the host supports it.
+pub const K_ASIO_SELECTOR_SUPPORTED: AsioLong = 1;
+/// Answer the host's ASIO implementation version (2).
+pub const K_ASIO_ENGINE_VERSION: AsioLong = 2;
+/// The driver asks the host to close and reopen it (a setting changed in its panel, say).
+pub const K_ASIO_RESET_REQUEST: AsioLong = 3;
+/// "Not yet supported, will currently always return 0; use kAsioResetRequest instead."
+pub const K_ASIO_BUFFER_SIZE_CHANGE: AsioLong = 4;
+/// The driver went out of sync: its timestamps are no longer valid.
+pub const K_ASIO_RESYNC_REQUEST: AsioLong = 5;
+/// The driver's latencies changed; the host refetches them.
+pub const K_ASIO_LATENCIES_CHANGED: AsioLong = 6;
+/// Answering 1 asks the driver to call `bufferSwitchTimeInfo` instead of `bufferSwitch`.
+pub const K_ASIO_SUPPORTS_TIME_INFO: AsioLong = 7;
+pub const K_ASIO_SUPPORTS_TIME_CODE: AsioLong = 8;
+/// The driver detected an overload (ASIO 2.3).
+pub const K_ASIO_OVERLOAD: AsioLong = 15;
+
+// `AsioTimeInfoFlags` (`asio.h`).
+pub const K_SYSTEM_TIME_VALID: u32 = 1;
+pub const K_SAMPLE_POSITION_VALID: u32 = 1 << 1;
+
 /// `ASIOSamples` (`asio.h`, `NATIVE_INT64` 0): a 64-bit sample count as two 32-bit halves.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -88,6 +112,10 @@ impl AsioSamples {
     pub const fn value(self) -> u64 {
         ((self.hi as u64) << 32) | self.lo as u64
     }
+
+    pub const fn from_value(value: u64) -> Self {
+        Self { hi: (value >> 32) as u32, lo: value as u32 }
+    }
 }
 
 /// `ASIOTimeStamp` (`asio.h`, `NATIVE_INT64` 0): system time in nanoseconds as two halves.
@@ -96,6 +124,16 @@ impl AsioSamples {
 pub struct AsioTimeStamp {
     pub hi: u32,
     pub lo: u32,
+}
+
+impl AsioTimeStamp {
+    pub const fn value(self) -> u64 {
+        ((self.hi as u64) << 32) | self.lo as u64
+    }
+
+    pub const fn from_value(value: u64) -> Self {
+        Self { hi: (value >> 32) as u32, lo: value as u32 }
+    }
 }
 
 /// `ASIODriverInfo` (`asio.h`): filled by the SDK's `ASIOInit`; a direct `IASIO` host passes only
@@ -180,7 +218,7 @@ pub struct AsioTime {
     pub timeCode: AsioTimeCode,
 }
 
-/// `ASIOCallbacks` (`asio.h`): the host's four callbacks, passed to `createBuffers` (slice b).
+/// `ASIOCallbacks` (`asio.h`): the host's four callbacks, passed to `createBuffers`.
 #[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 pub struct AsioCallbacks {

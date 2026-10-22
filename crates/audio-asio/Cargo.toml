@@ -1,6 +1,6 @@
 [package]
 name = "transit-audio-asio"
-description = "transit native ASIO backend: hand-written IASIO bindings, a dedicated STA host thread, driver listing and open/close (ADR 0016 amendment, draft); empty off 64-bit Windows"
+description = "transit native ASIO backend: hand-written IASIO bindings, a dedicated STA host thread, driver listing, render and capture streams through the driver's callback (ADR 0016 amendment, draft); empty off 64-bit Windows"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,15 +16,20 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(all(windows, target_pointer_width = "64"))'.dev-dependencies]
+transit-rt = { workspace = true, features = ["testing"] }
+
 # ADR 0013 and the draft native-ASIO amendment: this crate may contain `unsafe` for COM, the
-# registry, the host thread's window and the IASIO vtable, all in `src/com.rs`. Every `unsafe`
-# block carries a `// SAFETY:` comment stating the invariant and the thread. The rest mirrors
-# `[workspace.lints]` and `crates/audio-wasapi`.
+# registry, the host thread's window and the IASIO vtable (`src/com.rs`), and for the driver's
+# callbacks and the buffers they touch (`src/callback.rs`). Every `unsafe` block carries a
+# `// SAFETY:` comment stating the invariant and the thread. The rest mirrors `[workspace.lints]`
+# and `crates/audio-wasapi`.
 [lints.rust]
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "forbid"

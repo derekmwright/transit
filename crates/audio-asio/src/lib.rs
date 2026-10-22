@@ -1,6 +1,6 @@
-//! The native ASIO backend (ADR 0016 amendment, draft "native ASIO"), slice (a): the driver list,
-//! and opening and closing a driver without streaming. 64-bit Windows only: on every other target
-//! the crate is empty.
+//! The native ASIO backend (ADR 0016 amendment, draft "native ASIO"), slices (a) and (b): the
+//! driver list, opening and closing a driver, and render and capture streams through the driver's
+//! buffer-switch callback. 64-bit Windows only: on every other target the crate is empty.
 //!
 //! - The bindings are our own ([`abi`]): `#[repr(C)]` structures and the `IASIO` vtable with
 //!   compile-time layout assertions. No ASIO SDK download, no C++ and no bindgen in the build.
@@ -11,23 +11,37 @@
 //!   listed is reported by [`AsioBackend::diagnostics`] and a `log::warn!`, never dropped silently.
 //! - [`AsioBackend::load`] keeps one driver loaded and initialized, with no buffers created, for
 //!   queries, the sample rate and the control panel; [`Loaded::close`] (or dropping it) releases it.
-//!
-//! Streaming (`open_render`, `open_capture`) is slice (b): those calls return an error today.
+//! - `open_render` and `open_capture` open the two directions of one driver's [`session`]: one
+//!   `createBuffers` for both, the driver started by the first stream's `start`. Open both before
+//!   starting either (the open-order rule, [`session`]). The callback runs on the driver's thread
+//!   ([`callback`]); its work ([`engine`]) converts ([`convert`]), stamps and counts ([`stats`]).
+//! - [`AsioFactory`] hands out one process-wide backend: one host thread and one enumeration cache.
 //!
 //! This is a sanctioned `unsafe` crate (ADR 0013 and the draft amendment): all `unsafe` is in
-//! [`com`], each block with a `// SAFETY:` comment.
+//! [`com`] (COM, registry, window, vtable calls) and [`callback`] (the driver's callbacks and the
+//! buffers they touch), each block with a `// SAFETY:` comment.
 #![cfg(all(windows, target_pointer_width = "64"))]
-// No audio callback exists in this slice; control-thread code may allocate and format.
+// The callback modules (`callback`, `engine`, `convert`, `stats`) deny these lints; control-thread
+// code may allocate and format.
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 pub mod abi;
+mod callback;
 mod com;
+mod convert;
 pub mod driver;
+mod engine;
 mod host;
+mod session;
+mod stats;
+#[cfg(test)]
+mod stream_tests;
 
 pub use driver::{BufferSize, DirectionType, DriverDiagnostic, DriverEntry, DriverInfo, PROBE_RATES, SampleType};
 
 use host::{Host, Loader, Slot};
+use session::{Callback, SideOwner};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use transit_audio_backend as ab;
@@ -40,10 +54,10 @@ pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 const PANEL_TIMEOUT: Duration = Duration::from_secs(600);
 /// An enumeration is reused for this long, so listing both directions loads each driver once.
 const ENUMERATION_REUSE: Duration = Duration::from_secs(5);
-/// What `open_render` and `open_capture` answer until slice (b).
-const NOT_YET: &str = "the native ASIO backend does not stream yet (ADR 0016 amendment, ASIO slice (b))";
 
-/// Creates the native ASIO backend for the system named "ASIO".
+/// Creates the native ASIO backend for the system named "ASIO": every call hands out the same
+/// process-wide backend ([`AsioBackend::shared`]), so repeated calls share one host thread and one
+/// enumeration cache instead of probing every driver again.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AsioFactory;
 
@@ -52,7 +66,7 @@ impl ab::BackendFactory for AsioFactory {
         if system.is_some_and(|s| s != SYSTEM) {
             return None;
         }
-        match AsioBackend::new() {
+        match AsioBackend::shared() {
             Ok(backend) => Some(Box::new(backend)),
             Err(e) => {
                 log::warn!("ASIO: the native backend did not start: {e}");
@@ -76,20 +90,37 @@ struct Enumeration {
     diagnostics: Vec<DriverDiagnostic>,
 }
 
-/// The native ASIO audio system. `Send` and `Sync`: every driver call is a request to the host thread.
+/// The native ASIO audio system. `Send` and `Sync`: every driver call is a request to the host
+/// thread. Clones share the host thread and the enumeration cache.
+#[derive(Clone)]
 pub struct AsioBackend {
     host: Arc<Host>,
-    last: Mutex<Option<(Instant, Enumeration)>>,
+    last: Arc<Mutex<Option<(Instant, Enumeration)>>>,
 }
 
 impl AsioBackend {
-    /// Starts the host thread over the registry and the real drivers.
+    /// Starts a host thread of its own over the registry and the real drivers. The app uses
+    /// [`AsioBackend::shared`] (through [`AsioFactory`]).
     pub fn new() -> Result<Self, ab::OpenError> {
         Self::with_loader(Box::new(com::ComLoader), Slot::process(), HOST_TIMEOUT)
     }
 
+    /// The process's one backend, started on first use and kept for the life of the process (a
+    /// failed start is retried by the next call). Dropping a host can block for up to
+    /// [`HOST_TIMEOUT`], so the shared one is never dropped.
+    pub fn shared() -> Result<Self, ab::OpenError> {
+        static SHARED: Mutex<Option<AsioBackend>> = Mutex::new(None);
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(backend) = shared.as_ref() {
+            return Ok(backend.clone());
+        }
+        let backend = Self::new()?;
+        *shared = Some(backend.clone());
+        Ok(backend)
+    }
+
     fn with_loader(loader: Box<dyn Loader>, slot: Slot, timeout: Duration) -> Result<Self, ab::OpenError> {
-        Ok(Self { host: Arc::new(Host::spawn(loader, slot, timeout)?), last: Mutex::new(None) })
+        Ok(Self { host: Arc::new(Host::spawn(loader, slot, timeout)?), last: Arc::new(Mutex::new(None)) })
     }
 
     /// The installed drivers from the registry, nothing loaded.
@@ -203,6 +234,107 @@ impl AsioBackend {
         let chosen = device.and_then(|d| endpoints.iter().find(|e| e.name == d || e.id == d)).or_else(|| endpoints.first());
         chosen.cloned().ok_or_else(|| format!("no ASIO driver offers {direction:?} channels"))
     }
+
+    /// Opens one direction of the endpoint's driver (see [`session`] for the open-order rule).
+    fn open_stream(
+        &self,
+        endpoint: &ab::Endpoint,
+        request: &ab::OpenRequest,
+        callback: Callback,
+        error: ab::ErrorCallback,
+    ) -> Result<(AsioStream, ab::Achieved), ab::OpenError> {
+        let device = endpoint.handle::<AsioEndpoint>().ok_or_else(|| ab::OpenError::Other("the endpoint is not an ASIO driver".into()))?;
+        let entry = device.entry.clone();
+        let name = entry.name.clone();
+        let direction = match &callback {
+            Callback::Render(_) => ab::Direction::Output,
+            Callback::Capture(_) => ab::Direction::Input,
+        };
+        let what = if direction == ab::Direction::Output { "render" } else { "capture" };
+        let request_copy = *request;
+        let opened = self.host.call(&format!("open {what} of \"{name}\""), move |s| s.open_stream(&entry, &request_copy, callback, error))?;
+        let latency = opened.achieved.latency;
+        let achieved = opened.achieved;
+        let stream = AsioStream {
+            host: Arc::clone(&self.host),
+            name,
+            generation: opened.generation,
+            direction,
+            origin: request.origin,
+            latency,
+            system_step: opened.system_step,
+            owner: opened.owner,
+        };
+        Ok((stream, achieved))
+    }
+}
+
+/// One direction of a driver's session. Every control call is a request to the host thread;
+/// dropping it detaches the direction (and ends the session with its last stream), which can block
+/// for up to [`HOST_TIMEOUT`]: drop it on a control thread, never in a callback.
+pub(crate) struct AsioStream {
+    host: Arc<Host>,
+    name: String,
+    generation: u64,
+    direction: ab::Direction,
+    origin: ab::HostOrigin,
+    latency: Option<Duration>,
+    system_step: Arc<AtomicU64>,
+    owner: SideOwner,
+}
+
+impl AsioStream {
+    fn what(&self) -> &'static str {
+        if self.direction == ab::Direction::Output { "render" } else { "capture" }
+    }
+
+    /// The smallest step of the driver's `systemTime` seen so far, in ns (the diagnostic of its
+    /// grain: about 1_000_000 for a `timeGetTime` clock), `None` before two valid readings.
+    pub(crate) fn system_time_step_ns(&self) -> Option<u64> {
+        Some(self.system_step.load(Ordering::Relaxed)).filter(|step| *step != u64::MAX)
+    }
+}
+
+impl ab::Stream for AsioStream {
+    /// Starts this direction, and the driver with the first one. A stream starts once.
+    fn start(&self) -> Result<(), ab::OpenError> {
+        let pair = callback::origin_pair(self.origin);
+        let (name, generation, direction) = (self.name.clone(), self.generation, self.direction);
+        self.host.call(&format!("start {} of \"{}\"", self.what(), self.name), move |s| s.start_stream(&name, generation, direction, pair))
+    }
+
+    /// Stops this direction for good (a stopped stream is reopened, not restarted); the driver
+    /// stops when no stream of it runs.
+    fn stop(&self) -> Result<(), ab::OpenError> {
+        let (name, generation, direction) = (self.name.clone(), self.generation, self.direction);
+        self.host.call(&format!("stop {} of \"{}\"", self.what(), self.name), move |s| s.stop_stream(&name, generation, direction))
+    }
+
+    fn latency(&self) -> Option<Duration> {
+        self.latency
+    }
+
+    /// The callback runs on the driver's own thread; its priority is the driver's.
+    fn thread_priority(&self) -> ab::WorkerPriority {
+        ab::WorkerPriority::Unobserved
+    }
+
+    fn stats(&self) -> Option<ab::StreamStats> {
+        Some(self.owner.0.stats.snapshot())
+    }
+}
+
+impl Drop for AsioStream {
+    fn drop(&mut self) {
+        if let Some(step) = self.system_time_step_ns() {
+            log::debug!("ASIO: \"{}\" {}: the driver's systemTime moved in steps of at least {step} ns", self.name, self.what());
+        }
+        let (name, generation, direction) = (self.name.clone(), self.generation, self.direction);
+        let label = format!("close {} of \"{}\"", self.what(), self.name);
+        if let Err(e) = self.host.call(&label, move |s| s.detach_stream(&name, generation, direction)) {
+            log::warn!("ASIO: {label}: {e}");
+        }
+    }
 }
 
 /// A loaded and initialized driver (no buffers). Every call goes to the host thread.
@@ -235,7 +367,7 @@ impl Loaded {
 
     /// `getChannels`: (inputs, outputs).
     pub fn channels(&self) -> Result<(u16, u16), ab::OpenError> {
-        let (i, o) = self.call("getChannels", com::Driver::channels)?;
+        let (i, o) = self.call("getChannels", |d| d.channels().map(|c| (c.inputs(), c.outputs())))?;
         let clamp = |n: i32| u16::try_from(n.max(0)).unwrap_or(u16::MAX);
         Ok((clamp(i), clamp(o)))
     }
@@ -342,24 +474,30 @@ impl ab::Backend for AsioBackend {
         format_of(&device.info, ab::Direction::Input, rate)
     }
 
+    /// Opens the driver's output (its first `format.channels` channels). Open the capture stream
+    /// of the same driver before either starts, if one is wanted (see [`session`]).
     fn open_render(
         &self,
-        _endpoint: &ab::Endpoint,
-        _request: &ab::OpenRequest,
-        _render: ab::RenderCallback,
-        _error: ab::ErrorCallback,
+        endpoint: &ab::Endpoint,
+        request: &ab::OpenRequest,
+        render: ab::RenderCallback,
+        error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
-        Err(ab::OpenError::Other(NOT_YET.into()))
+        let (stream, achieved) = self.open_stream(endpoint, request, Callback::Render(render), error)?;
+        Ok((Box::new(stream), achieved))
     }
 
+    /// Opens the driver's input (its first `format.channels` channels), in either order with the
+    /// render stream, before either starts.
     fn open_capture(
         &self,
-        _endpoint: &ab::Endpoint,
-        _request: &ab::OpenRequest,
-        _capture: ab::CaptureCallback,
-        _error: ab::ErrorCallback,
+        endpoint: &ab::Endpoint,
+        request: &ab::OpenRequest,
+        capture: ab::CaptureCallback,
+        error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
-        Err(ab::OpenError::Other(NOT_YET.into()))
+        let (stream, achieved) = self.open_stream(endpoint, request, Callback::Capture(capture), error)?;
+        Ok((Box::new(stream), achieved))
     }
 }
 
@@ -534,9 +672,6 @@ mod tests {
         let capture = backend.plan_capture(&ab::InputWish::default()).expect("capture plan");
         assert_eq!(capture.endpoint.name, "Model Mixer ASIO Driver");
         assert_eq!(capture.attempts[0].format.channels, 12);
-        let request = plan.attempts[0];
-        let open = backend.open_render(&plan.endpoint, &request, Box::new(|_| {}), Box::new(|_| {}));
-        assert!(matches!(open.err(), Some(ab::OpenError::Other(t)) if t.contains("slice (b)")));
     }
 }
 
@@ -624,6 +759,103 @@ mod hardware {
                 loaded.close().unwrap_or_else(|e| panic!("round {round}: close {}: {e}", entry.name));
             }
         }
+    }
+
+    /// What two seconds of duplex streaming saw.
+    #[derive(Default)]
+    struct Tally {
+        render: std::sync::atomic::AtomicU64,
+        capture: std::sync::atomic::AtomicU64,
+        invalid: std::sync::atomic::AtomicU64,
+        errors: std::sync::atomic::AtomicU64,
+        /// The first render and capture stamps' (backend callback, frame) times.
+        first: Mutex<Vec<(ab::Direction, ab::Stamp)>>,
+    }
+
+    /// Opens `driver`'s capture then render at `rate` and `period` (every channel), runs two
+    /// seconds of silence and checks the callbacks, stamps and counters.
+    fn stream_two_seconds(driver: &str, rate: u32, period: Option<u32>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let backend = AsioBackend::new().expect("backend");
+        let endpoint = backend
+            .endpoints(ab::Direction::Output)
+            .expect("endpoints")
+            .into_iter()
+            .find(|e| e.name == driver || e.name.starts_with(driver))
+            .unwrap_or_else(|| panic!("{driver} is listed"));
+        let info = endpoint.handle::<AsioEndpoint>().expect("handle").info.clone();
+        let wish = ab::OutputWish { device: Some(endpoint.name.clone()), rates: vec![rate], channels: info.outputs, period };
+        let render_request = backend.plan_render(&wish).expect("plan").attempts[0];
+        let capture_request =
+            backend.plan_capture(&ab::InputWish { device: Some(endpoint.name.clone()), rate: Some(rate), period }).expect("plan").attempts[0];
+        assert_eq!((render_request.format.rate, capture_request.format.rate), (rate, rate), "never another rate on this interface");
+        let tally = Arc::new(Tally::default());
+        let (t1, t2, t3) = (Arc::clone(&tally), Arc::clone(&tally), Arc::clone(&tally));
+        let capture: ab::CaptureCallback = Box::new(move |block| {
+            if t1.capture.fetch_add(1, Relaxed) == 0
+                && let Ok(mut first) = t1.first.try_lock()
+            {
+                first.push((ab::Direction::Input, block.stamp));
+            }
+            if block.stamp.quality == ab::Quality::Invalid {
+                t1.invalid.fetch_add(1, Relaxed);
+            }
+            block.chunks(&mut |_, _| {});
+        });
+        let render: ab::RenderCallback = Box::new(move |block| {
+            if t2.render.fetch_add(1, Relaxed) == 0
+                && let Ok(mut first) = t2.first.try_lock()
+            {
+                first.push((ab::Direction::Output, block.stamp));
+            }
+            if block.stamp.quality == ab::Quality::Invalid {
+                t2.invalid.fetch_add(1, Relaxed);
+            }
+            block.render(&mut |chunk| chunk.fill(0.0));
+        });
+        let error = move || -> ab::ErrorCallback {
+            let t = Arc::clone(&t3);
+            Box::new(move |_| {
+                t.errors.fetch_add(1, Relaxed);
+            })
+        };
+        let (capture, cap) = backend.open_stream(&endpoint, &capture_request, Callback::Capture(capture), error()).expect("open capture");
+        let (render, ren) = backend.open_stream(&endpoint, &render_request, Callback::Render(render), error()).expect("open render");
+        println!("{driver}: capture {cap:?}");
+        println!("{driver}: render {ren:?}");
+        let started = Instant::now();
+        ab::Stream::start(&capture).expect("start capture");
+        ab::Stream::start(&render).expect("start render");
+        std::thread::sleep(Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        let (rs, cs) = (ab::Stream::stats(&render).expect("stats"), ab::Stream::stats(&capture).expect("stats"));
+        ab::Stream::stop(&render).expect("stop render");
+        ab::Stream::stop(&capture).expect("stop capture");
+        println!("{driver}: render backend: {}{}", rs.line(false), rs.events_tail());
+        println!("{driver}: capture backend: {}{}", cs.line(true), cs.events_tail());
+        println!("{driver}: systemTime step {:?} ns; first stamps {:?}", render.system_time_step_ns(), tally.first.lock().map(|f| f.clone()));
+        drop(render);
+        drop(capture);
+        let frames = ren.period.frames().expect("frames");
+        let expected = elapsed.as_secs_f64() * f64::from(rate) / f64::from(frames);
+        let (r, c) = (tally.render.load(Relaxed), tally.capture.load(Relaxed));
+        println!("{driver}: {r} render and {c} capture callbacks in {elapsed:?}; about {expected:.0} expected");
+        assert!(r as f64 > expected * 0.8 && (r as f64) < expected * 1.2, "render callbacks {r} against {expected:.0}");
+        assert!(c as f64 > expected * 0.8, "capture callbacks {c}");
+        assert_eq!((tally.invalid.load(Relaxed), tally.errors.load(Relaxed)), (0, 0), "invalid stamps, stream errors");
+        assert_eq!(rs.overloads, 0);
+    }
+
+    #[test]
+    #[ignore = "streams the Focusrite ASIO driver at 48 kHz, 64 frames, for two seconds"]
+    fn hardware_scarlett_duplex_streams_two_seconds() {
+        stream_two_seconds(FOCUSRITE, 48_000, Some(64));
+    }
+
+    #[test]
+    #[ignore = "streams the Model 12 ASIO driver at 44.1 kHz (its pinned rate), fixed 256 frames, for two seconds"]
+    fn hardware_model12_duplex_streams_two_seconds() {
+        stream_two_seconds(MODEL12, 44_100, None);
     }
 
     #[test]
