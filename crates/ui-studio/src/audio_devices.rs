@@ -438,15 +438,32 @@ fn settings_path(app: &StudioApp) -> String {
         .map_or_else(|| r"%APPDATA%\transit\ui.json".to_string(), |dir| dir.join("ui.json").display().to_string())
 }
 
-/// The Calibration line under the Paired input: the saved loopback of this exact pair, rate and
-/// buffer, or the command that measures it (`device` is the output's name, `settings` the
-/// `ui.json` to merge into; close the app before running it).
+/// The checkbox under the Backend selector (native WASAPI): unchecked is exclusive, the default.
+pub const SHARE_LABEL: &str = "Share the device with other apps";
+
+/// The one-line hint under the checkbox, for the state it is in.
+pub fn share_hint(shared: bool) -> &'static str {
+    if shared {
+        "Shared: Windows mixes other apps in with transit; higher latency."
+    } else {
+        "Exclusive: the lowest latency the driver allows; other apps are silenced while transit runs."
+    }
+}
+
+/// The Calibration line under the Paired input: the saved loopback of this exact pair, rate,
+/// buffer and mode (the checkbox's: shared or exclusive), or the command that measures it
+/// (`device` is the output's name, `settings` the `ui.json` to merge into; close the app before
+/// running it).
 pub fn calibration_line(cfg: &AudioConfig, device: &str, rate: u32, settings: &str) -> String {
     let period = cfg.buffer_size.unwrap_or(0);
-    if let Some(c) = cfg.find_calibration(device, rate, period) {
-        return format!("measured {} frames \u{b1}{} ({})", c.round_trip_frames, c.spread_frames, c.measured_at);
+    let mode = if cfg.share_device { devices::MODE_SHARED } else { devices::MODE_EXCLUSIVE };
+    if let Some(c) = cfg.find_calibration(device, mode, rate, period) {
+        return format!("measured {} frames \u{b1}{} ({}) \u{b7} {mode}", c.round_trip_frames, c.spread_frames, c.measured_at);
     }
     let mut command = format!("audio-bench --backend wasapi --loopback --out-device \"{device}\"");
+    if !cfg.share_device {
+        command.push_str(" --mode exclusive");
+    }
     if let Some(input) = &cfg.input_pairing {
         command.push_str(&format!(" --in-device \"{input}\""));
     }
@@ -454,7 +471,7 @@ pub fn calibration_line(cfg: &AudioConfig, device: &str, rate: u32, settings: &s
         command.push_str(&format!(" --period {period}"));
     }
     command.push_str(&format!(" --rate {rate} --settings \"{settings}\""));
-    format!("not calibrated: run {command} (with this app closed)")
+    format!("not calibrated \u{b7} {mode}: run {command} (with this app closed)")
 }
 
 /// One list of choices (`None` is "System default"). Returns the combo's rect.
@@ -591,6 +608,15 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     let (rect, text) = choose_backend(ui, audio_on, &mut draft.backend, &mut lay.items);
                     controls.push((text, "backend", rect));
                     ui.end_row();
+                    if draft.backend == Backend::NativeWasapi {
+                        ui.label("");
+                        let b = ui.add_enabled(audio_on, egui::Checkbox::new(&mut draft.share_device, SHARE_LABEL));
+                        controls.push((SHARE_LABEL.into(), "share_device", b.rect));
+                        ui.end_row();
+                        ui.label("");
+                        ui.label(egui::RichText::new(share_hint(draft.share_device)).color(TOKENS.text_dim).size(11.0));
+                        ui.end_row();
+                    }
                 }
 
                 label(ui, "Output");
@@ -757,7 +783,8 @@ fn opened_lines(app: &StudioApp) -> Vec<String> {
     match &app.player {
         Some(p) => {
             let buffer = p.device_buffer.map_or("default buffer".to_string(), |b| format!("{b}-sample buffer"));
-            lines.push(format!("Output open: {} · {} Hz · {} ch · {buffer}", p.device_name, p.device_rate, p.device_channels));
+            let host = if p.native_backend { format!(" · {}", crate::telemetry::host_name(p)) } else { String::new() };
+            lines.push(format!("Output open: {} · {} Hz · {} ch · {buffer}{host}", p.device_name, p.device_rate, p.device_channels));
         }
         None => lines.push("Output open: none".into()),
     }

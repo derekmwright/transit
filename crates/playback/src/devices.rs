@@ -81,6 +81,10 @@ pub struct AudioConfig {
     /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`). Only the
     /// native WASAPI backend applies one, and only on an exact key match.
     pub calibrations: Vec<LoopbackCalibration>,
+    /// The native WASAPI backend opens the device shared (through the Windows mixer) instead of
+    /// exclusive, which is its default (ADR 0016, amendment of 2026-10-22). Missing in a saved
+    /// config reads as alse: exclusive.
+    pub share_device: bool,
 }
 
 /// The `mode` key of a shared-mode calibration.
@@ -132,13 +136,14 @@ impl LoopbackCalibration {
 }
 
 impl AudioConfig {
-    /// The saved calibration of the pair opened on output `device` at `rate` and the requested
-    /// `period` (0 is the driver's default), under this config's paired input.
-    pub fn find_calibration(&self, device: &str, rate: u32, period: u32) -> Option<&LoopbackCalibration> {
+    /// The saved calibration of the pair opened on output `device` in `mode` ([`MODE_SHARED`] or
+    /// [`MODE_EXCLUSIVE`]) at `rate` and the requested `period` (0 is the driver's default), under
+    /// this config's paired input.
+    pub fn find_calibration(&self, device: &str, mode: &str, rate: u32, period: u32) -> Option<&LoopbackCalibration> {
         let want = LoopbackCalibration {
             device: device.to_owned(),
             input: self.input_pairing.clone(),
-            mode: MODE_SHARED.to_owned(),
+            mode: mode.to_owned(),
             rate,
             period,
             round_trip_frames: 0,
@@ -151,11 +156,12 @@ impl AudioConfig {
     /// The calibration for the pair opened on output `device` with `request`; `None` when no saved
     /// calibration has exactly that key.
     pub fn calibration_for(&self, device: &str, request: &transit_audio_backend::OpenRequest) -> Option<transit_audio_backend::Calibration> {
-        match request.mode {
-            transit_audio_backend::Mode::Shared => {}
+        let mode = match request.mode {
+            transit_audio_backend::Mode::Shared => MODE_SHARED,
+            transit_audio_backend::Mode::Exclusive => MODE_EXCLUSIVE,
             _ => return None,
-        }
-        self.find_calibration(device, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
+        };
+        self.find_calibration(device, mode, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
     }
 }
 
@@ -460,6 +466,7 @@ mod tests {
             buffer_size: Some(256),
             backend: Backend::NativeWasapi,
             calibrations: vec![sample_calibration()],
+            share_device: true,
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);
@@ -467,6 +474,33 @@ mod tests {
         assert_eq!(serde_json::from_str::<AudioConfig>("{}").unwrap().backend, Backend::Auto, "settings saved before the field exist stay on Auto");
         assert!(s.contains("\"native_wasapi\""));
         assert_eq!(serde_json::from_str::<AudioConfig>(r#"{"output":"X","unknown":1}"#).unwrap().output.as_deref(), Some("X"));
+    }
+
+    #[test]
+    fn the_share_checkbox_defaults_to_exclusive_and_round_trips() {
+        assert!(!AudioConfig::default().share_device, "exclusive is the default");
+        assert!(
+            !serde_json::from_str::<AudioConfig>(r#"{"output":"X"}"#).unwrap().share_device,
+            "a config saved before the field exists is exclusive"
+        );
+        let shared = AudioConfig { share_device: true, ..Default::default() };
+        let text = serde_json::to_string(&shared).unwrap();
+        assert!(serde_json::from_str::<AudioConfig>(&text).unwrap().share_device);
+    }
+
+    #[test]
+    fn a_calibration_is_keyed_by_the_requests_mode() {
+        use transit_audio_backend::{Mode, Period};
+        let shared = sample_calibration();
+        let exclusive = LoopbackCalibration { mode: MODE_EXCLUSIVE.into(), round_trip_frames: 960, ..shared.clone() };
+        let cfg = AudioConfig { input_pairing: shared.input.clone(), calibrations: vec![shared, exclusive], ..Default::default() };
+        let device = "Speakers (Scarlett 2i2)";
+        let mut req = request(48_000, Period::Frames(128));
+        assert_eq!(cfg.calibration_for(device, &req).unwrap().round_trip_ns, 10_000_000, "shared request, shared calibration");
+        req.mode = Mode::Exclusive;
+        assert_eq!(cfg.calibration_for(device, &req).unwrap().round_trip_ns, 20_000_000, "exclusive request, exclusive calibration");
+        let only_shared = AudioConfig { calibrations: vec![sample_calibration()], ..cfg };
+        assert!(only_shared.calibration_for(device, &req).is_none(), "a shared calibration never applies to an exclusive open");
     }
 
     #[test]

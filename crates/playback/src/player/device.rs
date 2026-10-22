@@ -94,6 +94,9 @@ pub struct Player {
     pub device_system: String,
     /// The open device is served by the native WASAPI backend (ADR 0016), not cpal.
     pub native_backend: bool,
+    /// The open device was opened in WASAPI exclusive mode (native backend only; false when the
+    /// user asked to share the device or the open fell back to shared).
+    pub device_exclusive: bool,
     /// Said when the chosen backend did not open and another did: "Native WASAPI failed: ...".
     pub backend_note: Option<String>,
     pub device_rate: u32,
@@ -192,6 +195,7 @@ impl Player {
             device_name: "No audio device (silent)".into(),
             device_system: String::new(),
             native_backend: false,
+            device_exclusive: false,
             backend_note: None,
             device_rate: rate,
             device_channels: 0,
@@ -292,16 +296,30 @@ impl Player {
         native: &dyn ab::BackendFactory,
         fallback: &dyn ab::BackendFactory,
     ) -> Result<Self, String> {
-        match Self::open_with(Arc::clone(&session), cfg, native) {
-            Ok(mut player) => {
-                player.native_backend = true;
-                Ok(player)
-            }
-            Err(reason) => {
-                log::warn!("native WASAPI did not open ({reason}); using the cpal backend");
-                let mut player = Self::open_with(session, cfg, fallback)?;
-                player.backend_note = Some(native_fallback_note(&reason));
-                Ok(player)
+        // Exclusive unless the user asked to share the device; each step down the ladder
+        // (`exclusive_fallback`) reopens the whole device, before any stream has started.
+        let mut step = OpenStep { mode: Some(if cfg.share_device { ab::Mode::Shared } else { ab::Mode::Exclusive }), default_period: false };
+        let mut notes: Vec<String> = Vec::new();
+        loop {
+            match Self::open_stepped(Arc::clone(&session), cfg, native, step) {
+                Ok(mut player) => {
+                    player.native_backend = true;
+                    player.backend_note = (!notes.is_empty()).then(|| notes.join("; "));
+                    return Ok(player);
+                }
+                Err(failure) => {
+                    if let Some((next, note)) = failure.error.as_ref().and_then(|error| exclusive_fallback(step, cfg, error)) {
+                        log::warn!("{note} ({})", failure.text);
+                        notes.push(note);
+                        step = next;
+                        continue;
+                    }
+                    let reason = failure.text;
+                    log::warn!("native WASAPI did not open ({reason}); using the cpal backend");
+                    let mut player = Self::open_with(session, cfg, fallback)?;
+                    player.backend_note = Some(native_fallback_note(&reason));
+                    return Ok(player);
+                }
             }
         }
     }
@@ -310,6 +328,12 @@ impl Player {
     /// the backend trait; the adapter owns the sample format, the ASIO duplex order and the
     /// timestamps of the clocks.
     fn open_with(session: Arc<Session>, cfg: &AudioConfig, factory: &dyn ab::BackendFactory) -> Result<Self, String> {
+        Self::open_stepped(session, cfg, factory, OpenStep::PLANNED).map_err(|failure| failure.text)
+    }
+
+    /// [`Self::open_with`] with `step` applied to every planned request; the failure keeps the
+    /// backend's own error for the exclusive-mode ladder.
+    fn open_stepped(session: Arc<Session>, cfg: &AudioConfig, factory: &dyn ab::BackendFactory, step: OpenStep) -> Result<Self, OpenFailure> {
         let want_ch = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
         let backend = factory.backend(cfg.system.as_deref()).ok_or_else(|| "no audio system".to_string())?;
         // Prefer a config at the chosen (else session) rate; else the device default (we resample).
@@ -323,20 +347,35 @@ impl Player {
         let inputs = if duplex { backend.capture_format(endpoint, Some(first.format.rate)).map_or(0, |format| format.channels) } else { 0 };
         let wide = first.format.channels;
         let mut error = "no usable output stream".to_owned();
+        // The first backend error decides the ladder: the first attempt is the device's own rate.
+        let mut typed: Option<ab::OpenError> = None;
         for attempt in &plan.attempts {
             // A measured loopback of this exact pair, mode, rate and period makes both streams `Measured`.
             let mut request = *attempt;
+            if let Some(mode) = step.mode {
+                request.mode = mode;
+            }
+            if step.default_period {
+                request.period = ab::Period::Default;
+            }
             request.calibration = if duplex { cfg.calibration_for(&name, &request) } else { None };
             let (rate, channels) = (request.format.rate, request.format.channels);
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
             *player.input.get_mut() = if duplex {
                 let progress = player.record_start.get_mut().as_ref().map(record::start::Control::input_progress);
-                let built = progress
-                    .ok_or_else(|| "the record start latch is missing".to_owned())
-                    .and_then(|progress| record::Recorder::build_on(&*backend, endpoint, rate, request.period, progress, request.calibration));
+                let built = progress.ok_or_else(|| ab::OpenError::Other("the record start latch is missing".to_owned())).and_then(|progress| {
+                    record::Recorder::build_on(&*backend, endpoint, rate, request.period, request.mode, progress, request.calibration)
+                });
                 match built {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
+                    // Both streams must open in the same mode: an exclusive output beside a shared
+                    // input would have the Windows mixer holding the device the output owns. So an
+                    // exclusive input the ladder can answer fails the whole open, and the next
+                    // step reopens output and input together. Any other input failure stays soft.
+                    Err(error) if request.mode == ab::Mode::Exclusive && exclusive_fallback(step, cfg, &error).is_some() => {
+                        return Err(OpenFailure { text: error.to_string(), error: Some(error) });
+                    }
                     Err(error) => HeldInput::Failed(format!("the audio input did not open with the output ({error})")),
                 }
             } else if system == devices::ASIO_SYSTEM {
@@ -349,6 +388,7 @@ impl Player {
                 Ok(opened) => opened,
                 Err(failure) => {
                     error = failure.to_string();
+                    typed.get_or_insert(failure);
                     continue;
                 }
             };
@@ -365,6 +405,7 @@ impl Player {
             let started = player.stream.as_ref().ok_or("output stream disappeared")?.start();
             if let Err(failure) = started {
                 error = failure.to_string();
+                typed.get_or_insert(failure);
                 continue;
             }
             log::info!("audio output opened with {} channels (asked for {})", achieved.format.channels, wide);
@@ -372,6 +413,7 @@ impl Player {
             player.device_system = system.clone();
             player.device_channels = achieved.format.channels;
             player.device_buffer = achieved.period.frames();
+            player.device_exclusive = request.mode == ab::Mode::Exclusive;
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {
@@ -379,7 +421,7 @@ impl Player {
             }
             return Ok(player);
         }
-        Err(error)
+        Err(OpenFailure { text: error, error: typed })
     }
 
     fn silent_runtime(session: Arc<Session>, error: String) -> Self {
@@ -969,6 +1011,61 @@ impl Player {
             *slot = Some(recorder);
         }
         Ok(())
+    }
+}
+
+/// How one open attempt departs from what the backend planned: the exclusive-mode ladder's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenStep {
+    /// The mode to request; `None` keeps the planned one (the cpal backend has only shared).
+    mode: Option<ab::Mode>,
+    /// Open at the device's own period instead of the chosen buffer size.
+    default_period: bool,
+}
+
+impl OpenStep {
+    const PLANNED: Self = Self { mode: None, default_period: false };
+}
+
+/// Why an open failed: the text, and the backend's error when it gave one.
+struct OpenFailure {
+    text: String,
+    /// Read by the native backend's ladder only.
+    #[cfg_attr(not(any(test, all(windows, feature = "native-wasapi"))), allow(dead_code))]
+    error: Option<ab::OpenError>,
+}
+
+impl From<String> for OpenFailure {
+    fn from(text: String) -> Self {
+        Self { text, error: None }
+    }
+}
+
+impl From<&str> for OpenFailure {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
+/// The next step down the exclusive-mode ladder (ADR 0016) for an open at `step` that failed with
+/// `error`, and what to tell the user; `None` when `error` is not one the ladder answers (the
+/// caller falls back to cpal). Only before `start()` succeeded: a running stream is never reopened.
+fn exclusive_fallback(step: OpenStep, cfg: &AudioConfig, error: &ab::OpenError) -> Option<(OpenStep, String)> {
+    if step.mode != Some(ab::Mode::Exclusive) {
+        return None;
+    }
+    let shared = OpenStep { mode: Some(ab::Mode::Shared), default_period: false };
+    match error {
+        // The backend words a period the driver refuses with "period" in the message.
+        ab::OpenError::Other(text) if text.contains("period") => {
+            let frames = cfg.buffer_size.filter(|_| !step.default_period)?;
+            Some((OpenStep { default_period: true, ..step }, format!("Exclusive mode could not use {frames} frames; using the device period")))
+        }
+        ab::OpenError::InUse(_) => {
+            Some((shared, "Exclusive mode unavailable: another app holds the device; opened shared (higher latency)".to_owned()))
+        }
+        ab::OpenError::ExclusiveDisallowed(_) => Some((shared, "Exclusive mode is turned off for this device in Windows; opened shared".to_owned())),
+        _ => None,
     }
 }
 

@@ -130,9 +130,14 @@ pub fn detail_rows(t: &CallbackTelemetry) -> Vec<String> {
 }
 
 /// The host shown in the load readout: the audio system, starred when the native backend serves it
-/// (`WASAPI*`; see `docs/contributing/knowledge/clocks.md`).
-fn host_name(player: &soundcraft_playback::Player) -> String {
-    if player.native_backend { format!("{}*", player.device_system) } else { player.device_system.clone() }
+/// (`WASAPI*`; see `docs/contributing/knowledge/clocks.md`), with the mode it opened in
+/// (`WASAPI* exclusive`, `WASAPI* shared`).
+pub(crate) fn host_name(player: &soundcraft_playback::Player) -> String {
+    if player.native_backend {
+        format!("{}* {}", player.device_system, if player.device_exclusive { "exclusive" } else { "shared" })
+    } else {
+        player.device_system.clone()
+    }
 }
 
 /// Read the counters when due (about four times a second) and keep the overload hold running.

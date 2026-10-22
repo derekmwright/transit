@@ -312,6 +312,7 @@ impl Recorder {
     /// Build the input stream on `endpoint` (the output's own ASIO device) at `rate` and exactly
     /// `period`, without starting it: [`Player`](crate::Player) builds it before the output so
     /// the driver creates both directions' buffers once, then starts both ([`Recorder::start`]).
+    /// `mode` is the output's: both streams open in the same one.
     /// The buffer must be the output's: cpal sizes the input's scratch buffer at build time,
     /// and the output's build recreates the buffers at its own size.
     pub(crate) fn build_on(
@@ -319,15 +320,16 @@ impl Recorder {
         endpoint: &ab::Endpoint,
         rate: u32,
         period: ab::Period,
+        mode: ab::Mode,
         progress: start::InputProgress,
         calibration: Option<ab::Calibration>,
-    ) -> Result<Recorder, String> {
-        let format = backend.capture_format(endpoint, Some(rate))?;
+    ) -> Result<Recorder, ab::OpenError> {
+        let format = backend.capture_format(endpoint, Some(rate)).map_err(ab::OpenError::Other)?;
         if format.rate != rate {
-            return Err(format!("the input does not run at {rate} Hz"));
+            return Err(ab::OpenError::Other(format!("the input does not run at {rate} Hz")));
         }
-        let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration };
-        Recorder::build(backend, endpoint, &request, Some(progress)).map_err(|e| e.to_string())
+        let request = ab::OpenRequest { format, period, mode, origin: ab::HostOrigin::default(), calibration };
+        Recorder::build(backend, endpoint, &request, Some(progress))
     }
 
     /// The recorder around a new, not yet started input stream on `endpoint`.
