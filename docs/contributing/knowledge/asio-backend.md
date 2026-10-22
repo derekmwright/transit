@@ -327,7 +327,9 @@ Code: `crates/playback/src/reopen.rs` (`Reopener`), `Player::reopen_cause` and `
   backend's `host_blocked`), nothing is attempted and no attempt is used: the panel holds the host
   thread, and a reopen then would be refused. The panel's close message says the device reopens.
 - **What it says.** The status line says what happened and what happens next; Audio Devices shows a
-  "Recovery:" line with the state and the counts ("resets 1, stalls 0, reopened 1"). The streams'
+  "Recovery:" line with the state and the counts ("resets 1, stalls 0, reopened 1"). Once the
+  attempts ran out (or while a reopen is pending), Play and Record are refused with the same advice
+  ("use Audio › Reconnect Device"), never ignored silently. The streams'
   own `resets` counter starts from zero with each reopen.
 - **Tests:** `crates/playback/src/reopen.rs` (the policy on a fake clock),
   `a_driver_reset_*` and `a_device_that_does_not_reopen_*` in `crates/ui-studio/src/audio_devices_tests.rs`
@@ -366,11 +368,18 @@ Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` b
   left as it is.
 - Before the driver's `stop`, the host asks the registered thread to revert at its next switch and
   waits up to three buffers (20 to 200 ms); a driver that does not call again by then is reverted
-  from the host thread, and that is logged (known issue K33).
+  from the host thread, and that is logged. Microsoft asks for the revert on the registering
+  thread; the host-thread revert is a deliberate best-effort deviation, checked safe by the slice
+  d1 review's probe (known issue K33). Each handle is reverted at most once.
+- A thread the driver already registered itself is refused a second registration (error 1552):
+  that is the driver's, left to it and not reported as a failure.
 - `Stream::thread_priority` reports it: `Pending` before the first switch, `MmcssProAudio` while it
   runs, `PromotionFailed` when MMCSS refused (logged at the stop with the OS error; playback goes
-  on), `Released`/`ReleaseFailed` after the stop, `Unobserved` on the host thread. The ignored
-  hardware stream tests print it and expect `MmcssProAudio` while running and `Released` after.
+  on), `Released`/`ReleaseFailed` after the stop, `Unobserved` on the host thread or in the driver's
+  own registration. Audio Devices shows it on the Output open and Input open lines ("MMCSS Pro
+  Audio", "MMCSS released", ...). The ignored hardware stream tests print it and expect
+  `MmcssProAudio` while running and `Released` after.
+- `raw-dylib` needs `dlltool` on the `windows-gnu` targets; transit builds MSVC only.
 - **Tests** use counting hooks (no test thread is really registered): `mmcss.rs` and
   `the_buffer_switch_thread_joins_mmcss_*`, `a_driver_that_does_not_call_at_the_stop_*` in
   `stream_tests.rs`; `the_host_thread_runs_above_normal_priority` in `host.rs`.

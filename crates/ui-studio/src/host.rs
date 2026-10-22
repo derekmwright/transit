@@ -27,6 +27,9 @@ use soundcraft_time::{Range, Samples};
 impl StudioApp {
     pub(crate) fn start_play(&mut self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.clear_clip_latches();
+        if self.refuse_for_reopen() {
+            return;
+        }
         if !self.sync_player_session() {
             return;
         }
@@ -182,7 +185,7 @@ impl StudioApp {
             midi_journal: self.midi_journal.as_ref().map(|j| j.path().to_path_buf()),
             midi_placed: false,
         });
-        if !self.sync_player_session() {
+        if self.refuse_for_reopen() || !self.sync_player_session() {
             self.finish_recording();
             return;
         }
@@ -835,6 +838,23 @@ impl StudioApp {
             }
             Err(error) => self.player_requests.fail(&mut self.status, error),
         }
+    }
+
+    /// Refuses a transport start, saying why, while the device waits to be reopened after a driver
+    /// reset or stall, or after the automatic reopen gave up (until the user reconnects): the
+    /// runtime can play nothing then, and Play must not just do nothing.
+    pub(crate) fn refuse_for_reopen(&mut self) -> bool {
+        let waiting = self.player.as_ref().is_some_and(|p| p.reopen_cause().is_some());
+        if !waiting && !self.reopen.gave_up() {
+            return false;
+        }
+        let what = self.reopen.cause().map_or("driver reset", ReopenCause::text);
+        self.status = if self.reopen.gave_up() {
+            format!("The audio device did not reopen after the {what}. Use Audio › Reconnect Device.")
+        } else {
+            format!("The audio device is reopening after the {what}; try again in a moment.")
+        };
+        true
     }
 
     /// Stops the transport of a Player whose driver asked to be reset, for good: a take in

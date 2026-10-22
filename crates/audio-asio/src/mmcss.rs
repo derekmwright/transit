@@ -41,6 +41,14 @@ const HOST_THREAD: u8 = 5;
 const RELEASE: u8 = 6;
 const RELEASED: u8 = 7;
 const RELEASE_FAILED: u8 = 8;
+/// The thread was already in an MMCSS task (the driver registered it itself): nothing of ours to
+/// revert.
+const DRIVERS: u8 = 9;
+
+/// What `AvSetMmThreadCharacteristicsW` returns for a thread already registered with a task (the
+/// slice d1 review's probe on Windows 11 26200): a second registration of one thread is refused,
+/// so ours can never stack on the driver's, nor our revert end it.
+pub(crate) const ALREADY_REGISTERED: u32 = 1552;
 
 /// One driver session's registration, shared by the callback, the session and its streams.
 pub(crate) struct Mmcss {
@@ -110,6 +118,7 @@ impl Mmcss {
                             self.thread.store(me, Ordering::Relaxed);
                             REGISTERED
                         }
+                        Err(ALREADY_REGISTERED) => DRIVERS,
                         Err(code) => {
                             self.error.store(code, Ordering::Relaxed);
                             FAILED
@@ -176,7 +185,9 @@ impl Mmcss {
         match self.state.load(Ordering::Acquire) {
             REGISTERED | RELEASE => WorkerPriority::MmcssProAudio,
             FAILED => WorkerPriority::PromotionFailed,
-            HOST_THREAD => WorkerPriority::Unobserved,
+            // On the host thread, or in the driver's own MMCSS registration (its task and level
+            // are the driver's, not observed here).
+            HOST_THREAD | DRIVERS => WorkerPriority::Unobserved,
             RELEASED => WorkerPriority::Released,
             RELEASE_FAILED => WorkerPriority::ReleaseFailed,
             _ => WorkerPriority::Pending,
@@ -301,12 +312,22 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_the_driver_registered_itself_is_left_to_it_and_not_reported_as_refused() {
+        let m = Mmcss::new(Hooks { register: || Err(ALREADY_REGISTERED), revert: |_| panic!("not ours to revert"), thread_id: || 9 });
+        let m = Mmcss { host_thread: 1, ..m };
+        m.arm();
+        m.tend();
+        assert_eq!((m.priority(), m.error()), (WorkerPriority::Unobserved, 0), "not PromotionFailed, no error to log");
+        assert_eq!(m.release(Duration::from_millis(5)), Released::Nothing);
+    }
+
+    #[test]
     fn a_refused_registration_is_reported_and_not_retried_in_that_run() {
         static TRIES: AtomicUsize = AtomicUsize::new(0);
         let m = Mmcss::new(Hooks {
             register: || {
                 TRIES.fetch_add(1, Ordering::SeqCst);
-                Err(1552)
+                Err(1450)
             },
             revert: |_| panic!("nothing to revert"),
             thread_id: || 9,
@@ -315,7 +336,7 @@ mod tests {
         m.arm();
         m.tend();
         m.tend();
-        assert_eq!((TRIES.load(Ordering::SeqCst), m.priority(), m.error()), (1, WorkerPriority::PromotionFailed, 1552));
+        assert_eq!((TRIES.load(Ordering::SeqCst), m.priority(), m.error()), (1, WorkerPriority::PromotionFailed, 1450));
         assert_eq!(m.release(Duration::from_millis(5)), Released::Nothing);
     }
 }

@@ -1334,6 +1334,23 @@ fn a_device_that_does_not_reopen_is_tried_three_times_then_left_to_reconnect() {
     assert!(t.app.status.ends_with("after 3 attempts. Use Audio › Reconnect Device."), "{}", t.app.status);
     run(&mut t, &driver, 300);
     assert_eq!(tries.get(), 3, "no more");
+    // Play then is refused with the advice, not ignored; the Recovery line keeps it too.
+    t.app.start_play(0, None, None);
+    assert_eq!(t.app.status, "The audio device did not reopen after the driver reset. Use Audio › Reconnect Device.");
+    assert!(!t.app.is_playing());
+    assert!(t.app.reopen.status(false).unwrap().ends_with("use Reconnect (resets 1, stalls 0, reopened 0)"));
+}
+
+#[test]
+fn the_open_lines_end_with_the_workers_mmcss_state() {
+    use crate::audio_devices::priority_detail;
+    use soundcraft_playback::scheduling::WorkerPriority as P;
+    assert_eq!(priority_detail(P::MmcssProAudio), " · MMCSS Pro Audio");
+    assert_eq!(priority_detail(P::Pending), " · MMCSS pending");
+    assert_eq!(priority_detail(P::PromotionFailed), " · MMCSS refused");
+    assert_eq!(priority_detail(P::Released), " · MMCSS released");
+    assert_eq!(priority_detail(P::Unobserved), "", "nothing where the backend observes none (a scripted driver, the driver's own registration)");
+    assert_eq!(priority_detail(P::NoWorker), "");
 }
 
 #[test]

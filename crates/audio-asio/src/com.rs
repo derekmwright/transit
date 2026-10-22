@@ -641,7 +641,8 @@ mod avrt {
     }
 }
 
-/// The MMCSS task name "Pro Audio", NUL-terminated UTF-16 (defined under `HKLM\SOFTWARE\Microsoft/// Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks`).
+/// The MMCSS task name "Pro Audio", NUL-terminated UTF-16 (defined under
+/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks`).
 const PRO_AUDIO: [u16; 10] = [0x50, 0x72, 0x6f, 0x20, 0x41, 0x75, 0x64, 0x69, 0x6f, 0];
 
 /// The calling thread's last-error value.
@@ -665,10 +666,18 @@ fn mmcss_register() -> Result<usize, u32> {
 
 /// Ends the MMCSS registration `handle` ([`mmcss_register`]'s): Ok, or the OS error.
 fn mmcss_revert(handle: usize) -> Result<(), u32> {
-    // SAFETY: `handle` is a non-null handle `AvSetMmThreadCharacteristicsW` returned and that has
-    // not been reverted ([`crate::mmcss::Mmcss`] swaps it out before it calls this, so it is
-    // reverted at most once). It is called on the registered thread at its last buffer switch, or
-    // from the host thread once the driver stopped calling back; a refusal is a return value.
+    // SAFETY: `handle` is a non-null handle `AvSetMmThreadCharacteristicsW` returned, and it is
+    // reverted at most once: [`crate::mmcss::Mmcss`] swaps it out of its cell before calling this,
+    // and only the one side (callback or host) that wins the RELEASE -> BUSY compare-exchange
+    // calls it (a second revert of a recycled handle value could close an unrelated process
+    // handle). Microsoft documents that the revert "must be called in the same thread that called
+    // AvSetMmThreadCharacteristics"; the normal path does that (the registered thread reverts at
+    // its last buffer switch). When the driver stopped calling back, the host thread reverts it
+    // instead, a deliberate, best-effort deviation: the handle is an entry of the process handle
+    // table, not a per-thread pointer, and the slice d1 review's probe (Windows 11 26200) found a
+    // revert from another thread returns TRUE and restores the registered thread's priority, a
+    // second revert fails cleanly with error 6 (ERROR_INVALID_HANDLE), and a registration never
+    // reverted is a leaked handle, not undefined behavior. A refusal is a return value.
     if unsafe { avrt::AvRevertMmThreadCharacteristics(handle as *mut c_void) } != 0 { Ok(()) } else { Err(last_error()) }
 }
 

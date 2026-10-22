@@ -1020,7 +1020,12 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
         Some(p) => {
             let buffer = p.device_buffer.map_or("default buffer".to_string(), |b| format!("{b}-sample buffer"));
             let host = if p.native_backend {
-                format!(" · {}{}", crate::telemetry::host_name(p), achieved_detail(p.output_sample, p.output_latency, "out"))
+                format!(
+                    " · {}{}{}",
+                    crate::telemetry::host_name(p),
+                    achieved_detail(p.output_sample, p.output_latency, "out"),
+                    priority_detail(p.thread_priority())
+                )
             } else {
                 String::new()
             };
@@ -1060,10 +1065,29 @@ fn input_line(r: &soundcraft_playback::record::Recorder, native: bool) -> String
     if native {
         let buffer = r.buffer_frames.map_or(String::new(), |b| format!(" · {b}-sample buffer"));
         let detail = achieved_detail(r.sample_format, r.latency, "in");
-        format!("Input open: {} · {} Hz · {} ch{buffer}{detail}", r.device_name, r.sample_rate, r.channels)
+        let priority = priority_detail(r.thread_priority());
+        format!("Input open: {} · {} Hz · {} ch{buffer}{detail}{priority}", r.device_name, r.sample_rate, r.channels)
     } else {
         format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels)
     }
+}
+
+/// The scheduling of a native stream's worker as its "open" line ends: " · MMCSS Pro Audio" (the
+/// WASAPI worker, the ASIO buffer-switch thread once it switched), " · MMCSS pending" before that,
+/// and so on; nothing where the backend observes none.
+pub fn priority_detail(priority: soundcraft_playback::scheduling::WorkerPriority) -> String {
+    use soundcraft_playback::scheduling::WorkerPriority as P;
+    let text = match priority {
+        P::Pending => "MMCSS pending",
+        P::MmcssAudio => "MMCSS Audio",
+        P::MmcssProAudio => "MMCSS Pro Audio",
+        P::RaisedPriority => "raised priority",
+        P::PromotionFailed => "MMCSS refused",
+        P::Released => "MMCSS released",
+        P::ReleaseFailed => "MMCSS release failed",
+        _ => return String::new(),
+    };
+    format!(" · {text}")
 }
 
 /// What a native stream reported at open, for its "open" line: " · i24 · 15.8 ms out" (each part
