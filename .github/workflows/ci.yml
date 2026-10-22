@@ -79,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Linux system libraries
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config mesa-vulkan-drivers libvulkan1
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update && rustup default stable
         shell: bash
@@ -92,7 +92,14 @@ jobs:
       # Check production host code without the integration tests' self-dev feature activation.
       - run: cargo check --locked -p soundcraft-clap-host -p soundcraft-vst3-host --lib
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo test --locked --workspace
+      # The egui_kittest tests render with wgpu; the runner has no GPU, so use Mesa's CPU Vulkan
+      # driver (lavapipe). Both variables are set because Vulkan loaders honor either name.
+      - name: Test
+        run: cargo test --locked --workspace
+        env:
+          WGPU_BACKEND: vulkan
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
 
   # crates/au-host and the objc2 code in crates/vst3-host compile only here.
   macos:

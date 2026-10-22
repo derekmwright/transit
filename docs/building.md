@@ -5,6 +5,7 @@
 - Rust 1.90 or newer (`rust-version` in `Cargo.toml`), from <https://rustup.rs>.
 - Windows: the Visual Studio 2019+ Build Tools with the "Desktop development with C++" workload.
 - Linux: `libasound2-dev` and `pkg-config` (for example `sudo apt install libasound2-dev pkg-config`).
+- Linux, headless test runs (CI, containers, WSL2): the egui tests render with wgpu and need a Vulkan adapter. Install `mesa-vulkan-drivers libvulkan1` (Mesa's CPU driver, lavapipe) and run with `WGPU_BACKEND=vulkan VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json` (`VK_DRIVER_FILES` is the newer name for the same setting). CI sets both. On WSL2 the default GL path can segfault, so set these there too.
 - macOS: the Xcode Command Line Tools (`xcode-select --install`).
 
 ## Build and run

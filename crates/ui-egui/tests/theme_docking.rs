@@ -1,4 +1,9 @@
 //! Synthetic appearance checks for populated shared panels and custom controls.
+//!
+//! The wgpu harness already prefers a software adapter when one exists, but it needs some Vulkan,
+//! Metal, or DX12 adapter. On a machine without a GPU (Linux CI, containers, WSL2) install
+//! `mesa-vulkan-drivers` and set `WGPU_BACKEND=vulkan` and
+//! `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`; CI does this with lavapipe.
 use egui::{Color32, vec2};
 use egui_kittest::Harness;
 use serde_json::json;
