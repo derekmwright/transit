@@ -6,6 +6,7 @@ calls), `render_loop.rs` (`Fill`). Decision: [ADR 0016](../../adr/0016-native-wa
 **Shared** (`Mode::Shared`) goes through the Windows audio engine: one mix format, the engine's period
 (`IAudioClient3` where the driver offers a small one), APOs and rate conversion. Other apps keep playing.
 On the Scarlett 2i2 its round trip is about 248 ms against 23 ms through ASIO.
+The native backend opens the session's (wished) rate first and lets the engine convert, and uses the endpoint's own mix rate only as the fallback, because Windows resets an endpoint's default format when the device re-enumerates (K28).
 
 **Exclusive** (`Mode::Exclusive`) bypasses the engine: the stream talks to the driver, so other apps are
 silenced while it is open. What changes:

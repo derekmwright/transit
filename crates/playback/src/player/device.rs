@@ -993,7 +993,14 @@ impl Player {
     pub fn open_input(&self, config: &AudioConfig) -> Result<record::Recorder, String> {
         let mut input = self.input.try_borrow_mut().map_err(|_| "input transition is busy")?;
         match &mut *input {
-            HeldInput::No => record::Recorder::open_with(config),
+            HeldInput::No => {
+                // The session's rate first: Windows resets an endpoint's default format when it
+                // re-enumerates, and the recorder must not silently run at another rate.
+                let config = AudioConfig { sample_rate: Some(self.device_rate), ..config.clone() };
+                let recorder = record::Recorder::open_with(&config)?;
+                check_input_rate(recorder.sample_rate, self.device_rate)?;
+                Ok(recorder)
+            }
             HeldInput::Held(slot) => {
                 let recorder = slot.take().ok_or("audio input is already open")?;
                 recorder.monitor.clear_monitor();
@@ -1017,6 +1024,14 @@ impl Player {
         }
         Ok(())
     }
+}
+
+/// Refuses an input that opened at a rate other than the session's: there is no input resampler.
+fn check_input_rate(input: u32, session: u32) -> Result<(), String> {
+    if input == session {
+        return Ok(());
+    }
+    Err(format!("input opened at {input} Hz for a {session} Hz session; set the device to the session rate"))
 }
 
 /// How one open attempt departs from what the backend planned: the exclusive-mode ladder's state.
@@ -1275,5 +1290,18 @@ fn error_callback(
 
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod rate_tests {
+    use super::check_input_rate;
+
+    #[test]
+    fn an_input_at_another_rate_is_refused_with_a_clear_message() {
+        assert!(check_input_rate(44_100, 44_100).is_ok());
+        assert_eq!(
+            check_input_rate(48_000, 44_100).unwrap_err(),
+            "input opened at 48000 Hz for a 44100 Hz session; set the device to the session rate"
+        );
+    }
+}
 #[cfg(test)]
 mod tests;

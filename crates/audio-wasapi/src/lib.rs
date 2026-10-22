@@ -79,11 +79,12 @@ fn range(format: &ab::Format, rate: u32, period: Option<(u32, u32)>) -> ab::Form
     ab::FormatRange { sample: format.sample, channels: format.channels, min_rate: rate, max_rate: rate, period }
 }
 
-/// The requests to try on `info`: its own rate first (no conversion in the engine), then the wished
-/// rates, which the engine converts.
+/// The requests to try on `info`: the wished rates first, in the order given (the session's rate
+/// wins; where it differs from the endpoint's mix rate the engine converts in shared mode), then the
+/// endpoint's own mix rate as the fallback when no wished rate can be opened.
 fn attempts(info: &EndpointInfo, wished: Vec<u32>, period: Option<u32>) -> Vec<ab::OpenRequest> {
-    let mut rates = vec![info.mix.rate];
-    for rate in wished {
+    let mut rates = Vec::new();
+    for rate in wished.into_iter().chain([info.mix.rate]) {
         if !rates.contains(&rate) {
             rates.push(rate);
         }
@@ -216,6 +217,32 @@ impl ab::Backend for WasapiBackend {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_order {
+    use super::*;
+    use crate::convert::Wire;
+
+    fn endpoint(rate: u32) -> EndpointInfo {
+        let mix = com::Fmt { rate, channels: 2, sample: ab::SampleFormat::F32, wire: Wire::F32, valid_bits: 32, mask: 3 };
+        EndpointInfo { id: "id".into(), name: "name".into(), mix, periods: None, container: None }
+    }
+
+    fn rates(info: &EndpointInfo, wished: Vec<u32>) -> Vec<u32> {
+        attempts(info, wished, None).iter().map(|r| r.format.rate).collect()
+    }
+
+    #[test]
+    fn the_wished_rate_comes_before_the_endpoint_mix_rate() {
+        assert_eq!(rates(&endpoint(48_000), vec![44_100]), [44_100, 48_000]);
+    }
+
+    #[test]
+    fn wished_rates_keep_their_order_and_the_mix_rate_is_not_repeated() {
+        assert_eq!(rates(&endpoint(48_000), vec![96_000, 48_000, 44_100]), [96_000, 48_000, 44_100]);
+        assert_eq!(rates(&endpoint(48_000), vec![]), [48_000]);
     }
 }
 
