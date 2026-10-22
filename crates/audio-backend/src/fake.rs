@@ -6,7 +6,7 @@
 use crate::{
     Achieved, Backend, BackendFactory, CaptureBlock, CaptureCallback, CaptureSource, Direction, Endpoint, ErrorCallback, Format, InputWish, Mode,
     OpenError, OpenRequest, OutputWish, Period, Plan, RenderBlock, RenderCallback, RenderSink, SCRATCH_FRAMES, SampleFormat, Stamp, Stream,
-    StreamError, WorkerPriority,
+    StreamError, StreamStats, WorkerPriority,
 };
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -21,6 +21,9 @@ struct State {
     fail_start: Option<OpenError>,
     opens: Vec<(Direction, OpenRequest)>,
     started: [bool; 2],
+    /// The snapshot each direction's stream reports (output, input): a pump counts a wake; a test
+    /// can script the rest.
+    stats: [StreamStats; 2],
 }
 
 /// The scripted backend. Clones share one script and one set of streams.
@@ -73,6 +76,7 @@ impl FakeBackend {
         let (started, format) = (state.started[slot(Direction::Output)], self.attempts.first().map(|a| a.format));
         let (Some(render), Some(format), true) = (state.render.as_mut(), format, started) else { return false };
         render(&mut RenderBlock::new(frames, stamp, format, sink));
+        state.stats[slot(Direction::Output)].wakes += 1;
         true
     }
     /// Run one capture callback. False when no started capture stream exists.
@@ -81,7 +85,12 @@ impl FakeBackend {
         let started = state.started[slot(Direction::Input)];
         let (Some(capture), true) = (state.capture.as_mut(), started) else { return false };
         capture(&mut CaptureBlock::new(frames, stamp, format, source));
+        state.stats[slot(Direction::Input)].wakes += 1;
         true
+    }
+    /// Script the snapshot the stream of `direction` reports from [`Stream::stats`].
+    pub fn set_stream_stats(&self, direction: Direction, stats: StreamStats) {
+        self.lock().stats[slot(direction)] = stats;
     }
     /// Deliver a stream fault to the error callback of `direction`.
     pub fn inject_error(&self, direction: Direction, error: StreamError) -> bool {
@@ -198,6 +207,9 @@ impl Stream for FakeStream {
     fn thread_priority(&self) -> WorkerPriority {
         WorkerPriority::Unobserved
     }
+    fn stats(&self) -> Option<StreamStats> {
+        Some(self.lock().stats[slot(self.direction)])
+    }
 }
 
 impl Drop for FakeStream {
@@ -290,6 +302,21 @@ mod tests {
         assert!(fake.inject_error(Direction::Output, StreamError::DeviceNotAvailable));
         assert_eq!(*errors.lock().unwrap(), [StreamError::DeviceNotAvailable]);
         assert_eq!(fake.opens().len(), 2);
+    }
+
+    #[test]
+    fn a_stream_reports_a_snapshot_that_counts_pumps_and_can_be_scripted() {
+        let fake = fake();
+        let plan = fake.plan_render(&OutputWish::default()).unwrap();
+        let (stream, _) = fake.open_render(&plan.endpoint, &plan.attempts[0], Box::new(|_| {}), Box::new(|_| {})).unwrap();
+        stream.start().unwrap();
+        let mut data = [0.0f32; 8];
+        let mut sink = SliceSink { data: &mut data, channels: 2 };
+        assert!(fake.pump_render(4, Stamp::INVALID, &mut sink));
+        assert!(fake.pump_render(4, Stamp::INVALID, &mut sink));
+        assert_eq!(stream.stats().map(|s| s.wakes), Some(2));
+        fake.set_stream_stats(Direction::Output, StreamStats { skipped_wakes: 3, ..Default::default() });
+        assert_eq!(stream.stats().map(|s| (s.wakes, s.skipped_wakes)), Some((0, 3)));
     }
 
     #[test]

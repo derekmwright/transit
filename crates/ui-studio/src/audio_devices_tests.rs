@@ -917,3 +917,38 @@ mod hardware_inserts {
         assert_eq!(t.layout()["hardware"]["result"], "Measurement cancelled: the audio device was re-opened");
     }
 }
+
+#[test]
+fn the_window_shows_the_backend_loop_lines_under_the_open_lines_from_a_scripted_snapshot() {
+    use soundcraft_playback::telemetry::StreamStats;
+    let mut hist = [0u64; 16];
+    hist[0] = 90;
+    hist[3] = 10; // 10 wakes of 64..127 us
+    let output = StreamStats {
+        wakes: 1200,
+        skipped_wakes: 2,
+        wake_late_us: hist,
+        max_wake_late_us: 90,
+        service_us: hist,
+        max_service_us: 100,
+        min_padding_frames: 96,
+        ..Default::default()
+    };
+    let input = StreamStats { wakes: 800, timeouts: 1, max_packets_per_wake: 3, max_wake_late_us: 5, wake_late_us: hist, ..Default::default() };
+    let mut t = T::new();
+    t.app.audio_devices.injected_backend = Some((Some(output), Some(input)));
+    t.open_window();
+    let lines: Vec<String> = t.layout()["opened"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert!(lines[0].starts_with("Output open"));
+    assert_eq!(lines[1], "Backend: wakes 1200, late p95 90 µs, max 90 µs; service p95 100 µs, max 100 µs; skipped 2, timeouts 0; min padding 96");
+    assert!(lines[2].starts_with("Input open"));
+    assert_eq!(
+        lines[3], "Backend: wakes 800, late p95 5 µs, max 5 µs; service p95 0 µs, max 0 µs; skipped 0, timeouts 1; max packets 3",
+        "the capture line ends with the most packets of a wake"
+    );
+    t.app.audio_devices.injected_backend = None;
+    t.frames(3);
+    let plain = t.layout()["opened"].as_array().unwrap().len();
+    assert_eq!(plain, 2, "no snapshot, no backend lines");
+}

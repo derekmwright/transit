@@ -103,6 +103,10 @@ pub struct AudioDevicesState {
     pub(crate) measure_note: Option<String>,
     #[cfg(test)]
     pub(crate) fake_probe: Option<crate::hardware_measure::FakeProbe>,
+    /// Scripted device-loop counters (output, input) standing in for the streams, so tests can
+    /// render the Backend lines without a native backend.
+    #[cfg(test)]
+    pub(crate) injected_backend: Option<(Option<soundcraft_playback::telemetry::StreamStats>, Option<soundcraft_playback::telemetry::StreamStats>)>,
 }
 
 impl AudioDevicesState {
@@ -788,10 +792,16 @@ fn opened_lines(app: &StudioApp) -> Vec<String> {
         }
         None => lines.push("Output open: none".into()),
     }
+    let output = app.player.as_ref().and_then(|p| p.backend_stats());
+    let input = app.recorder.as_ref().and_then(|r| r.backend_stats());
+    #[cfg(test)]
+    let (output, input) = app.audio_devices.injected_backend.unwrap_or((output, input));
+    lines.extend(output.map(|s| crate::telemetry::backend_line(&s, false)));
     lines.push(match &app.recorder {
         Some(r) => format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels),
         None => "Input open: none yet (it opens when a track is armed or monitored)".into(),
     });
+    lines.extend(input.map(|s| crate::telemetry::backend_line(&s, true)));
     lines
 }
 

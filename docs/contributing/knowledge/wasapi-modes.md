@@ -21,7 +21,8 @@ silenced while it is open. What changes:
   padding is not read.
 - **Alignment retry.** `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` means: read the aligned frames from
   `GetBufferSize`, drop the client, activate a new one and `Initialize` once more at that size (a failed
-  `Initialize` cannot be retried on the same client). `AUDCLNT_E_BUFFER_SIZE_ERROR` names the range and is returned as the typed `OpenError::PeriodRefused` (requested, minimum and default frames), which the app's ladder matches to retry at the device period.
+  `Initialize` cannot be retried on the same client). `AUDCLNT_E_BUFFER_SIZE_ERROR` names the range and is the typed
+  `OpenError::PeriodRefused` (requested, minimum, default frames), which the app's ladder matches.
 - **Errors.** `AUDCLNT_E_DEVICE_IN_USE` is `OpenError::InUse` (another app holds it);
   `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` is `OpenError::ExclusiveDisallowed` (the endpoint's Advanced
   settings forbid it); a gone endpoint is `DeviceNotAvailable`. No raw mode, no `AUTOCONVERTPCM`.
@@ -30,3 +31,23 @@ silenced while it is open. What changes:
 On the Scarlett 2i2 exclusive mode at 480 frames still measures about 223 ms round trip: that latency is
 in the Focusrite WDM driver, and ASIO is the low-latency path there. The cpal adapter opens shared
 streams only; it refuses `Mode::Exclusive`.
+
+## Instrumentation
+
+Each native stream keeps a `LoopStats` block of relaxed atomics (created at open, written by the loop,
+read by `Stream::stats()` as an `ab::StreamStats` snapshot). The Audio Devices panel shows it under the
+"Output open" and "Input open" lines, and `audio-bench --backend wasapi` prints it after the table.
+
+- **wakes / timeouts / faults.** Events served; waits that timed out (the stream ends); faults that ended it.
+- **skipped.** Exclusive events whose buffer was not free yet (`AUDCLNT_E_BUFFER_TOO_LARGE`), skipped.
+- **late p95 / max.** How late each wake was in microseconds: render, against the previous wake plus one
+  period; capture, against the end of the first packet waiting (its QPC plus its duration, so it includes
+  the pipeline delay of the capture path). The first render wake is not measured. p95 is the upper edge of
+  the 16-bin log2 histogram bin (bins under 16, 32, 64, ... microseconds), capped at the exact maximum.
+- **service p95 / max.** Wake to after `ReleaseBuffer` (capture: every waiting packet drained): the
+  callback plus the conversion.
+- **min padding** (render, shared only; 0 in exclusive) and **max packets** (capture, per wake).
+
+Good looks like late p95 under one period, service time well under one period, and no timeouts or faults.
+Skips are normal on some exclusive drivers (K25) but should stay a small share of the wakes. A max late far
+past a period with a small p95 is a rare stall (scheduling, a driver hiccup), not a steady overload.

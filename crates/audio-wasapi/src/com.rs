@@ -11,6 +11,7 @@ use crate::exclusive::{self, ApiError, E_UNSUPPORTED_FORMAT, ExclusiveApi};
 use crate::lifecycle::Lifecycle;
 use crate::pairing::{self, Candidate};
 use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, Fill, LoopConfig, Position, RenderDevice, RenderStats, Stamper, UnwindGuard, Wake};
+use crate::stats::LoopStats;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -714,6 +715,10 @@ fn device_position(clock: &IAudioClock2, clock_frequency: u64, rate: u32) -> Res
 // to the fake the `no_alloc` test runs the loop on.
 #[deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 impl RenderDevice for Live {
+    fn now_100ns(&mut self) -> u64 {
+        qpc_100ns()
+    }
+
     fn wait(&mut self, timeout_ms: u32) -> Wake {
         // The stop event is first so that it wins when both are signaled.
         let handles = [self.stop.0, self.event.0];
@@ -839,6 +844,10 @@ const BUFFER_TIMESTAMP_ERROR: u32 = 4;
 // Hot-path methods: the allocation bans of `capture_loop` apply to the real device too.
 #[deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 impl CaptureDevice for LiveCapture {
+    fn now_100ns(&mut self) -> u64 {
+        qpc_100ns()
+    }
+
     fn wait(&mut self, timeout_ms: u32) -> Wake {
         // The stop event is first so that it wins when both are signaled.
         let handles = [self.stop.0, self.event.0];
@@ -943,6 +952,8 @@ struct Ctx {
     priority: Arc<AtomicU8>,
     ready: mpsc::SyncSender<Result<Opened, ab::OpenError>>,
     commands: Receiver<Command>,
+    /// The loop's counters, created on the control thread and shared with the stream handle.
+    stats: Arc<LoopStats>,
 }
 
 /// One native stream, render or capture: a dedicated MTA thread owns every COM object and runs the
@@ -954,6 +965,7 @@ pub(crate) struct NativeStream {
     life: Lifecycle,
     priority: Arc<AtomicU8>,
     latency: Option<Duration>,
+    stats: Arc<LoopStats>,
 }
 
 impl NativeStream {
@@ -976,10 +988,12 @@ impl NativeStream {
     fn spawn(name: &str, body: impl FnOnce(Ctx) + Send + 'static) -> Result<(Self, ab::Achieved), ab::OpenError> {
         let stop = Arc::new(Event::new(true)?);
         let priority = Arc::new(AtomicU8::new(PRIO_PENDING));
+        let stats = Arc::new(LoopStats::new());
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Opened, ab::OpenError>>(1);
         let (command_tx, command_rx) = mpsc::channel::<Command>();
         let thread = {
-            let ctx = Ctx { stop: Arc::clone(&stop), priority: Arc::clone(&priority), ready: ready_tx, commands: command_rx };
+            let ctx =
+                Ctx { stop: Arc::clone(&stop), priority: Arc::clone(&priority), ready: ready_tx, commands: command_rx, stats: Arc::clone(&stats) };
             std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || body(ctx))
@@ -997,8 +1011,15 @@ impl NativeStream {
             }
         };
         let latency = opened.achieved.latency;
-        let stream =
-            Self { stop, commands: Mutex::new(Some(command_tx)), thread: Mutex::new(Some(thread)), life: Lifecycle::default(), priority, latency };
+        let stream = Self {
+            stop,
+            commands: Mutex::new(Some(command_tx)),
+            thread: Mutex::new(Some(thread)),
+            life: Lifecycle::default(),
+            priority,
+            latency,
+            stats,
+        };
         Ok((stream, opened.achieved))
     }
 }
@@ -1039,6 +1060,10 @@ impl ab::Stream for NativeStream {
             _ => ab::WorkerPriority::Unobserved,
         }
     }
+
+    fn stats(&self) -> Option<ab::StreamStats> {
+        Some(self.stats.snapshot())
+    }
 }
 
 /// Dropping joins the stream thread, so it must run on the control thread (the Player's), never
@@ -1077,13 +1102,18 @@ fn demote(promotion: transit_rt::Promotion, priority: &AtomicU8) {
     }
 }
 
+/// One period in 100 ns units.
+fn period_100ns(period_frames: u32, rate: u32) -> u64 {
+    u64::from(period_frames) * 10_000_000 / u64::from(rate.max(1))
+}
+
 /// Four periods, but never so short that a scheduling hiccup reads as a dead device.
 fn timeout_ms(period_frames: u32, rate: u32) -> u32 {
     ((u64::from(period_frames) * 1000 / u64::from(rate.max(1))) as u32 * 4).max(250)
 }
 
 fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, mut error: ab::ErrorCallback) {
-    let Ctx { stop, priority, ready, commands } = ctx;
+    let Ctx { stop, priority, ready, commands, stats: shared } = ctx;
     // Declared first, so dropped last: COM stays initialized until every COM object is released.
     let com = match ComGuard::mta() {
         Ok(com) => com,
@@ -1124,12 +1154,14 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
                     stamper,
                     origin,
                     timeout_ms: timeout_ms(live.period_frames, live.fmt.rate),
+                    period_100ns: period_100ns(live.period_frames, live.fmt.rate),
+                    live: Arc::clone(&shared),
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
                 // Stops and resets the client when the loop ends, even by a panic in the callback.
                 let mut stats = RenderStats::default();
                 let exit = render_loop::serve(&mut live, &config, &mut scratch, &mut render, &mut error, &mut stats);
-                log::debug!("WASAPI render loop ended: {exit:?}, {stats:?}");
+                log::debug!("WASAPI render loop ended: {exit:?}, {stats:?}, {:?}", shared.snapshot());
                 if stats.skipped_wakes > 0 {
                     log::info!("WASAPI exclusive render skipped {} of {} wakes whose buffer was not free yet", stats.skipped_wakes, stats.wakes);
                 }
@@ -1148,7 +1180,7 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
 }
 
 fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback, mut error: ab::ErrorCallback) {
-    let Ctx { stop, priority, ready, commands } = ctx;
+    let Ctx { stop, priority, ready, commands, stats: shared } = ctx;
     let com = match ComGuard::mta() {
         Ok(com) => com,
         Err(e) => {
@@ -1186,12 +1218,13 @@ fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback
                     origin,
                     timeout_ms: timeout_ms(live.period_frames, live.fmt.rate),
                     filled: Arc::new(AtomicU64::new(0)),
+                    live: Arc::clone(&shared),
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
                 let mut stats = CaptureStats::default();
                 // Stops and resets the client when the loop ends, even by a panic in the callback.
                 let exit = capture_loop::serve(&mut live, &config, &mut scratch, &mut capture, &mut error, &mut stats);
-                log::debug!("WASAPI capture loop ended: {exit:?}, {stats:?}");
+                log::debug!("WASAPI capture loop ended: {exit:?}, {stats:?}, {:?}", shared.snapshot());
                 if stats.discontinuities + stats.timestamp_errors > 0 {
                     log::info!("WASAPI capture saw {} discontinuities and {} timestamp errors", stats.discontinuities, stats.timestamp_errors);
                     log::info!("WASAPI capture filled {} frames of lost packets with zeros", config.filled.load(Ordering::Relaxed));

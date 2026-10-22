@@ -26,6 +26,9 @@ pub struct Row {
     pub measurements: Measurements,
     /// The loopback calibration of a native run (`--loopback` on `--backend wasapi`), when it was measurable.
     pub calibration: Option<Result<crate::calibration::Figures, String>>,
+    /// The device-loop counters of the render and capture streams, when the backend keeps them.
+    pub render_stats: Option<ab::StreamStats>,
+    pub capture_stats: Option<ab::StreamStats>,
     pub machine: Machine,
     pub date: String,
 }
@@ -35,6 +38,12 @@ fn cell(text: &str) -> String {
 }
 
 impl Row {
+    /// One line per stream that kept device-loop counters (`--backend wasapi` and the fake one).
+    pub fn stats_lines(&self) -> Vec<String> {
+        let line = |name: &str, stats: &Option<ab::StreamStats>, capture: bool| stats.map(|s| format!("{name} backend: {}", s.line(capture)));
+        [line("render", &self.render_stats, false), line("capture", &self.capture_stats, true)].into_iter().flatten().collect()
+    }
+
     pub fn markdown(&self) -> String {
         let m = &self.measurements;
         let requested = self.requested.map_or_else(|| "default".to_string(), |p| p.to_string());
@@ -231,9 +240,26 @@ mod tests {
                 input_peaks: Vec::new(),
             },
             calibration: None,
+            render_stats: None,
+            capture_stats: None,
             machine: Machine { cpu: "Test CPU | 8 cores".into(), os: "Test OS 1.0".into() },
             date: "2026-10-21".into(),
         }
+    }
+
+    #[test]
+    fn a_stream_with_counters_gets_one_backend_line_after_the_table() {
+        let mut with = row(true);
+        assert!(with.stats_lines().is_empty());
+        with.render_stats = Some(ab::StreamStats { wakes: 10, skipped_wakes: 1, min_padding_frames: 64, ..Default::default() });
+        with.capture_stats = Some(ab::StreamStats { wakes: 9, max_packets_per_wake: 2, ..Default::default() });
+        assert_eq!(
+            with.stats_lines(),
+            [
+                "render backend: wakes 10, late p95 0 µs, max 0 µs; service p95 0 µs, max 0 µs; skipped 1, timeouts 0; min padding 64",
+                "capture backend: wakes 9, late p95 0 µs, max 0 µs; service p95 0 µs, max 0 µs; skipped 0, timeouts 0; max packets 2",
+            ]
+        );
     }
 
     #[test]

@@ -272,6 +272,11 @@ impl Recorder {
         self._stream.as_ref().map_or(crate::scheduling::WorkerPriority::NoWorker, |stream| stream.thread_priority())
     }
 
+    /// The device loop's counters of the input stream, when the backend keeps them (native WASAPI).
+    pub fn backend_stats(&self) -> Option<crate::telemetry::StreamStats> {
+        self._stream.as_ref().and_then(|stream| stream.stats())
+    }
+
     /// Open the default input device. Errors when there is none (the caller shows a message).
     pub fn open() -> Result<Recorder, String> {
         Recorder::open_with(&crate::AudioConfig::default())

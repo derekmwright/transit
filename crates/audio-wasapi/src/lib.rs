@@ -20,6 +20,7 @@ mod exclusive;
 mod lifecycle;
 mod pairing;
 mod render_loop;
+mod stats;
 
 use com::{EndpointInfo, NativeStream, OpenParams, Watcher};
 use std::sync::{Mutex, PoisonError};

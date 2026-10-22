@@ -964,7 +964,12 @@ impl Player {
         self.fault.telemetry.reset_peak();
     }
     pub fn callback_telemetry(&self) -> telemetry::CallbackTelemetry {
-        self.fault.telemetry.snapshot()
+        telemetry::CallbackTelemetry { backend: self.backend_stats(), ..self.fault.telemetry.snapshot() }
+    }
+    /// The device loop's counters of the output stream (relaxed reads: call from the UI or control
+    /// side), when the backend keeps them; the native WASAPI backend does, cpal does not.
+    pub fn backend_stats(&self) -> Option<telemetry::StreamStats> {
+        self.stream.as_ref().and_then(|stream| stream.stats())
     }
     pub fn clock_report(&self) -> Option<device_clock::ClockReport> {
         self.clock.try_borrow_mut().ok()?.as_mut().map(device_clock::MaintainedClock::report)

@@ -5,6 +5,7 @@
 
 use crate::convert::{ConvertSource, Wire};
 use crate::render_loop::{Exit, Fault, Held, Wake, contain, fail, quality_of, relative_ns};
+use crate::stats::LoopStats;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use transit_audio_backend::{Calibration, CaptureBlock, CaptureCallback, ErrorCallback, Format, HostOrigin, Stamp, StreamError};
@@ -43,6 +44,8 @@ pub(crate) trait CaptureDevice {
     /// Lend the next packet to `fill` (`GetBuffer`, then `ReleaseBuffer` with its frames). The
     /// bytes are `None` for a silent packet. `Ok(false)` when no packet is waiting.
     fn read(&mut self, fill: &mut dyn FnMut(&Packet, Option<&[u8]>)) -> Result<bool, Fault>;
+    /// The QPC now, in 100 ns units (the clock of [`Packet::qpc_100ns`]).
+    fn now_100ns(&mut self) -> u64;
     /// Stop and reset the client. Idempotent; called once the loop has ended, however it ended.
     fn halt(&mut self);
 }
@@ -98,6 +101,8 @@ pub(crate) struct CaptureConfig {
     /// Frames of zeros delivered in place of lost packets since the stream started. Shared so the
     /// owner can read the total after (or while) the loop runs.
     pub(crate) filled: Arc<AtomicU64>,
+    /// The shared counters the owner reads through `Stream::stats`.
+    pub(crate) live: Arc<LoopStats>,
 }
 
 /// What the loop remembers of the previous packet to size a gap before the next one.
@@ -156,18 +161,29 @@ pub(crate) fn run(
     let mut stamper = config.stamper;
     let channels = usize::from(config.format.channels).max(1);
     let mut previous: Option<Previous> = None;
+    let live = &*config.live;
+    let rate = u64::from(config.format.rate).max(1);
     loop {
         match device.wait(config.timeout_ms) {
-            Wake::Event => {}
+            Wake::Event => live.wake(),
             Wake::Stop => return Exit::Stopped,
             Wake::Timeout => {
+                live.timeout();
                 error(StreamError::DeviceNotAvailable);
                 return Exit::Timeout;
             }
-            Wake::Failed(fault) => return fail(error, fault),
+            Wake::Failed(fault) => return fail(error, fault, live),
         }
+        let woke = device.now_100ns();
+        let mut drained = 0u32;
         for _ in 0..MAX_PACKETS_PER_WAKE {
             let read = device.read(&mut |packet, bytes| {
+                // The event is due when the packet's last frame has been captured: its first frame's
+                // QPC plus its duration. Measured on the first packet of the wake.
+                if drained == 0 {
+                    let due = packet.qpc_100ns.saturating_add(u64::from(packet.frames) * 10_000_000 / rate);
+                    live.wake_late(woke.saturating_sub(due));
+                }
                 stats.packets += 1;
                 stats.frames += u64::from(packet.frames);
                 stats.silent += u64::from(packet.silent);
@@ -190,11 +206,13 @@ pub(crate) fn run(
                 capture(&mut block);
             });
             match read {
-                Ok(true) => {}
+                Ok(true) => drained += 1,
                 Ok(false) => break,
-                Err(fault) => return fail(error, fault),
+                Err(fault) => return fail(error, fault, live),
             }
         }
+        live.packets(drained);
+        live.service(device.now_100ns().saturating_sub(woke));
     }
 }
 
@@ -250,7 +268,7 @@ mod tests {
     use crate::render_loop::UnwindGuard;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use transit_audio_backend::{Quality, SampleFormat};
+    use transit_audio_backend::{Quality, SampleFormat, StreamStats};
     use transit_rt::testing::measure;
 
     const RATE: u32 = 48_000;
@@ -302,6 +320,11 @@ mod tests {
         halts: u32,
         gets: u32,
         releases: std::cell::Cell<u32>,
+        /// The scripted QPC: a wake sets it to `wake_at_100ns` past the end of the last packet
+        /// delivered; each packet read moves it `read_100ns`.
+        now: u64,
+        wake_after_100ns: u64,
+        read_100ns: u64,
     }
 
     impl Fake {
@@ -317,6 +340,9 @@ mod tests {
                 halts: 0,
                 gets: 0,
                 releases: std::cell::Cell::new(0),
+                now: ORIGIN_QPC,
+                wake_after_100ns: READ_DELAY_100NS,
+                read_100ns: 0,
             }
         }
         fn wakes(count: usize) -> Self {
@@ -328,7 +354,12 @@ mod tests {
     }
 
     impl CaptureDevice for Fake {
+        fn now_100ns(&mut self) -> u64 {
+            self.now
+        }
         fn wait(&mut self, _timeout_ms: u32) -> Wake {
+            // The wake is `wake_after_100ns` past the end of the next packet to arrive.
+            self.now = self.qpc_of(self.position + u64::from(PERIOD)) + self.wake_after_100ns;
             match self.steps.pop_front() {
                 Some(Step::Wake(packets)) => {
                     self.waiting = packets.into();
@@ -381,6 +412,7 @@ mod tests {
                 self.bytes[i * 4..i * 4 + 4].copy_from_slice(&((self.position as f32 * CHANNELS as f32 + i as f32) / 1000.0).to_le_bytes());
             }
             self.position += u64::from(scripted.frames);
+            self.now += self.read_100ns;
             let releases = &self.releases;
             let guard = UnwindGuard::new(|| releases.set(gets));
             fill(&packet, (!scripted.silent).then(|| &self.bytes[..len]));
@@ -401,6 +433,7 @@ mod tests {
             origin: HostOrigin::default(),
             timeout_ms: 250,
             filled: Arc::new(AtomicU64::new(0)),
+            live: Arc::new(LoopStats::new()),
         }
     }
 
@@ -700,6 +733,40 @@ mod tests {
         let mut device = Fake::new([Step::Wait(Wake::Failed(Fault::Other(7)))]);
         let run = drive(&mut device, &config(None));
         assert_eq!((run.exit, run.errors), (Exit::Faulted(Fault::Other(7)), vec![StreamError::Other]));
+    }
+
+    #[test]
+    fn the_shared_block_gets_wake_lateness_service_time_and_packets_per_wake() {
+        // Three wakes: one packet, three packets, one packet. Each wake is 8 ms after the end of its
+        // first packet; each packet read takes 100 us.
+        let mut device = Fake::new([Step::Wake(vec![normal()]), Step::Wake(vec![normal(); 3]), Step::Wake(vec![normal()])]);
+        device.read_100ns = 1_000;
+        let config = config(None);
+        let live = Arc::clone(&config.live);
+        let run = drive(&mut device, &config);
+        assert_eq!(run.exit, Exit::Stopped);
+        let s = live.snapshot();
+        assert_eq!((s.wakes, s.timeouts, s.faults), (3, 0, 0));
+        assert_eq!(s.wake_late_us.iter().sum::<u64>(), 3, "once per wake, on the first packet");
+        assert_eq!((s.wake_late_us[StreamStats::bin_of_us(8_000)], s.max_wake_late_us), (3, 8_000));
+        assert_eq!(s.max_packets_per_wake, 3);
+        assert_eq!(s.service_us.iter().sum::<u64>(), 3);
+        assert_eq!(s.max_service_us, 300, "three reads of 100 us");
+        assert_eq!(s.min_padding_frames, 0);
+    }
+
+    #[test]
+    fn timeouts_and_faults_are_counted_in_the_shared_block() {
+        let config_timeout = config(None);
+        let live = Arc::clone(&config_timeout.live);
+        drive(&mut Fake::new([Step::Wait(Wake::Timeout)]), &config_timeout);
+        assert_eq!(live.snapshot().timeouts, 1);
+        let config_fault = config(None);
+        let live = Arc::clone(&config_fault.live);
+        let mut device = Fake::wakes(1);
+        device.fail_read = Some(Fault::DeviceGone);
+        drive(&mut device, &config_fault);
+        assert_eq!((live.snapshot().faults, live.snapshot().timeouts), (1, 0));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use crate::StudioApp;
 
 use crate::theme::{SPACE, TOKENS};
-use soundcraft_playback::telemetry::{CallbackTelemetry, DURATION_LIMITS_NS};
+use soundcraft_playback::telemetry::{CallbackTelemetry, DURATION_LIMITS_NS, StreamStats};
 
 /// Minimum time between two reads of the counters (about four a second).
 pub const POLL_SECS: f64 = 0.25;
@@ -127,6 +127,11 @@ pub fn detail_rows(t: &CallbackTelemetry) -> Vec<String> {
         format!("Frames silenced by a render fault: {}", t.fault_silence_frames),
     ]);
     rows
+}
+
+/// The Audio Devices line for the device loop of a native stream (see [`StreamStats::line`]).
+pub fn backend_line(s: &StreamStats, capture: bool) -> String {
+    format!("Backend: {}", s.line(capture))
 }
 
 /// The host shown in the load readout: the audio system, starred when the native backend serves it

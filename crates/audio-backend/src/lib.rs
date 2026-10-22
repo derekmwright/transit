@@ -315,6 +315,95 @@ pub enum WorkerPriority {
     ReleaseFailed,
 }
 
+/// The number of bins of a [`StreamStats`] histogram.
+pub const STATS_BINS: usize = 16;
+
+/// How well a backend's device loop keeps up, for one stream: counters since the stream opened and
+/// two microsecond histograms. Read on the control or UI side from relaxed atomics, so the fields
+/// are individually exact but can span a few loop iterations.
+///
+/// Histogram bin `i` below the last counts values under `16 << i` microseconds (bin 0: under 16,
+/// bin 1: under 32, ... bin 14: under 262144); the last bin counts everything beyond. Together with
+/// the exact maxima that is enough for a percentile ([`StreamStats::wake_late_p95_us`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamStats {
+    /// Device events the loop served (not stop, timeout or failure).
+    pub wakes: u64,
+    /// Waits that timed out: the device stopped signaling, and the stream ended.
+    pub timeouts: u64,
+    /// Exclusive-mode events whose buffer was not free yet; the loop skipped them.
+    pub skipped_wakes: u64,
+    /// Faults that ended the stream (device lost, failed calls).
+    pub faults: u64,
+    /// How late each wake was against when the event was due: the previous wake plus one period
+    /// (render), or the end of the first packet waiting (capture). Never negative.
+    pub wake_late_us: [u64; STATS_BINS],
+    pub max_wake_late_us: u64,
+    /// Time from the wake to the end of the work (the callback and `ReleaseBuffer`; capture: every
+    /// packet drained).
+    pub service_us: [u64; STATS_BINS],
+    pub max_service_us: u64,
+    /// The smallest `GetCurrentPadding` seen at a wake, in frames (render, shared mode; 0 where
+    /// the backend does not read it).
+    pub min_padding_frames: u32,
+    /// The most packets one wake drained (capture; 0 for render).
+    pub max_packets_per_wake: u32,
+}
+
+impl StreamStats {
+    /// The bin of a value in microseconds, see the type documentation.
+    pub fn bin_of_us(us: u64) -> usize {
+        match (us / 16).checked_ilog2() {
+            None => 0,
+            Some(log) => (log as usize + 1).min(STATS_BINS - 1),
+        }
+    }
+
+    /// The 95th percentile of `hist` in microseconds: the upper edge of the bin it falls in, never
+    /// above `max_us` (the exact maximum). 0 for an empty histogram.
+    pub fn p95_us(hist: &[u64; STATS_BINS], max_us: u64) -> u64 {
+        let total: u64 = hist.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let want = total - total / 20;
+        let mut seen = 0;
+        for (bin, count) in hist.iter().enumerate() {
+            seen += count;
+            if seen >= want {
+                return if bin + 1 == STATS_BINS { max_us } else { (16u64 << bin).min(max_us) };
+            }
+        }
+        max_us
+    }
+
+    /// One line of the counters, for the Audio Devices panel and the bench (the caller adds its
+    /// own prefix): wakes, lateness and service percentiles, skips and timeouts, then the minimum
+    /// padding (render) or the most packets of a wake (`capture`), and the faults when there were any.
+    pub fn line(&self, capture: bool) -> String {
+        let tail = if capture { format!("max packets {}", self.max_packets_per_wake) } else { format!("min padding {}", self.min_padding_frames) };
+        let faults = if self.faults > 0 { format!("; faults {}", self.faults) } else { String::new() };
+        format!(
+            "wakes {}, late p95 {} µs, max {} µs; service p95 {} µs, max {} µs; skipped {}, timeouts {}; {tail}{faults}",
+            self.wakes,
+            self.wake_late_p95_us(),
+            self.max_wake_late_us,
+            self.service_p95_us(),
+            self.max_service_us,
+            self.skipped_wakes,
+            self.timeouts,
+        )
+    }
+
+    pub fn wake_late_p95_us(&self) -> u64 {
+        Self::p95_us(&self.wake_late_us, self.max_wake_late_us)
+    }
+
+    pub fn service_p95_us(&self) -> u64 {
+        Self::p95_us(&self.service_us, self.max_service_us)
+    }
+}
+
 /// A running (or startable) stream. Dropping it closes the device.
 pub trait Stream {
     fn start(&self) -> Result<(), OpenError>;
@@ -323,6 +412,12 @@ pub trait Stream {
     fn latency(&self) -> Option<Duration>;
     /// The observed scheduling state of the device worker (the result of the MMCSS or priority hook).
     fn thread_priority(&self) -> WorkerPriority;
+    /// A snapshot of the device loop's counters, where the backend keeps them (the native WASAPI
+    /// backend does; cpal and the others return `None`). A relaxed read: call it on a control or UI
+    /// thread, never from a callback.
+    fn stats(&self) -> Option<StreamStats> {
+        None
+    }
 }
 
 /// Where the samples of a render block go: the adapter lends scratch, converts to the device
@@ -460,6 +555,29 @@ mod tests {
         assert!(got[5..10].iter().all(|f| f.rate == 48_000 && f.channels == 8 && f.channel_mask == Some(0)), "other counts are direct out");
         let rates: Vec<u32> = got.iter().step_by(10).map(|f| f.rate).collect();
         assert_eq!(rates, [48_000, 44_100, 88_200, 96_000, 176_400, 192_000], "the wished rate first, then the standard ones once each");
+    }
+
+    #[test]
+    fn stats_bins_follow_the_documented_limits() {
+        for (us, bin) in [(0, 0), (15, 0), (16, 1), (31, 1), (32, 2), (100, 3), (262_143, 14), (262_144, 15), (u64::MAX, 15)] {
+            assert_eq!(StreamStats::bin_of_us(us), bin, "{us} us");
+        }
+    }
+
+    #[test]
+    fn the_p95_is_the_bin_edge_capped_at_the_maximum() {
+        let mut hist = [0u64; STATS_BINS];
+        assert_eq!(StreamStats::p95_us(&hist, 0), 0);
+        hist[0] = 96;
+        hist[3] = 4;
+        assert_eq!(StreamStats::p95_us(&hist, 90), 16, "95 of 100 are under 16 us");
+        hist[0] = 90;
+        hist[3] = 10;
+        assert_eq!(StreamStats::p95_us(&hist, 90), 90, "the bin edge 128 is capped at the maximum");
+        hist[15] = 1;
+        assert_eq!(StreamStats::p95_us(&hist, 400_000), 128);
+        let stats = StreamStats { wake_late_us: hist, max_wake_late_us: 90, ..Default::default() };
+        assert_eq!(stats.wake_late_p95_us(), 90);
     }
 
     #[test]

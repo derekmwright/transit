@@ -28,6 +28,9 @@ pub struct Opened {
     pub capture_rate: Option<u32>,
     /// What the render stream opened with (format, period, latency).
     pub render: ab::Achieved,
+    /// The device-loop counters of each stream at the end of the run, where the backend keeps them.
+    pub render_stats: Option<ab::StreamStats>,
+    pub capture_stats: Option<ab::StreamStats>,
 }
 
 fn open_first<T>(attempts: &[ab::OpenRequest], mut open: impl FnMut(&ab::OpenRequest) -> Result<T, ab::OpenError>) -> Result<T, String> {
@@ -131,6 +134,9 @@ pub fn run(
         render.start().map_err(|e| format!("start output: {e}"))?;
         drive()
     })();
+    // Before the stops, so the figures are the run's alone.
+    let render_stats = render.stats();
+    let capture_stats = capture.as_ref().and_then(|(stream, _)| stream.stats());
     let _ = render.stop();
     if let Some((stream, _)) = &capture {
         let _ = stream.stop();
@@ -141,5 +147,7 @@ pub fn run(
         render_rate: achieved.format.rate,
         capture_rate: capture.as_ref().map(|(_, a)| a.format.rate),
         render: achieved,
+        render_stats,
+        capture_stats,
     })
 }

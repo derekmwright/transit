@@ -177,3 +177,14 @@ fn an_exclusive_run_notes_its_mode_and_calibrates_under_the_exclusive_key() {
     assert_eq!(modes, [soundcraft_playback::devices::MODE_EXCLUSIVE, soundcraft_playback::devices::MODE_SHARED]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn the_fake_run_exports_a_snapshot_per_stream() {
+    let row = run(&config(64, 2.0, true, script(0, None, 144))).expect("the fake run");
+    let (render, capture) = (row.render_stats.expect("render stats"), row.capture_stats.expect("capture stats"));
+    assert_eq!((render.wakes, capture.wakes), (1500, 1500), "one wake per pumped block");
+    let lines = row.stats_lines();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("render backend: wakes 1500, "), "{}", lines[0]);
+    assert!(lines[1].starts_with("capture backend: wakes 1500, "), "{}", lines[1]);
+}

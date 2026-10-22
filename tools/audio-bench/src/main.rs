@@ -13,6 +13,9 @@ fn main() -> ExitCode {
             let row = run(&config)?;
             let rows = [row];
             print!("{}", report::table(&rows));
+            for line in rows[0].stats_lines() {
+                println!("{line}");
+            }
             match &rows[0].calibration {
                 Some(Ok(figures)) => {
                     println!("{}", figures.describe());

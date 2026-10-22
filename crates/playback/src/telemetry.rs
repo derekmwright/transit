@@ -19,6 +19,10 @@ use std::time::Duration;
 pub const DURATION_LIMITS_NS: [u64; 15] =
     [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000, 1_024_000, 2_048_000, 4_096_000, 8_192_000, 16_384_000];
 
+/// The device-loop snapshot a native backend keeps (wake lateness, service time, skips), re-exported
+/// so the UI needs no dependency on the backend crate.
+pub use transit_audio_backend::StreamStats;
+
 /// Approximate, nonblocking view of lifetime output diagnostics.
 ///
 /// Fields are loaded independently and can span several publications if the reader is delayed:
@@ -71,6 +75,9 @@ pub struct CallbackTelemetry {
     pub unavailable_silence_frames: u64,
     /// Render frames silenced because rendering panicked, or an earlier panic latched the fault.
     pub fault_silence_frames: u64,
+    /// The output stream's device-loop counters when the native WASAPI backend serves it (`None`
+    /// on cpal). Filled by `Player::callback_telemetry` from the stream, not by the callback.
+    pub backend: Option<StreamStats>,
 }
 
 /// Callbacks kept for the recent window: one second at 48 kHz down to 47-frame buffers. Smaller
@@ -146,6 +153,7 @@ impl Counters {
             contention_silence_frames: self.contention_silence_frames.load(Ordering::Relaxed),
             unavailable_silence_frames: self.unavailable_silence_frames.load(Ordering::Relaxed),
             fault_silence_frames: self.fault_silence_frames.load(Ordering::Relaxed),
+            backend: None,
         }
     }
 

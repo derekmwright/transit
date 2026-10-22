@@ -526,6 +526,17 @@ fn the_native_backend_is_asked_for_exclusive_unless_the_user_shares_the_device()
 }
 
 #[test]
+fn the_telemetry_carries_the_backend_snapshot_of_the_output_stream() {
+    let native = fake_factory(false);
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fake_factory(false)).unwrap();
+    assert_eq!(player.callback_telemetry().backend, Some(ab::StreamStats::default()), "the fake backend keeps counters");
+    let scripted = ab::StreamStats { wakes: 9, skipped_wakes: 2, max_wake_late_us: 700, ..Default::default() };
+    native.set_stream_stats(ab::Direction::Output, scripted);
+    assert_eq!(player.callback_telemetry().backend, Some(scripted));
+    assert_eq!(player.backend_stats(), Some(scripted));
+}
+
+#[test]
 fn a_refused_period_retries_exclusive_at_the_device_period_and_says_so() {
     let native = fake_at_128();
     native.fail_next_open(ab::OpenError::PeriodRefused {

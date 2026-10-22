@@ -113,6 +113,8 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         mode: (config.request.mode == ab::Mode::Exclusive).then(|| report::exclusive_note(&opened.render)),
         measurements,
         calibration,
+        render_stats: opened.render_stats,
+        capture_stats: opened.capture_stats,
         machine: report::machine(),
         date,
     })

@@ -5,7 +5,9 @@
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use crate::convert::{ConvertSink, Wire};
+use crate::stats::LoopStats;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use transit_audio_backend::{Calibration, ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
 
 /// `AUDCLNT_E_DEVICE_INVALIDATED`: the endpoint was removed, disabled or its format changed.
@@ -70,6 +72,8 @@ pub(crate) trait RenderDevice {
     fn position(&mut self) -> Result<Position, Fault>;
     /// Lend the `frames` of the device buffer to `fill` (`GetBuffer`, then `ReleaseBuffer`).
     fn write(&mut self, frames: u32, fill: &mut dyn FnMut(&mut [u8])) -> Result<(), Fault>;
+    /// The QPC now, in 100 ns units (the clock of [`Position::qpc_100ns`]).
+    fn now_100ns(&mut self) -> u64;
     /// Stop and reset the client. Idempotent; called once the loop has ended, however it ended.
     fn halt(&mut self);
 }
@@ -209,6 +213,10 @@ pub(crate) struct LoopConfig {
     pub(crate) stamper: Stamper,
     pub(crate) origin: HostOrigin,
     pub(crate) timeout_ms: u32,
+    /// One period in 100 ns units: when the next wake is due after this one.
+    pub(crate) period_100ns: u64,
+    /// The shared counters the owner reads through `Stream::stats`.
+    pub(crate) live: Arc<LoopStats>,
 }
 
 /// How the loop ended.
@@ -246,21 +254,35 @@ pub(crate) fn run(
     stats: &mut RenderStats,
 ) -> Exit {
     let mut stamper = config.stamper;
+    let live = &*config.live;
+    let mut previous_wake: Option<u64> = None;
     loop {
         match device.wait(config.timeout_ms) {
-            Wake::Event => stats.wakes += 1,
+            Wake::Event => {
+                stats.wakes += 1;
+                live.wake();
+            }
             Wake::Stop => return Exit::Stopped,
             Wake::Timeout => {
                 stats.timeouts += 1;
+                live.timeout();
                 error(StreamError::DeviceNotAvailable);
                 return Exit::Timeout;
             }
-            Wake::Failed(fault) => return fail(error, fault),
+            Wake::Failed(fault) => return fail(error, fault, live),
+        }
+        // The event is due one period after the previous wake; the first wake has nothing to be late against.
+        let woke = device.now_100ns();
+        if let Some(previous) = previous_wake.replace(woke) {
+            live.wake_late(woke.saturating_sub(previous.saturating_add(config.period_100ns)));
         }
         let (padding, frames) = match config.fill {
             Fill::Free => match device.padding() {
-                Ok(padding) => (padding, config.buffer_frames.saturating_sub(padding)),
-                Err(fault) => return fail(error, fault),
+                Ok(padding) => {
+                    live.padding(padding);
+                    (padding, config.buffer_frames.saturating_sub(padding))
+                }
+                Err(fault) => return fail(error, fault, live),
             },
             Fill::Whole => (config.buffer_frames, config.buffer_frames),
         };
@@ -277,11 +299,14 @@ pub(crate) fn run(
             render(&mut block);
         });
         match written {
-            Ok(()) => {}
+            Ok(()) => live.service(device.now_100ns().saturating_sub(woke)),
             // The early event of an exclusive driver: `GetBuffer` acquired nothing and the
             // callback did not run; the next event brings the free buffer.
-            Err(Fault::Other(E_BUFFER_TOO_LARGE)) if config.fill == Fill::Whole => stats.skipped_wakes += 1,
-            Err(fault) => return fail(error, fault),
+            Err(Fault::Other(E_BUFFER_TOO_LARGE)) if config.fill == Fill::Whole => {
+                stats.skipped_wakes += 1;
+                live.skipped();
+            }
+            Err(fault) => return fail(error, fault, live),
         }
     }
 }
@@ -317,7 +342,8 @@ pub(crate) fn contain(error: &mut ErrorCallback, work: impl FnOnce(&mut ErrorCal
     }
 }
 
-pub(crate) fn fail(error: &mut ErrorCallback, fault: Fault) -> Exit {
+pub(crate) fn fail(error: &mut ErrorCallback, fault: Fault, live: &LoopStats) -> Exit {
+    live.fault();
     error(fault.stream_error());
     Exit::Faulted(fault)
 }
@@ -327,7 +353,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use transit_audio_backend::SampleFormat;
+    use transit_audio_backend::{SampleFormat, StreamStats};
     use transit_rt::testing::{CountingAlloc, measure};
 
     #[global_allocator]
@@ -357,6 +383,12 @@ mod tests {
         /// A second `GetBuffer` while one is outstanding.
         double_get: bool,
         padding_reads: u32,
+        /// The scripted QPC: each event moves it one period plus `late_100ns[event]`; each write
+        /// moves it `service_100ns`.
+        now: u64,
+        events: usize,
+        late_100ns: Vec<u64>,
+        service_100ns: u64,
     }
 
     impl Fake {
@@ -377,13 +409,25 @@ mod tests {
                 releases: std::cell::Cell::new(0),
                 double_get: false,
                 padding_reads: 0,
+                now: 5_000_000,
+                events: 0,
+                late_100ns: Vec::new(),
+                service_100ns: 0,
             }
         }
     }
 
     impl RenderDevice for Fake {
         fn wait(&mut self, _timeout_ms: u32) -> Wake {
-            self.wakes.pop_front().unwrap_or(Wake::Stop)
+            let wake = self.wakes.pop_front().unwrap_or(Wake::Stop);
+            if wake == Wake::Event {
+                self.now += PERIOD_100NS + self.late_100ns.get(self.events).copied().unwrap_or(0);
+                self.events += 1;
+            }
+            wake
+        }
+        fn now_100ns(&mut self) -> u64 {
+            self.now
         }
         fn padding(&mut self) -> Result<u32, Fault> {
             self.padding_reads += 1;
@@ -420,6 +464,7 @@ mod tests {
             fill(&mut self.buffer[..frames as usize * 2 * 4]);
             guard.disarm();
             self.releases.set(gets);
+            self.now += self.service_100ns;
             Ok(())
         }
         fn halt(&mut self) {
@@ -436,6 +481,8 @@ mod tests {
             stamper: Stamper::new(5_000_000, origin_ns, RATE, latency_100ns),
             origin: HostOrigin::default(),
             timeout_ms: 250,
+            period_100ns: PERIOD_100NS,
+            live: Arc::new(LoopStats::new()),
         }
     }
 
@@ -613,6 +660,52 @@ mod tests {
         let mut device = Fake::new([Wake::Event, Wake::Timeout]);
         let (_, _, _, stats) = drive_stats(&mut device, &exclusive(0));
         assert_eq!(stats, RenderStats { wakes: 1, skipped_wakes: 0, timeouts: 1 });
+    }
+
+    #[test]
+    fn the_shared_block_gets_wake_lateness_service_time_and_padding() {
+        let mut device = Fake::new([Wake::Event; 5]);
+        // Wake 0 has nothing to be late against; wake 2 is 1 ms late (10_000 hns), wake 3 on time again
+        // relative to the late one; each write takes 200 us (2_000 hns).
+        device.late_100ns = vec![50_000, 0, 10_000, 0, 700_000];
+        device.service_100ns = 2_000;
+        device.padding = PERIOD / 2;
+        let config = config(0, 0);
+        let live = Arc::clone(&config.live);
+        let (exit, _, _, stats) = drive_stats(&mut device, &config);
+        assert_eq!((exit, stats.wakes), (Exit::Stopped, 5));
+        let s = live.snapshot();
+        // Service time moves the clock too: a wake after a write is a service time later than a period.
+        let late = |event: usize| -> u64 {
+            let service = if event == 0 { 0 } else { 2_000 };
+            (device.late_100ns[event] + service) / 10
+        };
+        assert_eq!(s.wakes, 5);
+        assert_eq!(s.wake_late_us.iter().sum::<u64>(), 4, "the first wake is not measured");
+        assert_eq!(s.max_wake_late_us, late(4), "the 70 ms wake is the largest");
+        assert_eq!(s.wake_late_us[StreamStats::bin_of_us(late(4))], 1);
+        assert_eq!(s.service_us.iter().sum::<u64>(), 5);
+        assert_eq!((s.service_us[StreamStats::bin_of_us(200)], s.max_service_us), (5, 200));
+        assert_eq!(s.min_padding_frames, PERIOD / 2);
+        assert_eq!((s.timeouts, s.skipped_wakes, s.faults), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_exclusive_loop_leaves_the_padding_at_zero_and_counts_skips_timeouts_and_faults() {
+        let mut device = Fake::new([Wake::Event, Wake::Event, Wake::Event, Wake::Timeout]);
+        device.fail_once = Some((1, Fault::from_hresult(E_BUFFER_TOO_LARGE)));
+        let config = exclusive(0);
+        let live = Arc::clone(&config.live);
+        drive_stats(&mut device, &config);
+        let s = live.snapshot();
+        assert_eq!((s.wakes, s.skipped_wakes, s.timeouts, s.faults, s.min_padding_frames), (3, 1, 1, 0, 0));
+        assert_eq!(s.service_us.iter().sum::<u64>(), 2, "a skipped wake did no work");
+        let mut gone = Fake::new([Wake::Event]);
+        gone.fail_write = Some(Fault::DeviceGone);
+        let config = exclusive(0);
+        let live = Arc::clone(&config.live);
+        drive_stats(&mut gone, &config);
+        assert_eq!(live.snapshot().faults, 1);
     }
 
     #[test]
