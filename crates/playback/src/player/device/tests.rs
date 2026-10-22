@@ -722,6 +722,68 @@ fn player_on_native_asio(driver: &str, rate: u32, buffer: Option<u32>) -> (u16, 
     shape
 }
 
+/// The ADR 0015 hardware-insert measurement (the click train) through the Player on native ASIO, over
+/// the bench's loopback cable: output `send` to input `ret` (0-based). Returns the measured frames.
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+fn hardware_ping_on_native_asio(driver: &str, rate: u32, buffer: Option<u32>, send: u16, ret: u16) -> u32 {
+    let cfg = AudioConfig {
+        backend: crate::Backend::NativeAsio,
+        system: Some("ASIO".into()),
+        output: Some(driver.into()),
+        sample_rate: Some(rate),
+        buffer_size: buffer,
+        ..Default::default()
+    };
+    let session = Session { sample_rate: soundcraft_time::SampleRate::new(rate).expect("a rate"), ..Session::default() };
+    let player = Player::with_config(Arc::new(session), &cfg);
+    assert!(!player.silent && player.native_backend, "{:?} {:?}", player.initial_error(), player.backend_note);
+    let recorder = player.open_input(&cfg).expect("the duplex input is held");
+    player.set_input(Arc::clone(&recorder.monitor)).expect("input");
+    let settle = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < settle {
+        player.service().expect("service");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // The plan adopts the live input a few blocks late; start from an empty ring (K22).
+    recorder.monitor.clear_monitor();
+    player.start_hardware_probe(&[send], &[ret]).unwrap_or_else(|e| panic!("{e}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let result = loop {
+        player.service().expect("service");
+        if let Some(result) = player.hardware_probe_result() {
+            break result;
+        }
+        assert!(std::time::Instant::now() < deadline, "no result in 10 s");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let measured = result.unwrap_or_else(|e| panic!("{driver}: {e}"));
+    println!(
+        "{driver}: out {} -> in {}: {measured:?} ({:.3} ms at {} Hz, buffer {:?})",
+        send + 1,
+        ret + 1,
+        f64::from(measured.round_trip_frames) * 1000.0 / f64::from(rate),
+        player.device_rate,
+        player.device_buffer
+    );
+    measured.round_trip_frames
+}
+
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+#[test]
+#[ignore = "plays a click train out of the Scarlett's output 2 (cabled to input 2) through the Player"]
+fn hardware_player_measures_a_hardware_insert_on_the_scarlett_over_native_asio() {
+    let frames = hardware_ping_on_native_asio("Focusrite USB ASIO", 48_000, Some(64), 1, 1);
+    assert!((250..400).contains(&frames), "{frames} frames: the bench measures about 300 at 64");
+}
+
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+#[test]
+#[ignore = "plays a click train out of the Model 12's output 2 (cabled to input 1) through the Player"]
+fn hardware_player_measures_a_hardware_insert_on_the_model12_over_native_asio() {
+    let frames = hardware_ping_on_native_asio("Model Mixer ASIO Driver", 44_100, None, 1, 0);
+    assert!((900..1_300).contains(&frames), "{frames} frames: the bench measures 974 to 1239");
+}
+
 #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
 #[test]
 #[ignore = "opens the Focusrite ASIO driver through the Player for two seconds"]
