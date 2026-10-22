@@ -100,6 +100,10 @@ pub struct Player {
     pub device_channels: u16,
     /// This machine's paths on the open device (ADR 0015).
     io: RefCell<Arc<IoMap>>,
+    /// The hardware-insert round-trip probe (ADR 0015 section 5); the audio thread plays and records it.
+    probe: Option<Arc<crate::hardware_probe::HwProbe>>,
+    /// A live input ring feeds the plan (`set_input`): the probe has something to read.
+    plan_input: Cell<bool>,
     pub device_buffer: Option<u32>,
     pub silent: bool,
 }
@@ -192,6 +196,8 @@ impl Player {
             device_rate: rate,
             device_channels: 0,
             io: RefCell::new(Arc::new(IoMap::default())),
+            probe: None,
+            plan_input: Cell::new(false),
             device_buffer: None,
             silent: true,
         }
@@ -254,6 +260,9 @@ impl Player {
         *player.record_start.get_mut() = Some(record_start);
         let (capture, sink) = crate::midi_capture::pair(crate::midi_capture::CAPACITY);
         audio.set_midi_capture(sink);
+        let probe = Arc::new(crate::hardware_probe::HwProbe::new(target.sample_rate));
+        audio.set_probe(Arc::clone(&probe));
+        player.probe = Some(probe);
         *player.capture.get_mut() = Some(capture);
         let (anchor, access) = Anchor::new(audio);
         player.state = Some(anchor);
@@ -484,7 +493,59 @@ impl Player {
         Ok(id)
     }
     pub fn set_input(&self, input: Arc<record::InputRing>) -> Result<SessionRequestId, PlayerError> {
-        self.owner()?.set_input(Some(input))
+        let id = self.owner()?.set_input(Some(input))?;
+        self.plan_input.set(true);
+        Ok(id)
+    }
+
+    /// Whether a live input feeds the plan: the device is duplex and its input is open, so a
+    /// hardware insert's return has something to read.
+    pub fn duplex(&self) -> bool {
+        !self.silent && self.plan_input.get() && self.io_map().inputs > 0
+    }
+
+    /// Start measuring the round trip of a hardware insert: a click train plays on the device
+    /// channels of the send path (0-based `send`) and the probe records those of the return path
+    /// (`ret`) for about two seconds and a third. Poll [`Self::hardware_probe_result`]. Refuses
+    /// when the transport is playing, there is no live input, the speed is not 1x, or a
+    /// measurement is already running. Control side only; the audio thread allocates nothing.
+    pub fn start_hardware_probe(&self, send: &[u16], ret: &[u16]) -> Result<(), String> {
+        let probe = self.probe.as_ref().filter(|_| !self.silent).ok_or("there is no audio device to measure through")?;
+        let io = self.io_map();
+        if !self.plan_input.get() || io.inputs == 0 {
+            return Err("this device has no live input open (hardware inserts need a duplex device)".into());
+        }
+        if self.is_playing() {
+            return Err("stop the transport before measuring".into());
+        }
+        if self.speed() != 1.0 {
+            return Err("set the playback speed to 1x before measuring".into());
+        }
+        if send.iter().any(|c| *c >= self.device_channels) || ret.iter().any(|c| *c >= io.inputs) {
+            return Err("a path names a channel the device did not open".into());
+        }
+        if !probe.arm(send, ret) {
+            return Err("a measurement is already running".into());
+        }
+        Ok(())
+    }
+
+    /// The result of the measurement started by [`Self::start_hardware_probe`] once it is done
+    /// (`None` while it runs, and after it has been taken).
+    pub fn hardware_probe_result(&self) -> Option<Result<crate::hardware_probe::Measured, crate::hardware_probe::ProbeError>> {
+        self.probe.as_ref()?.take_result()
+    }
+
+    /// Whether a measurement is running.
+    pub fn hardware_probe_running(&self) -> bool {
+        self.probe.as_ref().is_some_and(|p| p.armed())
+    }
+
+    /// Stop a measurement in progress.
+    pub fn cancel_hardware_probe(&self) {
+        if let Some(p) = &self.probe {
+            p.cancel();
+        }
     }
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) -> Result<action_lane::Sequence, PlayerError> {
         self.owner()?.send_action(Command::Play { from, end, looped }, true)

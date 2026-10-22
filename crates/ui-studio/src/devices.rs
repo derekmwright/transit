@@ -146,14 +146,26 @@ pub fn hosted_label(id: &str, instrument: bool, cached_name: Option<&str>, scann
 /// so a strip adds to its own track whichever one is focused.
 pub(crate) fn add_device_menu(app: &mut StudioApp, resp: &egui::Response, tid: TrackId, menu: &mut Vec<MenuItem>) {
     let mut picked: Option<String> = None;
+    let mut hardware = false;
     let mut filter = std::mem::take(&mut app.mixer.effect_filter);
     let mut filter_rect = app.mixer.filter_rect;
     egui::Popup::menu(resp).width(260.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        // A hardware insert (ADR 0015 section 5): the signal leaves on one path and returns on another.
+        let b = ui.button("Hardware Insert…").on_hover_text("Send the signal through outboard gear on the audio interface");
+        menu.push(MenuItem::at(ui, "Hardware Insert…".into(), "hardware_insert".into(), b.rect));
+        if b.clicked() {
+            hardware = true;
+            ui.close();
+        }
+        ui.separator();
         let lists = app.effect_lists();
         picked = plugin_menu(ui, &lists, "effects", None, &mut filter, &mut filter_rect, menu);
     });
     app.mixer.effect_filter = filter;
     app.mixer.filter_rect = filter_rect;
+    if hardware {
+        app.mixer.hw_picker = Some(tid);
+    }
     if let Some(id) = picked {
         app.mixer.effect_filter.clear();
         let _ = app.add_device(tid, &id);
@@ -203,6 +215,7 @@ pub fn chain(app: &mut StudioApp, ui: &mut Ui) {
         x += CARD_W + 14.0;
     }
     drag_devices(app, ui, &p, lane, tid, &mut layout);
+    crate::hardware_ui::picker(app, ui.ctx());
     // "+": add a device.
     let add = Rect::from_min_size(pos2(x, lane.min.y), vec2(40.0, lane.height()));
     layout.add = r4(add);
@@ -308,7 +321,14 @@ fn card_body(
     let title = Rect::from_min_size(r.min, vec2(r.width(), 22.0));
     pc.rect_filled(title, crate::theme::top_corners(), if on { TOKENS.button } else { TOKENS.bg });
     let plugin = ins.map(|i| i.plugin.clone()).unwrap_or_default();
-    let name = if plugin.is_empty() { "No instrument".to_string() } else { app.plugin_name(&plugin, slot.is_none()) };
+    let hw = ins.and_then(|i| i.hardware.clone());
+    let name = if hw.is_some() {
+        "Hardware Insert".to_string()
+    } else if plugin.is_empty() {
+        "No instrument".to_string()
+    } else {
+        app.plugin_name(&plugin, slot.is_none())
+    };
     let mut c =
         DeviceCard { slot, plugin: plugin.clone(), name: name.clone(), bypass: ins.is_some_and(|i| i.bypass), rect: r4(r), ..DeviceCard::default() };
     let salt = slot.map_or(u64::MAX, |s| s as u64);
@@ -361,6 +381,7 @@ fn card_body(
         if on { TOKENS.text } else { TOKENS.text_dim },
     );
     let kind = match (slot, plugin.split(':').next()) {
+        _ if hw.is_some() => hw.as_ref().map_or_else(String::new, |h| crate::hardware_ui::card_line(&h.send, &h.ret)),
         (None, Some("vst3")) => "VST3 instrument".to_string(),
         (None, Some("clap")) => "CLAP instrument".into(),
         (None, _) => "Instrument".into(),
@@ -416,6 +437,10 @@ fn card_body(
             return c;
         }
     }
+    if let (Some(slot), Some(h)) = (slot, hw.as_ref()) {
+        hardware_state(app, ui, &pc, lane, t, slot, h, eb, &mut c);
+        return c;
+    }
     if let Some(slot) = slot {
         key_control(app, ui, p, lane, t, slot, &plugin, r, menu, &mut c);
     }
@@ -456,6 +481,43 @@ fn card_body(
     c.editor_open = open;
     c.editor_enabled = enabled;
     c
+}
+
+/// A hardware insert's state in the place of the editor button: the measured latency, or why the
+/// slot passes the signal through (ADR 0015 section 5). A disabled insert is made again, and so
+/// enabled when nothing conflicts, by pressing it.
+#[allow(clippy::too_many_arguments)]
+fn hardware_state(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    pc: &egui::Painter,
+    lane: Rect,
+    t: TrackId,
+    slot: usize,
+    h: &soundcraft_model::HardwareInsert,
+    eb: Rect,
+    c: &mut DeviceCard,
+) {
+    let rate = app.engine.session().sample_rate.hz();
+    let report = app.hardware_reports().into_iter().find(|r| r.track == t && r.slot == slot);
+    let text = report.as_ref().map_or_else(String::new, |r| crate::hardware_ui::state_text(&r.state, r.latency, rate));
+    let disabled = h.disabled.is_some();
+    let resp = ui.interact(eb.intersect(lane), ui.id().with(("hardware_state", t.0, slot)), Sense::click());
+    pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && disabled { TOKENS.button_hover } else { TOKENS.button });
+    let ink =
+        if disabled || report.as_ref().is_some_and(|r| r.state != soundcraft_mix::HardwareState::Ready) { TOKENS.text_dim } else { TOKENS.text };
+    pc.with_clip_rect(eb.intersect(lane)).text(eb.center(), Align2::CENTER_CENTER, &text, FontId::proportional(10.5), ink);
+    let resp = resp.on_hover_text(if disabled {
+        "Make the insert again to switch it on"
+    } else {
+        "The round trip through the hardware, measured in Audio Devices"
+    });
+    if resp.clicked() && disabled {
+        let _ = app.add_hardware_device_at(t, slot, &h.send, &h.ret);
+    }
+    c.hardware = crate::hardware_ui::card_line(&h.send, &h.ret);
+    c.hardware_state = text;
+    c.hardware_button = r4(eb);
 }
 
 /// What a device card and an insert slot say while the plug-in is being made.

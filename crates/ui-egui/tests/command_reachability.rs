@@ -18,7 +18,9 @@ const KNOWN_UNREACHED: &[&str] = &[
     "event.midi_note",
     "file.bounce_paths", // studio UI only (Bounce dialog, "Stems by output path"); the old UI has no named I/O paths
     "file.bounce_stems",
-    "file.commit_import", // studio UI only (async import, L30); the old UI imports synchronously
+    "file.commit_import",          // studio UI only (async import, L30); the old UI imports synchronously
+    "io.clear_hardware_latency",   // studio UI only (Audio Devices I/O, Hardware inserts); the old UI has no named I/O paths
+    "io.measure_hardware_latency", // same
     "markers.next",
     "markers.previous",
     "mix.clear_mutes",

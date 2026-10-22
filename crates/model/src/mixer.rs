@@ -491,6 +491,11 @@ pub struct HardwareInsert {
     /// The input path it comes back on.
     #[serde(rename = "return")]
     pub ret: String,
+    /// Why the insert is switched off (`None`: it runs). A disabled insert passes the signal
+    /// through dry and claims no send path; it is set when a session opens with an insert that
+    /// cannot work, or on a duplicated track's copy, and cleared by making the insert again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
 }
 
 /// A plugin instance on an insert slot.
@@ -549,7 +554,11 @@ impl Insert {
 
     /// A hardware insert slot sending on output path `send` and returning on input path `ret`.
     pub fn hardware(send: impl Into<String>, ret: impl Into<String>) -> Self {
-        Insert { hardware: Some(HardwareInsert { send: send.into(), ret: ret.into() }), preset: String::new(), ..Insert::new(HARDWARE_PLUGIN) }
+        Insert {
+            hardware: Some(HardwareInsert { send: send.into(), ret: ret.into(), disabled: None }),
+            preset: String::new(),
+            ..Insert::new(HARDWARE_PLUGIN)
+        }
     }
 
     /// The decoded plugin state (`None` when absent or malformed).

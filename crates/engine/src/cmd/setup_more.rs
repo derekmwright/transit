@@ -70,6 +70,24 @@ pub fn specs() -> Vec<CommandSpec> {
             io_map_setup
         ),
         cmd!(
+            noundo "io.measure_hardware_latency",
+            "Measure Hardware Insert Latency",
+            [],
+            None,
+            "{send: output path, ret: input path} -> {round_trip_frames, spread_frames, ms}: plays a click on the send path and times its return on the live audio device (the transport must be stopped); the result is kept per machine",
+            always,
+            measure_hardware_latency
+        ),
+        cmd!(
+            noundo "io.clear_hardware_latency",
+            "Clear Hardware Insert Latency",
+            [],
+            None,
+            "{send: output path, ret: input path} -> {cleared}: forget the measured round trip of the pair",
+            always,
+            clear_hardware_latency
+        ),
+        cmd!(
             "setup.current_timecode",
             "Current Timecode Position...",
             ["Setup"],
@@ -285,6 +303,34 @@ fn io_map_setup(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     e.set_io_map(io);
     Ok(io_map_state(e))
+}
+
+/// The pair named by `send` and `ret` (`ret` is also accepted as `return`).
+fn hardware_pair(p: &Value, id: &str) -> Result<(String, String)> {
+    let name = |keys: &[&str]| keys.iter().find_map(|k| str_param(p, k)).map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    let send = name(&["send"]).ok_or_else(|| bad(id, "`send` (an output path) required"))?;
+    let ret = name(&["ret", "return"]).ok_or_else(|| bad(id, "`ret` (an input path) required"))?;
+    Ok((send, ret))
+}
+
+/// `io.measure_hardware_latency`: the engine checks the request; the click and the clock are the
+/// app's (the live audio device), which runs this command itself (`StudioApp::run`). Without one
+/// there is nothing to measure through.
+fn measure_hardware_latency(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (send, ret) = hardware_pair(p, "io.measure_hardware_latency")?;
+    e.hardware_measurement(&send, &ret)?;
+    Err(bad("io.measure_hardware_latency", "measuring needs the live audio device: run it from the app"))
+}
+
+/// `io.clear_hardware_latency`: forget a pair's measurements (every rate).
+fn clear_hardware_latency(e: &mut Engine, p: &Value) -> Result<Value> {
+    let (send, ret) = hardware_pair(p, "io.clear_hardware_latency")?;
+    let mut io = e.io_map().clone();
+    let cleared = io.clear_hardware_latency(&send, &ret);
+    if cleared {
+        e.set_io_map(io);
+    }
+    Ok(json!({"cleared": cleared}))
 }
 
 fn io_setup(e: &mut Engine, p: &Value) -> Result<Value> {
@@ -571,6 +617,9 @@ fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
         s.tracks.insert(pos, tr);
     }
     s.edit.selected_tracks = out.clone();
+    // An imported hardware insert whose send path is taken here comes in disabled.
+    let disabled = soundcraft_model::disable_hardware_conflicts(s);
+    e.messages.extend(disabled);
     Ok(json!({"tracks": out, "sources": map.len(), "missing": missing}))
 }
 

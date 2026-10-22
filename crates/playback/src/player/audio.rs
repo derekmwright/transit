@@ -479,6 +479,10 @@ pub(super) struct Audio {
     midi_inbox: midi::Inbox,
     /// Live MIDI copied out for a MIDI recording (preallocated by Main).
     capture: Option<crate::midi_capture::Sink>,
+    /// The hardware-insert round-trip probe (control arms it; this thread plays and records).
+    probe: Option<Arc<crate::hardware_probe::HwProbe>>,
+    /// The probe's plan frame at the start of the pending block, while it is running.
+    probe_block: Option<u64>,
     transport: Transport,
     shared: Arc<Shared>,
     pending: usize,
@@ -581,6 +585,8 @@ impl Audio {
                 #[cfg(not(target_arch = "wasm32"))]
                 midi_inbox: midi::Inbox::new(),
                 capture: None,
+                probe: None,
+                probe_block: None,
                 shared,
                 pending: 0,
                 read,
@@ -628,6 +634,10 @@ impl Audio {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn set_midi(&mut self, midi: action_lane::Audio<super::ingress::Packet, ActionResult>) {
         self.midi = Some(midi);
+    }
+
+    pub(super) fn set_probe(&mut self, probe: Arc<crate::hardware_probe::HwProbe>) {
+        self.probe = Some(probe);
     }
 
     pub(super) fn set_midi_capture(&mut self, capture: crate::midi_capture::Sink) {
@@ -826,6 +836,9 @@ impl Audio {
         // The mixer owns each processor's suspension rules. A completed note
         // release does not prove that its envelope or any downstream tail ended.
         self.plans.render(state.render_position, frames);
+        // The hardware probe records the return of this block; the click for it is added as the
+        // block plays (`fill_inner`).
+        self.probe_block = self.probe.as_ref().and_then(|p| p.record_block(self.plans.input(), frames));
         self.pending = frames;
         if let Some(c) = &mut state.count_in {
             c.left -= frames as i64;
@@ -981,6 +994,12 @@ impl Audio {
                     for out in frame.iter_mut() {
                         *out = out.clamp(-1.0, 1.0);
                     }
+                }
+            }
+            if let (Some(probe), Some(block)) = (&self.probe, self.probe_block) {
+                probe.add_click(frame, block + index as u64);
+                for out in frame.iter_mut() {
+                    *out = out.clamp(-1.0, 1.0);
                 }
             }
             self.read.advance(step)?;

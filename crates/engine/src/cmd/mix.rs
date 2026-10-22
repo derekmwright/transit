@@ -376,6 +376,9 @@ fn insert_hardware(e: &mut Engine, p: &Value, h: &Value) -> Result<Value> {
 
 fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     if let Some(h) = p.get("hardware").filter(|h| h.is_object()) {
+        if p.get("plugin").is_some() {
+            return Err(bad("mix.insert", "give `plugin` or `hardware`, not both"));
+        }
         return insert_hardware(e, p, h);
     }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.insert", "`plugin` required"))?.to_string();

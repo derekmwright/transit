@@ -2064,7 +2064,8 @@ fn the_device_chain_and_strip_plus_menus_list_effects_only_and_both_add() {
     frames(&mut app, &ctx, 3, &mut time);
     app.mixer.effect_filter = "gain".into();
     frames(&mut app, &ctx, 3, &mut time);
-    let menu = app.mixer.devices.menu.clone();
+    // The Hardware Insert entry is not an effect: the filter leaves it alone.
+    let menu: Vec<_> = app.mixer.devices.menu.iter().filter(|m| m.value != "hardware_insert").cloned().collect();
     assert_eq!(menu.len(), 1, "the filter narrows the rows: {menu:?}");
     assert!(menu[0].visible);
     // The chain menu's rows are reachable by UI input, like the instrument menu's.
@@ -2879,4 +2880,97 @@ fn a_device_without_a_key_input_has_no_key_dropdown() {
     assert_ne!(cards[0].key_button, [0.0; 4]);
     assert_eq!(cards[1].plugin, "gain");
     assert_eq!(cards[1].key_button, [0.0; 4], "gain has no sidechain");
+}
+
+mod hardware_inserts {
+    use super::*;
+    use soundcraft_model::IoMap;
+
+    fn open_add_menu(app: &mut StudioApp, ctx: &egui::Context, time: &mut f64) {
+        let at = mid(app.mixer.devices.add);
+        click(app, at);
+        frames(app, ctx, 6, time);
+    }
+
+    #[test]
+    fn the_plus_menu_adds_a_hardware_insert_through_a_picker_that_lists_measured_pairs_first() {
+        let (mut app, ctx, mut time, t) = mixer_app();
+        app.engine.set_io_map(IoMap::for_device("test", "test", 4, 4));
+        app.engine.store_hardware_latency("Out 3-4", "In 3-4", 612);
+        app.focus(t);
+        frames(&mut app, &ctx, 3, &mut time);
+        open_add_menu(&mut app, &ctx, &mut time);
+        let item = app.mixer.devices.menu.iter().find(|m| m.value == "hardware_insert").cloned().expect("the + menu offers Hardware Insert…");
+        assert_eq!(item.label, "Hardware Insert…");
+        click(&mut app, mid(item.rect));
+        frames(&mut app, &ctx, 6, &mut time);
+        let picker = app.mixer.hw_picker_layout.clone();
+        assert!(picker.open && picker.track == Some(t.0));
+        let values: Vec<&str> = picker.rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(values.first(), Some(&"Out 3-4|In 3-4"), "the measured pair comes first: {values:?}");
+        let io = app.engine.io_map();
+        let want = io.paths_of(soundcraft_model::IoDirection::Output).count() * io.paths_of(soundcraft_model::IoDirection::Input).count();
+        assert_eq!(values.len(), want, "every output with every input, the measured pair among them once");
+        assert!(picker.rows[0].label.contains("612 frames (12.8 ms)"), "{}", picker.rows[0].label);
+        assert!(picker.rows[1..].iter().all(|r| r.label.ends_with("not measured")), "{:?}", picker.rows);
+        let steps = undo_len(&mut app);
+        click(&mut app, mid(picker.rows[0].rect));
+        frames(&mut app, &ctx, 6, &mut time);
+        assert!(!app.mixer.hw_picker_layout.open, "the picker closes on a pick");
+        assert_eq!(undo_len(&mut app), steps + 1);
+        let h = app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().hardware.clone().unwrap();
+        assert_eq!((h.send.as_str(), h.ret.as_str()), ("Out 3-4", "In 3-4"));
+        // The card names the pair and the state: no audio device here, so no live input.
+        let card = app.mixer.devices.cards.first().cloned().expect("a card");
+        assert_eq!((card.name.as_str(), card.hardware.as_str()), ("Hardware Insert", "HW: Out 3-4 → In 3-4"));
+        assert_eq!(card.hardware_state, "No input");
+        // Bypass works like any insert's.
+        click(&mut app, mid(card.bypass_button));
+        frames(&mut app, &ctx, 6, &mut time);
+        assert!(app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().bypass);
+        assert!(app.mixer.devices.cards[0].bypass);
+    }
+
+    #[test]
+    fn the_card_says_why_a_pair_does_not_run() {
+        let (mut app, ctx, mut time, t) = mixer_app();
+        app.engine.set_io_map(IoMap::for_device("test", "test", 4, 4));
+        app.run("mix.insert", json!({"track": t.0, "slot": 0, "hardware": {"send": "Nowhere", "return": "In 3-4"}})).unwrap();
+        app.run("mix.insert", json!({"track": t.0, "slot": 1, "hardware": {"send": "Out 3-4", "return": "Nothing"}})).unwrap();
+        app.focus(t);
+        frames(&mut app, &ctx, 4, &mut time);
+        let states: Vec<String> = app.mixer.devices.cards.iter().map(|c| c.hardware_state.clone()).collect();
+        assert_eq!(states, ["Missing send", "Missing return"]);
+        // A copy of the track keeps its insert, disabled, and the card gives the reason.
+        app.run("mix.insert_remove", json!({"track": t.0, "slot": 1})).unwrap();
+        app.run("mix.insert_remove", json!({"track": t.0, "slot": 0})).unwrap();
+        app.run("mix.insert", json!({"track": t.0, "slot": 0, "hardware": {"send": "Out 3-4", "return": "In 3-4"}})).unwrap();
+        app.run("track.duplicate", json!({"track": t.0})).unwrap();
+        let copy = app.engine.session().tracks.iter().find(|x| x.name.ends_with(".dup")).map(|x| x.id).unwrap();
+        app.focus(copy);
+        frames(&mut app, &ctx, 4, &mut time);
+        let card = app.mixer.devices.cards.first().cloned().unwrap();
+        assert_eq!(card.hardware_state, "Disabled: send path in use by Gtr");
+        // Pressing the state makes the insert again; the original still holds the path, so it is refused.
+        click(&mut app, mid(card.hardware_button));
+        frames(&mut app, &ctx, 4, &mut time);
+        assert!(app.status.contains("Out 3-4"), "{}", app.status);
+        assert!(app.mixer.devices.cards[0].hardware_state.starts_with("Disabled"));
+    }
+
+    #[test]
+    fn the_state_words_and_the_blockers_are_plain() {
+        use crate::hardware_ui::{measure_blocker, state_text};
+        use soundcraft_mix::HardwareState as S;
+        assert_eq!(state_text(&S::Ready, Some(612), 48_000), "12.8 ms");
+        assert_eq!(state_text(&S::Unmeasured, None, 48_000), "Unmeasured");
+        assert_eq!(state_text(&S::NoInput, None, 48_000), "No input");
+        assert_eq!(state_text(&S::MissingSend, None, 48_000), "Missing send");
+        assert_eq!(state_text(&S::MissingReturn, None, 48_000), "Missing return");
+        assert_eq!(state_text(&S::Disabled("x".into()), None, 48_000), "Disabled: x");
+        assert_eq!(measure_blocker(true, true, false), None);
+        assert!(measure_blocker(false, false, false).unwrap().contains("audio device"));
+        assert!(measure_blocker(true, false, false).unwrap().contains("duplex"));
+        assert!(measure_blocker(true, true, true).unwrap().contains("Stop the transport"));
+    }
 }

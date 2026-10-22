@@ -746,31 +746,56 @@ pub fn would_create_cycle_all(s: &Session, changes: &[RouteChange]) -> Option<Ve
     None
 }
 
-/// The first reason `s` holds a hardware insert (ADR 0015 section 5) that cannot work, `None` when
-/// it holds none: two hardware inserts sending on one output path (the paths sum, which is wrong
-/// for a send), or a hardware insert whose send path is fed by a route downstream of the insert
-/// itself (its own output, or anything its signal reaches through busses), which would feed the
-/// return back into the send through the device. The send, the device and the return are an edge
+/// A hardware insert (ADR 0015 section 5) that cannot work, with why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareConflict {
+    /// Index of the track in `Session::tracks`.
+    pub track: usize,
+    /// The insert slot.
+    pub slot: usize,
+    /// The refusal message for an edit that makes the conflict.
+    pub message: String,
+    /// The short reason a disabled insert shows.
+    pub reason: String,
+}
+
+/// The first hardware insert of `s` that cannot work, `None` when there is none. Disabled inserts
+/// claim no send path and are not checked. A conflict is: two hardware inserts sending on one
+/// output path (the paths sum, which is wrong for a send); a route downstream of the insert itself
+/// feeding its send path (the return would feed the send through the device); or any ordinary
+/// route (a track output or a send) to a send path, which would sum into the insert's send and
+/// skip the latency padding the plan gives it. The send, the device and the return are an edge
 /// that never orders the render (the return arrives blocks later), so this is a check on edits and
 /// not part of the render graph.
 #[must_use]
-pub fn hardware_problem(s: &Session) -> Option<String> {
-    let hw: Vec<(usize, &str)> = s
+pub fn hardware_conflict(s: &Session) -> Option<HardwareConflict> {
+    let hw: Vec<(usize, usize, &str)> = s
         .tracks
         .iter()
         .enumerate()
-        .flat_map(|(i, t)| t.mixer.inserts.iter().flatten().filter_map(move |x| x.hardware.as_ref().map(|h| (i, h.send.as_str()))))
+        .flat_map(|(i, t)| {
+            t.mixer.inserts.iter().enumerate().filter_map(move |(slot, x)| {
+                x.as_ref().and_then(|x| x.hardware.as_ref()).filter(|h| h.disabled.is_none()).map(|h| (i, slot, h.send.as_str()))
+            })
+        })
         .collect();
     if hw.is_empty() {
         return None;
     }
-    for (k, (_, send)) in hw.iter().enumerate() {
-        if hw[..k].iter().any(|(_, o)| o.eq_ignore_ascii_case(send)) {
-            return Some(format!("two hardware inserts send on `{send}`; a send path can serve only one"));
+    let name = |i: usize| s.tracks.get(i).map_or("a track", |x| x.name.as_str());
+    for (k, &(track, slot, send)) in hw.iter().enumerate() {
+        if let Some(&(first, ..)) = hw[..k].iter().find(|(_, _, o)| o.eq_ignore_ascii_case(send)) {
+            return Some(HardwareConflict {
+                track,
+                slot,
+                message: format!("two hardware inserts send on `{send}`; a send path can serve only one"),
+                reason: format!("send path in use by {}", name(first)),
+            });
         }
     }
     let graph = RouteGraph::new(s);
-    for &(t, send) in &hw {
+    for &(t, slot, send) in &hw {
+        let names = |r: &Route| matches!(r, Route::Hardware(h) if h.eq_ignore_ascii_case(send));
         // Everything the insert's strip feeds: tracks and busses reached through the routing edges.
         let mut seen: Vec<RouteNode> = vec![RouteNode::Track(t)];
         let mut at = 0;
@@ -782,20 +807,64 @@ pub fn hardware_problem(s: &Session) -> Option<String> {
                 }
             }
         }
-        let names = |r: &Route| matches!(r, Route::Hardware(h) if h.eq_ignore_ascii_case(send));
         for n in &seen {
             let RouteNode::Track(i) = n else { continue };
             let Some(src) = s.tracks.get(*i) else { continue };
             if names(&src.mixer.output) || src.mixer.sends.iter().flatten().any(|x| names(&x.target)) {
-                let from = s.tracks.get(t).map_or("a track", |x| x.name.as_str());
-                return Some(format!(
-                    "`{}` feeds `{send}`, the send path of a hardware insert on `{from}`: the return would feed its own send",
-                    src.name
-                ));
+                return Some(HardwareConflict {
+                    track: t,
+                    slot,
+                    message: format!(
+                        "`{}` feeds `{send}`, the send path of a hardware insert on `{}`: the return would feed its own send",
+                        src.name,
+                        name(t)
+                    ),
+                    reason: format!("`{}` routes to its send path", src.name),
+                });
             }
+        }
+        if let Some(src) = s.tracks.iter().find(|x| names(&x.mixer.output) || x.mixer.sends.iter().flatten().any(|y| names(&y.target))) {
+            return Some(HardwareConflict {
+                track: t,
+                slot,
+                message: format!("`{}` routes to `{send}`, the send path of a hardware insert on `{}`", src.name, name(t)),
+                reason: format!("send path in use by {}", src.name),
+            });
         }
     }
     None
+}
+
+/// The first reason `s` holds a hardware insert that cannot work ([`hardware_conflict`]).
+#[must_use]
+pub fn hardware_problem(s: &Session) -> Option<String> {
+    hardware_conflict(s).map(|c| c.message)
+}
+
+/// The reason an edit from `before` to `after` made a hardware insert unworkable, `None` when it
+/// did not. Skips the check when the routing and the insert set are as they were
+/// (`same_routing`), so ordinary edits cost nothing, and ignores a problem that was already there.
+#[must_use]
+pub fn new_hardware_problem(before: &Session, after: &Session) -> Option<String> {
+    if same_routing(before, after) {
+        return None;
+    }
+    hardware_problem(after).filter(|_| hardware_problem(before).is_none())
+}
+
+/// Disable every hardware insert of `s` that cannot work (a session opened from disk, an imported
+/// track): each is kept with its pair and the reason, and passes the signal through dry. Returns
+/// one line per insert disabled, for the status line.
+pub fn disable_hardware_conflicts(s: &mut Session) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(c) = hardware_conflict(s) {
+        let Some(t) = s.tracks.get_mut(c.track) else { break };
+        let name = t.name.clone();
+        let Some(h) = t.mixer.inserts.get_mut(c.slot).and_then(Option::as_mut).and_then(|i| i.hardware.as_mut()) else { break };
+        out.push(format!("hardware insert on `{name}` disabled: {}", c.reason));
+        h.disabled = Some(c.reason);
+    }
+    out
 }
 
 /// Whether two sessions route alike (same tracks, kinds, inputs, outputs, send targets and busses,
@@ -943,6 +1012,57 @@ mod tests {
         assert_eq!(names(&s, &c), ["FX 2", "FX 1"]);
         assert_eq!(describe_cycle(&s, &c), "FX 2 → FX 1 → FX 2");
         assert!(would_create_cycle(&s, &RouteChange::Output { track: b, route: Route::Main }).is_none());
+    }
+
+    fn hardware_pair(s: &mut Session, name: &str, send: &str) -> TrackId {
+        let t = s.add_track(TrackKind::Audio, ChannelFormat::Stereo, Some(name));
+        if let Some(tr) = s.track_mut(t) {
+            tr.mixer.inserts[0] = Some(crate::Insert::hardware(send, "In 3-4"));
+        }
+        t
+    }
+
+    #[test]
+    fn the_hardware_check_runs_only_when_routing_or_the_insert_set_changed() {
+        let mut s = session();
+        let a = hardware_pair(&mut s, "A", "Out 3-4");
+        let b = hardware_pair(&mut s, "B", "Out 3-4");
+        assert!(hardware_problem(&s).is_some(), "two inserts on one path");
+        // An edit that touches neither routing nor inserts is not checked, so an existing problem is not re-reported.
+        let mut after = s.clone();
+        after.track_mut(a).expect("a").mixer.volume_db = -3.0;
+        assert_eq!(new_hardware_problem(&s, &after), None);
+        // Changing an insert set is: here a third insert on the same path.
+        let mut after = s.clone();
+        after.track_mut(b).expect("b").mixer.inserts[1] = Some(crate::Insert::hardware("Out 5-6", "In 3-4"));
+        assert_eq!(new_hardware_problem(&s, &after), None, "the problem was already there");
+        let mut clean = s.clone();
+        clean.track_mut(b).expect("b").mixer.inserts[0] = None;
+        let mut worse = clean.clone();
+        worse.track_mut(b).expect("b").mixer.inserts[0] = Some(crate::Insert::hardware("Out 3-4", "In 3-4"));
+        assert!(new_hardware_problem(&clean, &worse).is_some_and(|m| m.contains("Out 3-4")));
+        // A route to the path is a routing change and is checked.
+        let mut routed = clean.clone();
+        set_output(&mut routed, b, Route::Hardware("Out 3-4".into()));
+        assert!(new_hardware_problem(&clean, &routed).is_some_and(|m| m.contains("send path of a hardware insert")));
+    }
+
+    #[test]
+    fn disabled_inserts_claim_no_path_and_conflicts_are_disabled_one_at_a_time() {
+        let mut s = session();
+        let a = hardware_pair(&mut s, "A", "Out 3-4");
+        let b = hardware_pair(&mut s, "B", "Out 3-4");
+        let c = hardware_pair(&mut s, "C", "Out 5-6");
+        set_output(&mut s, c, Route::Hardware("Out 5-6".into()));
+        let lines = disable_hardware_conflicts(&mut s);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let why =
+            |t: TrackId| s.track(t).and_then(|x| x.mixer.inserts[0].as_ref()).and_then(|i| i.hardware.as_ref()).and_then(|h| h.disabled.clone());
+        assert_eq!(why(a), None);
+        assert_eq!(why(b).as_deref(), Some("send path in use by A"));
+        assert!(why(c).is_some_and(|w| w.contains("routes to its send path")));
+        assert_eq!(hardware_problem(&s), None, "nothing left to refuse");
+        assert!(disable_hardware_conflicts(&mut s).is_empty());
     }
 
     #[test]

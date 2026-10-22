@@ -675,3 +675,105 @@ fn a_calibrated_duplex_pair_fits_measured_clocks_and_maps_output_frames_to_input
     let expected = frame + ((PRESENT_NS + 3_000_000 + ROUND_TRIP_NS) as u64) * 48_000 / 1_000_000_000;
     assert!(captured.abs_diff(expected) <= 1, "input frame {captured}, expected {expected}");
 }
+
+/// A duplex fake device whose capture is the render's channel 0 delayed by `delay` frames: the
+/// plan's own view of a hardware loop. Pumps `blocks` blocks, counting the probe's frames.
+#[cfg(not(target_arch = "wasm32"))]
+fn loopback_player(delay: usize, send: &[u16], ret: &[u16], blocks: usize) -> (Player, Result<crate::hardware_probe::Measured, String>) {
+    use ab::fake::{SliceSink, SliceSource};
+    const BLOCK: usize = 192;
+    let fake = fake_factory(false).with_capture(2, true);
+    let cfg = AudioConfig::default();
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+    let recorder = player.open_input(&cfg).expect("the duplex input");
+    player.set_input(Arc::clone(&recorder.monitor)).unwrap();
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let (mut output, mut input) = (vec![0.0f32; BLOCK * 2], vec![0.0f32; BLOCK * 2]);
+    let mut sent: Vec<f32> = Vec::new();
+    let mut started = false;
+    // The plan adopts its live input on the first blocks after `set_input`; until then the ring
+    // would pile up a backlog the insert would also see. Settle first, then start from empty.
+    for _ in 0..4 {
+        assert!(fake.pump_render(BLOCK, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 2 }));
+        player.service().unwrap();
+    }
+    recorder.monitor.clear_monitor();
+    let mut result = Err("no result".to_string());
+    for i in 0..blocks {
+        // Let the plan and the input ring settle for a few blocks before arming.
+        if i == 20 && !started {
+            player.start_hardware_probe(send, ret).unwrap_or_else(|e| panic!("{e}"));
+            started = true;
+        }
+        for f in 0..BLOCK {
+            let n = i * BLOCK + f;
+            let x = n.checked_sub(delay).and_then(|k| sent.get(k)).copied().unwrap_or(0.0);
+            input[f * 2] = x;
+            input[f * 2 + 1] = 0.0;
+        }
+        assert!(fake.pump_capture(BLOCK, ab::Stamp::INVALID, format, &mut SliceSource { data: &input, channels: 2 }));
+        assert!(fake.pump_render(BLOCK, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 2 }));
+        sent.extend(output.as_chunks::<2>().0.iter().map(|f| f[0]));
+        player.service().unwrap();
+        if let Some(r) = player.hardware_probe_result() {
+            result = r.map_err(|e| e.to_string());
+            break;
+        }
+    }
+    (player, result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_scripted_loopback_delay_is_measured_within_a_frame() {
+    for delay in [300usize, 1_000, 2_400] {
+        let (player, result) = loopback_player(delay, &[0], &[0], 700);
+        let m = result.unwrap_or_else(|e| panic!("delay {delay}: {e}"));
+        assert!(m.round_trip_frames.abs_diff(delay as u32) <= 1, "delay {delay}: measured {m:?}");
+        assert!(m.spread_frames <= 1 && m.found >= 6, "{m:?}");
+        assert!(!player.hardware_probe_running());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_click_plays_on_the_send_channels_only() {
+    use ab::fake::{SliceSink, SliceSource};
+    let fake = fake_factory(false).with_capture(2, true);
+    let cfg = AudioConfig::default();
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+    let recorder = player.open_input(&cfg).unwrap();
+    player.set_input(Arc::clone(&recorder.monitor)).unwrap();
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let (mut output, input) = (vec![0.0f32; 384], vec![0.0f32; 384]);
+    for _ in 0..4 {
+        fake.pump_capture(192, ab::Stamp::INVALID, format, &mut SliceSource { data: &input, channels: 2 });
+        fake.pump_render(192, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 2 });
+        player.service().unwrap();
+    }
+    player.start_hardware_probe(&[1], &[0]).unwrap();
+    let (mut left, mut right) = (0.0f32, 0.0f32);
+    for _ in 0..60 {
+        fake.pump_capture(192, ab::Stamp::INVALID, format, &mut SliceSource { data: &input, channels: 2 });
+        fake.pump_render(192, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 2 });
+        left = left.max(output.as_chunks::<2>().0.iter().map(|f| f[0].abs()).fold(0.0, f32::max));
+        right = right.max(output.as_chunks::<2>().0.iter().map(|f| f[1].abs()).fold(0.0, f32::max));
+    }
+    assert_eq!(left, 0.0, "the other channel stays silent");
+    assert!(right > 0.2, "the click is on the send channel: {right}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_measurement_is_refused_without_a_live_input_or_on_an_unknown_channel_and_silence_finds_nothing() {
+    let player =
+        Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &fake_factory(false), &fake_factory(false)).unwrap();
+    let why = player.start_hardware_probe(&[0], &[0]).unwrap_err();
+    assert!(why.contains("duplex"), "{why}");
+    let (player, _) = loopback_player(300, &[0], &[0], 3);
+    assert!(player.start_hardware_probe(&[0], &[7]).unwrap_err().contains("channel"));
+    assert!(player.start_hardware_probe(&[9], &[0]).unwrap_err().contains("channel"));
+    // A return that carries nothing: no click is found.
+    let (_player, result) = loopback_player(300, &[0], &[1], 700);
+    assert!(result.unwrap_err().contains("0 of"), "silence on the return");
+}

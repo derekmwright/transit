@@ -212,6 +212,12 @@ pub struct DeviceCard {
     pub key_label: String,
     /// The track is frozen: the card is greyed and its plug-in is off.
     pub frozen: bool,
+    /// A hardware insert's pair as the card shows it ("HW: Out 3-4 → In 3-4"); empty otherwise.
+    pub hardware: String,
+    /// A hardware insert's state as the card shows it ("12.8 ms", "Unmeasured", "No input", ...).
+    pub hardware_state: String,
+    /// The state area of a hardware insert (a button to enable it again when it is disabled).
+    pub hardware_button: R4,
 }
 
 /// Last frame's device chain geometry.
@@ -274,6 +280,10 @@ pub struct MixerState {
     wheel_taken: bool,
     /// The key dropdown's tap choice while an insert has no key yet: pre-fader when true.
     pub(crate) key_pre: bool,
+    /// The track a "Hardware Insert…" picker is open for.
+    pub(crate) hw_picker: Option<TrackId>,
+    /// The picker as last drawn.
+    pub hw_picker_layout: crate::hardware_ui::PickerLayout,
 }
 
 /// Fader position 0..1 for a gain in dB: the fourth root of the amplitude, scaled so +12 dB is

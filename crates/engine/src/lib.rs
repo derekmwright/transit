@@ -244,6 +244,43 @@ impl Engine {
         self.io_revision = self.io_revision.wrapping_add(1);
     }
 
+    /// Check a request to measure the round trip of a hardware insert on `send` (an output path)
+    /// and `ret` (an input path) of this machine, and return their 0-based device channels. Refuses
+    /// an unknown path, a path of the wrong direction and a running transport. The measurement
+    /// itself needs the live device (the app's `io.measure_hardware_latency`).
+    pub fn hardware_measurement(&self, send: &str, ret: &str) -> Result<(Vec<u16>, Vec<u16>)> {
+        use soundcraft_model::IoDirection;
+        let id = "io.measure_hardware_latency";
+        let find = |name: &str, direction: IoDirection, what: &str| {
+            self.io
+                .path(name)
+                .filter(|p| p.direction == direction)
+                .map(|p| p.channels.clone())
+                .ok_or_else(|| cmd::bad(id, format!("no {what} path `{name}` on this device")))
+        };
+        let out = find(send, IoDirection::Output, "output")?;
+        let back = find(ret, IoDirection::Input, "input")?;
+        if self.transport.playing || self.transport.recording {
+            return Err(cmd::bad(id, "stop the transport before measuring"));
+        }
+        Ok((out, back))
+    }
+
+    /// Keep a measured round trip for the pair at the session's rate (per machine: no undo step,
+    /// the session stays clean). The host passes the table on to the audio thread.
+    pub fn store_hardware_latency(&mut self, send: &str, ret: &str, round_trip_frames: u32) {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut io = self.io.clone();
+        io.set_hardware_latency(soundcraft_model::HardwareLatency {
+            send: send.into(),
+            ret: ret.into(),
+            round_trip_frames,
+            rate: self.doc.sample_rate.hz(),
+            measured_at: at,
+        });
+        self.set_io_map(io);
+    }
+
     pub fn session(&self) -> &Session {
         &self.doc
     }
@@ -271,6 +308,11 @@ impl Engine {
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
         self.transport_requests.clear();
         self.transport_requests.push(TransportRequest::ResetSession);
+        // A hardware insert that cannot work here (a send path in use, a loop through the device)
+        // opens disabled, with a warning (K18).
+        let mut s = s;
+        let disabled = soundcraft_model::disable_hardware_conflicts(&mut s);
+        self.messages.extend(disabled);
         self.doc = Arc::new(s);
         self.saved = Arc::clone(&self.doc);
         self.undo.clear();
@@ -446,7 +488,7 @@ impl Engine {
                     ))),
                     // A hardware insert (ADR 0015 section 5): a send path serves one insert, and the
                     // return may not feed its own send.
-                    None => match soundcraft_model::hardware_problem(&self.doc).filter(|_| soundcraft_model::hardware_problem(&before).is_none()) {
+                    None => match soundcraft_model::new_hardware_problem(&before, &self.doc) {
                         Some(why) => Ok(Err(cmd::bad(id, why))),
                         None => Ok(Ok(v)),
                     },

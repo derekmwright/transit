@@ -104,9 +104,36 @@ pub fn is_wasapi(system: &str) -> bool {
     system.eq_ignore_ascii_case("WASAPI")
 }
 
+/// What the Hardware inserts subsection asks for this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardwareAction {
+    /// Run `io.measure_hardware_latency` (Measure and Remeasure).
+    Measure { send: String, ret: String },
+    /// Run `io.clear_hardware_latency`.
+    Clear { send: String, ret: String },
+}
+
+/// What the subsection showed, for `ui.inspect` and tests.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HardwareLayout {
+    /// Why Measure is off; empty when it can run.
+    pub blocked: String,
+    pub send: String,
+    pub ret: String,
+    /// "<n> frames (<x> ms) ±<m>" or the refusal of the last run.
+    pub result: String,
+    /// The measured pairs listed: "Out 3-4 → In 3-4: 612 frames (12.8 ms)".
+    pub rows: Vec<String>,
+}
+
 /// What the user is typing or editing now (the table itself is the engine's).
 #[derive(Default)]
 pub struct IoEditor {
+    /// The pair picked for Measure.
+    hw_send: Option<String>,
+    hw_ret: Option<String>,
+    /// What the last measurement said.
+    pub hw_result: String,
     /// A path being renamed: (its name, the text so far).
     rename: Option<(String, String)>,
     /// The path whose channels are being picked.
@@ -202,6 +229,107 @@ pub fn section(ui: &mut egui::Ui, io: &IoMap, wasapi: bool, ed: &mut IoEditor, i
         });
     }
     edit
+}
+
+/// The "Hardware inserts" subsection: pick a send path and a return path and Measure, then the
+/// measured table with Remeasure and Clear. `blocked` is why Measure is off (no duplex device, the
+/// transport running), when it is. Controls go to `items`; the layout says what was shown.
+pub fn hardware_section(
+    ui: &mut egui::Ui,
+    io: &IoMap,
+    rate: u32,
+    blocked: Option<&str>,
+    ed: &mut IoEditor,
+    items: &mut Vec<MenuItem>,
+) -> (Option<HardwareAction>, HardwareLayout) {
+    use crate::hardware_ui::frames_text;
+    let mut action = None;
+    ui.separator();
+    ui.label(egui::RichText::new("Hardware inserts").strong());
+    dim(ui, "Time the round trip through outboard gear: a click plays on the send path and is found again on the return path.");
+    let outputs: Vec<&str> = io.paths_of(IoDirection::Output).map(|p| p.name.as_str()).collect();
+    let inputs: Vec<&str> = io.paths_of(IoDirection::Input).map(|p| p.name.as_str()).collect();
+    // A pick that no longer names a path is dropped.
+    if ed.hw_send.as_deref().is_some_and(|n| !outputs.contains(&n)) {
+        ed.hw_send = None;
+    }
+    if ed.hw_ret.as_deref().is_some_and(|n| !inputs.contains(&n)) {
+        ed.hw_ret = None;
+    }
+    ui.horizontal(|ui| {
+        for (label, key, names, pick) in [("Send", "hw_send", &outputs, &mut ed.hw_send), ("Return", "hw_ret", &inputs, &mut ed.hw_ret)] {
+            ui.label(label);
+            let combo = egui::ComboBox::from_id_salt(key).selected_text(pick.as_deref().unwrap_or("Choose…")).show_ui(ui, |ui| {
+                for n in names {
+                    let b = crate::menus::check_button(ui, pick.as_deref() == Some(*n), *n);
+                    items.push(MenuItem::at(ui, (*n).to_string(), format!("{key}_entry"), b.rect));
+                    if b.clicked() {
+                        *pick = Some((*n).to_string());
+                    }
+                }
+            });
+            items.push(MenuItem::at(ui, pick.clone().unwrap_or_default(), key.into(), combo.response.rect));
+        }
+        let ready = ed.hw_send.is_some() && ed.hw_ret.is_some();
+        let b = ui.add_enabled(ready && blocked.is_none(), egui::Button::new("Measure"));
+        items.push(MenuItem::at(ui, "Measure".into(), "hw_measure".into(), b.rect));
+        let tip = blocked.unwrap_or(if ready {
+            "Play a click out the send path and time it on the return path."
+        } else {
+            "Choose a send path and a return path."
+        });
+        if b.on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+            && let (Some(send), Some(ret)) = (ed.hw_send.clone(), ed.hw_ret.clone())
+        {
+            action = Some(HardwareAction::Measure { send, ret });
+        }
+    });
+    if let Some(why) = blocked {
+        dim(ui, why);
+    }
+    if !ed.hw_result.is_empty() {
+        let r = ui.label(egui::RichText::new(&ed.hw_result).color(TOKENS.text).size(11.5));
+        items.push(MenuItem::at(ui, ed.hw_result.clone(), "hw_result".into(), r.rect));
+    }
+    let mut layout = HardwareLayout {
+        blocked: blocked.unwrap_or_default().to_string(),
+        send: ed.hw_send.clone().unwrap_or_default(),
+        ret: ed.hw_ret.clone().unwrap_or_default(),
+        result: ed.hw_result.clone(),
+        rows: Vec::new(),
+    };
+    let measured: Vec<_> = io.hardware_latency.iter().filter(|m| m.rate == rate).collect();
+    if measured.is_empty() {
+        dim(ui, "Nothing measured yet.");
+    } else {
+        egui::Grid::new("hw_latency_grid").num_columns(3).spacing([SPACE, SPACE / 2.0]).show(ui, |ui| {
+            for m in measured {
+                let pair = format!("{} → {}", m.send, m.ret);
+                ui.label(&pair);
+                ui.label(frames_text(m.round_trip_frames, rate));
+                layout.rows.push(format!("{pair}: {}", frames_text(m.round_trip_frames, rate)));
+                ui.horizontal(|ui| {
+                    let b = ui.add_enabled(blocked.is_none(), egui::Button::new("Remeasure").small());
+                    items.push(MenuItem::at(ui, "Remeasure".into(), format!("hw_remeasure:{pair}"), b.rect));
+                    if b.clicked() {
+                        action = Some(HardwareAction::Measure { send: m.send.clone(), ret: m.ret.clone() });
+                    }
+                    let b = ui.small_button("Clear");
+                    items.push(MenuItem::at(ui, "Clear".into(), format!("hw_clear:{pair}"), b.rect));
+                    if b.clicked() {
+                        action = Some(HardwareAction::Clear { send: m.send.clone(), ret: m.ret.clone() });
+                    }
+                });
+                ui.end_row();
+            }
+        });
+    }
+    (action, layout)
+}
+
+/// What a finished measurement says: "612 frames (12.8 ms) ±2".
+pub fn measured_text(frames: u32, spread: u32, rate: u32) -> String {
+    format!("{} ±{spread}", crate::hardware_ui::frames_text(frames, rate))
 }
 
 fn path_row(ui: &mut egui::Ui, io: &IoMap, p: &IoPath, ed: &mut IoEditor, items: &mut Vec<MenuItem>, edit: &mut Option<IoEdit>) {

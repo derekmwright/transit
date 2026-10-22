@@ -665,6 +665,10 @@ impl Audio {
     pub fn output(&self) -> &[Vec<f32>] {
         &self.buffers.output
     }
+    /// The live input the last render read (planar device channels), for the hardware probe.
+    pub fn input(&self) -> &[Vec<f32>] {
+        &self.mix.input
+    }
     /// The device channel of each main channel; the callback leaves every other channel at zero.
     pub fn main_dest(&self) -> &[u16] {
         &self.buffers.main_dest

@@ -165,9 +165,9 @@ fn an_unmeasured_insert_reports_nothing_and_the_strip_is_late() {
     assert_eq!(hits(&r.main), [AT, AT + D], "uncompensated: the outboard track is late by the round trip");
     let report = hardware_report(&s, &io(None), 4, 4, true, SR);
     assert_eq!(report.len(), 1);
-    assert_eq!((report[0].state, report[0].latency), (HardwareState::Unmeasured, None));
+    assert_eq!((report[0].state.clone(), report[0].latency), (HardwareState::Unmeasured, None));
     let report = hardware_report(&s, &io(Some(D)), 4, 4, true, SR);
-    assert_eq!((report[0].state, report[0].latency), (HardwareState::Ready, Some(D as u32)));
+    assert_eq!((report[0].state.clone(), report[0].latency), (HardwareState::Ready, Some(D as u32)));
 }
 
 #[test]
@@ -212,4 +212,18 @@ fn the_send_path_is_a_sink_of_the_plan() {
     let p = plan_sinks(&s, &io(None), 4);
     assert_eq!(p.sinks.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(), [SEND]);
     assert_eq!(p.destinations(), [2, 3]);
+}
+
+#[test]
+fn a_disabled_insert_passes_the_signal_through_dry_claims_no_sink_and_reports_why() {
+    let mut s = session();
+    let t = impulse_track(&mut s, "Outboard");
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::hardware(SEND, RET));
+    s.track_mut(t).unwrap().mixer.inserts[0].as_mut().unwrap().hardware.as_mut().unwrap().disabled = Some("send path in use by Other".into());
+    let r = render(&s, &io(Some(D)), true, D);
+    assert_eq!((hits(&r.main), r.latency), (vec![AT], 0), "dry, no latency");
+    assert!(hits(&r.sent).is_empty(), "nothing is sent");
+    assert!(plan_sinks(&s, &io(None), 4).sinks.is_empty(), "a disabled insert's send path is no sink");
+    let report = hardware_report(&s, &io(Some(D)), 4, 4, true, SR);
+    assert_eq!((report[0].state.clone(), report[0].latency), (HardwareState::Disabled("send path in use by Other".into()), None));
 }

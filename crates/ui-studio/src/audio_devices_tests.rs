@@ -519,14 +519,14 @@ mod io_paths {
     use super::*;
     use soundcraft_model::IoMap;
 
-    fn with_window() -> T {
+    pub(super) fn with_window() -> T {
         let mut t = T::new();
         t.app.engine.set_io_map(IoMap::for_device("ASIO", "TASCAM Model 12", 4, 4));
         t.open_window();
         t
     }
 
-    fn item(t: &T, value: &str, label: &str) -> [f32; 4] {
+    pub(super) fn item(t: &T, value: &str, label: &str) -> [f32; 4] {
         T::rect(&t.layout()["controls"], Some(label), value)
     }
 
@@ -672,4 +672,59 @@ fn a_saved_calibration_is_shown_for_its_pair_and_survives_apply() {
     let apply = t.control_rect("apply");
     t.click(mid(apply));
     assert_eq!(t.app.ui.audio.calibrations.len(), 1, "Apply keeps the saved measurements");
+}
+
+mod hardware_inserts {
+    use super::io_paths::{item, with_window};
+    use super::*;
+    use serde_json::json;
+
+    fn measured() -> T {
+        let mut t = with_window();
+        t.app.engine.store_hardware_latency("Out 3-4", "In 3-4", 612);
+        t.frames(3);
+        t
+    }
+
+    #[test]
+    fn the_measured_table_lists_the_pair_with_its_latency_and_clear_forgets_it() {
+        let mut t = measured();
+        let h = t.layout()["hardware"].clone();
+        assert_eq!(h["rows"], json!(["Out 3-4 → In 3-4: 612 frames (12.8 ms)"]));
+        let revision = t.app.engine.io_revision();
+        t.click(mid(item(&t, "hw_clear:Out 3-4 → In 3-4", "Clear")));
+        assert!(t.app.engine.io_map().hardware_latency.is_empty());
+        assert_eq!(t.app.engine.io_revision(), revision + 1);
+        assert_eq!(t.layout()["hardware"]["rows"], json!([]));
+    }
+
+    #[test]
+    fn measure_is_off_without_a_live_duplex_device_and_says_so() {
+        let mut t = measured();
+        let h = t.layout()["hardware"].clone();
+        assert_eq!(h["blocked"], "Measuring needs an open audio device.");
+        item(&t, "hw_measure", "Measure");
+        item(&t, "hw_remeasure:Out 3-4 → In 3-4", "Remeasure");
+        // Choose a pair: the button is still off, and a click changes nothing.
+        t.click(mid(item(&t, "hw_send", "")));
+        t.click(mid(item(&t, "hw_send_entry", "Out 3-4")));
+        t.click(mid(item(&t, "hw_ret", "")));
+        t.click(mid(item(&t, "hw_ret_entry", "In 3-4")));
+        let h = t.layout()["hardware"].clone();
+        assert_eq!((h["send"].clone(), h["ret"].clone()), (json!("Out 3-4"), json!("In 3-4")));
+        let revision = t.app.engine.io_revision();
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        assert_eq!(t.app.engine.io_revision(), revision);
+        assert_eq!(t.app.engine.io_map().hardware_latency.len(), 1);
+    }
+
+    #[test]
+    fn the_command_without_a_device_says_why_in_the_status_line() {
+        let mut t = measured();
+        let why = t.app.run("io.measure_hardware_latency", json!({"send": "Out 3-4", "ret": "In 3-4"})).unwrap_err();
+        assert_eq!(why, "measuring needs a live audio device");
+        assert_eq!(t.app.status, why);
+        let why = t.app.run("io.measure_hardware_latency", json!({"send": "Nowhere", "ret": "In 3-4"})).unwrap_err();
+        assert!(why.contains("Nowhere"), "{why}");
+    }
 }

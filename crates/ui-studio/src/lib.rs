@@ -21,6 +21,8 @@ pub mod fine;
 pub mod finish;
 pub mod grid;
 pub mod groups;
+mod hardware_measure;
+pub mod hardware_ui;
 pub mod host;
 pub mod icons;
 pub mod import;
@@ -474,6 +476,9 @@ impl StudioApp {
         if id == "ui.set" {
             return self.set_ui(&params);
         }
+        if id == "io.measure_hardware_latency" {
+            return self.measure_hardware_latency(&params);
+        }
         if id == "track.clear_clip_indicators" {
             self.clear_clip_latches();
             return Ok(json!({"cleared": true}));
@@ -910,6 +915,7 @@ impl StudioApp {
             "focus_track": self.focus_track(),
             "mixer": self.mixer.layout,
             "devices": self.mixer.devices,
+            "hardware_picker": self.mixer.hw_picker_layout,
             "track_menu": self.arrange.menu,
             "bar_menu": self.arrange.bar_menu,
             "menu_state": {"filter_rect": self.mixer.filter_rect},

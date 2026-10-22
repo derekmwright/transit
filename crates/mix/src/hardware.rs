@@ -16,7 +16,7 @@ use super::{MAX_LATENCY, Session, Sink, Track, TrackId, TrackKind, sink::SinkSpe
 use soundcraft_model::{IoDirection, IoMap};
 
 /// What a hardware insert slot will do on this machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HardwareState {
     /// Both paths resolve and the round trip was measured: the slot runs and reports it.
     Ready,
@@ -30,6 +30,9 @@ pub enum HardwareState {
     /// Both paths resolve but no capture stream is open (not a duplex device): the slot passes the
     /// signal through dry.
     NoInput,
+    /// The insert is switched off (a session opened with a conflict, a duplicated track's copy):
+    /// the slot passes the signal through dry. The reason says why.
+    Disabled(String),
 }
 
 /// One hardware insert of a session as this machine sees it (the UI's card, the engine's report).
@@ -75,6 +78,7 @@ pub(crate) fn latency_of(t: &Track, io: &IoMap, rate: u32) -> usize {
         .flatten()
         .filter(|i| i.active && !i.bypass)
         .filter_map(|i| i.hardware.as_ref())
+        .filter(|h| h.disabled.is_none())
         .fold(0usize, |a, h| a.saturating_add(io.hardware_latency(&h.send, &h.ret, rate).unwrap_or(0) as usize))
         .min(MAX_LATENCY)
 }
@@ -83,7 +87,7 @@ pub(crate) fn latency_of(t: &Track, io: &IoMap, rate: u32) -> usize {
 pub(crate) fn specs_of(t: &Track, io: &IoMap, sinks: &[SinkSpec], in_channels: u16, rate: u32) -> Vec<HwSpec> {
     let mut out = Vec::new();
     for (slot, ins) in t.mixer.inserts.iter().enumerate() {
-        let Some(h) = ins.as_ref().and_then(|i| i.hardware.as_ref()) else { continue };
+        let Some(h) = ins.as_ref().and_then(|i| i.hardware.as_ref()).filter(|h| h.disabled.is_none()) else { continue };
         let Ok(slot) = u16::try_from(slot) else { continue };
         let sink = sinks.iter().position(|k| k.name.eq_ignore_ascii_case(&h.send));
         let src = io
@@ -112,23 +116,23 @@ pub fn hardware_report(s: &Session, io: &IoMap, out_channels: u16, in_channels: 
     let sinks = super::plan_sinks(s, io, out_channels).sinks;
     let mut out = Vec::new();
     for t in s.tracks.iter().filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) {
-        for spec in specs_of(t, io, &sinks, in_channels, rate) {
-            let Some(h) = t.mixer.inserts.get(usize::from(spec.slot)).and_then(Option::as_ref).and_then(|i| i.hardware.as_ref()) else { continue };
-            let state = match (spec.sink.is_some(), spec.src.is_empty(), duplex, spec.measured) {
-                (false, ..) => HardwareState::MissingSend,
-                (true, true, ..) => HardwareState::MissingReturn,
-                (true, false, false, _) => HardwareState::NoInput,
-                (true, false, true, true) => HardwareState::Ready,
-                (true, false, true, false) => HardwareState::Unmeasured,
+        let specs = specs_of(t, io, &sinks, in_channels, rate);
+        for (slot, ins) in t.mixer.inserts.iter().enumerate() {
+            let Some(h) = ins.as_ref().and_then(|i| i.hardware.as_ref()) else { continue };
+            let (state, latency) = if let Some(why) = &h.disabled {
+                (HardwareState::Disabled(why.clone()), None)
+            } else {
+                let Some(spec) = specs.iter().find(|p| usize::from(p.slot) == slot) else { continue };
+                let state = match (spec.sink.is_some(), spec.src.is_empty(), duplex, spec.measured) {
+                    (false, ..) => HardwareState::MissingSend,
+                    (true, true, ..) => HardwareState::MissingReturn,
+                    (true, false, false, _) => HardwareState::NoInput,
+                    (true, false, true, true) => HardwareState::Ready,
+                    (true, false, true, false) => HardwareState::Unmeasured,
+                };
+                (state, spec.measured.then_some(spec.latency))
             };
-            out.push(HardwareReport {
-                track: t.id,
-                slot: usize::from(spec.slot),
-                send: h.send.clone(),
-                ret: h.ret.clone(),
-                state,
-                latency: spec.measured.then_some(spec.latency),
-            });
+            out.push(HardwareReport { track: t.id, slot, send: h.send.clone(), ret: h.ret.clone(), state, latency });
         }
     }
     out

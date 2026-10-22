@@ -29,8 +29,8 @@ pub use mixer::{
     SendSlot, Speaker, SurroundPan, Tap, fader_db_to_pos, fader_pos_to_db,
 };
 pub use route_graph::{
-    EdgeKind, Layering, RouteChange, RouteCycle, RouteEdge, RouteGraph, RouteNode, RouteScratch, describe_cycle, hardware_problem, new_cycle,
-    would_create_cycle, would_create_cycle_all,
+    EdgeKind, HardwareConflict, Layering, RouteChange, RouteCycle, RouteEdge, RouteGraph, RouteNode, RouteScratch, describe_cycle,
+    disable_hardware_conflicts, hardware_conflict, hardware_problem, new_cycle, new_hardware_problem, would_create_cycle, would_create_cycle_all,
 };
 pub use session::{
     BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,

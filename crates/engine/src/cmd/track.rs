@@ -346,6 +346,11 @@ fn duplicate(e: &mut Engine, p: &Value) -> Result<Value> {
         if !snd {
             nt.mixer.sends.iter_mut().for_each(|i| *i = None);
         }
+        // A copy would send on the original's path: keep its hardware inserts, switched off.
+        let why = format!("send path in use by {}", s.tracks.get(idx).map_or("the original", |o| o.name.as_str()));
+        for h in nt.mixer.inserts.iter_mut().flatten().filter_map(|i| i.hardware.as_mut()) {
+            h.disabled = Some(why.clone());
+        }
         out.push(nt.id);
         s.tracks.insert((idx + 1).min(s.tracks.len()), nt);
     }

@@ -48,6 +48,8 @@ pub struct AudioDevicesLayout {
     pub io: Option<soundcraft_model::IoMap>,
     /// The Calibration line under the Paired input (only under the native backend).
     pub calibration: Option<String>,
+    /// The Hardware inserts subsection as drawn.
+    pub hardware: crate::audio_devices_io::HardwareLayout,
 }
 
 /// Devices standing in for the machine's (the control channel's `audio.fake_devices`, tests):
@@ -544,6 +546,10 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let mut editor = std::mem::take(&mut app.audio_devices.io_editor);
     let mut io_edit = None;
     let mut io_items = Vec::new();
+    let mut hw_action = None;
+    let mut hw_layout = Default::default();
+    let blocker = app.measure_blocker();
+    let rate = app.engine.session().sample_rate.hz();
     let mut open = true;
     let r = egui::Window::new("Audio Devices")
         .open(&mut open)
@@ -655,6 +661,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(REFUSED_RECORDING).color(TOKENS.record).size(11.5));
             }
             io_edit = crate::audio_devices_io::section(ui, &io, wasapi, &mut editor, &mut io_items);
+            (hw_action, hw_layout) = crate::audio_devices_io::hardware_section(ui, &io, rate, blocker, &mut editor, &mut io_items);
             ui.add_space(SPACE);
             ui.horizontal(|ui| {
                 let b = ui.add_enabled(!recording, egui::Button::new("Apply"));
@@ -679,6 +686,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         lay.window = r4(r.response.rect);
     }
     lay.io = Some(io);
+    lay.hardware = hw_layout;
     lay.draft = draft.clone();
     lay.notes = app.audio_devices.notes.clone();
     app.audio_devices.draft = draft.clone();
@@ -687,6 +695,24 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         match app.run("setup.io_map", edit.params()) {
             Ok(_) => editor.done(&edit),
             Err(error) => app.status = error,
+        }
+    }
+    if let Some(action) = hw_action {
+        use crate::audio_devices_io::HardwareAction;
+        match action {
+            HardwareAction::Measure { send, ret } => {
+                editor.hw_result = match app.run("io.measure_hardware_latency", serde_json::json!({"send": send, "ret": ret})) {
+                    Ok(v) => {
+                        let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
+                        crate::audio_devices_io::measured_text(n("round_trip_frames"), n("spread_frames"), rate)
+                    }
+                    Err(why) => why,
+                };
+            }
+            HardwareAction::Clear { send, ret } => {
+                editor.hw_result.clear();
+                let _ = app.run("io.clear_hardware_latency", serde_json::json!({"send": send, "ret": ret}));
+            }
         }
     }
     app.audio_devices.io_editor = editor;
