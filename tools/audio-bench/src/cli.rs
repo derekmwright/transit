@@ -6,13 +6,16 @@ use transit_audio_backend as ab;
 
 pub const USAGE: &str = "\
 usage: audio-bench [options]
-  --backend cpal|wasapi|fake  backend to measure (default cpal; wasapi is the native backend, built with --features native-wasapi)
+  --backend cpal|wasapi|asio|fake  backend to measure (default cpal; wasapi and asio are the native backends, built with
+                         --features native-wasapi or native-asio)
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
-  --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device)
+  --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device);
+                         with --backend asio the ASIO driver's registry name (Focusrite USB ASIO)
   --in-device <name>     input device when it differs from --device
   --mode shared|exclusive  device sharing of --backend wasapi (default shared); exclusive holds the device and silences other apps
   --in-mode shared|exclusive  mode of the capture stream when it differs from --mode (the calibration stays keyed on --mode)
-  --period <frames>      requested period: 32, 64, 128, ... (default: the driver's)
+  --period <frames>      requested period: 32, 64, 128, ... (default: the driver's); with --backend asio the buffer size
+                         asked of createBuffers, snapped to the driver's steps (the table shows what it granted)
   --rate <Hz>            sample rate (default 48000)
   --seconds <N>          measurement time (default 20)
   --loopback             output-to-input cable: measure the round trip
@@ -67,7 +70,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                     Some("cpal") => Kind::Cpal,
                     Some("fake") => Kind::Fake,
                     Some("wasapi") => Kind::Wasapi,
-                    other => return Err(format!("--backend: expected cpal, wasapi or fake, got {other:?}")),
+                    Some("asio") => Kind::Asio,
+                    other => return Err(format!("--backend: expected cpal, wasapi, asio or fake, got {other:?}")),
                 }
             }
             "--system" => system = Some(value().ok_or("--system needs a value")?),
@@ -121,8 +125,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if kind == Kind::Wasapi && system.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("WASAPI")) {
         return Err("--backend wasapi is the native WASAPI system; --system applies to the cpal backend".into());
     }
+    if kind == Kind::Asio && system.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("ASIO")) {
+        return Err("--backend asio is the native ASIO system; --system applies to the cpal backend".into());
+    }
     if (request.mode == ab::Mode::Exclusive || request.in_mode == Some(ab::Mode::Exclusive)) && kind == Kind::Cpal {
         return Err("--mode exclusive needs --backend wasapi (or fake): cpal opens shared streams only".into());
+    }
+    if (request.mode == ab::Mode::Exclusive || request.in_mode == Some(ab::Mode::Exclusive)) && kind == Kind::Asio {
+        return Err("--mode does not apply to --backend asio: an ASIO driver has one mode".into());
+    }
+    if settings.is_some() && kind == Kind::Asio {
+        return Err("--settings needs --backend wasapi: the app does not open native ASIO streams yet".into());
     }
     if settings.is_some() && !request.loopback {
         return Err("--settings needs --loopback: a calibration is a measured round trip".into());
@@ -187,6 +200,19 @@ mod tests {
         let Ok(Command::Run(c)) = parse_str("--backend fake --fake-burst") else { panic!("did not parse") };
         assert!(c.fake.burst);
         assert!(parse_str("--fake-burst").is_err(), "fake options need the fake backend");
+    }
+
+    #[test]
+    fn the_native_asio_backend_takes_a_driver_name_and_a_buffer_size() {
+        let Ok(Command::Run(c)) = parse_str("--backend asio --device Scarlett --period 64 --loopback --out-ch 2 --in-ch 2") else {
+            panic!("did not parse")
+        };
+        assert_eq!((c.kind, c.request.device.as_deref(), c.request.period), (Kind::Asio, Some("Scarlett"), Some(64)));
+        assert_eq!((c.request.out_ch, c.request.in_ch), (2, 2));
+        assert!(parse_str("--backend asio --system WASAPI").is_err());
+        assert!(matches!(parse_str("--backend asio --system ASIO"), Ok(Command::Run(_))));
+        assert!(parse_str("--backend asio --mode exclusive").unwrap_err().contains("one mode"));
+        assert!(parse_str("--backend asio --loopback --settings ui.json").unwrap_err().contains("--backend wasapi"));
     }
 
     #[test]

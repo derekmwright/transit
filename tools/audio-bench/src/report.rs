@@ -41,10 +41,18 @@ fn cell(text: &str) -> String {
 }
 
 impl Row {
-    /// One line per stream that kept device-loop counters (`--backend wasapi` and the fake one).
+    /// One line per stream that kept device-loop counters (`--backend wasapi`, `asio` and the fake
+    /// one). A native ASIO line always ends with the driver-event counters, zero or not.
     pub fn stats_lines(&self) -> Vec<String> {
+        let asio = self.backend == "asio";
         let line = |name: &str, stats: &Option<ab::StreamStats>, achieved: &Option<ab::Achieved>, capture: bool| {
-            stats.map(|s| format!("{name} backend: {}{}", s.line(capture), opened_figures(achieved.as_ref())))
+            stats.map(|s| {
+                let mut text = s.line(capture);
+                if asio && !text.contains("overloads") {
+                    text.push_str(&s.events_tail());
+                }
+                format!("{name} backend: {text}{}", opened_figures(achieved.as_ref()))
+            })
         };
         [line("render", &self.render_stats, &self.render_achieved, false), line("capture", &self.capture_stats, &self.capture_achieved, true)]
             .into_iter()
@@ -302,6 +310,17 @@ mod tests {
                 "capture backend: wakes 9, late p95 0 µs, max 0 µs; service p95 0 µs, max 0 µs; skipped 0, timeouts 0; max packets 2",
             ]
         );
+    }
+
+    #[test]
+    fn a_native_asio_line_always_ends_with_the_driver_events() {
+        let mut r = row(true);
+        r.backend = "asio".into();
+        r.render_stats = Some(ab::StreamStats { wakes: 10, ..Default::default() });
+        r.capture_stats = Some(ab::StreamStats { wakes: 10, overloads: 1, ..Default::default() });
+        let lines = r.stats_lines();
+        assert!(lines[0].ends_with("min padding 0; overloads 0, position jumps 0, resets 0"), "{}", lines[0]);
+        assert!(lines[1].ends_with("max packets 0; overloads 1, position jumps 0, resets 0"), "{}", lines[1]);
     }
 
     #[test]

@@ -15,6 +15,10 @@ asio = ["soundcraft-playback/asio", "dep:asio-sys"]
 # `--backend wasapi`: the native WASAPI backend (ADR 0016 slice c), Windows only.
 native-wasapi = ["dep:transit-audio-wasapi"]
 
+# `--backend asio`: the native ASIO backend (draft ADR 0016 amendment, ASIO slice b), 64-bit
+# Windows only. No ASIO SDK and no LLVM: unlike `asio` (cpal's host), it builds like the rest.
+native-asio = ["dep:transit-audio-asio"]
+
 [dependencies]
 serde_json.workspace = true
 transit-audio-backend.workspace = true
@@ -24,6 +28,7 @@ soundcraft-playback.workspace = true
 # The same asio-sys cpal uses; `--list-devices` asks it why a registered driver is not listed.
 asio-sys = { version = "0.2", optional = true }
 transit-audio-wasapi = { workspace = true, optional = true }
+transit-audio-asio = { workspace = true, optional = true }
 
 [dev-dependencies]
 transit-rt = { workspace = true, features = ["testing"] }
