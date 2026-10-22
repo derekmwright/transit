@@ -1,5 +1,7 @@
 # Builds transit for Windows, macOS and Linux and attaches the archives to the GitHub Release for
-# the tag. Everything is unsigned: macOS is ad-hoc signed by the linker only. Windows ships two zips:
+# the tag. Windows and Linux are unsigned. macOS ships transit.app on a DMG (packaging/macos/package.sh),
+# ad-hoc signed unless the optional signing secrets are set (docs/releasing.md), plus a tarball with
+# the bare binary and the bench harness. Windows ships two zips:
 # transit-<ver>-windows-x86_64-asio (ASIO + native WASAPI) and transit-<ver>-windows-x86_64 (WASAPI
 # only, the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
 # the project owner handles; see docs/building.md. Every archive also carries the audio-bench
@@ -129,6 +131,54 @@ jobs:
           $notice
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
           Compress-Archive -Path $d -DestinationPath "$d.zip"
+      # Optional: with all five secrets set, import the Developer ID certificate into a temporary
+      # keychain and hand its identity to package.sh, which signs (hardened runtime, entitlements),
+      # notarizes with notarytool --wait and staples. Without them package.sh signs ad hoc.
+      - name: Import signing certificate (macOS, optional)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE_P12" ] || [ -z "$MACOS_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "Signing secrets not all set: skipping signing and notarization (ad-hoc signed DMG)."
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/transit-signing.keychain-db"
+          kcpw="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$kc"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$kc"
+          security list-keychains -d user -s "$kc" login.keychain-db
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          identity="$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Developer ID Application:.*\)".*/\1/p' | head -n 1)"
+          if [ -z "$identity" ]; then echo "::error::no Developer ID Application identity in the certificate"; exit 1; fi
+          {
+            echo "MACOS_SIGN_IDENTITY=$identity"
+            echo "MACOS_KEYCHAIN=$kc"
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            echo "APPLE_PASSWORD=$APPLE_APP_PASSWORD"
+          } >> "$GITHUB_ENV"
+          echo "Signing with: $identity (notarization on)"
+      # transit.app on a drag-to-Applications DMG. package.sh builds the aarch64 binary itself (a second,
+      # app-only compile), signs inside-out, verifies, and notarizes and staples when the step above
+      # exported the credentials. The bare-binary tarball below stays: it carries audio-bench.
+      - name: Package transit.app DMG (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then export TRANSIT_VERSION="${GITHUB_REF_NAME#v}"; fi
+          chmod +x packaging/macos/package.sh
+          DIST="$PWD/dist-dmg" packaging/macos/package.sh --arch aarch64
+          cp dist-dmg/transit-*-macos-aarch64.dmg .
       - name: Package (macOS, Linux)
         if: runner.os != 'Windows'
         shell: bash
@@ -138,8 +188,12 @@ jobs:
           cp target/release/transit target/release/audio-bench LICENSE-MIT LICENSE-APACHE NOTICE "$d"
           if [ "$RUNNER_OS" = "macOS" ]; then
             printf '%s\n' 'transit for macOS (pre-alpha, Apple silicon)' '' \
-              'Unsigned and not notarized (ad-hoc only). Run: xattr -dr com.apple.quarantine transit' \
-              'or right-click the file and choose Open the first time.' > "$d/README-MACOS.txt"
+              'The matching .dmg release asset holds transit.app: open it and drag transit to Applications.' \
+              'This tarball holds the bare binary and the audio-bench harness.' '' \
+              'Unsigned (ad-hoc signed only) unless the release notes say notarized. If macOS refuses to open it, run:' \
+              '  xattr -dr com.apple.quarantine /Applications/transit.app   (the app from the DMG)' \
+              '  xattr -dr com.apple.quarantine transit                     (the bare binary here)' \
+              'or right-click the app or file and choose Open the first time.' > "$d/README-MACOS.txt"
           fi
           cat > "$d/BENCH-README.txt" <<'EOF'
           audio-bench: measure your interface (round trip, jitter, xruns)
@@ -163,6 +217,7 @@ jobs:
           path: |
             transit-*.zip
             transit-*.tar.gz
+            transit-*.dmg
 
   publish:
     needs: build
@@ -177,10 +232,12 @@ jobs:
         with:
           files: dist/*
           body: |
+            macOS: the `.dmg` holds `transit.app`; open it and drag transit to Applications. The app is unsigned (ad-hoc signed only) unless these notes say notarized. If macOS blocks it, run `xattr -dr com.apple.quarantine /Applications/transit.app` (or right-click the app and choose Open). The `.tar.gz` holds the bare binary and `audio-bench`; the same command applies to the binary.
+
             Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
             - windows-x86_64-asio: `audio-bench.exe` with ASIO, native WASAPI and cpal WASAPI.
             - windows-x86_64: `audio-bench.exe` with native WASAPI and cpal WASAPI.
-            - macos-arm64: `audio-bench` (cpal, Core Audio).
+            - macos-arm64: `audio-bench` (cpal, Core Audio), in the tarball only, not in the DMG.
             - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false
           prerelease: true

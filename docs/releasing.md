@@ -13,10 +13,29 @@ Releases are tag-driven. `.github/workflows/release.yml` does the building.
 3. `release.yml` builds four archives and attaches them to a GitHub pre-release for the tag:
    - Windows x86_64 (two zips): `windows-x86_64-asio` (ASIO and native WASAPI; see below) and
      `windows-x86_64` (WASAPI only, the fallback). Both unsigned. SmartScreen may ask for "More info", then "Run anyway".
-   - macOS arm64: unsigned and not notarized. Right-click the binary and choose Open, or run
-     `xattr -dr com.apple.quarantine transit`.
+   - macOS arm64: `transit-<version>-macos-aarch64.dmg` (`transit.app` with a drag-to-Applications
+     window, built by `packaging/macos/package.sh`) and a `macos-arm64` tarball with the bare binary
+     and `audio-bench`. Ad-hoc signed and not notarized unless the signing secrets below are set.
+     If macOS blocks the app, run `xattr -dr com.apple.quarantine /Applications/transit.app` or
+     right-click it and choose Open.
    - Linux x86_64.
 4. Check the pre-release page, edit the notes, and publish it when the archives look right.
+
+## macOS signing and notarization (optional)
+
+With all five repository secrets set, the macOS job imports the certificate into a temporary
+keychain, signs `transit.app` and the DMG (hardened runtime, `packaging/macos/entitlements.plist`),
+submits them with `notarytool --wait` and staples the tickets. With any of them missing the step logs
+that it is skipping and the DMG is ad-hoc signed. The owner provides:
+
+- `MACOS_CERTIFICATE_P12`: a Developer ID Application certificate exported with its private key
+  as a `.p12`, base64-encoded (`base64 -i certificate.p12 | pbcopy`).
+- `MACOS_CERTIFICATE_PASSWORD`: the password chosen when exporting the `.p12`.
+- `APPLE_ID`: the Apple ID of the developer account.
+- `APPLE_TEAM_ID`: the 10-character team ID.
+- `APPLE_APP_PASSWORD`: an app-specific password for that Apple ID (appleid.apple.com).
+
+When the build was notarized, say so in the release notes; they say the app is unsigned otherwise.
 
 ## ASIO
 
