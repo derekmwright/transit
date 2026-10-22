@@ -158,6 +158,26 @@ impl HwProbe {
         self.state.store(IDLE, Ordering::Release);
     }
 
+    /// Clicks sent so far of the clicks a measurement sends (control: for a progress line). Read
+    /// from the audio thread's frame counter, so it needs no lock. Zero when none is running.
+    #[must_use]
+    pub fn progress(&self) -> (u32, u32) {
+        let first = frames_of(self.rate, START_MS);
+        let interval = frames_of(self.rate, INTERVAL_MS).max(1);
+        let duration = frames_of(self.rate, DURATION_MS);
+        let total = (0..).map(|k| first + k * interval).take_while(|s| *s < duration).count();
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
+        match self.state.load(Ordering::Acquire) {
+            ARMED => {
+                let at = self.frame.load(Ordering::Relaxed);
+                let sent = if at < first { 0 } else { (at - first) / interval + 1 };
+                (u32::try_from(sent).unwrap_or(u32::MAX).min(total), total)
+            }
+            DONE => (total, total),
+            _ => (0, total),
+        }
+    }
+
     /// The result, once the measurement is done (and only once).
     #[must_use]
     pub fn take_result(&self) -> Option<Result<Measured, ProbeError>> {
@@ -288,6 +308,25 @@ mod tests {
             k += 1;
         }
         out
+    }
+
+    #[test]
+    fn progress_counts_the_clicks_sent_so_far() {
+        let p = HwProbe::new(RATE);
+        assert_eq!(p.progress(), (0, 8));
+        assert!(p.arm(&[0], &[0]));
+        assert_eq!(p.progress(), (0, 8));
+        let silence = vec![vec![0.0f32; 480]];
+        let mut seen = Vec::new();
+        while p.armed() {
+            p.record_block(&silence, 480);
+            seen.push(p.progress().0);
+        }
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "never goes back");
+        assert!(seen.contains(&4));
+        assert_eq!(p.progress(), (8, 8));
+        assert!(p.take_result().is_some());
+        assert_eq!(p.progress(), (0, 8));
     }
 
     #[test]

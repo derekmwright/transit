@@ -109,6 +109,8 @@ pub fn is_wasapi(system: &str) -> bool {
 pub enum HardwareAction {
     /// Run `io.measure_hardware_latency` (Measure and Remeasure).
     Measure { send: String, ret: String },
+    /// Stop the measurement that is running.
+    Cancel,
     /// Run `io.clear_hardware_latency`.
     Clear { send: String, ret: String },
 }
@@ -120,6 +122,8 @@ pub struct HardwareLayout {
     pub blocked: String,
     pub send: String,
     pub ret: String,
+    /// "Measuring… <n>/<total> clicks" while a measurement runs; empty otherwise.
+    pub progress: String,
     /// "<n> frames (<x> ms) ±<m>" or the refusal of the last run.
     pub result: String,
     /// The measured pairs listed: "Out 3-4 → In 3-4: 612 frames (12.8 ms)".
@@ -239,6 +243,7 @@ pub fn hardware_section(
     io: &IoMap,
     rate: u32,
     blocked: Option<&str>,
+    progress: Option<(u32, u32)>,
     ed: &mut IoEditor,
     items: &mut Vec<MenuItem>,
 ) -> (Option<HardwareAction>, HardwareLayout) {
@@ -256,24 +261,29 @@ pub fn hardware_section(
     if ed.hw_ret.as_deref().is_some_and(|n| !inputs.contains(&n)) {
         ed.hw_ret = None;
     }
+    let running = progress.is_some();
     ui.horizontal(|ui| {
-        for (label, key, names, pick) in [("Send", "hw_send", &outputs, &mut ed.hw_send), ("Return", "hw_ret", &inputs, &mut ed.hw_ret)] {
-            ui.label(label);
-            let combo = egui::ComboBox::from_id_salt(key).selected_text(pick.as_deref().unwrap_or("Choose…")).show_ui(ui, |ui| {
-                for n in names {
-                    let b = crate::menus::check_button(ui, pick.as_deref() == Some(*n), *n);
-                    items.push(MenuItem::at(ui, (*n).to_string(), format!("{key}_entry"), b.rect));
-                    if b.clicked() {
-                        *pick = Some((*n).to_string());
+        ui.add_enabled_ui(!running, |ui| {
+            for (label, key, names, pick) in [("Send", "hw_send", &outputs, &mut ed.hw_send), ("Return", "hw_ret", &inputs, &mut ed.hw_ret)] {
+                ui.label(label);
+                let combo = egui::ComboBox::from_id_salt(key).selected_text(pick.as_deref().unwrap_or("Choose…")).show_ui(ui, |ui| {
+                    for n in names {
+                        let b = crate::menus::check_button(ui, pick.as_deref() == Some(*n), *n);
+                        items.push(MenuItem::at(ui, (*n).to_string(), format!("{key}_entry"), b.rect));
+                        if b.clicked() {
+                            *pick = Some((*n).to_string());
+                        }
                     }
-                }
-            });
-            items.push(MenuItem::at(ui, pick.clone().unwrap_or_default(), key.into(), combo.response.rect));
-        }
+                });
+                items.push(MenuItem::at(ui, pick.clone().unwrap_or_default(), key.into(), combo.response.rect));
+            }
+        });
         let ready = ed.hw_send.is_some() && ed.hw_ret.is_some();
-        let b = ui.add_enabled(ready && blocked.is_none(), egui::Button::new("Measure"));
+        let b = ui.add_enabled(ready && blocked.is_none() && !running, egui::Button::new("Measure"));
         items.push(MenuItem::at(ui, "Measure".into(), "hw_measure".into(), b.rect));
-        let tip = blocked.unwrap_or(if ready {
+        let tip = blocked.unwrap_or(if running {
+            "A measurement is running."
+        } else if ready {
             "Play a click out the send path and time it on the return path."
         } else {
             "Choose a send path and a return path."
@@ -284,6 +294,19 @@ pub fn hardware_section(
             action = Some(HardwareAction::Measure { send, ret });
         }
     });
+    let mut progress_text = String::new();
+    if let Some((sent, total)) = progress {
+        progress_text = format!("Measuring\u{2026} {sent}/{total} clicks");
+        ui.horizontal(|ui| {
+            let r = ui.label(egui::RichText::new(&progress_text).color(TOKENS.text).size(11.5));
+            items.push(MenuItem::at(ui, progress_text.clone(), "hw_progress".into(), r.rect));
+            let b = ui.button("Cancel");
+            items.push(MenuItem::at(ui, "Cancel".into(), "hw_cancel".into(), b.rect));
+            if b.on_hover_text("Stop measuring; nothing is stored.").clicked() {
+                action = Some(HardwareAction::Cancel);
+            }
+        });
+    }
     if let Some(why) = blocked {
         dim(ui, why);
     }
@@ -293,6 +316,7 @@ pub fn hardware_section(
     }
     let mut layout = HardwareLayout {
         blocked: blocked.unwrap_or_default().to_string(),
+        progress: progress_text,
         send: ed.hw_send.clone().unwrap_or_default(),
         ret: ed.hw_ret.clone().unwrap_or_default(),
         result: ed.hw_result.clone(),
@@ -309,7 +333,7 @@ pub fn hardware_section(
                 ui.label(frames_text(m.round_trip_frames, rate));
                 layout.rows.push(format!("{pair}: {}", frames_text(m.round_trip_frames, rate)));
                 ui.horizontal(|ui| {
-                    let b = ui.add_enabled(blocked.is_none(), egui::Button::new("Remeasure").small());
+                    let b = ui.add_enabled(blocked.is_none() && !running, egui::Button::new("Remeasure").small());
                     items.push(MenuItem::at(ui, "Remeasure".into(), format!("hw_remeasure:{pair}"), b.rect));
                     if b.clicked() {
                         action = Some(HardwareAction::Measure { send: m.send.clone(), ret: m.ret.clone() });

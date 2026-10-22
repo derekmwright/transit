@@ -97,6 +97,12 @@ pub struct AudioDevicesState {
     pub layout: AudioDevicesLayout,
     verification: Option<Verification>,
     io_editor: crate::audio_devices_io::IoEditor,
+    /// The measurement the Hardware inserts Measure started and has not collected yet.
+    pub(crate) measuring: Option<crate::hardware_measure::Pending>,
+    /// What to show as the last measurement's result, set where the editor is not at hand.
+    pub(crate) measure_note: Option<String>,
+    #[cfg(test)]
+    pub(crate) fake_probe: Option<crate::hardware_measure::FakeProbe>,
 }
 
 impl AudioDevicesState {
@@ -520,7 +526,11 @@ fn choose_backend(ui: &mut egui::Ui, enabled: bool, value: &mut Backend, items: 
 pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     check(app);
     app.audio_devices.layout = AudioDevicesLayout::default();
+    if let Some(note) = app.audio_devices.measure_note.take() {
+        app.audio_devices.io_editor.hw_result = note;
+    }
     if !app.audio_devices.open {
+        app.cancel_measure("");
         return;
     }
     if app.audio_devices.base.as_ref() != Some(&app.ui.audio) {
@@ -549,6 +559,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let mut hw_action = None;
     let mut hw_layout = Default::default();
     let blocker = app.measure_blocker();
+    let progress = app.measure_progress();
     let rate = app.engine.session().sample_rate.hz();
     let mut open = true;
     let r = egui::Window::new("Audio Devices")
@@ -661,7 +672,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(REFUSED_RECORDING).color(TOKENS.record).size(11.5));
             }
             io_edit = crate::audio_devices_io::section(ui, &io, wasapi, &mut editor, &mut io_items);
-            (hw_action, hw_layout) = crate::audio_devices_io::hardware_section(ui, &io, rate, blocker, &mut editor, &mut io_items);
+            (hw_action, hw_layout) = crate::audio_devices_io::hardware_section(ui, &io, rate, blocker, progress, &mut editor, &mut io_items);
             ui.add_space(SPACE);
             ui.horizontal(|ui| {
                 let b = ui.add_enabled(!recording, egui::Button::new("Apply"));
@@ -701,13 +712,15 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         use crate::audio_devices_io::HardwareAction;
         match action {
             HardwareAction::Measure { send, ret } => {
-                editor.hw_result = match app.run("io.measure_hardware_latency", serde_json::json!({"send": send, "ret": ret})) {
-                    Ok(v) => {
-                        let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
-                        crate::audio_devices_io::measured_text(n("round_trip_frames"), n("spread_frames"), rate)
-                    }
-                    Err(why) => why,
-                };
+                editor.hw_result.clear();
+                if let Err(why) = app.start_measure(&send, &ret) {
+                    app.status.clone_from(&why);
+                    editor.hw_result = why;
+                }
+            }
+            HardwareAction::Cancel => {
+                editor.hw_result.clear();
+                app.cancel_measure("Measurement cancelled.");
             }
             HardwareAction::Clear { send, ret } => {
                 editor.hw_result.clear();
@@ -732,6 +745,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         app.status = format!("ASIO control panel: {e}");
     }
     if !open {
+        app.cancel_measure("");
         app.audio_devices.open = false;
         app.audio_devices.layout.open = false;
     }

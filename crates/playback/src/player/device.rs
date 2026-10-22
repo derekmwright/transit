@@ -541,6 +541,12 @@ impl Player {
         self.probe.as_ref().is_some_and(|p| p.armed())
     }
 
+    /// Clicks sent so far and in all, for a running measurement; (0, total) otherwise. Reads
+    /// atomics only.
+    pub fn hardware_probe_progress(&self) -> (u32, u32) {
+        self.probe.as_ref().map_or((0, 0), |p| p.progress())
+    }
+
     /// Stop a measurement in progress.
     pub fn cancel_hardware_probe(&self) {
         if let Some(p) = &self.probe {

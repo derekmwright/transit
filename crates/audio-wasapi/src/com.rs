@@ -11,7 +11,7 @@ use crate::lifecycle::Lifecycle;
 use crate::pairing::{self, Candidate};
 use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -1017,6 +1017,7 @@ fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback
                     stamper,
                     origin,
                     timeout_ms: timeout_ms(live.period_frames, live.fmt.rate),
+                    filled: Arc::new(AtomicU64::new(0)),
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
                 let mut stats = CaptureStats::default();
@@ -1025,6 +1026,7 @@ fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback
                 log::debug!("WASAPI capture loop ended: {exit:?}, {stats:?}");
                 if stats.discontinuities + stats.timestamp_errors > 0 {
                     log::info!("WASAPI capture saw {} discontinuities and {} timestamp errors", stats.discontinuities, stats.timestamp_errors);
+                    log::info!("WASAPI capture filled {} frames of lost packets with zeros", config.filled.load(Ordering::Relaxed));
                 }
             }
             Err(e) => {

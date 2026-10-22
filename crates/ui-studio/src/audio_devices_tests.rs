@@ -727,4 +727,110 @@ mod hardware_inserts {
         let why = t.app.run("io.measure_hardware_latency", json!({"send": "Nowhere", "ret": "In 3-4"})).unwrap_err();
         assert!(why.contains("Nowhere"), "{why}");
     }
+
+    use crate::hardware_measure::FakeProbe;
+    use soundcraft_playback::hardware_probe::{Measured, ProbeError};
+
+    fn with_fake_probe() -> T {
+        let mut t = with_window();
+        t.app.audio_devices.fake_probe = Some(FakeProbe { progress: (0, 8), ..Default::default() });
+        t.frames(3);
+        t
+    }
+
+    fn pick_pair(t: &mut T) {
+        t.click(mid(item(t, "hw_send", "")));
+        t.click(mid(item(t, "hw_send_entry", "Out 3-4")));
+        t.click(mid(item(t, "hw_ret", "")));
+        t.click(mid(item(t, "hw_ret_entry", "In 3-4")));
+    }
+
+    fn probe(t: &mut T) -> &mut FakeProbe {
+        t.app.audio_devices.fake_probe.as_mut().unwrap()
+    }
+
+    fn done(frames: u32, spread: u32) -> Result<Measured, ProbeError> {
+        Ok(Measured { round_trip_frames: frames, spread_frames: spread, found: 8, sent: 8 })
+    }
+
+    #[test]
+    fn measure_runs_without_blocking_shows_the_clicks_and_stores_the_result_when_it_completes() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        assert_eq!(t.layout()["hardware"]["blocked"], "");
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        assert_eq!(probe(&mut t).started, [(vec![2, 3], vec![2, 3])]);
+        assert_eq!(t.layout()["hardware"]["progress"], "Measuring\u{2026} 0/8 clicks");
+        assert!(t.app.engine.io_map().hardware_latency.is_empty(), "nothing is stored while it runs");
+        probe(&mut t).progress = (5, 8);
+        t.frames(3);
+        assert_eq!(t.layout()["hardware"]["progress"], "Measuring\u{2026} 5/8 clicks");
+        item(&t, "hw_progress", "Measuring\u{2026} 5/8 clicks");
+        item(&t, "hw_cancel", "Cancel");
+        // Measure is off while it runs: a click starts nothing more.
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        assert_eq!(probe(&mut t).started.len(), 1);
+        probe(&mut t).result = Some(done(612, 2));
+        t.frames(3);
+        assert_eq!(t.layout()["hardware"]["progress"], "");
+        assert_eq!(t.layout()["hardware"]["result"], "612 frames (12.8 ms) \u{b1}2");
+        assert_eq!(t.layout()["hardware"]["rows"], json!(["Out 3-4 \u{2192} In 3-4: 612 frames (12.8 ms)"]));
+        assert_eq!(t.app.engine.io_map().hardware_latency.len(), 1);
+        assert!(t.app.status.contains("612 frames"), "{}", t.app.status);
+    }
+
+    #[test]
+    fn a_failed_measurement_says_why_and_stores_nothing() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        probe(&mut t).result = Some(Err(ProbeError::NoSignal { found: 1, sent: 8 }));
+        t.frames(3);
+        assert_eq!(t.layout()["hardware"]["result"], "no signal returned on In 3-4: check the cable and input gain");
+        assert!(t.app.engine.io_map().hardware_latency.is_empty());
+        assert_eq!(t.layout()["hardware"]["progress"], "");
+    }
+
+    #[test]
+    fn cancel_stops_the_measurement_and_leaves_no_entry() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        t.click(mid(item(&t, "hw_cancel", "Cancel")));
+        assert_eq!(probe(&mut t).cancelled, 1);
+        t.frames(3);
+        let h = t.layout()["hardware"].clone();
+        assert_eq!((h["progress"].clone(), h["result"].clone()), (json!(""), json!("Measurement cancelled.")));
+        // A result arriving after the cancel is not collected.
+        probe(&mut t).result = Some(done(612, 0));
+        t.frames(3);
+        assert!(t.app.engine.io_map().hardware_latency.is_empty());
+        // Measure is available again.
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        assert_eq!(probe(&mut t).started.len(), 2);
+    }
+
+    #[test]
+    fn closing_the_dialog_cancels_the_measurement() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        t.app.audio_devices.open = false;
+        t.frames(3);
+        assert_eq!(probe(&mut t).cancelled, 1);
+        assert!(t.app.audio_devices.measuring.is_none());
+        probe(&mut t).result = Some(done(612, 0));
+        t.frames(3);
+        assert!(t.app.engine.io_map().hardware_latency.is_empty());
+    }
+
+    #[test]
+    fn the_command_path_still_answers_once_when_done_and_stores_the_same() {
+        let mut t = with_fake_probe();
+        probe(&mut t).result = Some(done(612, 2));
+        let v = t.app.run("io.measure_hardware_latency", json!({"send": "Out 3-4", "ret": "In 3-4"})).unwrap();
+        assert_eq!(v["round_trip_frames"], 612);
+        assert_eq!(t.app.engine.io_map().hardware_latency.len(), 1);
+        assert!(t.app.status.contains("612 frames"), "{}", t.app.status);
+    }
 }

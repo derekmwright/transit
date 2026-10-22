@@ -98,6 +98,10 @@ impl StudioApp {
     pub fn measure_blocker(&self) -> Option<&'static str> {
         let live = self.player.as_ref().is_some_and(|p| !p.silent);
         let duplex = self.player.as_ref().is_some_and(|p| p.duplex());
+        #[cfg(test)]
+        if self.audio_devices.fake_probe.is_some() {
+            return measure_blocker(true, true, false);
+        }
         measure_blocker(live, duplex, self.is_playing())
     }
 

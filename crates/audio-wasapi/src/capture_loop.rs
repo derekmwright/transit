@@ -5,11 +5,17 @@
 
 use crate::convert::{ConvertSource, Wire};
 use crate::render_loop::{Exit, Fault, Held, Position, Wake, contain, fail, quality_of, relative_ns};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use transit_audio_backend::{Calibration, CaptureBlock, CaptureCallback, ErrorCallback, Format, HostOrigin, Stamp, StreamError};
 
 /// The most packets drained after one wake. The buffer holds a few periods, so this is a bound on
 /// a device that keeps delivering, not a limit that real streams reach.
 const MAX_PACKETS_PER_WAKE: u32 = 256;
+
+/// The longest gap filled after one discontinuity, in seconds of the stream. A longer jump is a
+/// stream that was stopped or a clock that lost its way, not lost packets, and is not padded.
+const MAX_FILL_SECONDS: u64 = 1;
 
 /// One packet of the capture buffer, as `GetBuffer` described it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +92,39 @@ pub(crate) struct CaptureConfig {
     pub(crate) stamper: CaptureStamper,
     pub(crate) origin: HostOrigin,
     pub(crate) timeout_ms: u32,
+    /// Frames of zeros delivered in place of lost packets since the stream started. Shared so the
+    /// owner can read the total after (or while) the loop runs.
+    pub(crate) filled: Arc<AtomicU64>,
+}
+
+/// What the loop remembers of the previous packet to size a gap before the next one.
+#[derive(Debug, Clone, Copy)]
+struct Previous {
+    frames: u32,
+    qpc_100ns: u64,
+    /// The clock service's position read right after that packet's `GetBuffer`.
+    clock_frames: Option<u64>,
+}
+
+/// Frames lost before `packet`, a discontinuity: the device position advanced by more than the
+/// frames delivered since the previous packet. With both clock positions that is
+/// `(clock - previous clock) - frames of this packet`; without either, the QPC time the packet
+/// starts late of where the previous one ended, at the stream rate. Clamped to one second. A packet
+/// with a timestamp error has no trustworthy position, so nothing is filled.
+fn gap_frames(previous: &Previous, packet: &Packet, rate: u32) -> u64 {
+    if packet.timestamp_error {
+        return 0;
+    }
+    let rate = u64::from(rate);
+    let lost = match (previous.clock_frames, packet.clock) {
+        (Some(before), Some(now)) => now.frames.saturating_sub(before).saturating_sub(u64::from(packet.frames)),
+        _ => {
+            let ended = previous.qpc_100ns.saturating_add(u64::from(previous.frames) * 10_000_000 / rate.max(1));
+            let late = u128::from(packet.qpc_100ns.saturating_sub(ended));
+            u64::try_from(late * u128::from(rate) / 10_000_000).unwrap_or(u64::MAX)
+        }
+    };
+    lost.min(rate * MAX_FILL_SECONDS)
 }
 
 /// What the loop saw, for the log and the tests.
@@ -111,6 +150,7 @@ pub(crate) fn run(
 ) -> Exit {
     let mut stamper = config.stamper;
     let channels = usize::from(config.format.channels).max(1);
+    let mut previous: Option<Previous> = None;
     loop {
         match device.wait(config.timeout_ms) {
             Wake::Event => {}
@@ -128,6 +168,13 @@ pub(crate) fn run(
                 stats.silent += u64::from(packet.silent);
                 stats.discontinuities += u64::from(packet.discontinuity);
                 stats.timestamp_errors += u64::from(packet.timestamp_error);
+                if packet.discontinuity
+                    && let Some(previous) = previous.as_ref()
+                {
+                    let gap = gap_frames(previous, packet, config.format.rate);
+                    fill_gap(capture, scratch, channels, config, &mut stamper, packet, gap);
+                }
+                previous = Some(Previous { frames: packet.frames, qpc_100ns: packet.qpc_100ns, clock_frames: packet.clock.map(|c| c.frames) });
                 let stamp = stamper.stamp(packet, config.origin.now_ns());
                 let bytes = if packet.silent { None } else { bytes };
                 let mut source = ConvertSource { scratch: &mut *scratch, channels, frames: packet.frames as usize, bytes, wire: config.wire };
@@ -141,6 +188,37 @@ pub(crate) fn run(
                 Err(fault) => return fail(error, fault),
             }
         }
+    }
+}
+
+/// Deliver `gap` frames of zeros ending where `packet` starts, in blocks of at most the packet's
+/// size (the period), through the same silent-source path as a silent packet: the zeros come from
+/// the preallocated `scratch`, nothing allocates. The first block carries an invalid stamp, like
+/// the packet after a discontinuity, and so do the rest (the clock fit restarts at the packet).
+fn fill_gap(
+    capture: &mut CaptureCallback,
+    scratch: &mut [f32],
+    channels: usize,
+    config: &CaptureConfig,
+    stamper: &mut CaptureStamper,
+    packet: &Packet,
+    gap: u64,
+) {
+    let block = u64::from(packet.frames).max(1);
+    let mut position = packet.device_position.saturating_sub(gap);
+    let mut left = gap;
+    let mut stamp = stamper.invalid();
+    while left > 0 {
+        let frames = left.min(block);
+        let n = usize::try_from(frames).unwrap_or(usize::MAX);
+        let mut source = ConvertSource { scratch: &mut *scratch, channels, frames: n, bytes: None, wire: config.wire };
+        let mut zeros = CaptureBlock::new(n, stamp, config.format, &mut source);
+        zeros.device_position = Some(position);
+        capture(&mut zeros);
+        config.filled.fetch_add(frames, Ordering::Relaxed);
+        position += frames;
+        left -= frames;
+        stamp = Stamp::INVALID;
     }
 }
 
@@ -180,6 +258,8 @@ mod tests {
         Wait(Wake),
         /// A wake with this many ordinary packets behind it (no allocation in the fake).
         Normal(usize),
+        /// Like `Normal`, but every other packet (the first, third, ...) follows a loss of this many frames.
+        Lossy(usize, u64),
     }
 
     #[derive(Clone, Copy)]
@@ -188,16 +268,24 @@ mod tests {
         discontinuity: bool,
         timestamp_error: bool,
         frames: u32,
+        /// Device frames lost before this packet (the position jumps, the packet is flagged
+        /// separately).
+        skip: u64,
     }
 
     fn normal() -> ScriptedPacket {
-        ScriptedPacket { silent: false, discontinuity: false, timestamp_error: false, frames: PERIOD }
+        ScriptedPacket { silent: false, discontinuity: false, timestamp_error: false, frames: PERIOD, skip: 0 }
+    }
+
+    fn lost(skip: u64) -> ScriptedPacket {
+        ScriptedPacket { discontinuity: true, skip, ..normal() }
     }
 
     struct Fake {
         steps: VecDeque<Step>,
         waiting: VecDeque<ScriptedPacket>,
         pending_normal: usize,
+        lossy: Option<u64>,
         /// Device frames delivered so far (the position of the next packet).
         position: u64,
         fail_read: Option<Fault>,
@@ -214,6 +302,7 @@ mod tests {
                 steps: steps.into_iter().collect(),
                 waiting: VecDeque::new(),
                 pending_normal: 0,
+                lossy: None,
                 position: 0,
                 fail_read: None,
                 clock_ok: true,
@@ -240,7 +329,11 @@ mod tests {
                 }
                 Some(Step::Wait(wake)) => wake,
                 Some(Step::Normal(count)) => {
-                    self.pending_normal = count;
+                    (self.pending_normal, self.lossy) = (count, None);
+                    Wake::Event
+                }
+                Some(Step::Lossy(count, skip)) => {
+                    (self.pending_normal, self.lossy) = (count, Some(skip));
                     Wake::Event
                 }
                 None => Wake::Stop,
@@ -253,13 +346,18 @@ mod tests {
             let scripted = match self.waiting.pop_front() {
                 Some(scripted) => scripted,
                 None if self.pending_normal > 0 => {
+                    let left = self.pending_normal;
                     self.pending_normal -= 1;
-                    normal()
+                    match self.lossy {
+                        Some(skip) if left.is_multiple_of(2) => lost(skip),
+                        _ => normal(),
+                    }
                 }
                 None => return Ok(false),
             };
             self.gets += 1;
             let gets = self.gets;
+            self.position += scripted.skip;
             let packet = Packet {
                 frames: scripted.frames,
                 silent: scripted.silent,
@@ -298,6 +396,7 @@ mod tests {
             stamper: CaptureStamper::new(ORIGIN_QPC, 0, calibration),
             origin: HostOrigin::default(),
             timeout_ms: 250,
+            filled: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -381,6 +480,87 @@ mod tests {
         let quality: Vec<Quality> = run.seen.iter().map(|s| s.stamp.quality).collect();
         assert_eq!(quality, [Quality::BackendEstimate, Quality::BackendEstimate, Quality::Invalid, Quality::BackendEstimate]);
         assert_eq!(run.seen[2].frames, PERIOD as usize, "the data still reaches the recorder");
+    }
+
+    #[test]
+    fn a_discontinuity_with_a_known_position_jump_is_filled_with_exactly_that_many_zero_frames() {
+        let mut device = Fake::new([Step::Wake(vec![normal(), normal(), lost(300), normal()])]);
+        let config = config(None);
+        let run = drive(&mut device, &config);
+        // Two packets, the filler in period-sized blocks (128, 128, 44), the lost packet, one more.
+        assert_eq!(run.seen.iter().map(|s| s.frames).collect::<Vec<_>>(), [128, 128, 128, 128, 44, 128, 128]);
+        let filler = &run.seen[2..5];
+        assert!(filler.iter().all(|s| s.all_zero), "the gap is zeros");
+        assert_eq!(filler.iter().map(|s| s.frames).sum::<usize>(), 300);
+        // The filler sits where the lost frames were: it ends where the packet starts.
+        assert_eq!(filler[0].position, Some(2 * u64::from(PERIOD)));
+        assert_eq!(run.seen[5].position, Some(2 * u64::from(PERIOD) + 300));
+        assert_eq!(filler[0].stamp.quality, Quality::Invalid, "the first filled block restarts the fit");
+        assert_eq!(config.filled.load(Ordering::Relaxed), 300);
+        assert_eq!((run.stats.discontinuities, run.stats.packets, run.stats.frames), (1, 4, 4 * u64::from(PERIOD)));
+        assert!(!run.seen[5].all_zero, "the packet itself is delivered as it came");
+    }
+
+    #[test]
+    fn a_gap_is_bounded_at_one_second() {
+        let mut device = Fake::new([Step::Wake(vec![normal(), lost(10 * u64::from(RATE)), normal()])]);
+        let config = config(None);
+        let run = drive(&mut device, &config);
+        let filler: usize = run.seen[1..run.seen.len() - 2].iter().map(|s| s.frames).sum();
+        assert_eq!(filler, RATE as usize);
+        assert_eq!(config.filled.load(Ordering::Relaxed), u64::from(RATE));
+        assert!(run.seen[1..run.seen.len() - 2].iter().all(|s| s.all_zero));
+    }
+
+    #[test]
+    fn a_discontinuity_without_a_readable_position_uses_the_qpc_estimate() {
+        let mut device = Fake::new([Step::Wake(vec![normal(), lost(480), normal()])]);
+        device.clock_ok = false;
+        let config = config(None);
+        let run = drive(&mut device, &config);
+        assert_eq!(config.filled.load(Ordering::Relaxed), 480);
+        let filler: usize = run.seen[1..run.seen.len() - 2].iter().map(|s| s.frames).sum();
+        assert_eq!(filler, 480);
+        assert!(run.seen[1..run.seen.len() - 2].iter().all(|s| s.all_zero));
+    }
+
+    #[test]
+    fn a_discontinuity_with_no_jump_a_first_packet_or_a_timestamp_error_fills_nothing() {
+        let bad = ScriptedPacket { timestamp_error: true, discontinuity: true, skip: 500, ..normal() };
+        for steps in [vec![lost(0), normal()], vec![lost(700), normal()], vec![normal(), bad, normal()]] {
+            let mut device = Fake::new([Step::Wake(steps.clone())]);
+            let config = config(None);
+            let run = drive(&mut device, &config);
+            assert_eq!((run.seen.len(), config.filled.load(Ordering::Relaxed)), (steps.len(), 0));
+        }
+    }
+
+    #[test]
+    fn stamps_stay_monotonic_across_a_filled_gap() {
+        let mut device = Fake::new([Step::Wake(vec![normal(), normal(), lost(1000), normal(), normal()])]);
+        let run = drive(&mut device, &config(None));
+        let valid: Vec<Stamp> = run.seen.iter().map(|s| s.stamp).filter(|s| s.quality != Quality::Invalid).collect();
+        assert_eq!(valid.len(), 4, "the two before and the two after the gap");
+        for pair in valid.windows(2) {
+            assert!(pair[1].host_callback_ns > pair[0].host_callback_ns);
+            assert!(pair[1].backend_callback_ns >= pair[0].backend_callback_ns);
+            assert!(pair[1].backend_frame_ns >= pair[0].backend_frame_ns);
+        }
+    }
+
+    #[test]
+    fn filling_gaps_allocates_nothing() {
+        let mut device = Fake::new((0..50).map(|_| Step::Lossy(4, 480)));
+        let config = config(None);
+        let mut capture: CaptureCallback = Box::new(|block| block.chunks(&mut |_, s| assert!(s.len() <= 64 * CHANNELS)));
+        let mut error: ErrorCallback = Box::new(|_| {});
+        let mut scratch = vec![0.0f32; 64 * CHANNELS];
+        let mut stats = CaptureStats::default();
+        let (exit, allocations) = measure(|| run(&mut device, &config, &mut scratch, &mut capture, &mut error, &mut stats));
+        assert_eq!(exit, Exit::Stopped);
+        assert!(allocations.is_zero(), "the loop allocated: {allocations:?}");
+        // 100 packets follow a loss; the stream's first has nothing before it.
+        assert_eq!(config.filled.load(Ordering::Relaxed), 99 * 480);
     }
 
     #[test]

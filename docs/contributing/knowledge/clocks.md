@@ -108,3 +108,7 @@ residual. The `Measured` residual bound is therefore unchanged. Presentation jit
 discontinuity; measure it on the hardware before widening the bound.
 
 Tests: `crates/playback/src/device_clock/tests.rs`, `crates/playback/tests/backend_time_contract.rs`.
+
+## Capture gaps
+
+A native WASAPI capture packet flagged `DATA_DISCONTINUITY` has frames missing before it; the loop sizes the gap from the clock-position jump (QPC delta if unreadable), clamps it to one second, and delivers that many zero frames first (`crates/audio-wasapi/src/capture_loop.rs`, K16).

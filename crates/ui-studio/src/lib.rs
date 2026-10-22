@@ -732,6 +732,10 @@ impl StudioApp {
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
         self.poll_player();
+        self.step_measure();
+        if self.audio_devices.measuring.is_some() {
+            ctx.request_repaint();
+        }
         self.update_midi_live();
         self.step_poll();
         self.drive_editors();
