@@ -149,7 +149,7 @@ Also record, once per interface, `GetSharedModeEnginePeriod` (default, fundament
 maximum period in frames) from the Windows audio engine and paste it under the table; the harness
 does not read it yet (it arrives with the native backend).
 
-Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal), WASAPI exclusive, ASIO buffer sweep, re-measured with the drift detector](2026-10-22-ryzen-5900x-scarlett-2i2.md).
+Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal), WASAPI exclusive, ASIO buffer sweep, re-measured with the drift detector](2026-10-22-ryzen-5900x-scarlett-2i2.md); [2026-10-22 AMD Ryzen 9 5900X, TASCAM Model 12, WASAPI shared (native and cpal), WASAPI exclusive and mixed modes, ASIO not yet measurable](2026-10-22-ryzen-5900x-tascam-model12.md).
 
 ## Results
 

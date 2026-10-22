@@ -32,6 +32,8 @@ On the Scarlett 2i2 exclusive mode at 480 frames still measures about 223 ms rou
 in the Focusrite WDM driver, and ASIO is the low-latency path there. The app opens shared by default; exclusive is available via the "Take exclusive control of the device" checkbox (ADR 0016, amendment 2), because on a Model 12 it measures about 276 ms with silence on about half the opens. The cpal adapter opens shared
 streams only; it refuses `Mode::Exclusive`.
 
+Exclusive latency is driver-specific: the Scarlett's 223 ms is little better than its shared path, and the TASCAM Model 12 measures about 270 ms exclusive against 60 to 73 ms shared (K27) while the driver reports 10 ms. `audio-bench --in-mode shared|exclusive` opens the capture stream in a different mode than the render stream, which localizes a delay to one direction (on the Model 12 it follows the render stream).
+
 ## Instrumentation
 
 Each native stream keeps a `LoopStats` block of relaxed atomics (created at open, written by the loop,
