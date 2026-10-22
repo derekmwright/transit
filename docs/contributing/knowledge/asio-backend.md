@@ -282,7 +282,7 @@ backend error. The ADR 0015 hardware-insert click train through the Player
 326 frames (6.79 ms) on the Scarlett, output 2 to input 2 at 64 frames, against the bench's 294 to 300
 (the probe's view includes the input ring, known issue K22), and 984 frames (22.3 ms) on the Model 12,
 output 2 to input 1, every click found; without clearing the input ring after the open the Model 12
-read 1239 frames, one buffer more.
+read 1239 frames, one buffer more. On drivers whose loop phase changes between starts, such as the Model 12 (974 or 1239 frames, one buffer apart), remeasure hardware inserts after a reconnect.
 
 ## Next (slice d)
 

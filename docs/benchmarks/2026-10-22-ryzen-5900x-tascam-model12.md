@@ -76,7 +76,7 @@ or reset, against 60 to 73 ms for WASAPI shared (native) and 100 ms (cpal), and 
 WASAPI exclusive: ASIO is the tracking path on this interface. The driver reports 300 input plus 695
 output frames (995 frames, 22.6 ms); the loopback measures 244 frames (5.5 ms) more, almost exactly one
 256-frame buffer, and the stamp-time calibration agrees (245 frames, +-1). The callback time (12.8 us
-median, 22.8 us p95) is the conversion of 22 channels of packed 24-bit samples.
+median, 22.8 us p95) is the conversion of 22 channels of packed 24-bit samples. Two loop phases were observed, 974 frames (22.1 ms) and 1239 frames (28.1 ms), one buffer apart; the Player-level hardware-insert Measure read 1350 frames (28.1 ms) in the longer phase.
 
 ## Reading
 
