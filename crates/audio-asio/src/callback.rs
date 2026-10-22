@@ -28,6 +28,7 @@ use crate::abi::{self, AsioBool, AsioCallbacks, AsioLong, AsioSampleRate, AsioTi
 use crate::com::{CallbackDriver, Event};
 use crate::convert::{InputPlanes, OutputPlanes};
 use crate::engine::{Engine, Time};
+use crate::mmcss::Mmcss;
 use crate::stats::DriverEvents;
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -176,6 +177,8 @@ pub(crate) struct CallbackState {
     /// The QPC (100 ns) of the last buffer switch's entry, 0 before the first since the driver
     /// started: what the host thread's watchdog reads.
     last_switch: AtomicU64,
+    /// The buffer-switch thread's MMCSS registration, tended at each switch.
+    mmcss: Arc<Mmcss>,
 }
 
 // SAFETY: the `UnsafeCell`s are only accessed under `busy` (an acquire compare-exchange to take it,
@@ -185,7 +188,7 @@ pub(crate) struct CallbackState {
 unsafe impl Sync for CallbackState {}
 
 impl CallbackState {
-    pub(crate) fn new(engine: Engine, driver: CallbackDriver, events: Arc<DriverEvents>, wake: Arc<Event>) -> Box<Self> {
+    pub(crate) fn new(engine: Engine, driver: CallbackDriver, events: Arc<DriverEvents>, wake: Arc<Event>, mmcss: Arc<Mmcss>) -> Box<Self> {
         let rate = f64::from(engine.rate());
         Box::new(Self {
             busy: AtomicBool::new(false),
@@ -201,6 +204,7 @@ impl CallbackState {
             wake,
             busy_skips: AtomicU64::new(0),
             last_switch: AtomicU64::new(0),
+            mmcss,
         })
     }
 
@@ -234,6 +238,7 @@ impl CallbackState {
     /// One buffer switch on the driver's thread.
     fn switch(&self, index: AsioLong, time: Time, arrival_100ns: u64) {
         self.last_switch.store(arrival_100ns, Ordering::Relaxed);
+        self.mmcss.tend();
         if !self.try_take() {
             self.busy_skips.fetch_add(1, Ordering::Relaxed);
             return;

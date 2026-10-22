@@ -19,9 +19,12 @@
 //!   [`watchdog`] and reported as `StreamError::Stalled`.
 //! - [`AsioFactory`] hands out one process-wide backend: one host thread and one enumeration cache.
 //!
+//! - The buffer-switch thread joins the MMCSS task "Pro Audio" at its first switch after each
+//!   driver start and leaves it at the stop ([`mmcss`]); the host thread runs above normal priority.
+//!
 //! This is a sanctioned `unsafe` crate (ADR 0013 and the draft amendment): all `unsafe` is in
-//! [`com`] (COM, registry, window, vtable calls) and [`callback`] (the driver's callbacks and the
-//! buffers they touch), each block with a `// SAFETY:` comment.
+//! [`com`] (COM, registry, window, vtable, MMCSS and thread-priority calls) and [`callback`] (the
+//! driver's callbacks and the buffers they touch), each block with a `// SAFETY:` comment.
 #![cfg(all(windows, target_pointer_width = "64"))]
 // The callback modules (`callback`, `engine`, `convert`, `stats`) deny these lints; control-thread
 // code may allocate and format.
@@ -34,6 +37,7 @@ mod convert;
 pub mod driver;
 mod engine;
 mod host;
+mod mmcss;
 mod session;
 mod stats;
 #[cfg(test)]
@@ -278,6 +282,7 @@ impl AsioBackend {
             origin: request.origin,
             latency,
             system_step: opened.system_step,
+            mmcss: opened.mmcss,
             owner: opened.owner,
         };
         Ok((stream, achieved))
@@ -295,6 +300,7 @@ pub(crate) struct AsioStream {
     origin: ab::HostOrigin,
     latency: Option<Duration>,
     system_step: Arc<AtomicU64>,
+    mmcss: Arc<mmcss::Mmcss>,
     owner: SideOwner,
 }
 
@@ -329,9 +335,12 @@ impl ab::Stream for AsioStream {
         self.latency
     }
 
-    /// The callback runs on the driver's own thread; its priority is the driver's.
+    /// The callback runs on the driver's own thread, which its first buffer switch after a start
+    /// registers with MMCSS "Pro Audio" ([`mmcss`]): `Pending` until then, `MmcssProAudio` (or
+    /// `PromotionFailed`) while it runs, `Released` after the stop; `Unobserved` when the driver
+    /// calls back on the host thread.
     fn thread_priority(&self) -> ab::WorkerPriority {
-        ab::WorkerPriority::Unobserved
+        self.mmcss.priority()
     }
 
     fn stats(&self) -> Option<ab::StreamStats> {
@@ -858,8 +867,11 @@ mod hardware {
         std::thread::sleep(Duration::from_secs(2));
         let elapsed = started.elapsed();
         let (rs, cs) = (ab::Stream::stats(&render).expect("stats"), ab::Stream::stats(&capture).expect("stats"));
+        let running = ab::Stream::thread_priority(&render);
         ab::Stream::stop(&render).expect("stop render");
         ab::Stream::stop(&capture).expect("stop capture");
+        let stopped = ab::Stream::thread_priority(&render);
+        println!("{driver}: buffer-switch thread MMCSS while running {running:?}, after the stop {stopped:?}");
         println!("{driver}: render backend: {}{}", rs.line(false), rs.events_tail());
         println!("{driver}: capture backend: {}{}", cs.line(true), cs.events_tail());
         println!("{driver}: systemTime step {:?} ns; first stamps {:?}", render.system_time_step_ns(), tally.first.lock().map(|f| f.clone()));
@@ -873,6 +885,7 @@ mod hardware {
         assert!(c as f64 > expected * 0.8, "capture callbacks {c}");
         assert_eq!((tally.invalid.load(Relaxed), tally.errors.load(Relaxed)), (0, 0), "invalid stamps, stream errors");
         assert_eq!(rs.overloads, 0);
+        assert_eq!((running, stopped), (ab::WorkerPriority::MmcssProAudio, ab::WorkerPriority::Released), "MMCSS joined and left");
     }
 
     #[test]

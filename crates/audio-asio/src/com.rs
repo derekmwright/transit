@@ -1,6 +1,8 @@
 //! The COM, registry and Win32 calls of the backend and the calls through the `IASIO` vtable (with
-//! its test double, [`fake`], in the same file). The only other `unsafe` of the crate is in
-//! [`crate::callback`]: the driver's callbacks and the buffers they touch.
+//! its test double, [`fake`], in the same file), and the thread scheduling calls: MMCSS for the
+//! buffer-switch thread ([`MMCSS`], hand-written `avrt.dll` bindings) and the host thread's
+//! priority. The only other `unsafe` of the crate is in [`crate::callback`]: the driver's callbacks
+//! and the buffers they touch.
 //!
 //! Threading rule: a [`Driver`] is created, initialized, called and released on one thread, the
 //! ASIO host thread of [`crate::host`], which initialized COM as a single-threaded apartment. The
@@ -33,7 +35,9 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW,
     RegOpenKeyExW,
 };
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, GetCurrentThreadId, INFINITE, SetEvent, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
     TranslateMessage, WINDOW_EX_STYLE, WS_OVERLAPPED,
@@ -624,6 +628,76 @@ pub(crate) fn registry_drivers() -> Result<Vec<DriverEntry>, ab::OpenError> {
     Ok(entries)
 }
 
+/// `avrt.dll`, declared by hand (no new crate, no import library: `raw-dylib`). Signatures from
+/// `avrt.h`: `HANDLE AvSetMmThreadCharacteristicsW(LPCWSTR TaskName, LPDWORD TaskIndex)` and
+/// `BOOL AvRevertMmThreadCharacteristics(HANDLE AvrtHandle)`, both `WINAPI` (`system`).
+mod avrt {
+    use std::ffi::c_void;
+
+    #[link(name = "avrt.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    unsafe extern "system" {
+        pub(super) fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> *mut c_void;
+        pub(super) fn AvRevertMmThreadCharacteristics(avrt_handle: *mut c_void) -> i32;
+    }
+}
+
+/// The MMCSS task name "Pro Audio", NUL-terminated UTF-16 (defined under `HKLM\SOFTWARE\Microsoft/// Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks`).
+const PRO_AUDIO: [u16; 10] = [0x50, 0x72, 0x6f, 0x20, 0x41, 0x75, 0x64, 0x69, 0x6f, 0];
+
+/// The calling thread's last-error value.
+fn last_error() -> u32 {
+    // SAFETY: `GetLastError` reads the calling thread's last-error value; no arguments.
+    unsafe { windows::Win32::Foundation::GetLastError() }.0
+}
+
+/// Registers the calling thread with the MMCSS task "Pro Audio" (the buffer-switch thread, from
+/// its first switch after a start; [`crate::mmcss`]): its handle, or the OS error. Allocation-free
+/// on our side; the OS call may allocate inside the OS.
+fn mmcss_register() -> Result<usize, u32> {
+    let mut task_index = 0u32;
+    // SAFETY: `PRO_AUDIO` is a NUL-terminated UTF-16 string in static memory, valid for the call;
+    // `task_index` is a live, writable `u32` the call fills in. The call has no other
+    // preconditions and acts on the calling thread; it returns null on failure (checked below,
+    // with `GetLastError` read on the same thread right after).
+    let handle = unsafe { avrt::AvSetMmThreadCharacteristicsW(PRO_AUDIO.as_ptr(), &raw mut task_index) };
+    if handle.is_null() { Err(last_error()) } else { Ok(handle as usize) }
+}
+
+/// Ends the MMCSS registration `handle` ([`mmcss_register`]'s): Ok, or the OS error.
+fn mmcss_revert(handle: usize) -> Result<(), u32> {
+    // SAFETY: `handle` is a non-null handle `AvSetMmThreadCharacteristicsW` returned and that has
+    // not been reverted ([`crate::mmcss::Mmcss`] swaps it out before it calls this, so it is
+    // reverted at most once). It is called on the registered thread at its last buffer switch, or
+    // from the host thread once the driver stopped calling back; a refusal is a return value.
+    if unsafe { avrt::AvRevertMmThreadCharacteristics(handle as *mut c_void) } != 0 { Ok(()) } else { Err(last_error()) }
+}
+
+/// The calling thread's id.
+pub(crate) fn current_thread_id() -> u32 {
+    // SAFETY: `GetCurrentThreadId` has no arguments and cannot fail.
+    unsafe { GetCurrentThreadId() }
+}
+
+/// The real MMCSS calls.
+pub(crate) const MMCSS: crate::mmcss::Hooks = crate::mmcss::Hooks { register: mmcss_register, revert: mmcss_revert, thread_id: current_thread_id };
+
+/// Raises the calling thread (the host thread, at its start) to `THREAD_PRIORITY_ABOVE_NORMAL`:
+/// it serves the driver's messages, the watchdog and the stream requests, but never runs audio
+/// itself, so it stays below the time-critical and MMCSS threads.
+pub(crate) fn raise_host_priority() -> Result<(), ab::OpenError> {
+    // SAFETY: `GetCurrentThread` returns the calling thread's pseudo-handle (no closing needed),
+    // which has the set right; the level is a documented `THREAD_PRIORITY_*` constant.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) }
+        .map_err(|e| ab::OpenError::Other(format!("SetThreadPriority for the ASIO host thread: {e}")))
+}
+
+/// The calling thread's priority level (`GetThreadPriority`).
+#[cfg(test)]
+pub(crate) fn current_thread_priority() -> i32 {
+    // SAFETY: the calling thread's pseudo-handle, which has the query right.
+    unsafe { windows::Win32::System::Threading::GetThreadPriority(GetCurrentThread()) }
+}
+
 /// The real loader: the registry and `CoCreateInstance`.
 pub(crate) struct ComLoader;
 
@@ -1116,6 +1190,10 @@ pub(crate) mod fake {
     impl Loader for FakeLoader {
         fn list(&self) -> Result<Vec<DriverEntry>, ab::OpenError> {
             Ok(self.drivers.iter().map(|(e, _)| e.clone()).collect())
+        }
+        /// Counting MMCSS calls ([`crate::mmcss::testing`]): no test thread is really registered.
+        fn mmcss(&self) -> crate::mmcss::Hooks {
+            crate::mmcss::testing::HOOKS
         }
         fn create(&self, entry: &DriverEntry) -> Result<Driver, ab::OpenError> {
             if self.create_fails.contains(&entry.name) {

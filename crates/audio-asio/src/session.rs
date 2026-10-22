@@ -13,6 +13,10 @@
 //! session ends (buffers disposed, callback state freed, the driver unloaded unless a
 //! [`crate::Loaded`] handle holds it) when both streams are dropped.
 //!
+//! **MMCSS.** Each driver start arms the session's [`Mmcss`]: the first buffer switch registers its
+//! thread with "Pro Audio"; before the driver's `stop` the registration is reverted (see
+//! [`crate::mmcss`]).
+//!
 //! **The watchdog.** While the driver runs, the host thread checks between requests whether its
 //! buffer switches still come ([`Session::tend`], [`crate::watchdog`]); a driver silent for longer
 //! than the limit gets each open stream a `StreamError::Stalled`, once per start.
@@ -24,6 +28,7 @@ use crate::com::{Buffers, ChannelCount, Driver, Event, Running};
 use crate::convert::Wire;
 use crate::driver::{BufferSize, DriverInfo, asio_error};
 use crate::engine::{DETACHED, Engine, Latencies, OPENED, STARTED, STOPPED, Side, SideShared};
+use crate::mmcss::{Mmcss, Released};
 use crate::stats::DriverEvents;
 use crate::watchdog::Watchdog;
 use std::sync::Arc;
@@ -63,6 +68,8 @@ pub(crate) struct Opened {
     pub(crate) generation: u64,
     /// The smallest step of the driver's `systemTime` seen (ns; `u64::MAX` before two readings).
     pub(crate) system_step: Arc<AtomicU64>,
+    /// The MMCSS registration of the buffer-switch thread (the stream's `thread_priority`).
+    pub(crate) mmcss: Arc<Mmcss>,
 }
 
 enum BufferState {
@@ -85,6 +92,7 @@ pub(crate) struct Session {
     events: Arc<DriverEvents>,
     system_step: Arc<AtomicU64>,
     watchdog: Watchdog,
+    mmcss: Arc<Mmcss>,
     installed: Installed,
 }
 
@@ -169,6 +177,7 @@ impl Session {
         info: &DriverInfo,
         wake: Arc<Event>,
         watchdog_floor: Duration,
+        mmcss: crate::mmcss::Hooks,
         request: &ab::OpenRequest,
         callback: Callback,
         error: ab::ErrorCallback,
@@ -182,7 +191,8 @@ impl Session {
         let latencies = Arc::new(Latencies::default());
         let engine = Engine::new(frames, format.rate, Arc::clone(&events), Arc::clone(&latencies));
         let system_step = engine.system_time_step_ns();
-        let state = CallbackState::new(engine, driver.callback_driver(), Arc::clone(&events), wake);
+        let mmcss = Arc::new(Mmcss::new(mmcss));
+        let state = CallbackState::new(engine, driver.callback_driver(), Arc::clone(&events), wake, Arc::clone(&mmcss));
         let installed = Installed::install(state)
             .map_err(|_| ab::OpenError::InUse(format!("ASIO driver \"{name}\": another ASIO stream session is active in this process")))?;
         let mut session = Self {
@@ -197,6 +207,7 @@ impl Session {
             events,
             system_step,
             watchdog: Watchdog::new(frames, format.rate, watchdog_floor),
+            mmcss,
             installed,
         };
         let opened = session.add(name, driver, wire, format, request, callback, error)?;
@@ -290,7 +301,13 @@ impl Session {
             min_period: self.min_frames,
             buffer_frames: Some(frames),
         };
-        Ok(Opened { owner: SideOwner(shared), achieved, generation: self.generation, system_step: Arc::clone(&self.system_step) })
+        Ok(Opened {
+            owner: SideOwner(shared),
+            achieved,
+            generation: self.generation,
+            system_step: Arc::clone(&self.system_step),
+            mmcss: Arc::clone(&self.mmcss),
+        })
     }
 
     /// Drops a direction that failed to open from the engine and the session.
@@ -431,6 +448,7 @@ impl Session {
                 });
                 side.start(pair.0, pair.1);
                 self.installed.state().forget_last_switch();
+                self.mmcss.arm();
                 match driver.start(buffers) {
                     Ok(running) => {
                         self.buffers = BufferState::Running(running);
@@ -489,6 +507,7 @@ impl Session {
         self.buffers = match std::mem::replace(&mut self.buffers, BufferState::Missing) {
             BufferState::Running(running) => {
                 self.watchdog.disarm();
+                self.release_mmcss(name);
                 let (buffers, result) = driver.stop(running);
                 if let Err(code) = result {
                     log::warn!("{}", asio_error(name, "stop", code));
@@ -497,6 +516,23 @@ impl Session {
             }
             other => other,
         };
+    }
+
+    /// Reverts the buffer-switch thread's MMCSS registration before the driver stops: on that
+    /// thread at its next switch, within three buffers (20 to 200 ms), else from here.
+    fn release_mmcss(&self, name: &str) {
+        let period = Duration::from_secs_f64(self.frames as f64 / f64::from(self.rate.max(1)));
+        let wait = (period * 3).clamp(Duration::from_millis(20), Duration::from_millis(200));
+        if self.mmcss.priority() == ab::WorkerPriority::PromotionFailed {
+            log::warn!("ASIO driver \"{name}\": MMCSS refused the buffer-switch thread (error {})", self.mmcss.error());
+        }
+        match self.mmcss.release(wait) {
+            Released::Nothing => {}
+            Released::OnItsThread => log::debug!("ASIO driver \"{name}\": the buffer-switch thread left MMCSS at the stop"),
+            Released::FromHost => log::info!("ASIO driver \"{name}\": no buffer switch at the stop; MMCSS reverted from the host thread"),
+            Released::Failed(code) => log::warn!("ASIO driver \"{name}\": AvRevertMmThreadCharacteristics failed (error {code})"),
+            Released::Abandoned => log::warn!("ASIO driver \"{name}\": a buffer switch was still registering with MMCSS at the stop"),
+        }
     }
 
     /// Stops the driver, disposes the buffers and frees the callback state (and the callbacks).

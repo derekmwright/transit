@@ -469,6 +469,99 @@ fn the_watchdog_leaves_a_driver_that_calls_back_and_a_stopped_one_alone() {
     drop((capture, render));
 }
 
+/// Runs buffer switches from a thread of its own (the driver's) every millisecond until `stop`.
+fn driver_thread<'s>(
+    scope: &'s std::thread::Scope<'s, '_>,
+    rig: &'s Rig,
+    stop: &'s std::sync::atomic::AtomicBool,
+) -> std::thread::ScopedJoinHandle<'s, u32> {
+    scope.spawn(move || {
+        let mut position = 0;
+        while !stop.load(Ordering::SeqCst) {
+            drive(rig, 64, position, 1, &[]);
+            position += 64;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        crate::com::current_thread_id()
+    })
+}
+
+#[test]
+fn the_buffer_switch_thread_joins_mmcss_at_its_first_switch_and_leaves_it_at_the_stop() {
+    use crate::mmcss::testing as mmcss;
+    let _guard = lock();
+    mmcss::reset();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (capture, render, _, _) = duplex(&rig, 48_000, Some(64), &seen, vec![0.0; 2]);
+    assert_eq!(render.thread_priority(), ab::WorkerPriority::Pending, "no buffer switch yet");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let driver = std::thread::scope(|s| {
+        let driver = driver_thread(s, &rig, &stop);
+        while mmcss::REGISTERS.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!((render.thread_priority(), capture.thread_priority()), (ab::WorkerPriority::MmcssProAudio, ab::WorkerPriority::MmcssProAudio));
+        assert_eq!(mmcss::REGISTERS.load(Ordering::SeqCst), 1, "once per start, not per buffer");
+        render.stop().expect("stop render");
+        assert_eq!(mmcss::REVERTS.load(Ordering::SeqCst), 0, "the capture keeps the driver running");
+        capture.stop().expect("stop capture: the driver stops");
+        stop.store(true, Ordering::SeqCst);
+        driver.join().unwrap()
+    });
+    assert_eq!(mmcss::REGISTERED_ON.load(Ordering::SeqCst), driver, "the driver's thread registered itself");
+    assert_eq!((mmcss::REVERTS.load(Ordering::SeqCst), mmcss::REVERTED_ON.load(Ordering::SeqCst)), (1, driver), "and reverted on itself");
+    assert_eq!(render.thread_priority(), ab::WorkerPriority::Released);
+    assert!(seen.errors.lock().unwrap().is_empty());
+    drop((capture, render));
+}
+
+#[test]
+fn a_driver_that_does_not_call_at_the_stop_is_reverted_from_the_host_and_a_restart_registers_again() {
+    use crate::mmcss::testing as mmcss;
+    let _guard = lock();
+    mmcss::reset();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (capture, render) = (
+        rig.backend
+            .open_capture(
+                &rig.endpoint,
+                &request(&rig, ab::Direction::Input, 48_000, Some(64)),
+                capture_cb(&seen),
+                error_cb(&seen, ab::Direction::Input),
+            )
+            .expect("in")
+            .0,
+        rig.backend
+            .open_render(
+                &rig.endpoint,
+                &request(&rig, ab::Direction::Output, 48_000, Some(64)),
+                render_cb(&seen, vec![0.0; 2]),
+                error_cb(&seen, ab::Direction::Output),
+            )
+            .expect("out")
+            .0,
+    );
+    capture.start().expect("start capture");
+    drive(&rig, 64, 0, 2, &[]);
+    assert_eq!(mmcss::REGISTERS.load(Ordering::SeqCst), 1);
+    capture.stop().expect("stop: the driver stops, with no buffer switch to come");
+    assert_eq!(mmcss::REVERTS.load(Ordering::SeqCst), 1, "reverted after the wait");
+    assert_ne!(mmcss::REVERTED_ON.load(Ordering::SeqCst), crate::com::current_thread_id(), "from the host thread, not the test's");
+    assert_eq!(capture.thread_priority(), ab::WorkerPriority::Released);
+    // The render direction starts the driver again: its first switch registers again.
+    render.start().expect("start render");
+    assert_eq!(render.thread_priority(), ab::WorkerPriority::Pending);
+    mmcss::FAIL.store(true, Ordering::SeqCst);
+    drive(&rig, 64, 128, 2, &[]);
+    assert_eq!(render.thread_priority(), ab::WorkerPriority::PromotionFailed, "a refusal is reported, and playback goes on");
+    assert_eq!(seen.render.lock().unwrap().len(), 2);
+    drop((capture, render));
+    assert_eq!(mmcss::REVERTS.load(Ordering::SeqCst), 1, "nothing to revert after a refusal");
+}
+
 #[test]
 fn overloads_resyncs_and_position_jumps_are_counted() {
     let _guard = lock();

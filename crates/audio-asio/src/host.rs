@@ -50,6 +50,10 @@ use transit_audio_backend as ab;
 pub(crate) trait Loader: Send + 'static {
     fn list(&self) -> Result<Vec<DriverEntry>, ab::OpenError>;
     fn create(&self, entry: &DriverEntry) -> Result<Driver, ab::OpenError>;
+    /// The MMCSS calls the sessions' buffer-switch threads make ([`crate::mmcss`]).
+    fn mmcss(&self) -> crate::mmcss::Hooks {
+        crate::com::MMCSS
+    }
 }
 
 /// The one-loaded-driver rule: holds the name of the driver loaded in this process.
@@ -222,12 +226,12 @@ impl HostState {
             Some(open) if open == entry.name => {}
             Some(open) => return Err(Self::in_use(&open, entry)),
         }
-        let (wake, floor) = (Arc::clone(&self.wake), self.watchdog_floor);
+        let (wake, floor, mmcss) = (Arc::clone(&self.wake), self.watchdog_floor, self.loader.mmcss());
         let Some(loaded) = self.loaded.as_mut() else { return Err(not_open(&entry.name)) };
         let Loaded { entry: open, info, session, driver, .. } = &mut *loaded;
         let result = match session.as_mut() {
             Some(session) => session.attach(&open.name, driver, info, request, callback, error),
-            None => Session::open(&open.name, driver, info, wake, floor, request, callback, error).map(|(s, opened)| {
+            None => Session::open(&open.name, driver, info, wake, floor, mmcss, request, callback, error).map(|(s, opened)| {
                 *session = Some(s);
                 opened
             }),
@@ -501,6 +505,9 @@ fn run(
             return;
         }
     };
+    if let Err(e) = crate::com::raise_host_priority() {
+        log::warn!("ASIO: {e}; the host thread runs at normal priority");
+    }
     let window = match MessageWindow::new() {
         Ok(window) => window,
         Err(e) => {
@@ -634,6 +641,13 @@ mod tests {
         assert!(!host.is_stuck());
         assert_eq!(observed.live.load(Ordering::Acquire), 0, "the abandoned load was undone");
         assert!(slot.claim("x").is_ok(), "and the slot freed");
+    }
+
+    #[test]
+    fn the_host_thread_runs_above_normal_priority() {
+        let (host, _) = host(Vec::new(), Slot::default(), Duration::from_secs(10));
+        let level = host.call("priority", |_| Ok(crate::com::current_thread_priority())).expect("answers");
+        assert_eq!(level, windows::Win32::System::Threading::THREAD_PRIORITY_ABOVE_NORMAL.0);
     }
 
     #[test]
