@@ -528,7 +528,12 @@ fn the_native_backend_is_asked_for_exclusive_unless_the_user_shares_the_device()
 #[test]
 fn a_refused_period_retries_exclusive_at_the_device_period_and_says_so() {
     let native = fake_at_128();
-    native.fail_next_open(ab::OpenError::Other("Initialize(exclusive): the period is outside the range the device accepts".into()));
+    native.fail_next_open(ab::OpenError::PeriodRefused {
+        requested_frames: 128,
+        min_frames: Some(144),
+        default_frames: Some(480),
+        message: "Initialize(exclusive): the period is outside the range the device accepts".into(),
+    });
     let cfg = AudioConfig { buffer_size: Some(128), ..Default::default() };
     let fallback = fake_factory(false);
     let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &native, &fallback).unwrap();
@@ -543,7 +548,12 @@ fn a_refused_period_retries_exclusive_at_the_device_period_and_says_so() {
 #[test]
 fn a_period_error_at_the_device_period_has_no_step_left_and_falls_back_to_cpal() {
     let native = fake_factory(false);
-    native.fail_next_open(ab::OpenError::Other("Initialize(exclusive): the period is outside the range the device accepts".into()));
+    native.fail_next_open(ab::OpenError::PeriodRefused {
+        requested_frames: 128,
+        min_frames: Some(144),
+        default_frames: Some(480),
+        message: "Initialize(exclusive): the period is outside the range the device accepts".into(),
+    });
     let fallback = fake_factory(false);
     let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).unwrap();
     assert!(!player.native_backend);

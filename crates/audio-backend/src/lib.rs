@@ -248,15 +248,26 @@ pub enum OpenError {
     /// The endpoint's settings forbid exclusive use (`AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`: the
     /// "Allow applications to take exclusive control" box in its Advanced properties is cleared).
     ExclusiveDisallowed(String),
+    /// The device refuses the requested exclusive period (`AUDCLNT_E_BUFFER_SIZE_ERROR`): it is
+    /// outside the range the device accepts. The frames are at the stream's rate; the range is
+    /// what the device reported, where it did.
+    PeriodRefused {
+        requested_frames: u32,
+        min_frames: Option<u32>,
+        default_frames: Option<u32>,
+        message: String,
+    },
     Other(String),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::DeviceNotAvailable(text) | OpenError::InUse(text) | OpenError::ExclusiveDisallowed(text) | OpenError::Other(text) => {
-                f.write_str(text)
-            }
+            OpenError::DeviceNotAvailable(text)
+            | OpenError::InUse(text)
+            | OpenError::ExclusiveDisallowed(text)
+            | OpenError::PeriodRefused { message: text, .. }
+            | OpenError::Other(text) => f.write_str(text),
         }
     }
 }

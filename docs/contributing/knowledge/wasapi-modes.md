@@ -21,7 +21,7 @@ silenced while it is open. What changes:
   padding is not read.
 - **Alignment retry.** `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` means: read the aligned frames from
   `GetBufferSize`, drop the client, activate a new one and `Initialize` once more at that size (a failed
-  `Initialize` cannot be retried on the same client). `AUDCLNT_E_BUFFER_SIZE_ERROR` names the range.
+  `Initialize` cannot be retried on the same client). `AUDCLNT_E_BUFFER_SIZE_ERROR` names the range and is returned as the typed `OpenError::PeriodRefused` (requested, minimum and default frames), which the app's ladder matches to retry at the device period.
 - **Errors.** `AUDCLNT_E_DEVICE_IN_USE` is `OpenError::InUse` (another app holds it);
   `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` is `OpenError::ExclusiveDisallowed` (the endpoint's Advanced
   settings forbid it); a gone endpoint is `DeviceNotAvailable`. No raw mode, no `AUTOCONVERTPCM`.

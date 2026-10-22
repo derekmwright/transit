@@ -1056,8 +1056,7 @@ fn exclusive_fallback(step: OpenStep, cfg: &AudioConfig, error: &ab::OpenError) 
     }
     let shared = OpenStep { mode: Some(ab::Mode::Shared), default_period: false };
     match error {
-        // The backend words a period the driver refuses with "period" in the message.
-        ab::OpenError::Other(text) if text.contains("period") => {
+        ab::OpenError::PeriodRefused { .. } => {
             let frames = cfg.buffer_size.filter(|_| !step.default_period)?;
             Some((OpenStep { default_period: true, ..step }, format!("Exclusive mode could not use {frames} frames; using the device period")))
         }

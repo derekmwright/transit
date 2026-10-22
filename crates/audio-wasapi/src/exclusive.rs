@@ -151,13 +151,18 @@ fn period_text(duration_100ns: i64, rate: u32) -> String {
 fn initialize_error(error: &ApiError, rate: u32, requested_100ns: i64, default_100ns: i64, min_100ns: i64) -> ab::OpenError {
     let requested = period_text(requested_100ns, rate);
     match error.code {
-        E_BUFFER_SIZE_ERROR => ab::OpenError::Other(format!(
-            "Initialize(exclusive): the period of {requested} is outside the range the device accepts: at least {} at {rate} Hz, \
-             default {} ({})",
-            period_text(min_100ns, rate),
-            period_text(default_100ns, rate),
-            error.text
-        )),
+        E_BUFFER_SIZE_ERROR => ab::OpenError::PeriodRefused {
+            requested_frames: frames_of_100ns(requested_100ns, rate),
+            min_frames: Some(frames_of_100ns(min_100ns, rate)),
+            default_frames: Some(frames_of_100ns(default_100ns, rate)),
+            message: format!(
+                "Initialize(exclusive): the period of {requested} is outside the range the device accepts: at least {} at {rate} Hz, \
+                 default {} ({})",
+                period_text(min_100ns, rate),
+                period_text(default_100ns, rate),
+                error.text
+            ),
+        },
         E_ENDPOINT_CREATE_FAILED => ab::OpenError::DeviceNotAvailable(format!(
             "Initialize(exclusive) at a period of {requested}, {rate} Hz: {} (some drivers answer an unsupported period this way; \
              the device default is {})",
@@ -324,7 +329,8 @@ mod tests {
         let mut fake = scarlett();
         fake.inits.push_back(Err(E_BUFFER_SIZE_ERROR));
         let error = open(&mut fake, &i32_24(48_000), ab::Period::Frames(16)).err().unwrap();
-        let ab::OpenError::Other(text) = error else { panic!("{error:?}") };
+        let ab::OpenError::PeriodRefused { requested_frames, min_frames, default_frames, message: text } = error else { panic!("{error:?}") };
+        assert_eq!((requested_frames, min_frames, default_frames), (16, Some(144), Some(480)));
         assert!(text.contains("the period of 16 frames (0.33 ms) is outside"), "{text}");
         assert!(text.contains("at least 144 frames (3.00 ms) at 48000 Hz, default 480 frames (10.00 ms)"), "{text}");
     }
