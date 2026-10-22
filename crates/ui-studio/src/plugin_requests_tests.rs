@@ -14,6 +14,9 @@ const REQUESTS: &str = "clap:org.soundcraft.test.requests";
 fn requests_fixture() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
+        // Only the fixture folder: the first `create` runs a scan, which must not read the
+        // machine's installed plug-ins.
+        soundcraft_clap_host::set_scan_extra_dirs_only(true);
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../clap-host/tests/fixture/Cargo.toml");
         let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp/clap-requests-fixture-target");
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
@@ -50,6 +53,17 @@ fn frame(app: &mut StudioApp, ctx: &egui::Context) {
 
 #[test]
 fn the_frame_loop_restarts_a_gui_less_clap_plugin_with_no_audio_running() {
+    // The host registry is process-global: `create` below scans and publishes the fixture, which
+    // every other test in this process would then see as an installed plug-in. Run in a child.
+    if std::env::var_os("TRANSIT_REQUESTS_FIXTURE_CHILD").is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "plugin_requests_tests::the_frame_loop_restarts_a_gui_less_clap_plugin_with_no_audio_running", "--nocapture"])
+            .env("TRANSIT_REQUESTS_FIXTURE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
     requests_fixture();
     let mut app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
     let ctx = egui::Context::default();

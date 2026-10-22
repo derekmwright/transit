@@ -139,6 +139,17 @@ fn inspect_reports_the_plugin_scan_without_starting_one() {
     assert!(scan["vst3"].is_null() && scan["clap"].is_null());
 }
 
+/// Guard: the host registries are process-global, so a test that registers plug-in folders or
+/// runs a scan in this process leaks into every other test (and a scan reads the machine's
+/// installed plug-ins). Such tests must run in a child process (see `plugin_requests_tests`).
+/// With no scan started and no folders registered, no test here can see a real plug-in library.
+#[test]
+fn the_shared_host_registries_hold_no_scan_folders_or_results() {
+    assert!(soundcraft_clap_host::cached().is_none() && soundcraft_vst3_host::cached().is_none(), "a test scanned in the shared process");
+    assert!(soundcraft_clap_host::search_dirs().1.is_empty(), "a test registered a CLAP folder in the shared process");
+    assert!(soundcraft_vst3_host::search_dirs().1.is_empty(), "a test registered a VST3 folder in the shared process");
+}
+
 /// Run frames of the real UI, feeding `app.synthetic` like the control channel does.
 fn frames(app: &mut StudioApp, ctx: &egui::Context, n: usize, t0: &mut f64) {
     for _ in 0..n {
