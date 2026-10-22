@@ -450,6 +450,7 @@ dependencies = [
 name = "audio-bench"
 version = "0.8.0"
 dependencies = [
+ "asio-sys",
  "serde_json",
  "soundcraft-playback",
  "transit-audio-backend",

@@ -152,11 +152,55 @@ pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
 pub fn list_devices(system: Option<&str>) -> Result<String, String> {
     let backend = cpal_backend(system)?;
     let mut text = format!("system: {}\n", backend.system());
+    #[cfg(all(windows, feature = "asio"))]
+    let mut listed: Vec<String> = Vec::new();
     for (label, direction) in [("outputs", ab::Direction::Output), ("inputs", ab::Direction::Input)] {
         text.push_str(&format!("{label}:\n"));
         for endpoint in backend.endpoints(direction).map_err(|e| e.to_string())? {
             text.push_str(&format!("  {} ({} ch)\n", endpoint.name, endpoint.inputs.max(endpoint.outputs)));
+            #[cfg(all(windows, feature = "asio"))]
+            listed.push(endpoint.name.clone());
+        }
+    }
+    #[cfg(all(windows, feature = "asio"))]
+    if backend.system().eq_ignore_ascii_case("ASIO") {
+        // Release cpal's loaded driver first: ASIO holds one driver at a time, and a still-loaded
+        // one would make every probe below fail with "already exists".
+        drop(backend);
+        for line in unlisted_asio_drivers(&listed) {
+            text.push_str(&line);
+            text.push('\n');
         }
     }
     Ok(text)
+}
+
+/// One `driver "<name>": <error>` line per registered ASIO driver that cpal did not list. cpal's
+/// ASIO host skips a driver whose load fails without saying why; this repeats the load and the
+/// channel and sample-type queries, one driver at a time, and reports the first error. It opens no
+/// stream, but loading a driver initializes it (`ASIOInit`).
+#[cfg(all(windows, feature = "asio"))]
+fn unlisted_asio_drivers(listed: &[String]) -> Vec<String> {
+    let asio = asio_sys::Asio::new();
+    asio.driver_names()
+        .into_iter()
+        .filter(|name| !listed.contains(name))
+        .map(|name| {
+            let why = match asio.load_driver(&name) {
+                Err(e) => format!("load_driver failed: {e}"),
+                Ok(driver) => match driver.channels() {
+                    Err(e) => format!("loaded, but ASIOGetChannels failed: {e}"),
+                    Ok(ch) => match (driver.input_data_type(), driver.output_data_type()) {
+                        (Err(e), _) => format!("loaded ({} in, {} out), but the input sample type query failed: {e}", ch.ins, ch.outs),
+                        (_, Err(e)) => format!("loaded ({} in, {} out), but the output sample type query failed: {e}", ch.ins, ch.outs),
+                        (Ok(i), Ok(o)) => format!(
+                            "loaded ({} in, {} out, input type {i:?}, output type {o:?}) but cpal skipped it (unsupported sample type, no channels, or sample rate query failed)",
+                            ch.ins, ch.outs
+                        ),
+                    },
+                },
+            };
+            format!("driver \"{name}\": {why}")
+        })
+        .collect()
 }
