@@ -126,6 +126,30 @@ fn mid(r: [f32; 4]) -> (f32, f32) {
 }
 
 #[test]
+fn the_view_switcher_shows_in_the_piano_roll_the_mixer_and_the_devices() {
+    let mut t = T::new();
+    let have = |r: [f32; 4]| r[2] > r[0] && r[3] > r[1];
+    // Mixer view.
+    assert!(t.app.ui.show_mixer && !t.app.ui.show_devices);
+    let sw = t.app.keys.switcher;
+    assert!(sw.iter().all(|r| have(*r)), "mixer view: {sw:?}");
+    // The piano roll view carries the same three tabs.
+    let r = t.app.arrange.layout.clips.iter().find(|c| c.id == t.clip.0).unwrap().rect;
+    t.click_n(mid(r), 2, json!({}));
+    let l = t.app.keys.layout.clone();
+    assert!(l.visible && [l.tab_keys, l.tab_mixer, l.tab_devices].iter().all(|r| have(*r)), "{l:?}");
+    // Back to the mixer through its tab, then Devices through the strip.
+    t.click(mid(l.tab_mixer));
+    assert!(t.app.mixer.layout.visible);
+    t.click(mid(t.app.keys.switcher[2]));
+    assert!(t.app.ui.show_devices && !t.app.ui.show_mixer);
+    assert!(t.app.keys.switcher.iter().all(|r| have(*r)), "devices view");
+    // Piano Roll from the strip reopens the clip.
+    t.click(mid(t.app.keys.switcher[0]));
+    assert!(t.app.keys.layout.visible && t.app.keys.layout.clip == Some(t.clip.0));
+}
+
+#[test]
 fn a_double_click_on_a_midi_clip_opens_the_piano_roll_and_tabs_shortcut_and_escape_switch_back() {
     let mut t = T::new();
     assert!(t.app.mixer.layout.visible, "the mixer pane to start with");

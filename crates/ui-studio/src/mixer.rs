@@ -959,6 +959,7 @@ pub fn panes(app: &mut StudioApp, ui: &mut Ui) {
         let h = app.ui.mixer_height.clamp(260.0, 600.0);
         egui::Panel::bottom("mixer").exact_size(h).frame(egui::Frame::NONE.fill(TOKENS.bg)).show(ui, |ui| strips(app, ui));
     }
+    crate::keys::switcher_panel(app, ui);
 }
 
 /// The mixer filling the window (F3).

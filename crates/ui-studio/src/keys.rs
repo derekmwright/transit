@@ -310,6 +310,8 @@ pub struct KeysState {
     /// The last click on the grid (time, position), for double-clicks.
     last_click: Option<(f64, Pos2)>,
     pub layout: KeysLayout,
+    /// The Piano Roll / Mixer / Devices switcher as last drawn above the mixer or device panes.
+    pub switcher: [R4; 3],
 }
 
 impl Default for KeysState {
@@ -331,6 +333,7 @@ impl Default for KeysState {
             live_inputs: Vec::new(),
             serial: 0,
             last_click: None,
+            switcher: Default::default(),
             layout: KeysLayout::default(),
         }
     }
@@ -961,19 +964,19 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     app.keys.layout = layout;
 }
 
-/// Tabs (Piano Roll, Mixer, Devices), the clip's name, grid, Quantize and the audition switch.
-fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: &mut KeysLayout) {
-    let p = ui.painter();
-    p.rect_filled(r, 0.0, TOKENS.panel);
-    p.line_segment([pos2(r.min.x, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, TOKENS.line));
+/// The Piano Roll / Mixer / Devices tabs, left to right from `r`'s left edge, `on` marking the
+/// views shown. Returns where the tabs end, their rectangles and the tab clicked.
+fn switcher(ui: &mut Ui, r: Rect, on: [bool; 3]) -> (f32, [R4; 3], Option<usize>) {
     let mut x = r.min.x + 8.0;
     let font = FontId::proportional(12.0);
-    for (label, which) in [("Piano Roll", 0), ("Mixer", 1), ("Devices", 2)] {
+    let mut rects = [R4::default(); 3];
+    let mut clicked = None;
+    for (which, label) in ["Piano Roll", "Mixer", "Devices"].into_iter().enumerate() {
         let w = ui.painter().layout_no_wrap(label.into(), font.clone(), TOKENS.text).size().x + 16.0;
         let b = Rect::from_min_size(pos2(x, r.min.y + 3.0), vec2(w, r.height() - 6.0));
         x += w + 2.0;
         let resp = ui.interact(b, ui.id().with(("keys_tab", which)), Sense::click());
-        let on = which == 0;
+        let on = on[which];
         let p = ui.painter();
         if resp.hovered() && !on {
             p.rect_filled(b, crate::theme::RADIUS, TOKENS.button_hover);
@@ -982,16 +985,51 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
         if on {
             p.line_segment([pos2(b.min.x + 6.0, b.max.y), pos2(b.max.x - 6.0, b.max.y)], Stroke::new(2.0, TOKENS.accent));
         }
-        match which {
-            0 => layout.tab_keys = r4(b),
-            1 => layout.tab_mixer = r4(b),
-            _ => layout.tab_devices = r4(b),
-        }
+        rects[which] = r4(b);
         if resp.clicked() && !on {
-            app.close_keys();
-            app.ui.show_mixer = which == 1;
-            app.ui.show_devices = which == 2;
+            clicked = Some(which);
         }
+    }
+    (x, rects, clicked)
+}
+
+/// The switcher strip above the mixer and device panes (the piano roll draws its own in its
+/// header), so the three views switch the same way from each. Call after the panes are added.
+pub fn switcher_panel(app: &mut StudioApp, ui: &mut Ui) {
+    app.keys.switcher = Default::default();
+    if !(app.ui.show_devices || app.ui.show_mixer && !app.ui.mixer_full) {
+        return;
+    }
+    egui::Panel::bottom("bottom_switcher").exact_size(HEADER_H).frame(egui::Frame::NONE.fill(TOKENS.panel)).show(ui, |ui| {
+        let r = ui.max_rect();
+        let p = ui.painter();
+        p.line_segment([pos2(r.min.x, r.min.y + 0.5), pos2(r.max.x, r.min.y + 0.5)], Stroke::new(1.0, TOKENS.line));
+        let (_, rects, clicked) = switcher(ui, r, [false, app.ui.show_mixer, app.ui.show_devices]);
+        app.keys.switcher = rects;
+        match clicked {
+            Some(0) => app.toggle_keys(),
+            Some(w) => {
+                app.ui.show_mixer = w == 1;
+                app.ui.show_devices = w == 2;
+            }
+            None => {}
+        }
+    });
+}
+
+/// Tabs (Piano Roll, Mixer, Devices), the clip's name, grid, Quantize and the audition switch.
+fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: &mut KeysLayout) {
+    let p = ui.painter();
+    p.rect_filled(r, 0.0, TOKENS.panel);
+    p.line_segment([pos2(r.min.x, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, TOKENS.line));
+    let (x, rects, clicked) = switcher(ui, r, [true, false, false]);
+    layout.tab_keys = rects[0];
+    layout.tab_mixer = rects[1];
+    layout.tab_devices = rects[2];
+    if let Some(which) = clicked.filter(|w| *w != 0) {
+        app.close_keys();
+        app.ui.show_mixer = which == 1;
+        app.ui.show_devices = which == 2;
     }
     // The clip: a separator, a swatch in the track color, then its name (not a tab).
     let (track_name, color) = app.engine.session().track(cv.track).map(|t| (t.name.clone(), t.color)).unwrap_or_default();
