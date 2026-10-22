@@ -431,7 +431,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         let dx = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map_or(0.0, |(a, b)| b.x - a.x));
         let fine = ui.input(|i| i.modifiers.shift);
         let target = (start_db + dx * if fine { 0.02 } else { 0.1 }).clamp(-80.0, 12.0);
-        let _ = app.engine.execute_merged("mix.volume", &json!({"tracks": [t.id.0], "db": target}), &format!("fader:{}", t.id.0));
+        let _ = app.engine.execute_merged("mix.volume", &json!({"tracks": [t.id.0], "db": target}), &crate::mixer::fader_key(t.id));
         crate::automation::note_pass_edit(app);
     }
     if resp.drag_stopped() {

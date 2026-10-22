@@ -17,9 +17,8 @@
 //! - L4: sends are ten fixed slots. A strip lists the occupied ones as rows (target, level,
 //!   remove) under its input, Logic style, and "+ Send" fills the first free slot.
 //!
-//! Routing never offers a target that would close a loop of any length: the engine accepts
-//! loops (`track.output`, `track.input` and `mix.send` don't check), and the mix only bounds the
-//! aux depth, so the menus walk the graph themselves ([`feeding_loops`], [`listening_loops`]).
+//! Routing menus use the same route-change checks as the engine (ADR 0015), including
+//! sidechain keys. The engine validates the chosen route again on execution.
 
 use crate::StudioApp;
 use crate::arrange::R4;
@@ -377,16 +376,15 @@ fn bus_targets(t: &Track) -> impl Iterator<Item = BusId> + '_ {
 /// Whether audio put on bus `from` reaches bus `to`: through every track listening to a bus and
 /// on through its output and sends, any number of hops (`from == to` counts).
 pub fn reaches(s: &Session, from: BusId, to: BusId) -> bool {
-    let mut seen: Vec<BusId> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut todo = vec![from];
     while let Some(b) = todo.pop() {
         if b == to {
             return true;
         }
-        if seen.contains(&b) {
+        if !seen.insert(b) {
             continue;
         }
-        seen.push(b);
         for t in s.tracks.iter().filter(|t| t.mixer.input == Route::Bus(b)) {
             todo.extend(bus_targets(t));
         }
@@ -396,12 +394,29 @@ pub fn reaches(s: &Session, from: BusId, to: BusId) -> bool {
 
 /// Whether `t` feeding bus `b` (output or send) would close a loop back to `t`'s own input.
 pub fn feeding_loops(s: &Session, t: &Track, b: BusId) -> bool {
-    matches!(t.mixer.input, Route::Bus(input) if reaches(s, b, input))
+    route_loops(s, soundcraft_model::RouteChange::Output { track: t.id, route: Route::Bus(b) }) || audio_input_loop(s, t, b)
 }
 
 /// Whether `t` listening to bus `b` would close a loop: something `t` feeds reaches `b`.
 pub fn listening_loops(s: &Session, t: &Track, b: BusId) -> bool {
-    bus_targets(t).any(|o| reaches(s, o, b))
+    route_loops(s, soundcraft_model::RouteChange::Input { track: t.id, route: Route::Bus(b) })
+        // Audio tracks do not read buses in the model graph. Keep the UI's existing refusal
+        // for their input menus as well; changing that policy is separate from graph reuse.
+        || (t.kind == TrackKind::Audio && bus_targets(t).any(|o| reaches(s, o, b)))
+}
+
+// Preserve the existing audio-track input-menu policy in either edit order.
+fn audio_input_loop(s: &Session, t: &Track, b: BusId) -> bool {
+    t.kind == TrackKind::Audio && matches!(t.mixer.input, Route::Bus(input) if reaches(s, b, input))
+}
+
+fn route_loops(s: &Session, change: soundcraft_model::RouteChange) -> bool {
+    soundcraft_model::would_create_cycle_all(s, &[change]).is_some()
+}
+
+/// Shared by the arrangement and mixer so one fader gesture has one undo key.
+pub(crate) fn fader_key(track: TrackId) -> String {
+    format!("fader:{}", track.0)
 }
 
 /// Whether a track kind has sends here: audio, instrument, FX channels and groups (a group sums
@@ -413,12 +428,20 @@ pub fn takes_sends(kind: TrackKind) -> bool {
 /// Where a send from `t` can go: `(label, bus name)` for every bus that is not already one of its
 /// sends (`except` slot aside) and would not close a loop.
 pub fn send_targets(s: &Session, t: &Track, except: Option<usize>, io: &IoMap) -> Vec<(String, String)> {
+    let Some(slot) = except.filter(|&slot| slot < t.mixer.sends.len()).or_else(|| t.mixer.sends.iter().position(Option::is_none)) else {
+        return Vec::new();
+    };
     let taken: Vec<&Route> =
         t.mixer.sends.iter().enumerate().filter(|(i, _)| Some(*i) != except).filter_map(|(_, x)| x.as_ref()).map(|x| &x.target).collect();
     let mut v: Vec<(String, String)> = s
         .busses
         .iter()
-        .filter(|b| !taken.contains(&&Route::Bus(b.id)) && !feeding_loops(s, t, b.id) && heard(s, b.id))
+        .filter(|b| {
+            !taken.contains(&&Route::Bus(b.id))
+                && !audio_input_loop(s, t, b.id)
+                && !route_loops(s, soundcraft_model::RouteChange::Send { track: t.id, slot, route: Route::Bus(b.id) })
+                && heard(s, b.id)
+        })
         .map(|b| (bus_label(s, b.id), b.name.clone()))
         .collect();
     let paths: Vec<(String, String)> =
@@ -622,7 +645,7 @@ impl StudioApp {
     fn set_value_keyed(&mut self, t: Target, v: f32, key: Option<&str>) -> Result<Value, String> {
         match t {
             Target::Fader(id) => {
-                let key = key.map_or_else(|| format!("fader:{}", id.0), str::to_string);
+                let key = key.map_or_else(|| fader_key(id), str::to_string);
                 self.engine.execute_merged("mix.volume", &json!({"tracks": [id.0], "db": v}), &key).map_err(|e| e.to_string())
             }
             Target::Send(id, slot) => {

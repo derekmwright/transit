@@ -729,7 +729,17 @@ impl StudioApp {
         (fresh && !self.engine.session().tracks.iter().any(|t| t.mixer.record_arm)).then_some(why)
     }
 
-    /// Per-frame logic: control channel, plug-in editors, transport, document sync, autosave.
+    /// Per-frame logic, once per frame even when egui requests another layout pass.
+    ///
+    /// Ordering contract:
+    /// 1. Drain control requests before polling player replies and editor changes so commands
+    ///    can make progress in this frame. Poll before reading meters, MIDI and editor state.
+    /// 2. Apply wheel gestures before ending merges; automation owns its merge until Stop.
+    /// 3. Finish background bounce/import work before reconciling transport and the document.
+    /// 4. Handle transport before publishing a replacement session, and wait for outstanding
+    ///    play/locate/record admissions before syncing I/O and session state.
+    /// 5. Capture automation before autosaving, then open any newly needed input and schedule
+    ///    the next frame. Collect screenshots last, after the frame's state changes.
     pub fn logic(&mut self, ctx: &egui::Context) {
         if ctx.current_pass_index() > 0 {
             return;

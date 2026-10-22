@@ -224,3 +224,17 @@ fn ui_json_round_trips_the_list_and_an_old_file_loads() {
     old.as_object_mut().unwrap().remove("recent_files");
     assert!(serde_json::from_value::<UiState>(old).unwrap().recent_files.is_empty());
 }
+
+#[test]
+fn recent_menu_reuses_existence_results_then_refreshes_them() {
+    let mut t = T::new();
+    let path = t.save_new("cached");
+    assert!(!t.show_menu()[0].missing);
+    std::fs::remove_file(&path).unwrap();
+    t.frames(1);
+    assert!(!t.app.recent_menu[0].missing, "no filesystem probe on the next frame");
+    t.frames(70);
+    assert!(t.app.recent_menu[0].missing, "the bounded cache eventually refreshes");
+    t.app.open_recent(std::path::Path::new(&path));
+    assert_eq!(t.app.status, "File not found", "opening always rechecks the actual file");
+}

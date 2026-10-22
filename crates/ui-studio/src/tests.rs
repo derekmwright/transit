@@ -2974,3 +2974,41 @@ mod hardware_inserts {
         assert!(measure_blocker(true, true, true).unwrap().contains("Stop the transport"));
     }
 }
+
+#[test]
+fn routing_menus_reject_loops_through_sidechain_keys() {
+    use crate::mixer::{input_choices, output_choices, send_targets};
+    let mut app = app();
+    let source = new_track(&mut app, json!({"kind": "aux", "name": "Source"}));
+    let fx = app.new_fx_channel(None, 0.0).unwrap();
+    app.add_device(source, "compressor").unwrap();
+    app.run("mix.insert_key", json!({"track": source.0, "slot": 0, "from": {"track": fx.0}})).unwrap();
+    let s = app.engine.session();
+    let track = s.track(source).unwrap();
+    let io = app.engine.io_map().clone();
+    for choices in [output_choices(s, track, &io), send_targets(s, track, None, &io)] {
+        assert!(!choices.iter().any(|(_, value)| value == "FX 1"), "a key edge returns to Source");
+    }
+    // Reversing the dependency: Source now feeds FX 1, so FX 1 cannot key Source
+    // through a bus that Source listens to.
+    app.run("mix.insert_key", json!({"track": source.0, "slot": 0, "from": null})).unwrap();
+    app.add_device(fx, "compressor").unwrap();
+    app.run("mix.insert_key", json!({"track": fx.0, "slot": 0, "from": {"track": source.0}})).unwrap();
+    app.new_fx_channel(None, 0.0).unwrap();
+    app.set_output(fx, "FX 2").unwrap();
+    let s = app.engine.session();
+    assert!(!input_choices(s, s.track(source).unwrap(), 2, &io).iter().any(|(_, value)| value == "FX 2"));
+}
+
+#[test]
+fn audio_bus_input_policy_is_preserved_when_the_input_is_chosen_first() {
+    let mut app = app();
+    let source = new_track(&mut app, json!({"kind": "audio", "name": "Source"}));
+    app.new_fx_channel(None, 0.0).unwrap();
+    app.run("track.input", json!({"tracks": [source.0], "input": "FX 1"})).unwrap();
+    let s = app.engine.session();
+    let track = s.track(source).unwrap();
+    for choices in [crate::mixer::output_choices(s, track, app.engine.io_map()), crate::mixer::send_targets(s, track, None, app.engine.io_map())] {
+        assert!(!choices.iter().any(|(_, value)| value == "FX 1"));
+    }
+}

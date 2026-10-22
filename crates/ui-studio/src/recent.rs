@@ -86,6 +86,23 @@ impl StudioApp {
     }
 }
 
+/// Filesystem results live for one second, or until the list changes.
+#[derive(Clone, Default)]
+struct ExistenceCache {
+    checked_at: f64,
+    entries: Vec<(PathBuf, bool)>,
+}
+
+impl ExistenceCache {
+    fn refresh(&mut self, paths: &[PathBuf], now: f64, exists: impl Fn(&Path) -> bool) {
+        if now - self.checked_at < 1.0 && self.entries.iter().map(|(p, _)| p).eq(paths.iter()) {
+            return;
+        }
+        self.entries = paths.iter().map(|p| (p.clone(), !exists(p))).collect();
+        self.checked_at = now;
+    }
+}
+
 /// The Open Recent submenu, drawn inside the File menu.
 pub fn menu(app: &mut StudioApp, ui: &mut egui::Ui) {
     let empty = app.ui.recent_files.is_empty();
@@ -93,10 +110,14 @@ pub fn menu(app: &mut StudioApp, ui: &mut egui::Ui) {
         ui.menu_button("Open Recent", |ui| {
             let mut picked = None;
             let entries: Vec<PathBuf> = app.ui.recent_files.iter().map(|r| r.path.clone()).collect();
-            for path in entries {
+            let cache_id = egui::Id::new("recent_file_existence");
+            let mut cache = ui.ctx().data_mut(|d| d.get_temp::<ExistenceCache>(cache_id).unwrap_or_default());
+            cache.refresh(&entries, ui.input(|i| i.time), Path::exists);
+            let entries = cache.entries.clone();
+            ui.ctx().data_mut(|d| d.insert_temp(cache_id, cache));
+            for (path, missing) in entries {
                 let name = path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
                 let folder = path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let missing = !path.exists();
                 let text = egui::RichText::new(&name);
                 let text = if missing { text.color(TOKENS.text_dim) } else { text };
                 let b = ui.add(egui::Button::new(text).shortcut_text(egui::RichText::new(&folder).color(TOKENS.text_dim)));
