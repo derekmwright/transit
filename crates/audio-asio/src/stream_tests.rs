@@ -425,7 +425,122 @@ fn overloads_resyncs_and_position_jumps_are_counted() {
     assert!(seen.errors.lock().unwrap().is_empty(), "overloads and resyncs are counted, not errors");
     let renders = seen.render.lock().unwrap().clone();
     assert!(renders[..5].windows(2).all(|w| w[1].0.backend_callback_ns > w[0].0.backend_callback_ns), "forward up to the resync");
+    let qualities: Vec<ab::Quality> = renders.iter().map(|(s, _, _)| s.quality).collect();
+    let (estimate, invalid) = (ab::Quality::BackendEstimate, ab::Quality::Invalid);
+    assert_eq!(qualities, [estimate, estimate, estimate, invalid, estimate, invalid, estimate], "the block after the lost one and after the resync");
+    let captures: Vec<ab::Quality> = seen.capture.lock().unwrap().iter().map(|(s, _, _)| s.quality).collect();
+    assert_eq!(captures, qualities, "both directions restart their fit");
     assert!(stats.line(false).contains("overloads 2, position jumps 1, resets 1"), "{}", stats.line(false));
+    drop((capture, render));
+}
+
+#[test]
+fn a_position_that_goes_back_invalidates_the_next_stamp_and_reanchors() {
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (capture, render, _, _) = duplex(&rig, 48_000, Some(64), &seen, vec![0.0; 2]);
+    drive(&rig, 64, 6400, 3, &[]);
+    drive(&rig, 64, 0, 3, &[]);
+    let renders = seen.render.lock().unwrap().clone();
+    let qualities: Vec<ab::Quality> = renders.iter().map(|(s, _, _)| s.quality).collect();
+    assert_eq!(qualities[3], ab::Quality::Invalid, "the first block after the counter went back");
+    assert!(qualities.iter().enumerate().all(|(i, q)| i == 3 || *q == ab::Quality::BackendEstimate), "{qualities:?}");
+    let period_ns = 64 * 1_000_000_000 / 48_000;
+    assert!(near(renders[5].0.backend_callback_ns - renders[4].0.backend_callback_ns, period_ns, 1), "the new anchor maps the new counter");
+    assert!(renders.windows(2).all(|w| w[1].0.host_callback_ns > w[0].0.host_callback_ns));
+    drop((capture, render));
+}
+
+#[test]
+fn a_session_orphaned_while_the_host_was_stuck_is_swept() {
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let open_render = |rig: &Rig| {
+        rig.backend
+            .open_render(
+                &rig.endpoint,
+                &request(rig, ab::Direction::Output, 48_000, Some(64)),
+                render_cb(&seen, vec![0.0; 2]),
+                error_cb(&seen, ab::Direction::Output),
+            )
+            .expect("open render")
+            .0
+    };
+    // A stream dropped in the window where the host refuses requests: its detach is never sent,
+    // and the driver keeps running with no stream.
+    let render = open_render(&rig);
+    render.start().expect("start");
+    rig.backend.host.set_stuck(true);
+    drop(render);
+    assert_eq!(rig.observed.live.load(Ordering::Acquire), 1, "nothing told the host");
+    rig.backend.host.set_stuck(false);
+    // The next open ends that session instead of refusing to attach to a running driver.
+    let (capture, _) = rig
+        .backend
+        .open_capture(&rig.endpoint, &request(&rig, ab::Direction::Input, 48_000, Some(64)), capture_cb(&seen), error_cb(&seen, ab::Direction::Input))
+        .expect("the orphaned session is swept first");
+    drop(capture);
+    assert_eq!(rig.observed.live.load(Ordering::Acquire), 0);
+    // With no open coming, the idle host sweeps it by itself.
+    let render = open_render(&rig);
+    render.start().expect("start");
+    rig.backend.host.set_stuck(true);
+    drop(render);
+    rig.backend.host.set_stuck(false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rig.observed.live.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(rig.observed.live.load(Ordering::Acquire), 0, "the host swept the orphan between requests");
+    assert_eq!(rig.observed.call_names().last(), Some(&"disposeBuffers"));
+    assert!(!testing::installed());
+}
+
+#[test]
+fn stop_waits_for_a_callback_in_flight_while_the_other_direction_keeps_the_driver_running() {
+    use std::sync::atomic::AtomicBool;
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (entered, left) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (e, l) = (Arc::clone(&entered), Arc::clone(&left));
+    let calls = AtomicUsize::new(0);
+    let slow: ab::CaptureCallback = Box::new(move |block| {
+        block.chunks(&mut |_, _| {});
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            e.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            l.store(true, Ordering::SeqCst);
+        }
+    });
+    let (capture, _) = rig
+        .backend
+        .open_capture(&rig.endpoint, &request(&rig, ab::Direction::Input, 48_000, Some(64)), slow, error_cb(&seen, ab::Direction::Input))
+        .expect("in");
+    let (render, _) = rig
+        .backend
+        .open_render(
+            &rig.endpoint,
+            &request(&rig, ab::Direction::Output, 48_000, Some(64)),
+            render_cb(&seen, vec![0.0; 2]),
+            error_cb(&seen, ab::Direction::Output),
+        )
+        .expect("out");
+    capture.start().expect("start");
+    render.start().expect("start");
+    std::thread::scope(|s| {
+        s.spawn(|| drive(&rig, 64, 0, 1, &[]));
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        capture.stop().expect("stop capture");
+        assert!(left.load(Ordering::SeqCst), "stop returned while the capture callback was still running");
+    });
+    assert!(!rig.observed.call_names().contains(&"stop"), "the render stream keeps the driver running");
+    drive(&rig, 64, 64, 2, &[]);
+    assert_eq!(seen.render.lock().unwrap().len(), 3);
     drop((capture, render));
 }
 

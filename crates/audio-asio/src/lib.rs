@@ -147,6 +147,7 @@ impl AsioBackend {
         let entries = self.drivers()?;
         let mut blocked: Option<String> = None;
         for entry in entries {
+            let mut in_use = false;
             let problem = if let Some(stuck) = &blocked {
                 Some(format!("not probed: the host thread is blocked in {stuck}"))
             } else if !entry.dll_exists {
@@ -171,13 +172,18 @@ impl AsioBackend {
                         if self.host.is_stuck() {
                             blocked = Some(format!("the probe of \"{}\"", entry.name));
                         }
+                        in_use = matches!(e, ab::OpenError::InUse(_));
                         Some(e.to_string())
                     }
                 }
             };
             if let Some(problem) = problem {
-                let diagnostic = DriverDiagnostic { driver: entry.name.clone(), problem };
-                log::warn!("ASIO: {diagnostic}");
+                let diagnostic = DriverDiagnostic { driver: entry.name.clone(), problem, blocked: in_use };
+                if in_use {
+                    log::info!("ASIO: {diagnostic}");
+                } else {
+                    log::warn!("ASIO: {diagnostic}");
+                }
                 out.diagnostics.push(diagnostic);
             }
         }
@@ -474,6 +480,11 @@ impl ab::Backend for AsioBackend {
         format_of(&device.info, ab::Direction::Input, rate)
     }
 
+    /// `getChannelInfo`'s names, as the driver reported them when it was probed.
+    fn channel_names(&self, endpoint: &ab::Endpoint, direction: ab::Direction) -> Vec<String> {
+        endpoint.handle::<AsioEndpoint>().map(|device| device.info.channel_names(direction).to_vec()).unwrap_or_default()
+    }
+
     /// Opens the driver's output (its first `format.channels` channels). Open the capture stream
     /// of the same driver before either starts, if one is wanted (see [`session`]).
     fn open_render(
@@ -590,6 +601,9 @@ mod tests {
         let format = backend.capture_format(m, Some(48_000)).expect("a capture format");
         assert_eq!(format, ab::Format { rate: 48_000, channels: 12, sample: ab::SampleFormat::I24, valid_bits: None, channel_mask: None });
         assert!(backend.capture_with_render(m));
+        let (ins, outs) = (backend.channel_names(m, ab::Direction::Input), backend.channel_names(m, ab::Direction::Output));
+        assert_eq!((ins.len(), outs.len()), (12, 10), "every channel is named");
+        assert_eq!((ins[11].as_str(), outs[9].as_str()), ("Analog In 12", "Analog Out 10"), "getChannelInfo's names, in channel order");
     }
 
     #[test]
@@ -622,6 +636,7 @@ mod tests {
         let diagnostics = backend.diagnostics();
         let text: Vec<String> = diagnostics.iter().map(ToString::to_string).collect();
         assert_eq!(diagnostics.len(), 3, "{text:?}");
+        assert!(diagnostics.iter().all(|d| !d.blocked), "each of these failed on its own");
         assert!(text[0].starts_with("Absent: ") && text[0].contains("init failed: hardware not found"), "{text:?}");
         assert!(text[1].starts_with("Missing DLL: ") && text[1].contains("DLL not found"), "{text:?}");
         assert!(text[2].starts_with("Unregistered: ") && text[2].contains("CoCreateInstance"), "{text:?}");
@@ -649,6 +664,7 @@ mod tests {
         let outputs = backend.endpoints(ab::Direction::Output).expect("enumeration while one is open");
         assert_eq!(outputs.len(), 1, "the open driver is listed, the other is not probed");
         assert!(backend.diagnostics()[0].problem.contains("one driver per process"));
+        assert!(backend.diagnostics()[0].blocked, "not probed because another driver is open: not a failure of that driver");
         assert_eq!(observed.live.load(Ordering::Acquire), 1);
         loaded.close().expect("closes");
         assert_eq!(observed.live.load(Ordering::Acquire), 0);

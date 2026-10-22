@@ -222,7 +222,8 @@ impl Driver {
 
     /// `disposeBuffers`: the buffer pointers of `createBuffers` are invalid afterwards.
     pub(crate) fn dispose_buffers(&mut self, buffers: Buffers) -> Result<(), i32> {
-        let Buffers { _private: () } = buffers;
+        // The token ends here, the one place that may consume it.
+        std::mem::forget(buffers);
         let dispose = self.vtbl().disposeBuffers;
         // SAFETY: `disposeBuffers()` takes no pointers. Host thread; the `Buffers` token proves the
         // buffers exist and, not being inside a `Running`, that the driver is stopped.
@@ -290,14 +291,25 @@ impl ChannelIndex {
     }
 }
 
-/// Proof that `createBuffers` succeeded and `disposeBuffers` has not run. Not `Clone`.
+/// Proof that `createBuffers` succeeded and `disposeBuffers` has not run. Not `Clone`. It must
+/// end in [`Driver::dispose_buffers`]: dropping it otherwise leaks the driver's buffers, which a
+/// debug build reports as a panic (outside an unwind) and a release build logs.
 #[derive(Debug)]
+#[must_use = "the driver's buffers stay allocated until `dispose_buffers` takes this token"]
 pub(crate) struct Buffers {
     _private: (),
 }
 
+impl Drop for Buffers {
+    fn drop(&mut self) {
+        log::error!("ASIO: a buffer set was dropped without disposeBuffers");
+        debug_assert!(std::thread::panicking(), "ASIO: a buffer set was dropped without disposeBuffers");
+    }
+}
+
 /// Proof that `start` succeeded and `stop` has not run; holds the [`Buffers`].
 #[derive(Debug)]
+#[must_use = "a running driver is stopped through `stop`, which hands the buffers back"]
 pub(crate) struct Running(Buffers);
 
 /// The driver object as the buffer-switch callback uses it on the driver's thread: `outputReady`
@@ -962,7 +974,10 @@ pub(crate) mod fake {
             info.channelGroup = 0;
             info.type_ = sample;
             info.name = [0; 32];
-            info.name[0] = b'C';
+            let name = format!("{} {}", if info.isInput != 0 { "Analog In" } else { "Analog Out" }, info.channel + 1);
+            for (to, from) in info.name.iter_mut().zip(name.bytes().take(31)) {
+                *to = from;
+            }
         }
         abi::ASE_OK
     }
@@ -1135,6 +1150,29 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    #[should_panic(expected = "dropped without disposeBuffers")]
+    fn a_buffer_set_dropped_without_dispose_buffers_is_caught_in_debug_builds() {
+        let buffers = Buffers { _private: () };
+        drop(buffers);
+    }
+
+    #[test]
+    fn dispose_buffers_takes_the_token_without_the_leak_report() {
+        let observed = Arc::new(Observed::default());
+        let mut driver = create(FakeSpec::new("Fake ASIO", 2, 2, abi::ASIOST_INT32_LSB), &observed);
+        assert!(driver.init(0x1234 as *mut c_void));
+        let count = driver.channels().expect("channels");
+        let channels: Vec<ChannelIndex> = count.first(true, 2).chain(count.first(false, 2)).collect();
+        let (buffers, pointers) = driver.create_buffers(&channels, 64).expect("buffers");
+        assert_eq!(pointers.len(), 4);
+        let running = driver.start(buffers).expect("starts");
+        let (buffers, stopped) = driver.stop(running);
+        assert_eq!(stopped, Ok(()));
+        assert_eq!(driver.dispose_buffers(buffers), Ok(()), "no panic: the token ended in disposeBuffers");
+        assert_eq!(driver.channel_info(count.first(true, 1).next().expect("in 1")).map(|i| abi::c_string(&i.name)), Ok("Analog In 1".into()));
+    }
 
     #[test]
     fn the_wrapper_calls_every_queried_method_through_the_vtable_and_releases_once() {

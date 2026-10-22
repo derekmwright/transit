@@ -234,7 +234,7 @@ impl CallbackState {
         // SAFETY: `busy` is held (taken above): the only access to the cells until `give_back`.
         let (engine, planes) = unsafe { (&mut *self.engine.get(), &*self.planes.get()) };
         if self.resync.swap(false, Ordering::Relaxed) {
-            engine.restart();
+            engine.resync();
         }
         let half = usize::from(index & 1 == 1);
         let mut outputs = RawOutputs { table: &planes.outputs, half, bytes: planes.output_bytes };

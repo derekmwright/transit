@@ -210,6 +210,9 @@ impl HostState {
         callback: Callback,
         error: ab::ErrorCallback,
     ) -> Result<Opened, ab::OpenError> {
+        // A session whose streams all went while the host was stuck (their detach was never sent)
+        // would refuse this open; end it first.
+        self.sweep();
         match self.loaded_name() {
             None => {
                 self.load_driver(entry)?;
@@ -280,8 +283,11 @@ impl HostState {
         }
     }
 
-    /// Work between requests: a latency refetch the driver asked for.
+    /// Work between requests: a session left without streams (a stream dropped while the host
+    /// was stuck, whose detach could not be sent) is ended, and a latency refetch the driver
+    /// asked for is made.
     fn tend(&mut self) {
+        self.sweep();
         if let Some(Loaded { entry, session: Some(session), driver, .. }) = self.loaded.as_mut() {
             session.tend(&entry.name, driver);
         }
@@ -437,6 +443,14 @@ impl Host {
     /// Whether a request timed out and the host thread has not finished it yet.
     pub(crate) fn is_stuck(&self) -> bool {
         self.shared.stuck.load(Ordering::Acquire)
+    }
+
+    /// Marks the host stuck (or not) without a blocking request: the window in which a stream's
+    /// detach is refused (tests of the orphaned-session sweep).
+    #[cfg(test)]
+    pub(crate) fn set_stuck(&self, stuck: bool) {
+        self.shared.stuck.store(stuck, Ordering::Release);
+        self.wake.set();
     }
 }
 

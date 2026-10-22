@@ -25,7 +25,8 @@ use crate::convert::{InputPlanes, OutputPlanes, PlanarSink, PlanarSource, Wire, 
 use crate::stats::{DriverEvents, LoopStats};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use transit_audio_backend::{
     Calibration, CaptureBlock, CaptureCallback, ErrorCallback, Format, Quality, RenderBlock, RenderCallback, Stamp, StreamError,
 };
@@ -40,6 +41,9 @@ pub(crate) const DETACHED: u8 = 3;
 /// What the control side and the callback share for one direction.
 pub(crate) struct SideShared {
     pub(crate) state: AtomicU8,
+    /// A buffer switch is inside this direction's part (set before it reads `state`, cleared after
+    /// the user callback returned): what [`SideShared::quiesce`] waits for.
+    in_switch: AtomicBool,
     /// The `(QPC in 100 ns, host-origin ns)` pair of the stream's `start()`, written before
     /// `state` becomes [`STARTED`] (release) and read after it is seen (acquire).
     origin_qpc: AtomicU64,
@@ -49,7 +53,40 @@ pub(crate) struct SideShared {
 
 impl SideShared {
     pub(crate) fn new(events: Arc<DriverEvents>) -> Self {
-        Self { state: AtomicU8::new(OPENED), origin_qpc: AtomicU64::new(0), origin_ns: AtomicI64::new(0), stats: LoopStats::new(events) }
+        Self {
+            state: AtomicU8::new(OPENED),
+            in_switch: AtomicBool::new(false),
+            origin_qpc: AtomicU64::new(0),
+            origin_ns: AtomicI64::new(0),
+            stats: LoopStats::new(events),
+        }
+    }
+
+    /// The buffer switch enters this direction: marks it in flight, then reads whether it is
+    /// started. Both are `SeqCst`, as are the control side's state change and its read of the mark
+    /// in [`SideShared::quiesce`], so either the switch sees the stop or the stop sees the switch.
+    fn enter(&self) -> bool {
+        self.in_switch.store(true, Ordering::SeqCst);
+        self.state.load(Ordering::SeqCst) == STARTED
+    }
+
+    fn leave(&self) {
+        self.in_switch.store(false, Ordering::SeqCst);
+    }
+
+    /// Control side, after this direction's state left [`STARTED`] (with `SeqCst`): waits until no
+    /// buffer switch is inside its callback, so none runs after `stop()` or a drop returns while
+    /// the other direction keeps the driver running. Returns false if one did not leave within
+    /// `limit` (a callback that blocks; logged by the caller).
+    pub(crate) fn quiesce(&self, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while self.in_switch.load(Ordering::SeqCst) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
     }
 
     /// Publishes the origin pair, then the started state. False when the stream was not just opened.
@@ -139,6 +176,10 @@ pub(crate) struct Side<C> {
     faulted: bool,
     /// An error was delivered; one per stream.
     reported: bool,
+    /// The next stamp is [`Quality::Invalid`]: the position anchor moved (a resync, a position
+    /// that went back or skipped), so the clock fit restarts there, as after a WASAPI
+    /// discontinuity.
+    invalidate: bool,
 }
 
 impl<C> Side<C> {
@@ -154,7 +195,19 @@ impl<C> Side<C> {
     ) -> Self {
         let channels = usize::from(format.channels).max(1);
         let scratch = vec![0.0; frames.clamp(1, transit_audio_backend::SCRATCH_FRAMES) * channels];
-        Self { shared, callback, error, format, wire, calibration, scratch, held: Held::default(), faulted: false, reported: false }
+        Self {
+            shared,
+            callback,
+            error,
+            format,
+            wire,
+            calibration,
+            scratch,
+            held: Held::default(),
+            faulted: false,
+            reported: false,
+            invalidate: false,
+        }
     }
 
     pub(crate) fn channels(&self) -> usize {
@@ -167,6 +220,19 @@ impl<C> Side<C> {
 
     fn live(&self) -> bool {
         self.shared.state() == STARTED && !self.faulted
+    }
+
+    /// [`SideShared::enter`] for a side whose callback has not panicked.
+    fn enter(&self) -> bool {
+        self.shared.enter() && !self.faulted
+    }
+
+    /// Marks `stamp` invalid when a discontinuity asked for it (once).
+    fn invalidated(&mut self, stamp: &mut Stamp) {
+        if std::mem::take(&mut self.invalidate) {
+            stamp.quality = Quality::Invalid;
+            stamp.offset_uncertainty_ns = None;
+        }
     }
 
     /// Reports `error` once, if the stream is still the owner's (not stopped or dropped).
@@ -236,7 +302,27 @@ impl Engine {
         Arc::clone(&self.system_step)
     }
 
-    /// Forgets the anchor and the stamp history: the driver restarted or asked for a resync.
+    /// A resync request: forgets the anchor and the history like [`Engine::restart`], and the next
+    /// stamp of each direction is invalid, so the clock fit starts over at the new anchor.
+    pub(crate) fn resync(&mut self) {
+        self.restart();
+        self.invalidate_next();
+    }
+
+    /// Marks the next stamp of each started direction invalid (one not started yet begins a fit
+    /// of its own anyway).
+    fn invalidate_next(&mut self) {
+        for side in [self.render.as_mut().map(|s| (&s.shared, &mut s.invalidate)), self.capture.as_mut().map(|s| (&s.shared, &mut s.invalidate))]
+            .into_iter()
+            .flatten()
+        {
+            if side.0.state() == STARTED {
+                *side.1 = true;
+            }
+        }
+    }
+
+    /// Forgets the anchor and the stamp history: the driver (re)started.
     pub(crate) fn restart(&mut self) {
         self.anchor = None;
         self.last_arrival = None;
@@ -271,6 +357,8 @@ impl Engine {
         if let (Some(now), Some(before)) = (time.position, self.last_position) {
             if now != before.saturating_add(self.frames as u64) {
                 self.events.position_jumps.fetch_add(1, Ordering::Relaxed);
+                // A skipped or repeated block: the stamps around it do not continue each other.
+                self.invalidate_next();
             }
             if now < before {
                 // The counter went back: the old anchor no longer maps it.
@@ -293,13 +381,14 @@ impl Engine {
         let latency_in = self.ns_of_frames(u64::from(self.latencies.input.load(Ordering::Relaxed)));
         let latency_out = self.ns_of_frames(u64::from(self.latencies.output.load(Ordering::Relaxed)));
         let frames = self.frames;
-        // Each side's stamp, computed before borrowing the side mutably.
-        let capture_stamp = self.capture.as_ref().filter(|s| s.live()).map(|side| {
+        // Each side's stamp, computed before borrowing the side mutably. `enter` marks the side in
+        // flight before it reads whether the side runs; `leave` below ends that once its callback returned.
+        let capture_stamp = self.capture.as_ref().filter(|s| s.enter()).map(|side| {
             let (origin_qpc, origin_ns) = side.shared.origin();
             let backend = self.position_ns(time.position, origin_qpc, origin_ns);
             (origin_qpc, origin_ns, backend)
         });
-        let render_stamp = self.render.as_ref().filter(|s| s.live()).map(|side| {
+        let render_stamp = self.render.as_ref().filter(|s| s.enter()).map(|side| {
             let (origin_qpc, origin_ns) = side.shared.origin();
             let backend = self.position_ns(time.position, origin_qpc, origin_ns);
             (origin_qpc, origin_ns, backend)
@@ -310,9 +399,10 @@ impl Engine {
                 side.shared.stats.wake_late(late);
             }
             let round_trip = side.calibration.map_or(0, |c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
-            let stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, true, |callback| {
+            let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, true, |callback| {
                 callback.saturating_sub(latency_in).saturating_sub(round_trip)
             });
+            side.invalidated(&mut stamp);
             let mut source = PlanarSource { scratch: &mut side.scratch, planes: inputs, frames, wire: side.wire };
             let mut block = CaptureBlock::new(frames, stamp, side.format, &mut source);
             block.device_position = time.position;
@@ -327,9 +417,10 @@ impl Engine {
                 if let Some(late) = late {
                     side.shared.stats.wake_late(late);
                 }
-                let stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, false, |callback| {
+                let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, false, |callback| {
                     callback.saturating_add(latency_out)
                 });
+                side.invalidated(&mut stamp);
                 let mut sink = PlanarSink { scratch: &mut side.scratch, planes: &mut *outputs, frames, wire: side.wire };
                 let mut block = RenderBlock::new(frames, stamp, side.format, &mut sink);
                 block.device_position = time.position;
@@ -340,6 +431,9 @@ impl Engine {
                 }
             }
             _ => silence(outputs),
+        }
+        for shared in [self.capture.as_ref().map(|s| &s.shared), self.render.as_ref().map(|s| &s.shared)].into_iter().flatten() {
+            shared.leave();
         }
     }
 

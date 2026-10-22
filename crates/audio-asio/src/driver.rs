@@ -163,9 +163,21 @@ pub struct DriverInfo {
     pub output_type: DirectionType,
     /// `getLatencies` (input, output) in frames, where it answers.
     pub latencies: Option<(u32, u32)>,
+    /// `getChannelInfo`'s name of each input channel, in channel order (empty after a failed query).
+    pub input_names: Vec<String>,
+    /// `getChannelInfo`'s name of each output channel, in channel order.
+    pub output_names: Vec<String>,
 }
 
 impl DriverInfo {
+    /// The channel names of one direction, in channel order.
+    pub fn channel_names(&self, direction: ab::Direction) -> &[String] {
+        match direction {
+            ab::Direction::Input => &self.input_names,
+            ab::Direction::Output => &self.output_names,
+        }
+    }
+
     /// The sample type of one direction.
     pub fn sample_type(&self, direction: ab::Direction) -> &DirectionType {
         match direction {
@@ -208,6 +220,9 @@ pub struct DriverDiagnostic {
     /// The registry name.
     pub driver: String,
     pub problem: String,
+    /// Not probed because another driver is loaded in this process (ASIO allows one): the driver
+    /// did not fail, it could not be asked.
+    pub blocked: bool,
 }
 
 impl std::fmt::Display for DriverDiagnostic {
@@ -251,8 +266,8 @@ pub(crate) fn query(name: &str, driver: &mut Driver) -> Result<DriverInfo, ab::O
     let rates = PROBE_RATES.into_iter().filter(|rate| driver.can_sample_rate(f64::from(*rate)).is_ok()).collect();
     let current_rate = driver.sample_rate().ok();
     let latencies = driver.latencies().ok().map(|(i, o)| (i.max(0) as u32, o.max(0) as u32));
-    let input_type = direction_type(driver, count, true);
-    let output_type = direction_type(driver, count, false);
+    let (input_type, input_names) = direction_type(driver, count, true);
+    let (output_type, output_names) = direction_type(driver, count, false);
     let clamp = |n: i32| u16::try_from(n.max(0)).unwrap_or(u16::MAX);
     Ok(DriverInfo {
         name: name.to_owned(),
@@ -266,11 +281,16 @@ pub(crate) fn query(name: &str, driver: &mut Driver) -> Result<DriverInfo, ab::O
         input_type,
         output_type,
         latencies,
+        input_names,
+        output_names,
     })
 }
 
-fn direction_type(driver: &mut Driver, count: ChannelCount, input: bool) -> DirectionType {
+/// The sample type of one direction and its channels' names (a channel the driver leaves unnamed
+/// is "<direction> <n>", 1-based).
+fn direction_type(driver: &mut Driver, count: ChannelCount, input: bool) -> (DirectionType, Vec<String>) {
     let mut types: Vec<SampleType> = Vec::new();
+    let mut names = Vec::new();
     for index in count.first(input, usize::MAX) {
         let channel = index.channel();
         match driver.channel_info(index) {
@@ -279,15 +299,18 @@ fn direction_type(driver: &mut Driver, count: ChannelCount, input: bool) -> Dire
                 if !types.contains(&t) {
                     types.push(t);
                 }
+                let name = abi::c_string(&info.name);
+                names.push(if name.is_empty() { format!("{} {}", if input { "In" } else { "Out" }, channel + 1) } else { name });
             }
-            Err(code) => return DirectionType::QueryFailed { channel, code },
+            Err(code) => return (DirectionType::QueryFailed { channel, code }, Vec::new()),
         }
     }
-    match types.len() {
+    let kind = match types.len() {
         0 => DirectionType::NoChannels,
         1 => DirectionType::Uniform(types[0]),
         _ => DirectionType::Mixed(types),
-    }
+    };
+    (kind, names)
 }
 
 #[cfg(test)]
@@ -354,6 +377,8 @@ mod tests {
             input_type,
             output_type,
             latencies: Some((300, 400)),
+            input_names: Vec::new(),
+            output_names: Vec::new(),
         }
     }
 

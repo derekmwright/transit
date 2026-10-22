@@ -111,6 +111,9 @@ pub(crate) fn negotiate(buffer: BufferSize, period: ab::Period) -> Result<u32, S
     Ok(chosen.and_then(|c| u32::try_from(c).ok()).unwrap_or(fallback as u32))
 }
 
+/// How long `stop` and a drop wait for a callback still inside the direction they end.
+const QUIESCE_LIMIT: Duration = Duration::from_secs(2);
+
 fn next_generation() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -416,22 +419,39 @@ impl Session {
         }
     }
 
-    /// Stops `direction`; stops the driver when no stream of it runs any more.
+    /// Stops `direction`; stops the driver when no stream of it runs any more. Returns once no
+    /// buffer switch is inside this direction's callback (the other direction may keep the driver
+    /// running), so the owner sees no callback of it after `stop()` returns.
     pub(crate) fn stop(&mut self, name: &str, driver: &mut Driver, direction: ab::Direction) {
         if let Some(side) = self.side(direction) {
-            let _ = side.state.compare_exchange(OPENED, STOPPED, Ordering::AcqRel, Ordering::Acquire);
-            let _ = side.state.compare_exchange(STARTED, STOPPED, Ordering::AcqRel, Ordering::Acquire);
+            let _ = side.state.compare_exchange(OPENED, STOPPED, Ordering::SeqCst, Ordering::SeqCst);
+            let _ = side.state.compare_exchange(STARTED, STOPPED, Ordering::SeqCst, Ordering::SeqCst);
         }
+        self.quiesce(name, direction);
         self.stop_if_idle(name, driver);
     }
 
-    /// Marks `direction` detached; true when the session has no stream left.
+    /// Marks `direction` detached (waiting for a callback inside it, as [`Session::stop`]); true
+    /// when the session has no stream left.
     pub(crate) fn detach(&mut self, name: &str, driver: &mut Driver, direction: ab::Direction) -> bool {
         if let Some(side) = self.side(direction) {
-            side.state.store(DETACHED, Ordering::Release);
+            side.state.store(DETACHED, Ordering::SeqCst);
         }
+        self.quiesce(name, direction);
         self.stop_if_idle(name, driver);
         self.abandoned()
+    }
+
+    /// Waits while a buffer switch is inside `direction`'s callback, when the driver runs.
+    fn quiesce(&self, name: &str, direction: ab::Direction) {
+        if !matches!(self.buffers, BufferState::Running(_)) {
+            return;
+        }
+        if let Some(side) = self.side(direction)
+            && !side.quiesce(QUIESCE_LIMIT)
+        {
+            log::warn!("ASIO driver \"{name}\": a {direction:?} callback did not return within {} s of its stop", QUIESCE_LIMIT.as_secs());
+        }
     }
 
     fn stop_if_idle(&mut self, name: &str, driver: &mut Driver) {
