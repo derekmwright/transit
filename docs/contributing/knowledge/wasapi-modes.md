@@ -48,6 +48,12 @@ read by `Stream::stats()` as an `ab::StreamStats` snapshot). The Audio Devices p
   callback plus the conversion.
 - **min padding** (render, shared only; 0 in exclusive) and **max packets** (capture, per wake).
 
+Measured on the Focusrite Scarlett 2i2 at 48 kHz, 480 frames (2026-10-22, 6 s loopback runs): render service
+p95 16 µs shared and 64 µs exclusive (max 104 µs), render late p95 about 2 ms in both modes; capture late
+reads about 16 ms in shared mode, which is the engine's delivery delay rather than lateness, and 0 in
+exclusive. So the loops cost well under one percent of a period; what is late on that device is the driver
+(known issues K24, K25).
+
 Good looks like late p95 under one period, service time well under one period, and no timeouts or faults.
 Skips are normal on some exclusive drivers (K25) but should stay a small share of the wakes. A max late far
 past a period with a small p95 is a rare stall (scheduling, a driver hiccup), not a steady overload.
