@@ -18,11 +18,7 @@ const MAX_RESIDUAL_NS: f64 = 2_000_000.0;
 // bounded by the existing fit residual policy, not permission to relax that fit.
 const MAX_ESTIMATE_BACKSTEP_NS: i128 = 2_000_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Input,
-    Output,
-}
+pub use soundcraft_audio_backend::{Direction, HostOrigin, Quality, Stamp};
 
 /// A stream incarnation and a backend clock domain. Reopening A after B uses a new key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,26 +26,6 @@ pub struct ClockKey {
     pub generation: u64,
     pub domain: u64,
     pub direction: Direction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Quality {
-    Invalid,
-    Arrival,
-    BackendEstimate,
-    Measured,
-}
-
-/// Backend times are integer nanoseconds in this stream's explicitly identified domain.
-/// `host_callback_ns` is in a common process origin. An arrival observation can have an
-/// unknown dispatch bias; the residual jitter of a fit does not bound that bias.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamp {
-    pub host_callback_ns: u64,
-    pub backend_callback_ns: i64,
-    pub backend_frame_ns: i64,
-    pub quality: Quality,
-    pub offset_uncertainty_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,103 +439,9 @@ impl ClockFitter {
     }
 }
 
-/// The same timestamp extraction is used by real CPAL callbacks and fake-device tests.
-pub struct CpalObserver {
-    observer: Observer,
-    backend_origin: Option<cpal::StreamInstant>,
-}
-
-fn relative_ns(instant: cpal::StreamInstant, origin: cpal::StreamInstant) -> Option<i64> {
-    if let Some(elapsed) = instant.duration_since(&origin) {
-        i64::try_from(elapsed.as_nanos()).ok()
-    } else {
-        let elapsed = origin.duration_since(&instant)?;
-        i64::try_from(-i128::try_from(elapsed.as_nanos()).ok()?).ok()
-    }
-}
-
-impl CpalObserver {
-    pub fn next_frame(&self) -> u64 {
-        self.observer.next_frame()
-    }
-
-    pub fn new(observer: Observer) -> Self {
-        Self { observer, backend_origin: None }
-    }
-    pub fn input(&mut self, frames: usize, info: &cpal::InputCallbackInfo, host_ns: Option<u64>) {
-        let time = info.timestamp();
-        self.record(frames, time.callback, time.capture, host_ns);
-    }
-    pub fn output(&mut self, frames: usize, info: &cpal::OutputCallbackInfo, host_ns: Option<u64>) {
-        let time = info.timestamp();
-        self.record(frames, time.callback, time.playback, host_ns);
-    }
-    fn record(&mut self, frames: usize, callback: cpal::StreamInstant, frame: cpal::StreamInstant, host_ns: Option<u64>) {
-        if frames == 0 {
-            self.observer.counts.zero_frames.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let origin = *self.backend_origin.get_or_insert(callback);
-        let callback = relative_ns(callback, origin);
-        let frame = relative_ns(frame, origin);
-        let valid = callback.is_some() && frame.is_some() && host_ns.is_some();
-        self.observer.record(
-            frames,
-            Stamp {
-                host_callback_ns: host_ns.unwrap_or(0),
-                backend_callback_ns: callback.unwrap_or(0),
-                backend_frame_ns: frame.unwrap_or(0),
-                // Pinned CPAL does not expose the validity flags or calibrated ADC/DAC offset.
-                quality: if valid { Quality::BackendEstimate } else { Quality::Invalid },
-                offset_uncertainty_ns: None,
-            },
-        );
-    }
-}
-
-/// Initialized on control. Reading the cached origin performs no lazy callback initialization.
-#[derive(Clone, Copy)]
-pub struct HostOrigin {
-    #[cfg(not(target_arch = "wasm32"))]
-    instant: std::time::Instant,
-}
-
-impl Default for HostOrigin {
-    fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            Self { instant: *ORIGIN.get_or_init(std::time::Instant::now) }
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            Self {}
-        }
-    }
-}
-
-impl HostOrigin {
-    /// The exact origin used by native audio observations. Pass this to other
-    /// device adapters rather than comparing nanoseconds from separate origins.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn instant(self) -> std::time::Instant {
-        self.instant
-    }
-
-    pub fn now_ns(self) -> Option<u64> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            u64::try_from(self.instant.elapsed().as_nanos()).ok()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            None
-        }
-    }
-}
-
+/// What a stream callback owns: the observation lane producer and the stamp origin.
 pub struct CallbackClock {
-    pub cpal: CpalObserver,
+    pub observer: Observer,
     pub origin: HostOrigin,
 }
 pub struct ClockReader {
@@ -589,10 +471,7 @@ pub fn stream_clock(direction: Direction, nominal_rate: u32) -> Result<(Callback
     let key = ClockKey { generation, domain: generation, direction };
     let (observer, observations) = observation_lane(key, nominal_rate);
     let origin = HostOrigin::default();
-    Ok((
-        CallbackClock { cpal: CpalObserver::new(observer), origin },
-        ClockReader { inner: Box::new(Reader { observations, fitter: ClockFitter::new(key), origin }) },
-    ))
+    Ok((CallbackClock { observer, origin }, ClockReader { inner: Box::new(Reader { observations, fitter: ClockFitter::new(key), origin }) }))
 }
 
 impl ClockReader {

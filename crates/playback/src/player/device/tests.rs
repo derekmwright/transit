@@ -60,7 +60,7 @@ fn device_loss_closes_sources_and_actions_while_main_and_audio_are_busy() {
         let held = callback.access.enter().unwrap();
         let heap = std::thread::spawn(move || {
             crate::mark_audio_thread();
-            measure(|| error(cpal::StreamError::DeviceNotAvailable)).1
+            measure(|| error(ab::StreamError::DeviceNotAvailable)).1
         })
         .join()
         .unwrap();
@@ -430,13 +430,13 @@ fn failed_open_retaining_callback_cannot_hold_shutdown_or_plugin_reclamation_hos
         let ((), heap) = measure(|| callback.fill(&mut out));
         assert!(heap.is_zero(), "retained callback must render silence without heap work: {heap:?}");
         assert_eq!(out, [0.0; 128]);
-        let DeviceOutput { access, output, shared, fault } = callback;
+        let DeviceOutput { access, channels: _, timing, shared, fault, convert } = callback;
         // This is backend closure teardown, not timed rendering. The empty
         // allocation is permitted to be freed here; Audio was already reclaimed.
         let ((), heap) = measure(|| drop(access));
         assert_eq!(heap.allocs, 0);
         assert_eq!(heap.frees, 1);
-        drop((output, shared, fault));
+        drop((timing, shared, fault, convert));
     })
     .join()
     .unwrap();

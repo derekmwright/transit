@@ -163,15 +163,11 @@ fn shared_host(id: cpal::HostId) -> Option<&'static cpal::Host> {
     Some(host)
 }
 
-/// The chosen audio system, else the default one.
-pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
-    let chosen = cfg
-        .system
-        .as_deref()
-        .and_then(|want| cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case(want)))
-        .and_then(shared_host);
+/// The named audio system, else the default one.
+pub(crate) fn host_named(system: Option<&str>) -> Option<&'static cpal::Host> {
+    let chosen = system.and_then(|want| cpal::available_hosts().into_iter().find(|id| id.name().eq_ignore_ascii_case(want))).and_then(shared_host);
     let host = chosen.or_else(|| {
-        if let Some(s) = &cfg.system {
+        if let Some(s) = system {
             log::warn!("audio system `{s}` is not available; using the default");
         }
         shared_host(cpal::default_host().id())
@@ -182,16 +178,15 @@ pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
     host
 }
 
-static ASIO_OUTPUT: Mutex<Option<cpal::Device>> = Mutex::new(None);
-
-/// Release the buffer-sharing device after closing the old input and output, before opening
-/// their replacements. Streams retain their own driver references; this only removes the cache's
-/// ownership. Otherwise the process-wide ASIO loader cannot load a different driver.
-pub fn release_asio_device_cache() {
-    *ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+/// The chosen audio system, else the default one.
+#[cfg(test)]
+pub(crate) fn host(cfg: &AudioConfig) -> Option<&'static cpal::Host> {
+    host_named(cfg.system.as_deref())
 }
 
-fn cached_device<D: Clone>(
+pub use crate::backend::cpal::release_asio_device_cache;
+
+pub(crate) fn cached_device<D: Clone>(
     open: &mut Option<D>,
     asio: bool,
     name: Option<&str>,
@@ -218,19 +213,7 @@ fn cached_device<D: Clone>(
     d
 }
 
-/// The named output (or input) device of `host`, else its default device.
-///
-/// On ASIO the input of the open driver is taken from the output's own `cpal::Device`. cpal keeps
-/// the driver's buffers per `Device` value, and the SDK makes one set of buffers for the whole
-/// driver: an input opened from a freshly listed `Device` did not know about the running output,
-/// so it remade the buffers for the input alone and the output went silent (arming a track
-/// silenced the SSL 2+). From the same `Device`, cpal makes the buffers for both.
-pub(crate) fn device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
-    let mut open = ASIO_OUTPUT.lock().unwrap_or_else(PoisonError::into_inner);
-    cached_device(&mut open, host.id().name() == ASIO_SYSTEM, name, output, device_name, || find_device(host, name, output))
-}
-
-fn find_device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
+pub(crate) fn find_device(host: &cpal::Host, name: Option<&str>, output: bool) -> Option<cpal::Device> {
     if let Some(want) = name {
         let found = if output { host.output_devices().ok() } else { host.input_devices().ok() }
             .and_then(|mut ds| ds.find(|d| device_name(d).as_deref() == Some(want)));
@@ -355,7 +338,7 @@ mod tests {
         assert_eq!(host(&cfg).map(|h| h.id()), Some(cpal::default_host().id()));
         // No device with this name exists: the default (or none, on a machine without audio).
         let h = cpal::default_host();
-        let fallback = device(&h, Some("No Such Device 1234"), true).as_ref().and_then(device_name);
+        let fallback = crate::backend::cpal::device_on(&h, Some("No Such Device 1234"), true).as_ref().and_then(device_name);
         assert_eq!(fallback, h.default_output_device().as_ref().and_then(device_name));
     }
 

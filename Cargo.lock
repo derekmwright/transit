@@ -3835,6 +3835,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-audio-backend"
+version = "0.8.0"
+
+[[package]]
 name = "soundcraft-audio-io"
 version = "0.8.0"
 dependencies = [
@@ -3977,6 +3981,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soundcraft-asio-panel",
+ "soundcraft-audio-backend",
  "soundcraft-audio-io",
  "soundcraft-clap-host",
  "soundcraft-dsp",

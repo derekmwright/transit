@@ -21,6 +21,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("time", 0),
     ("rt", 0),
     ("audio-io", 0),
+    ("audio-backend", 0),
     ("midi-io", 0),
     ("midi", 0),
     ("video", 0),
@@ -124,6 +125,7 @@ fn parity() -> Result<(), String> {
 const WASM: &[&str] = &[
     "soundcraft-time",
     "soundcraft-audio-io",
+    "soundcraft-audio-backend",
     "soundcraft-midi",
     "soundcraft-video",
     "soundcraft-dsp",

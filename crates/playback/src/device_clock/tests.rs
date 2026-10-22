@@ -70,6 +70,26 @@ fn estimated_timestamp_jitter_does_not_relax_discontinuity_or_drift_checks() {
     }
 }
 
+/// The cpal timestamp mapping of the adapter, feeding an observation lane as a real callback does.
+struct CpalObserver {
+    observer: Observer,
+    stamper: crate::backend::cpal::Stamper,
+}
+
+impl CpalObserver {
+    fn new(observer: Observer) -> Self {
+        Self { observer, stamper: crate::backend::cpal::Stamper::default() }
+    }
+    fn input(&mut self, frames: usize, info: &cpal::InputCallbackInfo, host_ns: Option<u64>) {
+        let stamp = self.stamper.input(frames, info, host_ns);
+        self.observer.record(frames, stamp);
+    }
+    fn output(&mut self, frames: usize, info: &cpal::OutputCallbackInfo, host_ns: Option<u64>) {
+        let stamp = self.stamper.output(frames, info, host_ns);
+        self.observer.record(frames, stamp);
+    }
+}
+
 fn key(generation: u64, direction: Direction) -> ClockKey {
     ClockKey { generation, domain: generation + 100, direction }
 }
@@ -357,11 +377,12 @@ fn timestamp_extraction_does_not_fabricate_host_time_and_checks_signed_range() {
         }),
         Some(0),
     );
-    assert!(adapter.backend_origin.is_none(), "an empty callback must not establish an epoch");
+    assert!(adapter.stamper.backend_origin.is_none(), "an empty callback must not establish an epoch");
     adapter.input(128, &cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp { callback: instant(0), capture: instant(-2_666_667) }), None);
     let invalid = observations.pop().unwrap();
     assert_eq!(invalid.stamp.quality, Quality::Invalid);
     assert_eq!(invalid.stamp.backend_frame_ns, -2_666_667);
+    let relative_ns = crate::backend::cpal::relative_ns;
     assert_eq!(relative_ns(cpal::StreamInstant::new(i64::MAX, 0), cpal::StreamInstant::new(i64::MIN, 0)), None);
     assert_eq!(relative_ns(instant(-1), instant(0)), Some(-1));
 }
@@ -618,3 +639,54 @@ fn an_input_clock_cannot_be_used_as_the_consumed_output_timeline() {
         .unwrap();
     assert_eq!(timeline_map::place_host_event(1_001_000_000, input, 1, &clock, &history, now), Err(PlacementError::Clock(Unavailable::WrongClock)));
 }
+
+/// ADR 0016 slice (a): the stamps the CPAL timestamp mapping produces for the saved ASIO trace
+/// were captured before the backend trait; the adapter reproduces them bit for bit.
+#[test]
+fn cpal_stamp_sequences_match_the_captured_golden() {
+    let trace = include_str!("tests/focusrite_asio_trace.csv");
+    let mut lines = Vec::new();
+    for opened in 0..2 {
+        for direction in [Direction::Input, Direction::Output] {
+            let k = key(100 + opened, direction);
+            let (observer, mut observations) = observation_lane(k, 48_000);
+            let mut adapter = CpalObserver::new(observer);
+            let name = if direction == Direction::Input { "input" } else { "output" };
+            let (mut hash, mut count) = (0xcbf2_9ce4_8422_2325u64, 0);
+            for line in trace.lines().filter(|line| !line.starts_with('#')) {
+                let fields: Vec<_> = line.split(',').collect();
+                if fields[0].parse::<u64>().unwrap() != opened || fields[1] != name {
+                    continue;
+                }
+                let frames = fields[2].parse::<usize>().unwrap();
+                let (callback, sample) = (instant(fields[3].parse().unwrap()), instant(fields[4].parse().unwrap()));
+                let host = Some(fields[5].parse::<u64>().unwrap());
+                match direction {
+                    Direction::Input => {
+                        adapter.input(frames, &cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp { callback, capture: sample }), host)
+                    }
+                    Direction::Output => {
+                        adapter.output(frames, &cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp { callback, playback: sample }), host)
+                    }
+                }
+                let o = observations.pop().unwrap();
+                let s = o.stamp;
+                let words = [o.first_frame, u64::from(o.frames), s.host_callback_ns, s.backend_callback_ns as u64, s.backend_frame_ns as u64];
+                for w in words.into_iter().chain([s.quality as u64, s.offset_uncertainty_ns.unwrap_or(u64::MAX)]) {
+                    for b in w.to_le_bytes() {
+                        hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+                    }
+                }
+                count += 1;
+            }
+            lines.push(format!("{opened} {name} {count} {hash:016x}"));
+        }
+    }
+    if std::env::var_os("STAMP_GOLDEN_PRINT").is_some() {
+        panic!("{}", lines.join("\n"));
+    }
+    assert_eq!(lines, STAMP_GOLDEN);
+}
+
+const STAMP_GOLDEN: [&str; 4] =
+    ["0 input 512 e5a107c5575f2515", "0 output 512 2e994bbcddb8133c", "1 input 512 8518b35c4e70450a", "1 output 512 94f5f075b969a85e"];

@@ -2,8 +2,9 @@
 //! belong to this creating-thread owner; the device borrows its anchored audio state.
 use super::audio::{ActionResult, Audio, Command, CountIn};
 use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
-use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputCallback, OutputTrouble, PluginStates, Shared};
+use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
+use soundcraft_audio_backend as ab;
 use soundcraft_mix::{Arrival, DeviceGeneration, Due, EngineEpoch, InstrumentEvent, Message, NoteId, PlanLimits, RenderTarget, Source};
 use soundcraft_model::{IoMap, Session, TrackId};
 use soundcraft_rt::handoff::{Anchor, AudioAccess};
@@ -31,7 +32,7 @@ pub struct Player {
     state: Option<Anchor<Audio>>,
     #[cfg(feature = "test-hooks")]
     test_output: RefCell<Option<DeviceOutput>>,
-    stream: Option<cpal::Stream>,
+    stream: Option<Box<dyn ab::Stream>>,
     input: RefCell<HeldInput>,
     clock: RefCell<Option<device_clock::MaintainedClock>>,
     origin: device_clock::HostOrigin,
@@ -93,7 +94,7 @@ impl Player {
         if let Ok(mut output) = self.test_output.try_borrow_mut()
             && let Some(output) = output.as_mut()
         {
-            output.fill(&mut [0.0f32; 1024]);
+            output.fill_f32(&mut [0.0f32; 1024]);
         }
     }
 
@@ -209,21 +210,32 @@ impl Player {
     }
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
-        use cpal::traits::{DeviceTrait, StreamTrait};
+        Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
+    }
+
+    /// Open the output through the audio system `factory` makes. Every device call goes through
+    /// the backend trait; the adapter owns the sample format, the ASIO duplex order and the
+    /// timestamps of the clocks.
+    fn open_with(session: Arc<Session>, cfg: &AudioConfig, factory: &dyn ab::BackendFactory) -> Result<Self, String> {
         let want_ch = u16::try_from(soundcraft_mix::main_channels(&session)).unwrap_or(2);
-        let (device, config, format, name, system) = crate::open_device(session.sample_rate.hz(), want_ch, cfg)?;
-        let duplex = crate::input_with_output(system, || device.default_input_config().is_ok_and(|c| record::input_usable(&c)));
+        let backend = factory.backend(cfg.system.as_deref()).ok_or_else(|| "no audio system".to_string())?;
+        // Prefer a config at the chosen (else session) rate; else the device default (we resample).
+        let rates = cfg.sample_rate.into_iter().chain(Some(session.sample_rate.hz())).collect();
+        let plan = backend.plan_render(&ab::OutputWish { device: cfg.output.clone(), rates, channels: want_ch, period: cfg.buffer_size })?;
+        let (endpoint, system, name) = (&plan.endpoint, backend.system().to_owned(), plan.endpoint.name.clone());
+        let first = plan.attempts.first().ok_or("no usable output stream")?;
+        let duplex = backend.capture_with_render(endpoint);
         // Every output the stream opened, and the duplex device's inputs, get default paths; the
         // app replaces them with this machine's saved table (`set_io`).
-        let inputs = if duplex { record::input_channels_on(&device, config.sample_rate.0) } else { 0 };
-        let wide = config.channels;
-        let attempts = crate::output_attempts(&config, want_ch);
+        let inputs = if duplex { backend.capture_format(endpoint, Some(first.format.rate)).map_or(0, |format| format.channels) } else { 0 };
+        let wide = first.format.channels;
         let mut error = "no usable output stream".to_owned();
-        for config in attempts {
-            let io = IoMap::for_device(system, &name, inputs, config.channels);
-            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), config.sample_rate.0, io)?;
+        for request in &plan.attempts {
+            let (rate, channels) = (request.format.rate, request.format.channels);
+            let io = IoMap::for_device(&system, &name, inputs, channels);
+            let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
             *player.input.get_mut() = if duplex {
-                match record::Recorder::build_on(&device, config.sample_rate.0, config.buffer_size) {
+                match record::Recorder::build_on(&*backend, endpoint, rate, request.period) {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
                     Err(error) => HeldInput::Failed(format!("the audio input did not open with the output ({error})")),
                 }
@@ -232,22 +244,9 @@ impl Player {
             } else {
                 HeldInput::No
             };
-            let built = match format {
-                cpal::SampleFormat::I8 => build_output::<i8>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::I16 => build_output::<i16>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::I24 => build_output::<cpal::I24>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::I32 => build_output::<i32>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::I64 => build_output::<i64>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::U8 => build_output::<u8>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::U16 => build_output::<u16>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::U32 => build_output::<u32>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::U64 => build_output::<u64>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::F32 => build_output::<f32>(&device, &config, &player, access, clock),
-                cpal::SampleFormat::F64 => build_output::<f64>(&device, &config, &player, access, clock),
-                _ => return Err(format!("unsupported device sample format: {format}")),
-            };
-            let stream = match built {
-                Ok(stream) => stream,
+            let (render, on_error) = render_callbacks(&player, access, clock, usize::from(channels).max(1), rate);
+            let (stream, achieved) = match backend.open_render(endpoint, request, render, on_error) {
+                Ok(opened) => opened,
                 Err(failure) => {
                     error = failure.to_string();
                     continue;
@@ -263,19 +262,16 @@ impl Player {
                 error = failure.to_string();
                 continue;
             }
-            let started = player.stream.as_ref().ok_or("output stream disappeared")?.play();
+            let started = player.stream.as_ref().ok_or("output stream disappeared")?.start();
             if let Err(failure) = started {
                 error = failure.to_string();
                 continue;
             }
-            log::info!("audio output opened with {} channels (asked for {})", config.channels, wide);
+            log::info!("audio output opened with {} channels (asked for {})", achieved.format.channels, wide);
             player.device_name = name.clone();
-            player.device_system = system.to_string();
-            player.device_channels = config.channels;
-            player.device_buffer = match config.buffer_size {
-                cpal::BufferSize::Fixed(n) => Some(n),
-                cpal::BufferSize::Default => None,
-            };
+            player.device_system = system.clone();
+            player.device_channels = achieved.format.channels;
+            player.device_buffer = achieved.period.frames();
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {
@@ -340,7 +336,7 @@ impl Player {
                 let len = frames * 2;
                 fault.beats.fetch_add(1, Ordering::Relaxed);
                 if let Some(data) = data.get_mut(..len) {
-                    callback.fill(data);
+                    callback.fill_f32(data);
                 }
             }
         }));
@@ -652,7 +648,7 @@ impl Player {
         Ok(out)
     }
     pub fn thread_priority(&self) -> scheduling::WorkerPriority {
-        scheduling::observe(self.stream.as_ref())
+        self.stream.as_ref().map_or(scheduling::WorkerPriority::NoWorker, |stream| stream.thread_priority())
     }
     /// Start the since-open peak load over; the output callback applies it at its next block.
     pub fn reset_peak_load(&self) {
@@ -711,7 +707,6 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
-        use cpal::traits::StreamTrait;
         if let Some(anchor) = &self.state {
             anchor.close();
         }
@@ -725,7 +720,7 @@ impl Drop for Player {
             }
         }
         if let Some(stream) = &self.stream {
-            let _ = stream.pause();
+            let _ = stream.stop();
         }
         // Admission, not the backend's pause semantics, establishes quiescence.
         if let Some(anchor) = &self.state {
@@ -782,56 +777,87 @@ fn render_held(
 /// Its sole endpoint borrows Audio; the Player's anchor remains its final owner.
 struct DeviceOutput {
     access: AudioAccess<Audio>,
-    output: OutputCallback,
+    channels: usize,
+    timing: telemetry::Accumulator,
     shared: Arc<Shared>,
     fault: Arc<Fault>,
+    /// Typed device buffers in tests convert through the scratch of the adapter; real streams
+    /// convert inside their adapter.
+    #[cfg(test)]
+    convert: crate::OutputCallback,
 }
 
 impl DeviceOutput {
     fn new(access: AudioAccess<Audio>, player: &Player, channels: usize) -> Self {
-        Self { access, output: OutputCallback::new(channels), shared: Arc::clone(&player.shared), fault: Arc::clone(&player.fault) }
+        // Initialise the platform clock (including any frequency cache) before callbacks run.
+        let _ = telemetry::Timer::start().elapsed();
+        Self {
+            access,
+            channels: channels.max(1),
+            timing: telemetry::Accumulator::default(),
+            shared: Arc::clone(&player.shared),
+            fault: Arc::clone(&player.fault),
+            #[cfg(test)]
+            convert: crate::OutputCallback::new(channels),
+        }
     }
 
-    fn fill<T: cpal::SizedSample + cpal::FromSample<f32>>(&mut self, data: &mut [T]) {
-        let channels = self.output.channels;
-        self.output.fill_with(data, |buffer, plans, actions| {
-            render_held(&mut self.access, &self.fault, &self.shared, buffer, channels, plans, actions);
+    /// One device callback: the callback scope is shared by every conversion chunk of the
+    /// block; it must never be reconstructed inside a chunk.
+    fn render(&mut self, block: &mut ab::RenderBlock<'_>) {
+        let mut plans = plan_bridge::callback_scope();
+        let mut actions = action_lane::callback_scope();
+        let (access, fault, shared, channels) = (&mut self.access, &*self.fault, &*self.shared, self.channels);
+        block.render(&mut |buffer| {
+            render_held(access, fault, shared, buffer, channels, &mut plans, &mut actions);
+        });
+    }
+
+    /// The same callback scope over `f32` samples with no device conversion (the silent clock).
+    #[cfg(any(not(target_arch = "wasm32"), feature = "test-hooks"))]
+    fn fill_f32(&mut self, data: &mut [f32]) {
+        let mut plans = plan_bridge::callback_scope();
+        let mut actions = action_lane::callback_scope();
+        for buffer in data.chunks_mut(ab::SCRATCH_FRAMES * self.channels) {
+            render_held(&mut self.access, &self.fault, &self.shared, buffer, self.channels, &mut plans, &mut actions);
+        }
+    }
+
+    /// A typed device buffer through the conversion of the adapter.
+    #[cfg(test)]
+    fn fill<T: crate::backend::cpal::Sample>(&mut self, data: &mut [T]) {
+        let mut plans = plan_bridge::callback_scope();
+        let mut actions = action_lane::callback_scope();
+        let (access, fault, shared, channels) = (&mut self.access, &*self.fault, &*self.shared, self.channels);
+        self.convert.convert(data, &mut |buffer| {
+            render_held(access, fault, shared, buffer, channels, &mut plans, &mut actions);
         });
     }
 }
 
-fn build_output<T>(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
+/// The render and error callbacks the backend runs on its audio thread.
+fn render_callbacks(
     player: &Player,
     access: AudioAccess<Audio>,
     mut clock: device_clock::CallbackClock,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
-where
-    T: cpal::SizedSample + cpal::FromSample<f32>,
-{
-    use cpal::traits::DeviceTrait;
-    let channels = usize::from(config.channels).max(1);
-    let rate = config.sample_rate.0;
+    channels: usize,
+    rate: u32,
+) -> (ab::RenderCallback, ab::ErrorCallback) {
     let mut output = DeviceOutput::new(access, player, channels);
     let fault = Arc::clone(&player.fault);
     let error = error_callback(Arc::clone(&player.fault), Arc::clone(&player.shared), player.failure_signal.clone());
-    device.build_output_stream(
-        config,
-        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
-            crate::mark_audio_thread();
-            let started = telemetry::Timer::start();
-            let creating_before = soundcraft_mix::creating_instance();
-            let frames = data.len() / channels;
-            clock.cpal.output(frames, info, clock.origin.now_ns());
-            fault.beats.fetch_add(1, Ordering::Relaxed);
-            output.fill(data);
-            let creating = creating_before || soundcraft_mix::creating_instance();
-            output.output.timing.record_overlap(&fault.telemetry, frames, rate, started.elapsed(), creating);
-        },
-        error,
-        None,
-    )
+    let render = move |block: &mut ab::RenderBlock<'_>| {
+        crate::mark_audio_thread();
+        let started = telemetry::Timer::start();
+        let creating_before = soundcraft_mix::creating_instance();
+        let frames = block.frames;
+        clock.observer.record(frames, block.stamp);
+        fault.beats.fetch_add(1, Ordering::Relaxed);
+        output.render(block);
+        let creating = creating_before || soundcraft_mix::creating_instance();
+        output.timing.record_overlap(&fault.telemetry, frames, rate, started.elapsed(), creating);
+    };
+    (Box::new(render), Box::new(error))
 }
 
 /// Virtual fallback pacing, not a physical device clock. Keep sub-frame time
@@ -858,10 +884,10 @@ fn error_callback(
     fault: Arc<Fault>,
     shared: Arc<Shared>,
     signal: Option<plan_bridge::RuntimeIdentity>,
-) -> impl FnMut(cpal::StreamError) + Send + 'static {
+) -> impl FnMut(ab::StreamError) + Send + 'static {
     move |error| {
         crate::mark_audio_thread();
-        let gone = matches!(error, cpal::StreamError::DeviceNotAvailable);
+        let gone = matches!(error, ab::StreamError::DeviceNotAvailable);
         if gone {
             if let Some(signal) = &signal {
                 signal.fault();
@@ -873,5 +899,7 @@ fn error_callback(
     }
 }
 
+#[cfg(test)]
+mod golden;
 #[cfg(test)]
 mod tests;
