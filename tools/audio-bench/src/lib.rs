@@ -1,6 +1,6 @@
 //! The audio benchmark harness (ADR 0016 slice b). It drives any [`Backend`] through the trait
 //! only and measures by host arrival time at callback entry: achieved period, arrival jitter,
-//! xruns (gaps in the arrival times), callback time and, with an output-to-input cable, the
+//! xruns (steps in the arrival drift and render callbacks longer than a period), callback time and, with an output-to-input cable, the
 //! loopback round trip. Results are a Markdown table (`docs/benchmarks/`).
 //!
 //! The callbacks (`probe`) never allocate or lock; `analysis` and `report` run after the streams

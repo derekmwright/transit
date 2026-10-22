@@ -26,7 +26,7 @@ fn config(period: u32, seconds: f64, loopback: bool, script: Script) -> Config {
 }
 
 fn script(jitter_us: u32, gap_at_s: Option<f64>, delay_frames: u32) -> Script {
-    Script { seconds: 0.0, jitter_us, gap_at_s, delay_frames }
+    Script { seconds: 0.0, jitter_us, gap_at_s, burst: false, delay_frames }
 }
 
 fn measure(config: &Config) -> Measurements {
@@ -83,6 +83,22 @@ fn jitter_and_one_gap_are_reported() {
     assert_eq!(trip.paired, 8);
     assert!(trip.min_ms >= 3.0 - 0.2 - 1e-6 && trip.p95_ms <= 3.0 + 0.2 + 1e-6, "{trip:?}");
     assert!((trip.median_ms - 3.0).abs() <= 0.2 + 1e-6, "{trip:?}");
+}
+
+#[test]
+fn burst_delivery_is_not_an_xrun_but_a_lost_buffer_is() {
+    // Two-period waits and back-to-back pairs, no frames lost: every click pairs, nothing is counted.
+    for period in [64, 32] {
+        let mut burst = script(0, None, 144);
+        burst.burst = true;
+        let m = measure(&config(period, 4.0, true, burst));
+        assert_eq!((m.xruns_out, m.xruns_in), (0, Some(0)), "period {period}");
+        let trip = m.round_trip.expect("loopback");
+        assert_eq!(trip.paired, trip.clicks, "period {period}: {trip:?}");
+    }
+    // The scripted true xrun is still reported, on both streams.
+    let m = measure(&config(64, 4.0, true, script(0, Some(2.0), 144)));
+    assert_eq!((m.xruns_out, m.xruns_in), (1, Some(1)));
 }
 
 #[test]

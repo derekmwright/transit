@@ -1,4 +1,15 @@
 //! From the raw logs to the numbers of a row. Runs on the control thread after the streams stop.
+//!
+//! Xruns are counted by drift, not by callback gaps. Some drivers (the Focusrite ASIO driver at
+//! 64 and 32 frames) deliver callbacks in bursts: a two-period wait, then two callbacks back to
+//! back. Every gap is long, yet the frames delivered keep pace with the host clock, so nothing was
+//! lost. The detector therefore asks when each block was due (the first valid arrival after the
+//! warm-up plus the frames delivered since, at the nominal rate), takes the arrival's drift from
+//! that, removes the straight line of the device clock's rate error by least squares and counts
+//! each sustained upward step of the residual: a skipped buffer leaves the stream permanently one
+//! block behind wall time, a burst leaves a spike that returns to the baseline. On the render
+//! stream, callbacks whose body took longer than the period also count: on ASIO a host-side
+//! overrun does not change the callback cadence, so only the body time shows it.
 
 use crate::probe::{CallbackLog, INVALID_ARRIVAL, Shared, click_start};
 use std::sync::atomic::Ordering;
@@ -6,8 +17,11 @@ use std::sync::atomic::Ordering;
 /// Callbacks at the start of a stream that are left out of the jitter figures: drivers deliver
 /// the first few back to back while they fill their buffers.
 pub const WARMUP_CALLBACKS: usize = 8;
-/// An arrival interval longer than this many periods counts as an xrun.
-pub const XRUN_PERIODS: f64 = 1.5;
+/// Callbacks in each window the drift detector compares (at least four periods, as every
+/// callback delivers one period).
+pub const DRIFT_WINDOW: usize = 8;
+/// A step of the residual drift above this many periods counts as an xrun.
+pub const XRUN_STEP_PERIODS: f64 = 0.5;
 /// The longest round trip the pairing of clicks and detections accepts.
 pub const MAX_ROUND_TRIP_MS: f64 = 450.0;
 
@@ -42,8 +56,11 @@ pub struct Measurements {
     /// Deviation of the render arrival intervals from the achieved period, in ms.
     pub jitter_ms: Percentiles,
     pub duration_s: f64,
+    /// Xruns of the render stream: sustained steps of its arrival drift (see the module doc) plus
+    /// callbacks whose body time exceeded the period.
     pub xruns_out: u64,
-    /// Capture arrival gaps, when a capture stream ran.
+    /// Sustained steps of the capture stream's arrival drift, when a capture stream ran. The
+    /// capture body time is not counted.
     pub xruns_in: Option<u64>,
     /// Callback body time of the render stream, in microseconds.
     pub cpu_us: Percentiles,
@@ -119,9 +136,37 @@ impl Stream {
             .map(|i| self.arrival_ns[i] as f64 - self.arrival_ns[i - 1] as f64)
             .collect()
     }
-    fn gaps(&self) -> u64 {
-        let limit = self.period_ns() * XRUN_PERIODS;
-        self.intervals().into_iter().filter(|interval| *interval > limit).count() as u64
+    /// Sustained steps of the arrival drift: the arrivals' lag behind the frames delivered, after
+    /// the clock-rate line is removed. A burst is a spike that returns, a lost buffer a step.
+    fn drift_steps(&self) -> u64 {
+        let period = self.period_ns();
+        let starts = self.starts();
+        let valid: Vec<usize> = (WARMUP_CALLBACKS..self.arrival_ns.len()).filter(|&i| self.arrival_ns[i] != INVALID_ARRIVAL).collect();
+        let (Some(&first), true) = (valid.first(), period > 0.0) else { return 0 };
+        let rate = f64::from(self.rate.max(1));
+        let x: Vec<f64> = valid.iter().map(|&i| (starts[i] - starts[first]) as f64).collect();
+        let y: Vec<f64> = valid.iter().zip(&x).map(|(&i, x)| (self.arrival_ns[i] as f64 - self.arrival_ns[first] as f64) - x * 1e9 / rate).collect();
+        let n = x.len() as f64;
+        let (mx, my) = (x.iter().sum::<f64>() / n, y.iter().sum::<f64>() / n);
+        let sxx: f64 = x.iter().map(|x| (x - mx) * (x - mx)).sum();
+        let slope = if sxx > 0.0 { x.iter().zip(&y).map(|(x, y)| (x - mx) * (y - my)).sum::<f64>() / sxx } else { 0.0 };
+        let residual: Vec<f64> = x.iter().zip(&y).map(|(x, y)| y - my - slope * (x - mx)).collect();
+        let median = |window: &[f64]| percentile(&sorted(window.to_vec()), 0.5);
+        let (w, mut steps, mut at) = (DRIFT_WINDOW, 0u64, DRIFT_WINDOW);
+        while at + w <= residual.len() {
+            if median(&residual[at..at + w]) - median(&residual[at - w..at]) > period * XRUN_STEP_PERIODS {
+                steps += 1;
+                at += w;
+            } else {
+                at += 1;
+            }
+        }
+        steps
+    }
+    /// Callbacks after the warm-up whose body time exceeded the period.
+    fn overruns(&self) -> u64 {
+        let period = self.period_ns();
+        self.cpu_ns.iter().skip(WARMUP_CALLBACKS).filter(|ns| **ns as f64 > period).count() as u64
     }
     fn duration_s(&self) -> f64 {
         let mut valid = self.arrival_ns.iter().filter(|a| **a != INVALID_ARRIVAL);
@@ -252,8 +297,8 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
         achieved_ms: period_ns / 1e6,
         jitter_ms: jitter,
         duration_s: render.duration_s(),
-        xruns_out: render.gaps(),
-        xruns_in: capture.as_ref().map(Stream::gaps),
+        xruns_out: render.drift_steps() + render.overruns(),
+        xruns_in: capture.as_ref().map(Stream::drift_steps),
         cpu_us: cpu,
         round_trip,
         frame_trip,
@@ -298,5 +343,73 @@ mod tests {
         assert_eq!(stream.host_ns(&starts, 15), Some(2005.0));
         assert_eq!(stream.host_ns(&starts, 31), None, "invalid block");
         assert_eq!(stream.host_ns(&starts, 99), None, "past the end");
+    }
+
+    /// Blocks of `frames` at 48 kHz, arriving at `arrive(k)` ns, with body time `cpu`.
+    fn stream(frames: u64, blocks: u64, arrive: impl Fn(u64, f64) -> f64, cpu: impl Fn(u64) -> u64) -> Stream {
+        let period = frames as f64 * 1e9 / 48_000.0;
+        Stream {
+            arrival_ns: (0..blocks).map(|k| (1e9 + arrive(k, period)) as u64).collect(),
+            frame_ns: vec![0; blocks as usize],
+            frames: vec![frames; blocks as usize],
+            cpu_ns: (0..blocks).map(cpu).collect(),
+            rate: 48_000,
+        }
+    }
+
+    fn on_time(k: u64, period: f64) -> f64 {
+        k as f64 * period
+    }
+
+    #[test]
+    fn a_steady_stream_has_no_xruns() {
+        let s = stream(64, 3000, on_time, |_| 1000);
+        assert_eq!((s.drift_steps(), s.overruns()), (0, 0));
+    }
+
+    #[test]
+    fn one_true_gap_counts_once() {
+        // From block 1500 on every arrival is one period late: the frames never catch up.
+        let s = stream(64, 3000, |k, p| on_time(k, p) + if k >= 1500 { p } else { 0.0 }, |_| 0);
+        assert_eq!(s.drift_steps(), 1);
+        // The same with two separate losses.
+        let s = stream(64, 3000, |k, p| on_time(k, p) + p * f64::from(u8::from(k >= 1000)) + p * f64::from(u8::from(k >= 2000)), |_| 0);
+        assert_eq!(s.drift_steps(), 2);
+    }
+
+    #[test]
+    fn bursty_delivery_counts_nothing() {
+        // A two-period wait, then two blocks back to back, frames keeping pace.
+        for frames in [64, 32] {
+            let s = stream(frames, 4000, |k, p| (k | 1) as f64 * p, |_| 0);
+            assert_eq!(s.drift_steps(), 0, "{frames} frames");
+        }
+    }
+
+    #[test]
+    fn a_clock_rate_mismatch_is_not_an_xrun() {
+        // 300 ppm slow over 60 s at 32 frames: about 18 ms, hundreds of periods, as a straight line.
+        let blocks = 60 * 48_000 / 32;
+        let s = stream(32, blocks, |k, p| on_time(k, p) * 1.0003, |_| 0);
+        assert_eq!(s.drift_steps(), 0);
+        // A real gap on top of the mismatch is still found.
+        let s = stream(32, blocks, |k, p| on_time(k, p) * 1.0003 + if k >= blocks / 2 { p } else { 0.0 }, |_| 0);
+        assert_eq!(s.drift_steps(), 1);
+    }
+
+    #[test]
+    fn invalid_arrivals_are_skipped() {
+        let mut s = stream(64, 3000, on_time, |_| 0);
+        for i in (100..3000).step_by(7) {
+            s.arrival_ns[i] = INVALID_ARRIVAL;
+        }
+        assert_eq!(s.drift_steps(), 0);
+    }
+
+    #[test]
+    fn a_render_body_longer_than_the_period_counts() {
+        let period_ns = (64.0 * 1e9 / 48_000.0) as u64;
+        let s = stream(64, 3000, on_time, |k| if k == 1500 { period_ns + 1 } else { period_ns / 2 });
+        assert_eq!((s.drift_steps(), s.overruns()), (0, 1));
     }
 }

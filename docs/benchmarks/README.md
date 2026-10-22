@@ -19,11 +19,20 @@ Windows) taken at callback entry, as the backend reports it in `Stamp::host_call
 - **Jitter.** The deviation of the arrival interval of consecutive render callbacks from the achieved
   period: p50, p95 and max, in ms. The first 8 callbacks are left out (drivers deliver them back to
   back while they fill their buffers).
-- **Xruns.** The trait reports none today, so an xrun is an arrival gap longer than 1.5 periods,
-  counted on the render stream and on the capture stream (`out/in`). "Xruns/min" is the render count
-  over the measured span. The Notes column counts calls of the backends' error callbacks, invalid
-  stamps and any log entries lost to a full log. A gap is evidence of a late callback, not proof of an
-  audible glitch, and a backend that buffers more deeply may hide an underrun from this method. On the cpal backend the column is this gap heuristic (known issue K26); the native WASAPI backend's "render backend:" and "capture backend:" lines are the direct figures.
+- **Xruns.** The trait reports none today, so an xrun is a sustained drift step: the arrival of each
+  block is compared with when its frames were due (the first arrival after the warm-up plus the frames
+  delivered since, at the nominal rate), the straight line of the device clock's rate error is removed
+  by least squares, and each step of the residual of more than half a period (median of the next
+  window against the median of the previous one, windows of 8 callbacks) counts once. Bursty delivery
+  (a two-period wait, then two callbacks back to back) is a spike that returns to the baseline and
+  counts nothing; a skipped buffer leaves the stream behind wall time for good and counts one. The
+  render stream also counts every callback whose body time exceeded the period, because on ASIO a
+  host-side overrun does not change the callback cadence. Both are reported on the render stream and
+  the capture stream (`out/in`; the capture side has no body-time count). "Xruns/min" is the render
+  count over the measured span. The Notes column counts calls of the backends' error callbacks, invalid
+  stamps and any log entries lost to a full log. A drift step is evidence of lost frames, not proof of
+  an audible glitch, and a backend that buffers more deeply may hide an underrun from this method.
+  On the native WASAPI backend the "render backend:" and "capture backend:" lines are the direct figures.
 - **Callback time.** Wall time spent in the harness's render callback (p50, p95, in us). The harness
   callback does almost nothing, so this is the floor of the backend's own overhead as seen from
   inside the callback, not a CPU load figure.

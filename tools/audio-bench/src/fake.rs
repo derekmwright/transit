@@ -12,15 +12,19 @@ pub struct Script {
     pub seconds: f64,
     /// Peak arrival jitter, in microseconds, either way.
     pub jitter_us: u32,
-    /// From this time on every callback arrives one period late: a single arrival gap.
+    /// From this time on every callback arrives one period late: a true xrun (a buffer was
+    /// skipped, so the frames delivered stay one period behind the host clock for good).
     pub gap_at_s: Option<f64>,
+    /// Deliver callbacks in pairs: a two-period wait, then two blocks back to back. No frames are
+    /// lost, so it is not an xrun (a driver's burst delivery).
+    pub burst: bool,
     /// The software loopback delay, in frames.
     pub delay_frames: u32,
 }
 
 impl Script {
     pub fn new(seconds: f64) -> Self {
-        Self { seconds, jitter_us: 100, gap_at_s: Some(seconds / 2.0), delay_frames: 144 }
+        Self { seconds, jitter_us: 100, gap_at_s: Some(seconds / 2.0), burst: false, delay_frames: 144 }
     }
 }
 
@@ -65,7 +69,8 @@ pub fn drive(fake: &FakeBackend, request: &Request, period: u32, script: &Script
     let at = |k: u64| u64::try_from(u128::from(k) * u128::from(period_frames) * 1_000_000_000 / u128::from(rate)).unwrap_or(u64::MAX);
     let arrival = |k: u64, salt: u64| {
         let late = if gap_block.is_some_and(|g| k >= g) { at(1) } else { 0 };
-        (origin_ns + late + at(k)).saturating_add_signed(jitter_ns(k, salt, peak))
+        let due = if script.burst { at(k | 1) } else { at(k) };
+        (origin_ns + late + due).saturating_add_signed(jitter_ns(k, salt, peak))
     };
     let mut render = vec![0.0f32; period as usize * out_channels];
     let mut capture = vec![0.0f32; period as usize * in_channels];

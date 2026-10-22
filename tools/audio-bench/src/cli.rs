@@ -24,7 +24,8 @@ usage: audio-bench [options]
   fake mode only:
   --fake-delay <frames>  software loopback delay (default 144)
   --fake-jitter-us <us>  peak arrival jitter (default 100)
-  --fake-gap-at <sec>    one arrival gap at this time, or `none` (default: half way)";
+  --fake-gap-at <sec>    one true xrun at this time (every later callback one period late), or `none` (default: half way)
+  --fake-burst           deliver callbacks in pairs: a two-period wait, then two blocks back to back, no frames lost (not an xrun)";
 
 /// What the command line asks for.
 #[derive(Debug)]
@@ -46,7 +47,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     let mut request =
         session::Request { device: None, in_device: None, rate: 48_000, period: None, loopback: false, mode: ab::Mode::Shared, out_ch: 1, in_ch: 1 };
     let (mut seconds, mut out, mut settings) = (20.0f64, None, None);
-    let (mut delay, mut jitter, mut gap) = (None, None, None::<Option<f64>>);
+    let (mut delay, mut jitter, mut gap, mut burst) = (None, None, None::<Option<f64>>, false);
     let mut list = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next();
@@ -86,6 +87,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                     other => Some(number(&flag, other.map(str::to_string))?),
                 })
             }
+            "--fake-burst" => burst = true,
             "--help" | "-h" => return Ok(Command::Help),
             other => return Err(format!("unknown option {other}\n{USAGE}")),
         }
@@ -111,13 +113,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if settings.is_some() && kind == Kind::Cpal {
         return Err("--settings needs --backend wasapi: the frame times of cpal streams are not comparable".into());
     }
-    if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some()) {
+    if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some() || burst) {
         return Err("--fake-* options need --backend fake".into());
     }
     let mut script = fake::Script::new(seconds);
     script.delay_frames = delay.unwrap_or(script.delay_frames);
     script.jitter_us = jitter.unwrap_or(script.jitter_us);
     script.gap_at_s = gap.unwrap_or(script.gap_at_s);
+    script.burst = burst;
     Ok(Command::Run(Config { kind, system, request, seconds, fake: script, out, settings }))
 }
 
@@ -164,6 +167,9 @@ mod tests {
         assert!(matches!(parse_str("--list-devices --system WASAPI"), Ok(Command::List(Some(_)))));
         let Ok(Command::Run(c)) = parse_str("--backend fake --fake-gap-at none") else { panic!("did not parse") };
         assert_eq!(c.fake.gap_at_s, None);
+        let Ok(Command::Run(c)) = parse_str("--backend fake --fake-burst") else { panic!("did not parse") };
+        assert!(c.fake.burst);
+        assert!(parse_str("--fake-burst").is_err(), "fake options need the fake backend");
     }
 
     #[test]
