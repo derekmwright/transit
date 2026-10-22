@@ -86,6 +86,8 @@ impl LoopStats {
             max_service_us: self.max_service_us.load(Relaxed),
             min_padding_frames: if padding == NO_PADDING { 0 } else { padding },
             max_packets_per_wake: self.max_packets_per_wake.load(Relaxed),
+            // WASAPI has no driver-event reports.
+            ..StreamStats::default()
         }
     }
 }
