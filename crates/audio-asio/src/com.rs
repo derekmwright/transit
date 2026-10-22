@@ -23,6 +23,7 @@ use crate::host::Loader;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
+use std::time::Duration;
 use transit_audio_backend as ab;
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, HWND};
 use windows::Win32::System::Com::{
@@ -489,9 +490,10 @@ impl Event {
         let _ = unsafe { SetEvent(self.0) };
     }
 
-    /// Dispatches every queued window message of this thread, then sleeps until the event is set
-    /// or a new message arrives. Called by the host thread between requests.
-    pub(crate) fn pump_and_wait(&self) {
+    /// Dispatches every queued window message of this thread, then sleeps until the event is set,
+    /// a new message arrives or `timeout` passes (`None`: no timeout). Called by the host thread
+    /// between requests; the timeout is the watchdog's tick while a driver runs.
+    pub(crate) fn pump_and_wait(&self, timeout: Option<Duration>) {
         let mut msg = MSG::default();
         // SAFETY: `PeekMessageW` with `PM_REMOVE` fills the local `MSG`; `TranslateMessage` and
         // `DispatchMessageW` get a message just retrieved on this thread (drivers may post to the
@@ -503,13 +505,15 @@ impl Event {
                 DispatchMessageW(&msg);
             }
         }
+        let millis = timeout.map_or(INFINITE, |t| u32::try_from(t.as_millis()).unwrap_or(INFINITE - 1).min(INFINITE - 1));
         // SAFETY: waits on one live event handle (a slice that outlives the call) or any input
-        // for this thread's queue. INFINITE cannot strand the thread: every caller sets the event
-        // after queuing a request, and both ways the host ends (`Host::drop` and a `Host::spawn`
-        // that timed out waiting for the start) set `quit` and drop the request sender before
-        // setting it, so the loop wakes, sees the sender gone and exits. An auto-reset event set
-        // before the wait begins stays signaled until the wait consumes it.
-        let _ = unsafe { MsgWaitForMultipleObjects(Some(&[self.0]), false, INFINITE, QS_ALLINPUT) };
+        // for this thread's queue, for at most `millis` (a timeout only returns early). INFINITE
+        // cannot strand the thread: every caller sets the event after queuing a request, and both
+        // ways the host ends (`Host::drop` and a `Host::spawn` that timed out waiting for the
+        // start) set `quit` and drop the request sender before setting it, so the loop wakes, sees
+        // the sender gone and exits. An auto-reset event set before the wait begins stays
+        // signaled until the wait consumes it.
+        let _ = unsafe { MsgWaitForMultipleObjects(Some(&[self.0]), false, millis, QS_ALLINPUT) };
     }
 }
 

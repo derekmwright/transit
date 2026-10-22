@@ -46,9 +46,14 @@ fn model12() -> FakeSpec {
     spec
 }
 
+/// The test thread plays the driver and calls back when it likes: the watchdog waits an hour.
 fn rig(spec: FakeSpec) -> Rig {
+    rig_watching(spec, Duration::from_secs(3600))
+}
+
+fn rig_watching(spec: FakeSpec, watchdog_floor: Duration) -> Rig {
     let (loader, observed) = FakeLoader::new(vec![(entry("Driver", 40), spec)]);
-    let backend = AsioBackend::with_loader(Box::new(loader), Slot::default(), Duration::from_secs(10)).expect("backend");
+    let backend = AsioBackend::with_loader_watching(Box::new(loader), Slot::default(), Duration::from_secs(10), watchdog_floor).expect("backend");
     let endpoint = backend.endpoints(ab::Direction::Output).expect("endpoints").remove(0);
     Rig { backend, observed, endpoint }
 }
@@ -404,6 +409,63 @@ fn a_reset_request_is_one_stream_error_per_stream_and_a_rate_change_is_one_too()
     testing::rate_changed(44_100.0);
     assert_eq!(seen.errors.lock().unwrap().len(), 2, "a rate change under the streams resets them");
     assert_eq!(capture.stats().expect("stats").resets, 1);
+    drop((capture, render));
+}
+
+/// Waits up to five seconds for `n` stream errors.
+fn wait_for_errors(seen: &Seen, n: usize) -> Vec<(ab::Direction, ab::StreamError)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while seen.errors.lock().unwrap().len() < n && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut errors = seen.errors.lock().unwrap().clone();
+    errors.sort_by_key(|(d, _)| *d == ab::Direction::Output);
+    errors
+}
+
+#[test]
+fn a_driver_that_stops_calling_back_is_reported_stalled_once_by_the_watchdog() {
+    let _guard = lock();
+    // 64 frames at 48 kHz: eight buffers are 10.7 ms, so a 60 ms floor is the limit.
+    let rig = rig_watching(scarlett(), Duration::from_millis(60));
+    let seen = seen();
+    let (capture, render, _, _) = duplex(&rig, 48_000, Some(64), &seen, vec![0.0; 2]);
+    drive(&rig, 64, 0, 3, &[]);
+    let quiet = std::time::Instant::now();
+    let errors = wait_for_errors(&seen, 2);
+    let waited = quiet.elapsed();
+    assert_eq!(errors, [(ab::Direction::Input, ab::StreamError::Stalled), (ab::Direction::Output, ab::StreamError::Stalled)]);
+    assert!(waited >= Duration::from_millis(60), "not before the limit: {waited:?}");
+    let (rs, cs) = (render.stats().expect("stats"), capture.stats().expect("stats"));
+    assert_eq!((rs.timeouts, cs.timeouts, rs.resets), (1, 1, 0), "counted once for the driver, apart from resets");
+    // A driver that calls again is not reported again in this run.
+    drive(&rig, 64, 3 * 64, 2, &[]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(seen.errors.lock().unwrap().len(), 2);
+    assert_eq!(render.stats().expect("stats").timeouts, 1);
+    drop((capture, render));
+}
+
+#[test]
+fn the_watchdog_leaves_a_driver_that_calls_back_and_a_stopped_one_alone() {
+    let _guard = lock();
+    let rig = rig_watching(scarlett(), Duration::from_millis(250));
+    let seen = seen();
+    let (capture, render, _, _) = duplex(&rig, 48_000, Some(64), &seen, vec![0.0; 2]);
+    // The first callback may take up to a second after the start.
+    std::thread::sleep(Duration::from_millis(400));
+    let mut position = 0;
+    let until = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < until {
+        drive(&rig, 64, position, 1, &[]);
+        position += 64;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    render.stop().expect("stop");
+    capture.stop().expect("stop");
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(seen.errors.lock().unwrap().is_empty(), "{:?}", seen.errors.lock().unwrap());
+    assert_eq!(render.stats().expect("stats").timeouts, 0);
     drop((capture, render));
 }
 

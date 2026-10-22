@@ -1,7 +1,8 @@
 //! Automatic reopen of the audio device after its driver asked for it (native ASIO slice d1).
 //!
 //! An ASIO driver whose settings moved under a running stream (a buffer size or a rate changed in
-//! its panel) asks the host to close and reopen it (`kAsioResetRequest`). The Player reports that
+//! its panel) asks the host to close and reopen it (`kAsioResetRequest`); a driver that stopped
+//! calling back is caught by the backend's watchdog and reopened the same way. The Player reports that
 //! ([`crate::Player::reopen_cause`]); the app stops the transport (a take in progress ends there and
 //! is kept, never spliced onto the reopened stream), then reopens the device with the same
 //! configuration through its one reopen path. [`Reopener`] decides when: a short wait so the
@@ -15,6 +16,18 @@
 pub enum ReopenCause {
     /// The driver asked to be reset (ASIO `kAsioResetRequest`, or its rate changed under the stream).
     DriverReset,
+    /// The driver stopped calling back while the stream should run (the ASIO watchdog).
+    DriverStalled,
+}
+
+impl ReopenCause {
+    /// What happened, for the status line: "driver reset", "driver stopped calling back".
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::DriverReset => "driver reset",
+            Self::DriverStalled => "driver stopped calling back",
+        }
+    }
 }
 
 /// Attempts before the user is asked to reconnect.
@@ -43,12 +56,13 @@ pub struct Reopener {
     last_success: Option<f64>,
     cause: Option<ReopenCause>,
     resets: u64,
+    stalls: u64,
     reopened: u64,
 }
 
 impl Default for Reopener {
     fn default() -> Self {
-        Self { phase: Phase::Idle, streak: 0, last_success: None, cause: None, resets: 0, reopened: 0 }
+        Self { phase: Phase::Idle, streak: 0, last_success: None, cause: None, resets: 0, stalls: 0, reopened: 0 }
     }
 }
 
@@ -65,6 +79,7 @@ impl Reopener {
         self.cause = Some(cause);
         match cause {
             ReopenCause::DriverReset => self.resets += 1,
+            ReopenCause::DriverStalled => self.stalls += 1,
         }
         self.phase = self.next(now);
         true
@@ -126,6 +141,16 @@ impl Reopener {
         self.resets
     }
 
+    /// Stalls the backend's watchdog reported (counted apart from resets).
+    pub fn stalls(&self) -> u64 {
+        self.stalls
+    }
+
+    /// The cause of the last incident.
+    pub fn cause(&self) -> Option<ReopenCause> {
+        self.cause
+    }
+
     /// Automatic reopens that succeeded.
     pub fn reopened(&self) -> u64 {
         self.reopened
@@ -134,11 +159,8 @@ impl Reopener {
     /// The line for the Audio Devices window: what happened and what happens next; `None` before
     /// any request. `blocked` as in [`Self::due`].
     pub fn status(&self, blocked: bool) -> Option<String> {
-        let cause = self.cause?;
-        let what = match cause {
-            ReopenCause::DriverReset => "driver reset",
-        };
-        let counts = format!("resets {}, reopened {}", self.resets, self.reopened);
+        let what = self.cause?.text();
+        let counts = format!("resets {}, stalls {}, reopened {}", self.resets, self.stalls, self.reopened);
         let state = match self.phase {
             Phase::Waiting(_) if blocked => "waiting for the driver settings panel to close, then reopening".to_owned(),
             Phase::Waiting(_) => format!("reopening (attempt {} of {REOPEN_ATTEMPTS})", self.streak + 1),
@@ -166,11 +188,11 @@ mod tests {
         assert!(!r.due(10.2, false), "the driver settles first");
         assert!(r.due(10.25, false));
         assert_eq!(r.attempt(), Some(1));
-        assert_eq!(r.status(false).unwrap(), "Recovery: driver reset, reopening (attempt 1 of 3) (resets 1, reopened 0)");
+        assert_eq!(r.status(false).unwrap(), "Recovery: driver reset, reopening (attempt 1 of 3) (resets 1, stalls 0, reopened 0)");
         r.attempted(true, 10.3);
         assert!(!r.pending() && !r.due(20.0, false));
         assert_eq!(r.reopened(), 1);
-        assert_eq!(r.status(false).unwrap(), "Recovery: driver reset, reopened automatically (resets 1, reopened 1)");
+        assert_eq!(r.status(false).unwrap(), "Recovery: driver reset, reopened automatically (resets 1, stalls 0, reopened 1)");
     }
 
     #[test]
@@ -188,7 +210,7 @@ mod tests {
         assert!(!r.trouble(RESET, 5.0), "nothing more until the user reconnects");
         assert_eq!(
             r.status(false).unwrap(),
-            "Recovery: driver reset, the device did not reopen after 3 attempts; use Reconnect (resets 1, reopened 0)"
+            "Recovery: driver reset, the device did not reopen after 3 attempts; use Reconnect (resets 1, stalls 0, reopened 0)"
         );
         r.reconnected();
         assert!(r.trouble(RESET, 50.0) && r.due(50.25, false), "a reconnect starts the count afresh");
@@ -201,7 +223,7 @@ mod tests {
         assert!(!r.due(5.0, true));
         assert_eq!(
             r.status(true).unwrap(),
-            "Recovery: driver reset, waiting for the driver settings panel to close, then reopening (resets 1, reopened 0)"
+            "Recovery: driver reset, waiting for the driver settings panel to close, then reopening (resets 1, stalls 0, reopened 0)"
         );
         assert!(r.due(5.0, false));
         assert_eq!(r.attempt(), Some(1), "still the first attempt");
@@ -220,6 +242,17 @@ mod tests {
         assert!(r.trouble(RESET, 12.0));
         assert!(r.gave_up(), "a fourth request within the settle time is not retried");
         assert_eq!(r.reopened(), 3);
+    }
+
+    #[test]
+    fn a_stall_takes_the_same_path_and_is_counted_apart() {
+        let mut r = Reopener::default();
+        assert!(r.trouble(ReopenCause::DriverStalled, 0.0));
+        assert_eq!(r.cause(), Some(ReopenCause::DriverStalled));
+        assert!(r.due(0.25, false));
+        r.attempted(true, 0.25);
+        assert_eq!((r.resets(), r.stalls(), r.reopened()), (0, 1, 1));
+        assert_eq!(r.status(false).unwrap(), "Recovery: driver stopped calling back, reopened automatically (resets 0, stalls 1, reopened 1)");
     }
 
     #[test]

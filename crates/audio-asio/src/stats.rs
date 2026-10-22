@@ -3,9 +3,11 @@
 //! buffer-switch callback and `asioMessage` only do relaxed atomic adds and maxima on preallocated
 //! cells (no allocation, no lock). The reader takes a snapshot on any thread.
 //!
-//! ASIO has no wait to time out and no padding: `timeouts`, `skipped_wakes`, `min_padding_frames`
-//! and `max_packets_per_wake` stay 0. The driver-event counters (`overloads`, `position_jumps`,
-//! `resets`) belong to the driver, so both directions of one driver share them ([`DriverEvents`]).
+//! ASIO has no wait and no padding: `skipped_wakes`, `min_padding_frames` and
+//! `max_packets_per_wake` stay 0, and `timeouts` counts the watchdog's stalls (the driver stopped
+//! calling back, [`crate::watchdog`]). The driver-event counters (`overloads`, `position_jumps`,
+//! `resets`, `timeouts`) belong to the driver, so both directions of one driver share them
+//! ([`DriverEvents`]).
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -18,6 +20,8 @@ pub(crate) struct DriverEvents {
     pub(crate) overloads: AtomicU64,
     pub(crate) position_jumps: AtomicU64,
     pub(crate) resets: AtomicU64,
+    /// Stalls the watchdog found: the driver stopped calling back while a stream should run.
+    pub(crate) timeouts: AtomicU64,
 }
 
 /// Live counters of one direction.
@@ -73,6 +77,7 @@ impl LoopStats {
             overloads: self.events.overloads.load(Relaxed),
             position_jumps: self.events.position_jumps.load(Relaxed),
             resets: self.events.resets.load(Relaxed),
+            timeouts: self.events.timeouts.load(Relaxed),
             ..StreamStats::default()
         }
     }
@@ -107,11 +112,12 @@ mod tests {
         render.wake();
         events.overloads.fetch_add(2, Relaxed);
         events.resets.fetch_add(1, Relaxed);
+        events.timeouts.fetch_add(1, Relaxed);
         let s = render.snapshot();
         assert_eq!((s.wakes, s.wake_late_us[0], s.wake_late_us[15], s.max_wake_late_us), (1, 1, 1, 500_000));
         assert_eq!((s.service_us[5], s.max_service_us), (1, 300));
-        assert_eq!((s.overloads, s.position_jumps, s.resets), (2, 0, 1));
+        assert_eq!((s.overloads, s.position_jumps, s.resets, s.timeouts), (2, 0, 1, 1));
         assert_eq!((capture.snapshot().overloads, capture.snapshot().wakes), (2, 0), "one driver, one set of events");
-        assert_eq!((s.timeouts, s.skipped_wakes, s.min_padding_frames, s.max_packets_per_wake), (0, 0, 0, 0));
+        assert_eq!((s.skipped_wakes, s.min_padding_frames, s.max_packets_per_wake), (0, 0, 0));
     }
 }

@@ -36,6 +36,8 @@ const GONE: u8 = 1;
 const BROKEN: u8 = 2;
 /// The driver asked for a reset (ASIO): the input is reopened with the device.
 const RESET: u8 = 3;
+/// The driver stopped calling back (the ASIO watchdog): the input is reopened with the device.
+const DRIVER_STALLED: u8 = 4;
 const ARMED: u64 = 1;
 const CAPTURING: u64 = 2;
 const CAPTURE_FLAGS: u64 = ARMED | CAPTURING;
@@ -268,6 +270,7 @@ fn capture_callbacks(
         let fault = match e {
             ab::StreamError::DeviceNotAvailable => GONE,
             ab::StreamError::ResetRequested => RESET,
+            ab::StreamError::Stalled => DRIVER_STALLED,
             ab::StreamError::Other => return,
         };
         let _ = errors.fault.compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
@@ -521,6 +524,7 @@ impl Recorder {
             GONE => return Some(Trouble::Device(format!("“{name}” was disconnected"))),
             BROKEN => return Some(Trouble::Device("the audio input hit an internal error (see the log)".into())),
             RESET => return Some(Trouble::Device(crate::RESET_REQUESTED_TEXT.into())),
+            DRIVER_STALLED => return Some(Trouble::Device(crate::DRIVER_STALLED_TEXT.into())),
             _ => {}
         }
         let beats = self.shared.beats.load(Ordering::Relaxed);

@@ -1201,6 +1201,21 @@ fn a_driver_reset_request_stops_the_output_and_says_so_once() {
 }
 
 #[test]
+fn a_driver_the_watchdog_found_stalled_stops_the_output_and_is_reopened_like_a_reset() {
+    let fake = model12();
+    let cfg = asio_config();
+    let player = open_asio(&fake, &cfg);
+    let mut recorder = player.open_input(&cfg).unwrap();
+    assert!(fake.inject_error(ab::Direction::Output, ab::StreamError::Stalled));
+    assert!(!player.is_playing());
+    assert_eq!(player.trouble(), Some(OutputTrouble::Stalled));
+    assert_eq!(player.reopen_cause(), Some(crate::reopen::ReopenCause::DriverStalled));
+    assert_eq!(player.callback_telemetry().device_lost_errors, 0, "a stall is not a lost device");
+    assert!(fake.inject_error(ab::Direction::Input, ab::StreamError::Stalled));
+    assert_eq!(recorder.trouble(), Some(crate::record::Trouble::Device(crate::DRIVER_STALLED_TEXT.into())));
+}
+
+#[test]
 fn an_input_opened_on_demand_goes_through_the_native_backend_that_serves_the_output() {
     // Inputs that do not open with the output (native WASAPI without a pairing).
     let native = fake_factory(false).with_capture(2, false);

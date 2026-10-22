@@ -104,6 +104,8 @@ pub(crate) struct HostState {
     loaded: Option<Loaded>,
     /// The host's wake event, which `kAsioLatenciesChanged` sets so the thread refetches.
     wake: Arc<Event>,
+    /// The shortest stall limit of the sessions' watchdogs ([`crate::watchdog::STALL_FLOOR`]).
+    watchdog_floor: Duration,
 }
 
 impl HostState {
@@ -220,12 +222,12 @@ impl HostState {
             Some(open) if open == entry.name => {}
             Some(open) => return Err(Self::in_use(&open, entry)),
         }
-        let wake = Arc::clone(&self.wake);
+        let (wake, floor) = (Arc::clone(&self.wake), self.watchdog_floor);
         let Some(loaded) = self.loaded.as_mut() else { return Err(not_open(&entry.name)) };
         let Loaded { entry: open, info, session, driver, .. } = &mut *loaded;
         let result = match session.as_mut() {
             Some(session) => session.attach(&open.name, driver, info, request, callback, error),
-            None => Session::open(&open.name, driver, info, wake, request, callback, error).map(|(s, opened)| {
+            None => Session::open(&open.name, driver, info, wake, floor, request, callback, error).map(|(s, opened)| {
                 *session = Some(s);
                 opened
             }),
@@ -284,13 +286,14 @@ impl HostState {
     }
 
     /// Work between requests: a session left without streams (a stream dropped while the host
-    /// was stuck, whose detach could not be sent) is ended, and a latency refetch the driver
-    /// asked for is made.
-    fn tend(&mut self) {
+    /// was stuck, whose detach could not be sent) is ended, a latency refetch the driver asked for
+    /// is made, and the watchdog looks at a running driver. Returns how long the thread may sleep
+    /// before it looks again (`None`: until a request or a message).
+    fn tend(&mut self) -> Option<Duration> {
         self.sweep();
-        if let Some(Loaded { entry, session: Some(session), driver, .. }) = self.loaded.as_mut() {
-            session.tend(&entry.name, driver);
-        }
+        let Some(Loaded { entry, session: Some(session), driver, .. }) = self.loaded.as_mut() else { return None };
+        session.tend(&entry.name, driver);
+        session.tick()
     }
 
     /// Runs `call` on the loaded driver `name`; `what` names the method for errors.
@@ -350,12 +353,19 @@ pub(crate) struct Host {
 
 impl Host {
     /// Starts the host thread: STA, message window, then the request loop.
+    #[cfg(test)]
     pub(crate) fn spawn(loader: Box<dyn Loader>, slot: Slot, timeout: Duration) -> Result<Self, ab::OpenError> {
-        Self::spawn_after(loader, slot, timeout, Duration::ZERO)
+        Self::spawn_watching(loader, slot, timeout, crate::watchdog::STALL_FLOOR)
+    }
+
+    /// [`Host::spawn`] with `watchdog_floor` as the sessions' shortest stall limit (tests that
+    /// drive the callbacks by hand use a long one).
+    pub(crate) fn spawn_watching(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, watchdog_floor: Duration) -> Result<Self, ab::OpenError> {
+        Self::spawn_after(loader, slot, timeout, watchdog_floor, Duration::ZERO)
     }
 
     /// [`Host::spawn`] with the thread pausing `delay` before it starts (tests of the start timeout).
-    fn spawn_after(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, delay: Duration) -> Result<Self, ab::OpenError> {
+    fn spawn_after(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, watchdog_floor: Duration, delay: Duration) -> Result<Self, ab::OpenError> {
         let (tx, rx) = mpsc::channel::<Envelope>();
         let (started_tx, started_rx) = mpsc::channel();
         let (exited_tx, exited) = mpsc::channel();
@@ -368,7 +378,7 @@ impl Host {
                 if !delay.is_zero() {
                     std::thread::sleep(delay);
                 }
-                run(loader, slot, &rx, thread_wake, &thread_shared, &started_tx);
+                run(loader, slot, watchdog_floor, &rx, thread_wake, &thread_shared, &started_tx);
                 let _ = exited_tx.send(());
             })
             .map_err(|e| ab::OpenError::Other(format!("could not start the ASIO host thread: {e}")))?;
@@ -478,6 +488,7 @@ impl Drop for Host {
 fn run(
     loader: Box<dyn Loader>,
     slot: Slot,
+    watchdog_floor: Duration,
     jobs: &Receiver<Envelope>,
     wake: Arc<Event>,
     shared: &Shared,
@@ -498,7 +509,7 @@ fn run(
             return;
         }
     };
-    let mut state = HostState { loader, slot, sys_ref: window.sys_ref(), loaded: None, wake: Arc::clone(&wake) };
+    let mut state = HostState { loader, slot, sys_ref: window.sys_ref(), loaded: None, wake: Arc::clone(&wake), watchdog_floor };
     let _ = started.send(Ok(()));
     'serve: loop {
         loop {
@@ -511,8 +522,8 @@ fn run(
         if shared.quit.load(Ordering::Acquire) {
             break;
         }
-        state.tend();
-        wake.pump_and_wait();
+        let tick = state.tend();
+        wake.pump_and_wait(tick);
     }
     state.release();
     drop(state);
@@ -669,7 +680,14 @@ mod tests {
     #[test]
     fn a_host_that_starts_after_the_spawn_timeout_ends_instead_of_sleeping_forever() {
         let (loader, observed) = FakeLoader::new(Vec::new());
-        let err = Host::spawn_after(Box::new(loader), Slot::default(), Duration::from_millis(100), Duration::from_millis(400)).err();
+        let err = Host::spawn_after(
+            Box::new(loader),
+            Slot::default(),
+            Duration::from_millis(100),
+            crate::watchdog::STALL_FLOOR,
+            Duration::from_millis(400),
+        )
+        .err();
         assert!(matches!(&err, Some(ab::OpenError::Other(t)) if t.contains("did not start")), "{err:?}");
         // The late thread starts, finds the request channel closed and the event set, and exits,
         // dropping the loader (the only other holder of `observed`).

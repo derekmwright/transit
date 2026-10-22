@@ -12,6 +12,10 @@
 //! until its own `start`); the driver stops when no stream of it is running any more, and the
 //! session ends (buffers disposed, callback state freed, the driver unloaded unless a
 //! [`crate::Loaded`] handle holds it) when both streams are dropped.
+//!
+//! **The watchdog.** While the driver runs, the host thread checks between requests whether its
+//! buffer switches still come ([`Session::tend`], [`crate::watchdog`]); a driver silent for longer
+//! than the limit gets each open stream a `StreamError::Stalled`, once per start.
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -21,6 +25,7 @@ use crate::convert::Wire;
 use crate::driver::{BufferSize, DriverInfo, asio_error};
 use crate::engine::{DETACHED, Engine, Latencies, OPENED, STARTED, STOPPED, Side, SideShared};
 use crate::stats::DriverEvents;
+use crate::watchdog::Watchdog;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -79,6 +84,7 @@ pub(crate) struct Session {
     latencies: Arc<Latencies>,
     events: Arc<DriverEvents>,
     system_step: Arc<AtomicU64>,
+    watchdog: Watchdog,
     installed: Installed,
 }
 
@@ -162,6 +168,7 @@ impl Session {
         driver: &mut Driver,
         info: &DriverInfo,
         wake: Arc<Event>,
+        watchdog_floor: Duration,
         request: &ab::OpenRequest,
         callback: Callback,
         error: ab::ErrorCallback,
@@ -189,6 +196,7 @@ impl Session {
             latencies,
             events,
             system_step,
+            watchdog: Watchdog::new(frames, format.rate, watchdog_floor),
             installed,
         };
         let opened = session.add(name, driver, wire, format, request, callback, error)?;
@@ -352,11 +360,29 @@ impl Session {
         }
     }
 
-    /// The host thread's periodic duty: a `kAsioLatenciesChanged` refetch.
+    /// The host thread's periodic duty: a `kAsioLatenciesChanged` refetch, and the watchdog.
     pub(crate) fn tend(&mut self, name: &str, driver: &mut Driver) {
         if self.installed.state().latencies_dirty.swap(false, Ordering::Relaxed) {
             self.refresh_latencies(name, driver);
         }
+        self.watch(name, crate::callback::qpc_100ns());
+    }
+
+    /// The watchdog at `now` (QPC, 100 ns): a running driver whose buffer switches stopped while a
+    /// stream of it is started stalls each open stream, once per start.
+    fn watch(&mut self, name: &str, now: u64) {
+        let running = matches!(self.buffers, BufferState::Running(_)) && self.sides().any(|s| s.state() == STARTED);
+        let state = self.installed.state();
+        if self.watchdog.check(now, state.last_switch(), running) {
+            log::warn!("ASIO driver \"{name}\": no buffer switch for more than {} ms; the streams stalled", self.watchdog.limit().as_millis());
+            state.stalled();
+        }
+    }
+
+    /// How long the host thread may sleep before it next looks at the watchdog: `None` while the
+    /// driver does not run.
+    pub(crate) fn tick(&self) -> Option<Duration> {
+        self.watchdog.tick()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -404,9 +430,11 @@ impl Session {
                     planes.silence_outputs();
                 });
                 side.start(pair.0, pair.1);
+                self.installed.state().forget_last_switch();
                 match driver.start(buffers) {
                     Ok(running) => {
                         self.buffers = BufferState::Running(running);
+                        self.watchdog.arm(crate::callback::qpc_100ns());
                         Ok(())
                     }
                     Err((buffers, code)) => {
@@ -460,6 +488,7 @@ impl Session {
         }
         self.buffers = match std::mem::replace(&mut self.buffers, BufferState::Missing) {
             BufferState::Running(running) => {
+                self.watchdog.disarm();
                 let (buffers, result) = driver.stop(running);
                 if let Err(code) = result {
                     log::warn!("{}", asio_error(name, "stop", code));

@@ -20,6 +20,7 @@ use serde_json::json;
 use soundcraft_engine::TransportRequest;
 use soundcraft_model::TrackId;
 use soundcraft_playback::record::Trouble;
+use soundcraft_playback::reopen::ReopenCause;
 use soundcraft_playback::{CountIn, OutputTrouble, Player};
 use soundcraft_time::{Range, Samples};
 
@@ -887,19 +888,20 @@ impl StudioApp {
         let opened = result.is_ok() && player.is_some_and(|p| !p.silent && p.reopen_cause().is_none());
         self.reopen.attempted(opened, now);
         let name = player.map_or_else(String::new, |p| p.device_name.clone());
+        let what = self.reopen.cause().map_or("driver reset", ReopenCause::text);
         let why = match &result {
             Err(error) => error.clone(),
             Ok(_) => player.and_then(Player::initial_error).unwrap_or("it did not open").to_owned(),
         };
         self.status = if opened {
-            format!("“{name}” reopened after the driver reset.")
+            format!("“{name}” reopened after the {what}.")
         } else if self.reopen.gave_up() {
             format!(
-                "The device did not reopen after the driver reset ({why}), after {} attempts. Use Audio › Reconnect Device.",
+                "The device did not reopen after the {what} ({why}), after {} attempts. Use Audio › Reconnect Device.",
                 soundcraft_playback::reopen::REOPEN_ATTEMPTS
             )
         } else {
-            format!("The device did not reopen after the driver reset yet ({why}); trying again.")
+            format!("The device did not reopen after the {what} yet ({why}); trying again.")
         };
         if matches!(result, Ok(false)) {
             self.status.push(' ');
@@ -1693,18 +1695,24 @@ fn rec_event(offset: Samples, e: &soundcraft_playback::midi_capture::CapturedEve
 /// Said when a reopen could not take the plug-ins' live state and used the document's.
 const STATE_FROM_DOCUMENT: &str = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.";
 
-/// The status line when a driver reset stops the device and the app reopens it.
+/// The status line when a driver reset (or a driver that stopped calling back) stops the device
+/// and the app reopens it.
 fn reopen_note(reopen: &soundcraft_playback::reopen::Reopener, recording: bool, playing: bool) -> String {
+    let what = reopen.cause().map_or("driver reset", ReopenCause::text);
     let next = if reopen.gave_up() {
         format!("The device did not reopen after {} attempts; use Audio › Reconnect Device.", soundcraft_playback::reopen::REOPEN_ATTEMPTS)
     } else {
         "Reopening the device.".to_owned()
     };
     if recording {
-        format!("Recording ended: driver reset. The take is kept up to there. {next}")
+        format!("Recording ended: {what}. The take is kept up to there. {next}")
     } else if playing {
-        format!("Playback stopped: driver reset. {next}")
+        format!("Playback stopped: {what}. {next}")
     } else {
-        format!("Driver reset. {next}")
+        let mut what = what.to_owned();
+        if let Some(first) = what.get_mut(..1) {
+            first.make_ascii_uppercase();
+        }
+        format!("{what}. {next}")
     }
 }

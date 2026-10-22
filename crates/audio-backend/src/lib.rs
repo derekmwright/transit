@@ -286,6 +286,9 @@ pub enum StreamError {
     /// rate change under a running stream): the stream keeps its buffers but the driver's settings
     /// moved, so the owner reopens it.
     ResetRequested,
+    /// The driver stopped calling back while the stream should run (the ASIO watchdog: no buffer
+    /// switch for eight buffers, at least 250 ms); the owner reopens it, as after a reset.
+    Stalled,
 }
 
 /// Device changes a backend reports outside any stream.
@@ -336,7 +339,8 @@ pub const STATS_BINS: usize = 16;
 pub struct StreamStats {
     /// Device events the loop served (not stop, timeout or failure).
     pub wakes: u64,
-    /// Waits that timed out: the device stopped signaling, and the stream ended.
+    /// Waits that timed out: the device stopped signaling, and the stream ended (ASIO: the
+    /// watchdog found the driver had stopped calling back, [`StreamError::Stalled`]).
     pub timeouts: u64,
     /// Exclusive-mode events whose buffer was not free yet; the loop skipped them.
     pub skipped_wakes: u64,

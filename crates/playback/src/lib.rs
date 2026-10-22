@@ -97,6 +97,9 @@ impl Default for Metro {
 /// What the status line says when a driver asked to be reset ([`OutputTrouble::ResetRequested`],
 /// and the input's [`record::Trouble::Device`] for the same request).
 pub const RESET_REQUESTED_TEXT: &str = "ASIO driver asked for a reset; reopen the device";
+/// What the input's trouble says when the backend's watchdog found the driver had stopped calling
+/// back (the output's is [`OutputTrouble::Stalled`]).
+pub const DRIVER_STALLED_TEXT: &str = "the ASIO driver stopped calling back; reopen the device";
 
 /// What stopped the audio output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +108,8 @@ pub enum OutputTrouble {
     Bug,
     /// The device went away.
     Gone,
-    /// The device stopped asking for audio while playing.
+    /// The device stopped asking for audio while playing, or (ASIO) the backend's watchdog found
+    /// the driver had stopped calling back.
     Stalled,
     /// The driver asked to be reopened (ASIO `kAsioResetRequest`, or its rate changed under the
     /// stream); the output is silent until the device is reopened.
@@ -121,6 +125,8 @@ struct Fault {
     gone: AtomicBool,
     /// The driver asked for a reset (set with `gone`, which silences the output).
     reset: AtomicBool,
+    /// The backend's watchdog found the driver had stopped calling back (set with `gone`).
+    driver_stalled: AtomicBool,
     /// Blocks so far, to tell a device that stopped asking for audio.
     beats: std::sync::atomic::AtomicU64,
     /// The UI has been told.
@@ -134,6 +140,8 @@ impl Fault {
             OutputTrouble::Bug
         } else if self.reset.load(Ordering::Relaxed) {
             OutputTrouble::ResetRequested
+        } else if self.driver_stalled.load(Ordering::Relaxed) {
+            OutputTrouble::Stalled
         } else if self.gone.load(Ordering::Relaxed) {
             OutputTrouble::Gone
         } else if stalled {

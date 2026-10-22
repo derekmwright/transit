@@ -46,6 +46,8 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The pending bit of a reset request (or a rate change) not yet reported.
 const PENDING_RESET: u8 = 1;
+/// The pending bit of a stall the watchdog found, not yet reported.
+const PENDING_STALL: u8 = 2;
 
 /// The callback table handed to every `createBuffers`, in writable static memory: the SDK passes
 /// it as `ASIOCallbacks *` and the driver keeps the pointer until `disposeBuffers`.
@@ -171,6 +173,9 @@ pub(crate) struct CallbackState {
     wake: Arc<Event>,
     /// Buffer switches that found the state busy and did nothing (a driver calling twice at once).
     pub(crate) busy_skips: AtomicU64,
+    /// The QPC (100 ns) of the last buffer switch's entry, 0 before the first since the driver
+    /// started: what the host thread's watchdog reads.
+    last_switch: AtomicU64,
 }
 
 // SAFETY: the `UnsafeCell`s are only accessed under `busy` (an acquire compare-exchange to take it,
@@ -195,6 +200,7 @@ impl CallbackState {
             latencies_dirty: AtomicBool::new(false),
             wake,
             busy_skips: AtomicU64::new(0),
+            last_switch: AtomicU64::new(0),
         })
     }
 
@@ -227,6 +233,7 @@ impl CallbackState {
 
     /// One buffer switch on the driver's thread.
     fn switch(&self, index: AsioLong, time: Time, arrival_100ns: u64) {
+        self.last_switch.store(arrival_100ns, Ordering::Relaxed);
         if !self.try_take() {
             self.busy_skips.fetch_add(1, Ordering::Relaxed);
             return;
@@ -250,9 +257,32 @@ impl CallbackState {
     }
 
     fn deliver_locked(pending: &AtomicU8, engine: &mut Engine) {
-        if pending.swap(0, Ordering::SeqCst) & PENDING_RESET != 0 {
+        let bits = pending.swap(0, Ordering::SeqCst);
+        if bits & PENDING_RESET != 0 {
             engine.report(StreamError::ResetRequested);
         }
+        if bits & PENDING_STALL != 0 {
+            engine.report(StreamError::Stalled);
+        }
+    }
+
+    /// The QPC of the last buffer switch since the driver started, 0 before the first.
+    pub(crate) fn last_switch(&self) -> u64 {
+        self.last_switch.load(Ordering::Relaxed)
+    }
+
+    /// The driver (re)starts: the watchdog waits for its first buffer switch again.
+    pub(crate) fn forget_last_switch(&self) {
+        self.last_switch.store(0, Ordering::Relaxed);
+    }
+
+    /// The watchdog found the driver had stopped calling back (host thread): counted, and each
+    /// open stream gets `StreamError::Stalled` once, delivered at once when no buffer switch
+    /// holds the flag (else by its holder when it lets go).
+    pub(crate) fn stalled(&self) {
+        self.events.timeouts.fetch_add(1, Ordering::Relaxed);
+        self.pending.fetch_or(PENDING_STALL, Ordering::SeqCst);
+        self.deliver_pending();
     }
 
     /// Delivers pending errors if the flag is free; a holder delivers them before it lets go.

@@ -15,6 +15,8 @@
 //!   `createBuffers` for both, the driver started by the first stream's `start`. Open both before
 //!   starting either (the open-order rule, [`session`]). The callback runs on the driver's thread
 //!   ([`callback`]); its work ([`engine`]) converts ([`convert`]), stamps and counts ([`stats`]).
+//!   A driver that stops calling back while a stream should run is caught by the host thread's
+//!   [`watchdog`] and reported as `StreamError::Stalled`.
 //! - [`AsioFactory`] hands out one process-wide backend: one host thread and one enumeration cache.
 //!
 //! This is a sanctioned `unsafe` crate (ADR 0013 and the draft amendment): all `unsafe` is in
@@ -36,6 +38,7 @@ mod session;
 mod stats;
 #[cfg(test)]
 mod stream_tests;
+mod watchdog;
 
 pub use driver::{BufferSize, DirectionType, DriverDiagnostic, DriverEntry, DriverInfo, PROBE_RATES, SampleType};
 
@@ -120,7 +123,13 @@ impl AsioBackend {
     }
 
     fn with_loader(loader: Box<dyn Loader>, slot: Slot, timeout: Duration) -> Result<Self, ab::OpenError> {
-        Ok(Self { host: Arc::new(Host::spawn(loader, slot, timeout)?), last: Arc::new(Mutex::new(None)) })
+        Self::with_loader_watching(loader, slot, timeout, watchdog::STALL_FLOOR)
+    }
+
+    /// [`Self::with_loader`] with `watchdog_floor` as the shortest stall limit (tests that drive
+    /// the callbacks by hand use a long one).
+    fn with_loader_watching(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, watchdog_floor: Duration) -> Result<Self, ab::OpenError> {
+        Ok(Self { host: Arc::new(Host::spawn_watching(loader, slot, timeout, watchdog_floor)?), last: Arc::new(Mutex::new(None)) })
     }
 
     /// The installed drivers from the registry, nothing loaded.

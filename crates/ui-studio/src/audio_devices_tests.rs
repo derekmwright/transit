@@ -1193,7 +1193,7 @@ fn a_driver_reset_reopens_the_native_asio_output_and_input_without_user_action()
     assert!(!p.silent && p.reopen_cause().is_none(), "the new player runs");
     assert!(t.app.recorder.as_mut().is_some_and(|r| r.trouble().is_none()), "and monitoring has the reopened input again");
     assert_eq!(t.app.status, "“Focusrite USB ASIO” reopened after the driver reset.");
-    assert_eq!(t.app.reopen.status(false).as_deref(), Some("Recovery: driver reset, reopened automatically (resets 1, reopened 1)"));
+    assert_eq!(t.app.reopen.status(false).as_deref(), Some("Recovery: driver reset, reopened automatically (resets 1, stalls 0, reopened 1)"));
     run(&mut t, &driver, 60);
     assert_eq!(driver.opens().len(), opens + 2, "once");
 }
@@ -1237,6 +1237,25 @@ fn a_driver_reset_while_recording_ends_the_take_keeps_it_and_then_reopens() {
     assert_eq!(driver.opens().len(), 4, "then the device reopened");
     assert_eq!(t.app.engine.session().track(track).unwrap().clips().len(), 1, "and nothing was spliced onto the take");
     assert_eq!(t.app.reopen.reopened(), 1);
+}
+
+/// A driver the backend's watchdog found had stopped calling back takes the same reopen path,
+/// counted apart from resets.
+#[test]
+fn a_driver_that_stopped_calling_back_is_reopened_the_same_way() {
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    run(&mut t, &driver, 10);
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::Stalled));
+    assert!(inject(&driver, ab::Direction::Input, ab::StreamError::Stalled));
+    run(&mut t, &driver, 1);
+    assert_eq!(t.app.status, "Driver stopped calling back. Reopening the device.");
+    run(&mut t, &driver, 20);
+    assert_eq!(driver.opens().len(), 4, "input and output reopened");
+    assert_eq!(t.app.status, "“Focusrite USB ASIO” reopened after the driver stopped calling back.");
+    assert_eq!((t.app.reopen.resets(), t.app.reopen.stalls(), t.app.reopen.reopened()), (0, 1, 1));
 }
 
 /// While the driver's settings panel holds the driver's host thread, the reopen waits for it (a

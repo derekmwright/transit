@@ -1089,7 +1089,11 @@ impl Player {
         if self.silent || fault.failed.load(Ordering::Acquire) {
             return None;
         }
-        fault.reset.load(Ordering::Acquire).then_some(crate::reopen::ReopenCause::DriverReset)
+        if fault.reset.load(Ordering::Acquire) {
+            Some(crate::reopen::ReopenCause::DriverReset)
+        } else {
+            fault.driver_stalled.load(Ordering::Acquire).then_some(crate::reopen::ReopenCause::DriverStalled)
+        }
     }
     /// Whether the native backend that serves the device has its host thread blocked in a driver
     /// call (an ASIO driver's settings panel is open): a reopen now would be refused, so the app
@@ -1385,12 +1389,17 @@ fn error_callback(
     move |error| {
         crate::mark_audio_thread();
         // A driver's reset request (ASIO) stops the output like a lost device, but is said as
-        // itself: the app reopens the device ([`crate::reopen`], `Player::reopen_cause`).
+        // itself: the app reopens the device ([`crate::reopen`], `Player::reopen_cause`). So does
+        // a driver the backend's watchdog found had stopped calling back.
         let reset = matches!(error, ab::StreamError::ResetRequested);
+        let stalled = matches!(error, ab::StreamError::Stalled);
         if reset {
             fault.reset.store(true, Ordering::Release);
         }
-        let gone = reset || matches!(error, ab::StreamError::DeviceNotAvailable);
+        if stalled {
+            fault.driver_stalled.store(true, Ordering::Release);
+        }
+        let gone = reset || stalled || matches!(error, ab::StreamError::DeviceNotAvailable);
         if gone {
             if let Some(signal) = &signal {
                 signal.fault();
