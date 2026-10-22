@@ -13,6 +13,14 @@ fn main() -> ExitCode {
             let row = run(&config)?;
             let rows = [row];
             print!("{}", report::table(&rows));
+            match &rows[0].calibration {
+                Some(Ok(figures)) => println!("{}", figures.describe()),
+                Some(Err(why)) => println!("calibration: none ({why})"),
+                None => {}
+            }
+            if let Some(path) = &config.settings {
+                eprintln!("calibration merged into {}", path.display());
+            }
             if let Some(path) = &config.out {
                 report::write(path, &rows)?;
                 eprintln!("wrote {}", path.display());

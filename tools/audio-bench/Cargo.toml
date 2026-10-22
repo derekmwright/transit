@@ -16,6 +16,7 @@ asio = ["soundcraft-playback/asio"]
 native-wasapi = ["dep:transit-audio-wasapi"]
 
 [dependencies]
+serde_json.workspace = true
 transit-audio-backend.workspace = true
 soundcraft-playback.workspace = true
 

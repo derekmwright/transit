@@ -20,6 +20,8 @@ pub struct Row {
     pub device: String,
     pub requested: Option<u32>,
     pub measurements: Measurements,
+    /// The loopback calibration of a native run (`--loopback` on `--backend wasapi`), when it was measurable.
+    pub calibration: Option<Result<crate::calibration::Figures, String>>,
     pub machine: Machine,
     pub date: String,
 }
@@ -204,10 +206,12 @@ mod tests {
                 xruns_in: loopback.then_some(1),
                 cpu_us: Percentiles { p50: 1.5, p95: 2.4, max: 9.0 },
                 round_trip,
+                frame_trip: None,
                 backend_errors: 0,
                 invalid_stamps: 0,
                 dropped: 0,
             },
+            calibration: None,
             machine: Machine { cpu: "Test CPU | 8 cores".into(), os: "Test OS 1.0".into() },
             date: "2026-10-21".into(),
         }

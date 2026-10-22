@@ -36,7 +36,7 @@ pub struct AudioDevicesLayout {
     /// The audio systems listed.
     pub systems: Vec<String>,
     /// The controls: label is the text shown, value the control (`system`, `output`, `input`,
-    /// `backend` (only where offered), `rate`, `buffer`, `apply`, `reconnect`, `rescan`, `panel`).
+    /// `backend` (only where offered), `paired_input` (native backend only), `rate`, `buffer`, `apply`, `reconnect`, `rescan`, `panel`).
     pub controls: Vec<MenuItem>,
     /// The entries of the open list: label is the text shown, value the control it belongs to.
     pub items: Vec<MenuItem>,
@@ -46,6 +46,8 @@ pub struct AudioDevicesLayout {
     pub notes: Vec<String>,
     /// The path table the I/O section showed (the engine's, read this frame).
     pub io: Option<soundcraft_model::IoMap>,
+    /// The Calibration line under the Paired input (only under the native backend).
+    pub calibration: Option<String>,
 }
 
 /// Devices standing in for the machine's (the control channel's `audio.fake_devices`, tests):
@@ -417,6 +419,36 @@ fn check(app: &mut StudioApp) {
     app.audio_devices.input_reported = Some(pair);
 }
 
+/// The "no choice" entry of the Paired input list.
+pub const PAIRED_AUTOMATIC: &str = "Automatic (same device)";
+
+/// The `ui.json` the running app saves to, as `audio-bench --settings` should name it.
+fn settings_path(app: &StudioApp) -> String {
+    app.autosave_dir
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map_or_else(|| r"%APPDATA%\transit\ui.json".to_string(), |dir| dir.join("ui.json").display().to_string())
+}
+
+/// The Calibration line under the Paired input: the saved loopback of this exact pair, rate and
+/// buffer, or the command that measures it (`device` is the output's name, `settings` the
+/// `ui.json` to merge into; close the app before running it).
+pub fn calibration_line(cfg: &AudioConfig, device: &str, rate: u32, settings: &str) -> String {
+    let period = cfg.buffer_size.unwrap_or(0);
+    if let Some(c) = cfg.find_calibration(device, rate, period) {
+        return format!("measured {} frames \u{b1}{} ({})", c.round_trip_frames, c.spread_frames, c.measured_at);
+    }
+    let mut command = format!("audio-bench --backend wasapi --loopback --out-device \"{device}\"");
+    if let Some(input) = &cfg.input_pairing {
+        command.push_str(&format!(" --in-device \"{input}\""));
+    }
+    if period != 0 {
+        command.push_str(&format!(" --period {period}"));
+    }
+    command.push_str(&format!(" --rate {rate} --settings \"{settings}\""));
+    format!("not calibrated: run {command} (with this app closed)")
+}
+
 /// One list of choices (`None` is "System default"). Returns the combo's rect.
 fn choose<T: Clone + PartialEq>(
     ui: &mut egui::Ui,
@@ -426,17 +458,30 @@ fn choose<T: Clone + PartialEq>(
     options: &[(T, String)],
     items: &mut Vec<MenuItem>,
 ) -> (egui::Rect, String) {
+    choose_or(ui, key, enabled, value, options, items, SYSTEM_DEFAULT)
+}
+
+/// [`choose`] with its own words for "no choice".
+fn choose_or<T: Clone + PartialEq>(
+    ui: &mut egui::Ui,
+    key: &str,
+    enabled: bool,
+    value: &mut Option<T>,
+    options: &[(T, String)],
+    items: &mut Vec<MenuItem>,
+    none: &str,
+) -> (egui::Rect, String) {
     let shown = value.as_ref().and_then(|v| options.iter().find(|(o, _)| o == v).map(|(_, t)| t.clone()));
     // A saved choice not offered here (unplugged) still shows, marked.
     let text = match (value.as_ref(), shown) {
-        (None, _) => SYSTEM_DEFAULT.to_string(),
+        (None, _) => none.to_string(),
         (Some(_), Some(t)) => t,
         (Some(_), None) => "Not available (falls back to the default)".to_string(),
     };
     let r = ui.add_enabled_ui(enabled, |ui| {
         egui::ComboBox::from_id_salt(("audio_devices", key)).selected_text(&text).width(360.0).show_ui(ui, |ui| {
-            let b = crate::menus::check_button(ui, value.is_none(), SYSTEM_DEFAULT);
-            items.push(MenuItem::at(ui, SYSTEM_DEFAULT.into(), key.into(), b.rect));
+            let b = crate::menus::check_button(ui, value.is_none(), none);
+            items.push(MenuItem::at(ui, none.into(), key.into(), b.rect));
             if b.clicked() {
                 *value = None;
             }
@@ -518,7 +563,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let (rect, text) = choose(ui, "system", audio_on, &mut draft.system, &names, &mut lay.items);
                 if draft.system != before {
                     // Devices belong to their system.
-                    (draft.output, draft.input) = (None, None);
+                    (draft.output, draft.input, draft.input_pairing) = (None, None, None);
                 }
                 controls.push((text, "system", rect));
                 ui.end_row();
@@ -538,6 +583,13 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 controls.push((text, "output", rect));
                 ui.end_row();
 
+                // The chosen output (the system's default output otherwise): its rates and buffers
+                // are offered, and its name keys a calibration.
+                let dev = sys.and_then(|s| {
+                    let named = draft.output.as_deref().and_then(|w| s.outputs.iter().find(|d| d.name == w));
+                    named.or_else(|| s.outputs.iter().find(|d| d.is_default))
+                });
+                let native = devices::native_wasapi_offered(draft.system.as_deref()) && draft.backend == Backend::NativeWasapi;
                 label(ui, "Input");
                 let ins: Vec<(String, String)> =
                     sys.map(|s| s.inputs.iter().map(|d| (d.name.clone(), device_label(d))).collect()).unwrap_or_default();
@@ -550,11 +602,22 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     ui.end_row();
                 }
 
-                // Rates and buffers of the chosen output (the system's default output otherwise).
-                let dev = sys.and_then(|s| {
-                    let named = draft.output.as_deref().and_then(|w| s.outputs.iter().find(|d| d.name == w));
-                    named.or_else(|| s.outputs.iter().find(|d| d.is_default))
-                });
+                // The native backend pairs the output with a capture endpoint for recording, and a
+                // loopback calibration belongs to that pair.
+                if native {
+                    label(ui, "Paired input");
+                    let (rect, text) = choose_or(ui, "paired_input", audio_on, &mut draft.input_pairing, &ins, &mut lay.items, PAIRED_AUTOMATIC);
+                    controls.push((text, "paired_input", rect));
+                    ui.end_row();
+                    label(ui, "Calibration");
+                    let rate = draft.sample_rate.or(app.player.as_ref().map(|p| p.device_rate)).unwrap_or(48_000);
+                    let device = dev.map(|d| d.name.as_str()).or(app.player.as_ref().map(|p| p.device_name.as_str())).unwrap_or_default();
+                    let line = calibration_line(&draft, device, rate, &settings_path(app));
+                    ui.label(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5));
+                    lay.calibration = Some(line);
+                    ui.end_row();
+                }
+
                 label(ui, "Sample rate");
                 let rates: Vec<(u32, String)> =
                     dev.map_or(devices::STANDARD_RATES.to_vec(), |d| d.sample_rates.clone()).into_iter().map(|r| (r, format!("{r} Hz"))).collect();

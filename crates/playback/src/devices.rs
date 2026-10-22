@@ -78,6 +78,83 @@ pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
+    /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`). Only the
+    /// native WASAPI backend applies one, and only on an exact key match.
+    pub calibrations: Vec<LoopbackCalibration>,
+}
+
+/// The `mode` key of a shared-mode calibration.
+pub const MODE_SHARED: &str = "shared";
+
+/// One measured loopback of an output/input pair. The key is `(device, input, mode, rate,
+/// period)`; a calibration applies to a stream pair only when every part of the key is equal,
+/// because the round trip changes with any of them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopbackCalibration {
+    /// The output device name, as the backend lists it.
+    pub device: String,
+    /// The paired input as the user named it (`input_pairing`); `None` pairs by container id.
+    pub input: Option<String>,
+    /// How the device was opened (`"shared"`).
+    pub mode: String,
+    pub rate: u32,
+    /// The requested period in frames; 0 is the driver's default.
+    pub period: u32,
+    /// The median round trip, in frames at `rate`.
+    pub round_trip_frames: u32,
+    /// The uncertainty of `round_trip_frames`, in frames: the measured spread plus one frame of
+    /// position granularity.
+    pub spread_frames: u32,
+    /// UTC date of the measurement (`YYYY-MM-DD`).
+    pub measured_at: String,
+}
+
+impl LoopbackCalibration {
+    /// Whether `other` measured the same device pair under the same conditions.
+    pub fn same_key(&self, other: &Self) -> bool {
+        self.device.eq_ignore_ascii_case(&other.device)
+            && self.input == other.input
+            && self.mode == other.mode
+            && self.rate == other.rate
+            && self.period == other.period
+    }
+
+    /// The calibration the backend applies: the round trip and its bound in nanoseconds.
+    pub fn to_backend(&self) -> Option<transit_audio_backend::Calibration> {
+        if self.rate == 0 {
+            return None;
+        }
+        let ns = |frames: u32| u64::from(frames) * 1_000_000_000 / u64::from(self.rate);
+        Some(transit_audio_backend::Calibration { round_trip_ns: ns(self.round_trip_frames), uncertainty_ns: ns(self.spread_frames) })
+    }
+}
+
+impl AudioConfig {
+    /// The saved calibration of the pair opened on output `device` at `rate` and the requested
+    /// `period` (0 is the driver's default), under this config's paired input.
+    pub fn find_calibration(&self, device: &str, rate: u32, period: u32) -> Option<&LoopbackCalibration> {
+        let want = LoopbackCalibration {
+            device: device.to_owned(),
+            input: self.input_pairing.clone(),
+            mode: MODE_SHARED.to_owned(),
+            rate,
+            period,
+            round_trip_frames: 0,
+            spread_frames: 0,
+            measured_at: String::new(),
+        };
+        self.calibrations.iter().find(|c| c.same_key(&want))
+    }
+
+    /// The calibration for the pair opened on output `device` with `request`; `None` when no saved
+    /// calibration has exactly that key.
+    pub fn calibration_for(&self, device: &str, request: &transit_audio_backend::OpenRequest) -> Option<transit_audio_backend::Calibration> {
+        match request.mode {
+            transit_audio_backend::Mode::Shared => {}
+            _ => return None,
+        }
+        self.find_calibration(device, request.format.rate, request.period.frames().unwrap_or(0))?.to_backend()
+    }
 }
 
 /// One device as the settings window lists it.
@@ -320,6 +397,56 @@ mod tests {
         assert_eq!(b.as_str(), "B");
     }
 
+    fn sample_calibration() -> LoopbackCalibration {
+        LoopbackCalibration {
+            device: "Speakers (Scarlett 2i2)".into(),
+            input: Some("Line (Scarlett 2i2)".into()),
+            mode: MODE_SHARED.into(),
+            rate: 48_000,
+            period: 128,
+            round_trip_frames: 480,
+            spread_frames: 25,
+            measured_at: "2026-10-21".into(),
+        }
+    }
+
+    fn request(rate: u32, period: transit_audio_backend::Period) -> transit_audio_backend::OpenRequest {
+        use transit_audio_backend as ab;
+        ab::OpenRequest {
+            format: ab::Format::new(rate, 2, ab::SampleFormat::F32),
+            period,
+            mode: ab::Mode::Shared,
+            origin: ab::HostOrigin::default(),
+            calibration: None,
+        }
+    }
+
+    #[test]
+    fn a_calibration_applies_only_to_its_exact_key() {
+        use transit_audio_backend::Period;
+        let cal = sample_calibration();
+        let cfg = AudioConfig { input_pairing: cal.input.clone(), calibrations: vec![cal.clone()], ..Default::default() };
+        let found = cfg.calibration_for("speakers (scarlett 2i2)", &request(48_000, Period::Frames(128))).expect("the key matches");
+        assert_eq!((found.round_trip_ns, found.uncertainty_ns), (10_000_000, 520_833));
+        let device = "Speakers (Scarlett 2i2)";
+        assert!(cfg.calibration_for(device, &request(44_100, Period::Frames(128))).is_none(), "another rate");
+        assert!(cfg.calibration_for(device, &request(48_000, Period::Frames(64))).is_none(), "another period");
+        assert!(cfg.calibration_for(device, &request(48_000, Period::Default)).is_none(), "the default period is not 128");
+        assert!(cfg.calibration_for("Headphones", &request(48_000, Period::Frames(128))).is_none(), "another device");
+        let other_input = AudioConfig { input_pairing: Some("Mic".into()), ..cfg.clone() };
+        assert!(other_input.calibration_for(device, &request(48_000, Period::Frames(128))).is_none(), "another input");
+        let unpaired = AudioConfig { input_pairing: None, ..cfg };
+        assert!(unpaired.calibration_for(device, &request(48_000, Period::Frames(128))).is_none(), "container-id pairing is its own key");
+    }
+
+    #[test]
+    fn calibrations_survive_serde_and_old_files_have_none() {
+        let cfg = AudioConfig { calibrations: vec![sample_calibration()], ..Default::default() };
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(serde_json::from_str::<AudioConfig>(&text).unwrap().calibrations, cfg.calibrations);
+        assert!(serde_json::from_str::<AudioConfig>(r#"{"output":"X"}"#).unwrap().calibrations.is_empty());
+    }
+
     #[test]
     fn config_round_trips_and_tolerates_missing_fields() {
         let c = AudioConfig {
@@ -330,6 +457,7 @@ mod tests {
             sample_rate: Some(48_000),
             buffer_size: Some(256),
             backend: Backend::NativeWasapi,
+            calibrations: vec![sample_calibration()],
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);

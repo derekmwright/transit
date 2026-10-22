@@ -84,8 +84,10 @@ pub fn run(
         shared.capture_click.set(ClickTemplate::new(achieved.format.rate)?).map_err(|_| "capture template already set".to_string())?;
         Ok((stream, achieved))
     };
-    // A duplex backend (ASIO) needs the input built first, on the output's own device.
-    let duplex_first = capture_plan.is_some() && backend.capture_with_render(&render_plan.endpoint);
+    // A duplex backend (ASIO) needs the input built first, on the output's own device. The native WASAPI
+    // backend pairs an input with the output only when none is named: `--in-device` opens that input itself.
+    let named_input = request.in_device.is_some() && backend.system() == "WASAPI";
+    let duplex_first = capture_plan.is_some() && !named_input && backend.capture_with_render(&render_plan.endpoint);
     let mut capture = None;
     if let (true, Some(plan)) = (duplex_first, &capture_plan) {
         capture = Some(open_capture(&ab::Plan { endpoint: render_plan.endpoint.clone(), attempts: plan.attempts.clone() })?);

@@ -72,8 +72,39 @@ the stamps' own time (an output frame's presentation time to the input frame tim
 over a loopback cable). The input stream carries all of it (its frame time moves earlier by the round
 trip), so the output's presentation time stays the reference, and both streams report the
 `uncertainty_ns` bound. `Measured` therefore claims the pair is tied together to within that bound;
-it does not separate the DAC delay from the ADC delay. Nothing stores or supplies a calibration yet:
-the measurement (`audio-bench --backend wasapi --loopback`), its per-machine storage and the "calibrated"
-label are the remaining part of slice (d).
+it does not separate the DAC delay from the ADC delay.
+
+The calibration is stored per machine in `ui.json` as `audio.calibrations`
+(`LoopbackCalibration`: `device`, `input`, `mode`, `rate`, `period`, `round_trip_frames`,
+`spread_frames`, `measured_at`) and applies to a stream pair only when the key
+`(output device, paired input, mode, rate, requested period)` is exactly equal
+(`AudioConfig::calibration_for`); any mismatch leaves the pair uncalibrated (`BackendEstimate`, and
+recordings placed from it are approximate as before). `Player::open_with` sets
+`OpenRequest.calibration` on both streams of a duplex open. Audio Devices shows a "Paired input"
+selector (native backend only; it writes `input_pairing`) and a "Calibration" line for the chosen
+pair, and the MIDI timing readout says "calibrated (00b1x ms)" for a `Measured` map.
+
+### Calibrating a device pair
+
+1. Cable an output to an input of the same interface (see `docs/benchmarks/README.md`), close the
+   app, and run `audio-bench --backend wasapi --loopback --device <out> --in-device <in> --settings
+   <ui.json>` at the rate and `--period` the app uses. `--in-device` is the same string the app's
+   Paired input holds; without it the key's input is empty and matches an automatic pairing.
+2. Per click the bench takes the capture stream's `backend_frame_ns` of the detected click minus the
+   render stream's `backend_frame_ns` of the emitted click (each plus its frame's offset in its
+   block). `round_trip_frames` is the median of those, rounded; the uncertainty is `p95 - min` of the
+   same figures plus one frame of position granularity, rounded up. It refuses a run where fewer than
+   half the clicks (and fewer than three) were found.
+3. `--settings` merges the record into `audio.calibrations`, replacing an entry with the same key and
+   keeping everything else. The app rewrites its `audio` block from memory when it saves, so it must
+   be closed while the bench runs; it reads the file at its next start.
+
+Render padding jitters, so the fit of a `Measured` stream must tolerate it:
+`device_clock/tests.rs` fits a calibrated render stream (bound 0.5 ms) whose presentation time
+jitters by +-1 ms, at random, alternating and one-late-block patterns, and stays under
+`MAX_RESIDUAL_NS` (2 ms); the calibration offset is constant, so its bound does not enter the
+residual. The `Measured` residual bound is therefore unchanged. Presentation jitter of 2 ms or more
+(a padding that swings by a whole period at periods above about 4 ms) is still refused as a
+discontinuity; measure it on the hardware before widening the bound.
 
 Tests: `crates/playback/src/device_clock/tests.rs`, `crates/playback/tests/backend_time_contract.rs`.

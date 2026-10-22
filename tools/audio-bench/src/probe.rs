@@ -58,6 +58,9 @@ impl Log {
 /// What every callback of one stream records, in step: arrival, frames and the time spent in it.
 pub struct CallbackLog {
     pub arrival_ns: Log,
+    /// `backend_frame_ns` of each block, an `i64` stored as its bits: the time of its first frame in the
+    /// backend's clock (presentation for render, capture for input).
+    pub frame_ns: Log,
     pub frames: Log,
     pub cpu_ns: Log,
     pub errors: AtomicU64,
@@ -68,6 +71,7 @@ impl CallbackLog {
     pub fn new(capacity: usize) -> Self {
         Self {
             arrival_ns: Log::new(capacity),
+            frame_ns: Log::new(capacity),
             frames: Log::new(capacity),
             cpu_ns: Log::new(capacity),
             errors: AtomicU64::new(0),
@@ -80,6 +84,7 @@ impl CallbackLog {
             self.invalid.fetch_add(1, Ordering::Relaxed);
         }
         self.arrival_ns.push(if valid { stamp.host_callback_ns } else { INVALID_ARRIVAL });
+        self.frame_ns.push(stamp.backend_frame_ns as u64);
         self.frames.push(frames as u64);
         self.cpu_ns.push(cpu_ns);
     }

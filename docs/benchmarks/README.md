@@ -82,6 +82,31 @@ separately (a render endpoint and a capture endpoint), hence `--in-device`; ASIO
 both directions. `--out` appends rows to an existing file that has the table, so one file can hold a
 session. Without `--loopback` the round trip columns read `n/a`.
 
+## Calibrating the native backend
+
+The native WASAPI backend stamps its streams as `Measured` only for a device pair whose loopback
+round trip was measured in the stamps' own time (ADR 0016 slice d; method in
+`../contributing/knowledge/clocks.md`). With the output cabled to an input of the same interface,
+close the app and run, from the repository root, once per rate and buffer size the app uses
+(`--period` and `--rate` are part of the calibration's key, and `--in-device` is the string the
+app's Paired input holds):
+
+```
+cargo run -p audio-bench --features native-wasapi --release -- --backend wasapi --loopback --out-device "<Scarlett out>" --in-device "<Scarlett in>" --settings "%APPDATA%\transit\ui.json"
+```
+
+It prints the round trip in frames and ms with its uncertainty (`+-` the spread of the per-click
+round trips plus one frame) and merges it into `audio.calibrations` of that file. The app must be
+closed: it rewrites its `audio` block from memory when it saves. The fake mode proves the logic
+without a device: `cargo xtask audio-bench --backend fake --loopback --seconds 3`.
+
+The hardware tests open the owner's default endpoints and stay `#[ignore]`d; run them by hand:
+
+```
+cargo test -p transit-audio-wasapi -- --ignored hardware_ --nocapture
+cargo test -p soundcraft-playback --features native-wasapi -- --ignored hardware_ --nocapture
+```
+
 Without a device (what CI runs; opens no audio device and finishes at once, in virtual time):
 
 ```

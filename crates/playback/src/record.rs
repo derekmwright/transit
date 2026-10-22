@@ -320,12 +320,13 @@ impl Recorder {
         rate: u32,
         period: ab::Period,
         progress: start::InputProgress,
+        calibration: Option<ab::Calibration>,
     ) -> Result<Recorder, String> {
         let format = backend.capture_format(endpoint, Some(rate))?;
         if format.rate != rate {
             return Err(format!("the input does not run at {rate} Hz"));
         }
-        let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration: None };
+        let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration };
         Recorder::build(backend, endpoint, &request, Some(progress)).map_err(|e| e.to_string())
     }
 

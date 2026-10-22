@@ -7,6 +7,7 @@
 //! stop. `fake` is the device-free mode used by tests and CI.
 
 pub mod analysis;
+pub mod calibration;
 pub mod cli;
 pub mod fake;
 pub mod probe;
@@ -45,6 +46,8 @@ pub struct Config {
     pub seconds: f64,
     pub fake: fake::Script,
     pub out: Option<std::path::PathBuf>,
+    /// `ui.json` to merge the measured loopback calibration into (`--settings`).
+    pub settings: Option<std::path::PathBuf>,
 }
 
 /// The period the fake mode pumps when none is requested.
@@ -82,14 +85,27 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         }
     };
     let measurements = analysis::measure(&shared, opened.render_rate, opened.capture_rate);
+    let date = report::today();
+    // Frame times of the two streams are comparable only when one backend stamps both (the native
+    // one, in the shared host origin); a cpal run measures no calibration.
+    let calibration = (config.kind != Kind::Cpal && opened.capture_rate == Some(opened.render_rate))
+        .then_some(measurements.frame_trip)
+        .flatten()
+        .map(|trip| calibration::figures(&trip, opened.render_rate));
+    if let Some(path) = &config.settings {
+        let figures = calibration.clone().ok_or("--settings needs a native loopback run (--backend wasapi --loopback) at one rate")??;
+        let record = calibration::record(&figures, &opened.device, config.request.in_device.as_deref(), config.request.period.unwrap_or(0), &date);
+        calibration::merge_settings(path, &record)?;
+    }
     Ok(report::Row {
         backend: config.kind.name().to_string(),
         system,
         device: opened.device,
         requested: config.request.period,
         measurements,
+        calibration,
         machine: report::machine(),
-        date: report::today(),
+        date,
     })
 }
 

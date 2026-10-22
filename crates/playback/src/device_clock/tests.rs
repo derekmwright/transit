@@ -690,3 +690,61 @@ fn cpal_stamp_sequences_match_the_captured_golden() {
 
 const STAMP_GOLDEN: [&str; 4] =
     ["0 input 512 e5a107c5575f2515", "0 output 512 2e994bbcddb8133c", "1 input 512 8518b35c4e70450a", "1 output 512 94f5f075b969a85e"];
+
+/// Fits `blocks` render stamps of a calibrated native stream whose presentation time (callback +
+/// queued padding + stream latency) jitters by up to `jitter_ns` either way, in a pattern: the
+/// largest residual of the fit, or the failure.
+fn calibrated_render_fit(jitter_ns: i64, pattern: impl Fn(u64) -> i64) -> Result<f64, Unavailable> {
+    let k = key(60, Direction::Output);
+    let mut fit = ClockFitter::new(k);
+    let mut residual = Err(Unavailable::WarmingUp);
+    for i in 0..96u64 {
+        let callback = i as i64 * 4_000_000;
+        let jitter = pattern(i).clamp(-1, 1) * jitter_ns;
+        let observation = Observation {
+            key: k,
+            first_frame: i * 192,
+            frames: 192,
+            nominal_rate: 48_000,
+            stamp: Stamp {
+                host_callback_ns: 1_000_000_000 + i * 4_000_000,
+                backend_callback_ns: callback,
+                backend_frame_ns: callback + 6_000_000 + jitter,
+                quality: Quality::Measured,
+                offset_uncertainty_ns: Some(500_000),
+            },
+        };
+        match fit.observe(observation) {
+            Ok(map) => residual = Ok(map.residual_ns),
+            Err(Unavailable::WarmingUp) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    residual
+}
+
+/// ADR 0016 slice d: render padding jitters, and a `Measured` stamp is not given the leeway the
+/// `BackendEstimate` residual gets. +-1 ms of presentation-time jitter with a 0.5 ms calibration
+/// bound stays under `MAX_RESIDUAL_NS` (2 ms), for random and worst-case alternating patterns, so
+/// the Measured bound stays as it is. Alternating jitter of 2.5 ms is refused.
+#[test]
+fn a_calibrated_render_stream_with_one_millisecond_of_padding_jitter_keeps_its_fit() {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut random = move |_: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % 3) as i64 - 1
+    };
+    let patterns: [(&str, Vec<i64>); 3] = [
+        ("random", (0..96).map(&mut random).collect()),
+        ("alternating", (0..96).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect()),
+        ("one late block", (0..96).map(|i| i64::from(i == 60)).collect()),
+    ];
+    for (name, pattern) in patterns {
+        let residual = calibrated_render_fit(1_000_000, |i| pattern[i as usize]).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(residual <= MAX_RESIDUAL_NS, "{name}: residual {residual} ns");
+        assert!(residual >= 100_000.0, "{name}: the jitter reached the fit ({residual} ns)");
+    }
+    assert!(calibrated_render_fit(2_500_000, |i| if i % 2 == 0 { 1 } else { -1 }).is_err(), "jitter well past the bound is still refused");
+}

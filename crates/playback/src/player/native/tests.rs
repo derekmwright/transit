@@ -369,3 +369,14 @@ fn enumerated_identity_and_anonymous_fallback_match_midi_io_resolution() {
     let (handle, _consumer) = io.open_input(&Fake::key("Same name", 0), InputConfig::default()).unwrap();
     assert_eq!(handle.key(), &anonymous);
 }
+
+#[test]
+fn the_timing_label_names_the_calibration_bound_only_for_a_measured_clock() {
+    use crate::device_clock::Quality;
+    let label =
+        |quality, uncertainty_ns| Status { timing_quality: quality, timing_uncertainty_ns: uncertainty_ns, ..Status::default() }.timing_label();
+    assert_eq!(label(Some(Quality::Measured), Some(520_833)), "calibrated (\u{b1}0.5 ms)");
+    assert_eq!(label(Some(Quality::Measured), None), "calibrated");
+    assert_eq!(label(Some(Quality::BackendEstimate), None), "estimated device clock");
+    assert_eq!(label(None, None), "approximate (callback scheduling)");
+}

@@ -582,3 +582,96 @@ fn a_native_duplex_open_gives_both_streams_clocks_in_one_host_origin() {
     let expected = frame + ((PRESENT_NS + CAPTURED_NS) as u64) * 48_000 / 1_000_000_000;
     assert!(captured.abs_diff(expected) <= 1, "input frame {captured}, expected {expected}");
 }
+
+/// A saved loopback of the fake device at its rate and default period, 480 frames (10 ms) with a
+/// 25 frame (about 0.52 ms) bound.
+fn fake_calibration(rate: u32) -> crate::LoopbackCalibration {
+    crate::LoopbackCalibration {
+        device: "Fake device".into(),
+        input: None,
+        mode: crate::devices::MODE_SHARED.into(),
+        rate,
+        period: 0,
+        round_trip_frames: 480,
+        spread_frames: 25,
+        measured_at: "2026-10-21".into(),
+    }
+}
+
+#[test]
+fn a_matching_calibration_reaches_both_streams_and_a_mismatched_one_does_not() {
+    for (calibration_rate, expected) in [(48_000, Some(ab::Calibration { round_trip_ns: 10_000_000, uncertainty_ns: 520_833 })), (44_100, None)] {
+        let fake = fake_factory(false).with_capture(2, true);
+        let cfg = AudioConfig { calibrations: vec![fake_calibration(calibration_rate)], ..Default::default() };
+        let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+        assert!(player.native_backend && !player.silent);
+        let opens = fake.opens();
+        assert_eq!(opens.iter().map(|(direction, _)| *direction).collect::<Vec<_>>(), [ab::Direction::Input, ab::Direction::Output]);
+        for (direction, request) in opens {
+            assert_eq!(request.calibration, expected, "{direction:?} stream at calibration rate {calibration_rate}");
+        }
+    }
+    // Without a paired input there is no loopback to apply: the output stays uncalibrated.
+    let fake = fake_factory(false);
+    let cfg = AudioConfig { calibrations: vec![fake_calibration(48_000)], ..Default::default() };
+    let _player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+    assert!(fake.opens().iter().all(|(_, request)| request.calibration.is_none()));
+}
+
+/// The stamps a calibrated native pair reports are `Measured` with the calibration's bound, and the
+/// recorder's mapping of an output frame to the input frame resolves from the fits (the exact path,
+/// not the approximate placement by input frame ordinal).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_calibrated_duplex_pair_fits_measured_clocks_and_maps_output_frames_to_input_frames() {
+    use ab::fake::{SliceSink, SliceSource};
+    const BLOCK: usize = 192;
+    const PERIOD_NS: u64 = 4_000_000;
+    const PRESENT_NS: i64 = 6_000_000;
+    // The input is captured 3 ms before its callback; the calibration moves it earlier by the round trip (10 ms), so it
+    // reports the presentation time of the output frame that produced it.
+    const ROUND_TRIP_NS: i64 = 10_000_000;
+    const BOUND_NS: u64 = 520_833;
+    let fake = fake_factory(false).with_capture(2, true);
+    let cfg = AudioConfig { calibrations: vec![fake_calibration(48_000)], ..Default::default() };
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+    let mut recorder = player.open_input(&cfg).expect("the duplex input is held for the recorder");
+    let origin = player.origin;
+    let t0 = origin.now_ns().unwrap();
+    let stamp = |i: u64, direction: ab::Direction| {
+        let callback = (i * PERIOD_NS) as i64;
+        let frame = if direction == ab::Direction::Output { callback + PRESENT_NS } else { callback - 3_000_000 - ROUND_TRIP_NS };
+        ab::Stamp {
+            host_callback_ns: t0 + i * PERIOD_NS,
+            backend_callback_ns: callback,
+            backend_frame_ns: frame,
+            quality: ab::Quality::Measured,
+            offset_uncertainty_ns: Some(BOUND_NS),
+        }
+    };
+    let (mut output, input) = ([0.0f32; BLOCK * 2], [0.25f32; BLOCK * 2]);
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let mut maps = None;
+    for i in 0..2_000u64 {
+        while origin.now_ns().unwrap() < t0 + i * PERIOD_NS + 1_000_000 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(fake.pump_capture(BLOCK, stamp(i, ab::Direction::Input), format, &mut SliceSource { data: &input, channels: 2 }));
+        assert!(fake.pump_render(BLOCK, stamp(i, ab::Direction::Output), &mut SliceSink { data: &mut output, channels: 2 }));
+        if i % 4 == 3
+            && let (Some(out), Some(inp)) = (player.clock_report().and_then(|r| r.map), recorder.clock_report().and_then(|r| r.map))
+        {
+            maps = Some((out, inp));
+            break;
+        }
+    }
+    let (out, inp) = maps.expect("both streams' clocks fitted");
+    assert_eq!((out.quality, inp.quality), (ab::Quality::Measured, ab::Quality::Measured));
+    assert_eq!((out.offset_uncertainty_ns, inp.offset_uncertainty_ns), (Some(BOUND_NS), Some(BOUND_NS)));
+    let now = origin.now_ns().unwrap();
+    let frame = out.frame_range().start() + 4_800;
+    let host = out.frame_to_host(out.key, frame, now).expect("an output frame in the window");
+    let captured = inp.host_to_frame(inp.key, host, now).expect("the input frame of that host time resolves without the approximate path");
+    let expected = frame + ((PRESENT_NS + 3_000_000 + ROUND_TRIP_NS) as u64) * 48_000 / 1_000_000_000;
+    assert!(captured.abs_diff(expected) <= 1, "input frame {captured}, expected {expected}");
+}

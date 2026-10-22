@@ -2,7 +2,7 @@
 //! input queue, one frame at a time, over stand-in devices (`audio.fake_devices`). No player, no
 //! audio device is listed or opened.
 
-use crate::audio_devices::{Opened, REFUSED_RECORDING, fallback_notes};
+use crate::audio_devices::{Opened, PAIRED_AUTOMATIC, REFUSED_RECORDING, fallback_notes};
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
 use soundcraft_playback::{AudioConfig, Backend};
@@ -325,6 +325,7 @@ fn audio_patch_merges_fields_and_rejects_zero_atomically() {
             output: None,
             input_pairing: None,
             backend: Backend::Auto,
+            calibrations: Vec::new(),
         }
     );
     let before = t.app.ui.audio.clone();
@@ -585,4 +586,90 @@ mod io_paths {
         t.open_window();
         item(&t, "io_wasapi_note", crate::audio_devices_io::WASAPI_NOTE);
     }
+}
+
+fn calibration(device: &str, input: Option<&str>, rate: u32, period: u32) -> soundcraft_playback::LoopbackCalibration {
+    soundcraft_playback::LoopbackCalibration {
+        device: device.into(),
+        input: input.map(str::to_string),
+        mode: "shared".into(),
+        rate,
+        period,
+        round_trip_frames: 480,
+        spread_frames: 25,
+        measured_at: "2026-10-21".into(),
+    }
+}
+
+#[test]
+fn the_calibration_line_reports_the_measured_pair_or_the_command_that_measures_it() {
+    use crate::audio_devices::calibration_line;
+    let out = "Speakers (Focusrite USB Audio)";
+    let saved = AudioConfig {
+        input_pairing: Some(SCARLETT_IN.into()),
+        buffer_size: Some(128),
+        calibrations: vec![calibration(out, Some(SCARLETT_IN), 48_000, 128)],
+        ..Default::default()
+    };
+    assert_eq!(calibration_line(&saved, out, 48_000, "ui.json"), "measured 480 frames \u{b1}25 (2026-10-21)");
+    let unmeasured = calibration_line(&saved, out, 96_000, "C:/Users/me/transit/ui.json");
+    assert_eq!(
+        unmeasured,
+        format!(
+            "not calibrated: run audio-bench --backend wasapi --loopback --out-device \"{out}\" --in-device \"{SCARLETT_IN}\" --period 128 --rate 96000 \
+             --settings \"C:/Users/me/transit/ui.json\" (with this app closed)"
+        )
+    );
+    let other_period = AudioConfig { buffer_size: Some(64), ..saved };
+    assert!(calibration_line(&other_period, out, 48_000, "ui.json").starts_with("not calibrated: run "), "a calibration is for one buffer size");
+}
+
+#[test]
+fn the_paired_input_and_calibration_line_exist_only_under_the_native_backend() {
+    let mut t = T::new();
+    t.open_window();
+    let calibration_shown = |t: &T| !t.layout()["calibration"].is_null();
+    assert!(!has_control(&t, "paired_input") && !calibration_shown(&t), "the default backend has no pairing");
+    if !soundcraft_playback::devices::NATIVE_WASAPI_COMPILED {
+        return;
+    }
+    t.pick("backend", Backend::NativeWasapi.label());
+    assert!(has_control(&t, "paired_input") && calibration_shown(&t), "the native backend pairs an input");
+    let line = t.layout()["calibration"].as_str().unwrap().to_string();
+    assert!(line.starts_with("not calibrated: run audio-bench --backend wasapi --loopback --out-device \"Speakers (Realtek)\""), "{line}");
+    t.pick("paired_input", &format!("{SCARLETT_IN} \u{b7} 2 ch"));
+    assert_eq!(t.app.audio_devices.draft.input_pairing.as_deref(), Some(SCARLETT_IN));
+    assert!(t.layout()["calibration"].as_str().unwrap().contains(&format!("--in-device \"{SCARLETT_IN}\"")));
+    let apply = t.control_rect("apply");
+    t.click(mid(apply));
+    assert_eq!(t.reopened().last().and_then(|c| c.input_pairing.clone()).as_deref(), Some(SCARLETT_IN), "the pairing is applied and saved");
+    t.pick("backend", Backend::Auto.label());
+    assert!(!has_control(&t, "paired_input") && !calibration_shown(&t), "back to the default backend");
+    t.pick("backend", Backend::NativeWasapi.label());
+    t.pick("paired_input", PAIRED_AUTOMATIC);
+    assert_eq!(t.app.audio_devices.draft.input_pairing, None);
+}
+
+#[test]
+fn a_saved_calibration_is_shown_for_its_pair_and_survives_apply() {
+    if !soundcraft_playback::devices::NATIVE_WASAPI_COMPILED {
+        return;
+    }
+    let mut t = T::new();
+    let saved = AudioConfig {
+        backend: Backend::NativeWasapi,
+        system: Some("WASAPI".into()),
+        output: Some("Speakers (Focusrite USB Audio)".into()),
+        sample_rate: Some(48_000),
+        calibrations: vec![calibration("Speakers (Focusrite USB Audio)", None, 48_000, 0)],
+        ..Default::default()
+    };
+    t.app.apply_audio(saved).unwrap();
+    t.open_window();
+    assert_eq!(t.layout()["calibration"], json!("measured 480 frames \u{b1}25 (2026-10-21)"));
+    t.pick("buffer", "128 samples");
+    assert!(t.layout()["calibration"].as_str().unwrap().starts_with("not calibrated"), "another buffer size is another key");
+    let apply = t.control_rect("apply");
+    t.click(mid(apply));
+    assert_eq!(t.app.ui.audio.calibrations.len(), 1, "Apply keeps the saved measurements");
 }

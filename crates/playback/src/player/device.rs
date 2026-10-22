@@ -314,7 +314,10 @@ impl Player {
         let inputs = if duplex { backend.capture_format(endpoint, Some(first.format.rate)).map_or(0, |format| format.channels) } else { 0 };
         let wide = first.format.channels;
         let mut error = "no usable output stream".to_owned();
-        for request in &plan.attempts {
+        for attempt in &plan.attempts {
+            // A measured loopback of this exact pair, mode, rate and period makes both streams `Measured`.
+            let mut request = *attempt;
+            request.calibration = if duplex { cfg.calibration_for(&name, &request) } else { None };
             let (rate, channels) = (request.format.rate, request.format.channels);
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
@@ -322,7 +325,7 @@ impl Player {
                 let progress = player.record_start.get_mut().as_ref().map(record::start::Control::input_progress);
                 let built = progress
                     .ok_or_else(|| "the record start latch is missing".to_owned())
-                    .and_then(|progress| record::Recorder::build_on(&*backend, endpoint, rate, request.period, progress));
+                    .and_then(|progress| record::Recorder::build_on(&*backend, endpoint, rate, request.period, progress, request.calibration));
                 match built {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
                     Err(error) => HeldInput::Failed(format!("the audio input did not open with the output ({error})")),
@@ -333,7 +336,7 @@ impl Player {
                 HeldInput::No
             };
             let (render, on_error) = render_callbacks(&player, access, clock, usize::from(channels).max(1), rate);
-            let (stream, achieved) = match backend.open_render(endpoint, request, render, on_error) {
+            let (stream, achieved) = match backend.open_render(endpoint, &request, render, on_error) {
                 Ok(opened) => opened,
                 Err(failure) => {
                     error = failure.to_string();
@@ -720,7 +723,9 @@ impl Player {
         let midi = self.midi.try_borrow().map_err(|_| PlayerError::Busy)?;
         let mut status =
             midi.as_ref().map_or_else(|| super::MidiStatus { error: self.midi_error.clone(), ..Default::default() }, super::native::Native::status);
-        status.timing_quality = self.clock_report().and_then(|report| report.map).map(|map| map.quality);
+        let map = self.clock_report().and_then(|report| report.map);
+        status.timing_quality = map.map(|map| map.quality);
+        status.timing_uncertainty_ns = map.and_then(|map| map.offset_uncertainty_ns);
         Ok(status)
     }
     pub fn idle(&self) -> Result<Vec<EditorEdit>, PlayerError> {

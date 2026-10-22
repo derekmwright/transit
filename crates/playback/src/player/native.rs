@@ -22,6 +22,22 @@ pub struct Status {
     pub counts: ingress::Counters,
     pub error: Option<String>,
     pub timing_quality: Option<crate::device_clock::Quality>,
+    /// The bound of a `Measured` map: the calibration's uncertainty in nanoseconds.
+    pub timing_uncertainty_ns: Option<u64>,
+}
+
+impl Status {
+    /// How MIDI events are timed, as the UI says it: a loopback-calibrated device clock with its bound,
+    /// an estimated one, or the callback's scheduling.
+    pub fn timing_label(&self) -> String {
+        use crate::device_clock::Quality;
+        match (self.timing_quality, self.timing_uncertainty_ns) {
+            (Some(Quality::Measured), Some(ns)) => format!("calibrated (\u{b1}{:.1} ms)", ns as f64 / 1e6),
+            (Some(Quality::Measured), None) => "calibrated".to_string(),
+            (Some(Quality::BackendEstimate), _) => "estimated device clock".to_string(),
+            _ => "approximate (callback scheduling)".to_string(),
+        }
+    }
 }
 
 enum Request {

@@ -5,10 +5,9 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 usage: audio-bench [options]
-  --backend cpal|wasapi|fake  backend to measure (default cpal; wasapi is the native backend, built with --features native-wasapi,
-                         render only: no --loopback until slice d)
+  --backend cpal|wasapi|fake  backend to measure (default cpal; wasapi is the native backend, built with --features native-wasapi)
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
-  --device <name>        output device (and input, with --loopback); default device when absent
+  --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device)
   --in-device <name>     input device when it differs from --device
   --period <frames>      requested period: 32, 64, 128, ... (default: the driver's)
   --rate <Hz>            sample rate (default 48000)
@@ -17,6 +16,8 @@ usage: audio-bench [options]
   --out-ch <n>           1-based output channel of the cable (default 1)
   --in-ch <n>            1-based input channel of the cable (default 1)
   --out <path.md>        write the table here (rows are appended when the table is there)
+  --settings <ui.json>   with --loopback on --backend wasapi: merge the measured calibration into audio.calibrations of this
+                         settings file (close the app first: it rewrites its audio block when it saves)
   --list-devices         list the devices of --system and exit (opens no stream)
   fake mode only:
   --fake-delay <frames>  software loopback delay (default 144)
@@ -41,7 +42,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     let mut kind = Kind::Cpal;
     let mut system = None;
     let mut request = session::Request { device: None, in_device: None, rate: 48_000, period: None, loopback: false, out_ch: 1, in_ch: 1 };
-    let (mut seconds, mut out) = (20.0f64, None);
+    let (mut seconds, mut out, mut settings) = (20.0f64, None, None);
     let (mut delay, mut jitter, mut gap) = (None, None, None::<Option<f64>>);
     let mut list = false;
     while let Some(flag) = args.next() {
@@ -56,7 +57,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 }
             }
             "--system" => system = Some(value().ok_or("--system needs a value")?),
-            "--device" => request.device = Some(value().ok_or("--device needs a value")?),
+            "--device" | "--out-device" => request.device = Some(value().ok_or("--device needs a value")?),
             "--in-device" => request.in_device = Some(value().ok_or("--in-device needs a value")?),
             "--period" => request.period = Some(number(&flag, value())?),
             "--rate" => request.rate = number(&flag, value())?,
@@ -65,6 +66,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--out-ch" => request.out_ch = number(&flag, value())?,
             "--in-ch" => request.in_ch = number(&flag, value())?,
             "--out" => out = Some(PathBuf::from(value().ok_or("--out needs a path")?)),
+            "--settings" => settings = Some(PathBuf::from(value().ok_or("--settings needs a path")?)),
             "--list-devices" => list = true,
             "--fake-delay" => delay = Some(number(&flag, value())?),
             "--fake-jitter-us" => jitter = Some(number(&flag, value())?),
@@ -90,8 +92,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if kind == Kind::Wasapi && system.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("WASAPI")) {
         return Err("--backend wasapi is the native WASAPI system; --system applies to the cpal backend".into());
     }
-    if kind == Kind::Wasapi && request.loopback {
-        return Err("--backend wasapi renders only until capture arrives (slice d); drop --loopback".into());
+    if settings.is_some() && !request.loopback {
+        return Err("--settings needs --loopback: a calibration is a measured round trip".into());
+    }
+    if settings.is_some() && kind == Kind::Cpal {
+        return Err("--settings needs --backend wasapi: the frame times of cpal streams are not comparable".into());
     }
     if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some()) {
         return Err("--fake-* options need --backend fake".into());
@@ -100,7 +105,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     script.delay_frames = delay.unwrap_or(script.delay_frames);
     script.jitter_us = jitter.unwrap_or(script.jitter_us);
     script.gap_at_s = gap.unwrap_or(script.gap_at_s);
-    Ok(Command::Run(Config { kind, system, request, seconds, fake: script, out }))
+    Ok(Command::Run(Config { kind, system, request, seconds, fake: script, out, settings }))
 }
 
 #[cfg(test)]
@@ -130,7 +135,15 @@ mod tests {
         let Ok(Command::Run(c)) = parse_str("--backend wasapi --seconds 5 --period 64") else { panic!("did not parse") };
         assert_eq!((c.kind, c.request.period), (Kind::Wasapi, Some(64)));
         assert!(parse_str("--backend wasapi --system ASIO").is_err());
-        assert!(parse_str("--backend wasapi --loopback").unwrap_err().contains("slice d"));
+        let Ok(Command::Run(c)) = parse_str("--backend wasapi --loopback --device Out --in-device In --settings ui.json") else {
+            panic!("did not parse")
+        };
+        assert_eq!(
+            (c.kind, c.request.loopback, c.request.in_device.as_deref(), c.settings),
+            (Kind::Wasapi, true, Some("In"), Some(PathBuf::from("ui.json")))
+        );
+        assert!(parse_str("--backend wasapi --settings ui.json").unwrap_err().contains("--loopback"));
+        assert!(parse_str("--backend cpal --loopback --settings ui.json").unwrap_err().contains("--backend wasapi"));
         assert!(parse_str("--backend nope").is_err());
         assert!(parse_str("--period abc").is_err());
         assert!(parse_str("--seconds 0").is_err());

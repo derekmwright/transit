@@ -48,6 +48,8 @@ pub struct Measurements {
     /// Callback body time of the render stream, in microseconds.
     pub cpu_us: Percentiles,
     pub round_trip: Option<RoundTrip>,
+    /// The round trip in the stamps' own time, when a capture stream ran (see [`FrameTrip`]).
+    pub frame_trip: Option<FrameTrip>,
     /// Calls of the backends' error callbacks (render plus capture).
     pub backend_errors: u64,
     /// Callbacks with an invalid stamp, and log entries lost to a full log.
@@ -83,6 +85,8 @@ fn summary(values: Vec<f64>) -> Percentiles {
 /// The callbacks of one stream, read back.
 pub struct Stream {
     pub arrival_ns: Vec<u64>,
+    /// `backend_frame_ns` of each block (first frame, in the backend's clock).
+    pub frame_ns: Vec<i64>,
     pub frames: Vec<u64>,
     pub cpu_ns: Vec<u64>,
     pub rate: u32,
@@ -90,7 +94,13 @@ pub struct Stream {
 
 impl Stream {
     pub fn read(log: &CallbackLog, rate: u32) -> Self {
-        Self { arrival_ns: log.arrival_ns.snapshot(), frames: log.frames.snapshot(), cpu_ns: log.cpu_ns.snapshot(), rate }
+        Self {
+            arrival_ns: log.arrival_ns.snapshot(),
+            frame_ns: log.frame_ns.snapshot().into_iter().map(|bits| bits as i64).collect(),
+            frames: log.frames.snapshot(),
+            cpu_ns: log.cpu_ns.snapshot(),
+            rate,
+        }
     }
     fn median_frames(&self) -> u32 {
         let frames = sorted(self.frames.iter().map(|f| *f as f64).collect());
@@ -125,6 +135,14 @@ impl Stream {
         (arrival != INVALID_ARRIVAL && at < starts[block] + self.frames[block])
             .then(|| arrival as f64 + (at - starts[block]) as f64 * 1e9 / f64::from(self.rate))
     }
+    /// Backend time in ns of stream frame `at`: the `backend_frame_ns` of its block plus the offset
+    /// in it. A block whose stamp was invalid has no time.
+    fn frame_time_ns(&self, starts: &[u64], at: u64) -> Option<f64> {
+        let block = starts.partition_point(|s| *s <= at).checked_sub(1)?;
+        let valid = *self.arrival_ns.get(block)? != INVALID_ARRIVAL;
+        (valid && at < starts[block] + self.frames[block])
+            .then(|| *self.frame_ns.get(block).unwrap_or(&0) as f64 + (at - starts[block]) as f64 * 1e9 / f64::from(self.rate))
+    }
     /// First stream frame of each block.
     fn starts(&self) -> Vec<u64> {
         self.frames
@@ -138,21 +156,23 @@ impl Stream {
     }
 }
 
-/// Round trips: click `k` leaves at (render host time of its first frame); the detector finds
-/// it at (capture host time of its first frame). Each detection pairs with the latest click that
-/// left before it. The bias is the callback dispatch jitter of both streams (not removed).
-pub fn round_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> RoundTrip {
+/// The time in ns of stream frame `at` on one clock: `Stream::host_ns` or `Stream::frame_time_ns`.
+type Clock = fn(&Stream, &[u64], u64) -> Option<f64>;
+
+/// Pair each detection (a frame of the capture stream) with the latest click that left before it
+/// on the same clock, as (clicks emitted, trips in ms).
+fn pair_clicks(render: &Stream, capture: &Stream, detections: &[u64], time: Clock) -> (usize, Vec<f64>) {
     let (render_starts, capture_starts) = (render.starts(), capture.starts());
     let total: u64 = render.frames.iter().sum();
     let emitted: Vec<f64> = (0..)
         .map(|k| click_start(render.rate, k))
         .take_while(|start| *start < total)
-        .filter_map(|start| render.host_ns(&render_starts, start))
+        .filter_map(|start| time(render, &render_starts, start))
         .collect();
     let mut seen = vec![false; emitted.len()];
     let mut trips = Vec::new();
     for at in detections {
-        let Some(arrived) = capture.host_ns(&capture_starts, *at) else { continue };
+        let Some(arrived) = time(capture, &capture_starts, *at) else { continue };
         let Some(k) = emitted.partition_point(|sent| *sent <= arrived).checked_sub(1) else { continue };
         let trip_ms = (arrived - emitted[k]) / 1e6;
         if !seen[k] && (0.0..=MAX_ROUND_TRIP_MS).contains(&trip_ms) {
@@ -160,11 +180,18 @@ pub fn round_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> Rou
             trips.push(trip_ms);
         }
     }
-    let trips = sorted(trips);
+    (emitted.len(), sorted(trips))
+}
+
+/// Round trips: click `k` leaves at (render host time of its first frame); the detector finds
+/// it at (capture host time of its first frame). Each detection pairs with the latest click that
+/// left before it. The bias is the callback dispatch jitter of both streams (not removed).
+pub fn round_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> RoundTrip {
+    let (clicks, trips) = pair_clicks(render, capture, detections, Stream::host_ns);
     let frames = |ms: f64| ms * f64::from(render.rate) / 1000.0;
     let (min, median, p95) = (trips.first().copied().unwrap_or(0.0), percentile(&trips, 0.5), percentile(&trips, 0.95));
     RoundTrip {
-        clicks: emitted.len(),
+        clicks,
         paired: trips.len(),
         min_ms: min,
         median_ms: median,
@@ -172,6 +199,32 @@ pub fn round_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> Rou
         min_frames: frames(min),
         median_frames: frames(median),
         p95_frames: frames(p95),
+    }
+}
+
+/// The loopback round trip in the stamps' own time: per click, the capture frame time of the
+/// detected click minus the render presentation time of the emitted click (`backend_frame_ns` of
+/// both streams, read at the frame's offset in its block). It is the delay a calibration carries,
+/// and is meaningful only when both streams stamp one clock (the native backend's shared host
+/// origin).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameTrip {
+    pub clicks: usize,
+    pub paired: usize,
+    pub min_ns: f64,
+    pub median_ns: f64,
+    pub p95_ns: f64,
+}
+
+pub fn frame_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> FrameTrip {
+    let (clicks, trips) = pair_clicks(render, capture, detections, Stream::frame_time_ns);
+    let ns = |ms: f64| ms * 1e6;
+    FrameTrip {
+        clicks,
+        paired: trips.len(),
+        min_ns: ns(trips.first().copied().unwrap_or(0.0)),
+        median_ns: ns(percentile(&trips, 0.5)),
+        p95_ns: ns(percentile(&trips, 0.95)),
     }
 }
 
@@ -184,6 +237,7 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
     let cpu = summary(render.cpu_ns.iter().map(|ns| *ns as f64 / 1e3).collect());
     let frames = sorted(render.frames.iter().map(|f| *f as f64).collect());
     let round_trip = capture.as_ref().map(|capture| round_trips(&render, capture, &shared.detections.snapshot()));
+    let frame_trip = capture.as_ref().map(|capture| frame_trips(&render, capture, &shared.detections.snapshot()));
     let errors = shared.render.errors.load(Ordering::Relaxed) + shared.capture.errors.load(Ordering::Relaxed);
     let invalid = shared.render.invalid.load(Ordering::Relaxed) + shared.capture.invalid.load(Ordering::Relaxed);
     let dropped = [&shared.render, &shared.capture].iter().map(|l| l.arrival_ns.dropped()).sum::<u64>() + shared.detections.dropped();
@@ -200,6 +254,7 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
         xruns_in: capture.as_ref().map(Stream::gaps),
         cpu_us: cpu,
         round_trip,
+        frame_trip,
         backend_errors: errors,
         invalid_stamps: invalid,
         dropped,
@@ -221,7 +276,13 @@ mod tests {
 
     #[test]
     fn frame_lookup_spans_uneven_blocks() {
-        let stream = Stream { arrival_ns: vec![1000, 2000, INVALID_ARRIVAL], frames: vec![10, 20, 10], cpu_ns: vec![0; 3], rate: 1_000_000_000 };
+        let stream = Stream {
+            arrival_ns: vec![1000, 2000, INVALID_ARRIVAL],
+            frame_ns: vec![0; 3],
+            frames: vec![10, 20, 10],
+            cpu_ns: vec![0; 3],
+            rate: 1_000_000_000,
+        };
         let starts = stream.starts();
         assert_eq!(starts, [0, 10, 30]);
         assert_eq!(stream.host_ns(&starts, 0), Some(1000.0));

@@ -32,11 +32,7 @@ impl InputView {
                         })
                         .collect();
                     let c = status.counts;
-                    let timing = match status.timing_quality {
-                        Some(soundcraft_playback::device_clock::Quality::Measured) => "device clock",
-                        Some(soundcraft_playback::device_clock::Quality::BackendEstimate) => "estimated device clock",
-                        _ => "approximate (callback scheduling)",
-                    };
+                    let timing = status.timing_label();
                     let mut detail = format!(
                         "{} open MIDI inputs · {} active routes\nEvents received: {} · queued for audio: {} · filtered: {}\nCanceled: {} · dropped: {} · refused: {} · recovered: {}\nTiming: {timing}\nApproximate events: {}",
                         status.open_inputs,
