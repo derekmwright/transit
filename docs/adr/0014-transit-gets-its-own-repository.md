@@ -76,7 +76,7 @@ Sweep checklist for the inherited crates, so the rest is one mechanical job late
 - `xtask` tables (`LAYERS`, `EXEMPT`, `WASM`, the unsafe allowlist) and the prefix handling in `layers`.
 - Workflow files under `.github/workflows`.
 - `docs/adr` and `docs/contributing` mentions; `ATTRIBUTION.md`.
-- `packaging/` ids `ai.storyteller.soundcraft.*`, desktop and metainfo file names, and the Flatpak manifests.
+- `packaging/` ids `ai.storyteller.soundcraft.*`, desktop and metainfo file names, and the Flatpak manifests. Done: app id `dev.derekmwright.transit`, files `transit.*`.
 - The `SOUNDCRAFT_CONFIG_DIR` and scan-cache compatibility shim: keep reading the old cache dir.
 - The "Based on SoundCraft by storytold" credit stays (nominative use).
 - The private notes.

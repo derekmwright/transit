@@ -2,7 +2,7 @@
 <!-- AppStream metadata (software centres, Flathub). Template: package.sh and the Flatpak
      manifest substitute @VERSION@ and @DATE@ from Cargo.toml and the build date. -->
 <component type="desktop-application">
-  <id>ai.storyteller.soundcraft</id>
+  <id>dev.derekmwright.transit</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <name>SoundCraft</name>
@@ -23,7 +23,7 @@
       <li>A headless command line and an MCP server for scripting and agents</li>
     </ul>
   </description>
-  <launchable type="desktop-id">ai.storyteller.soundcraft.desktop</launchable>
+  <launchable type="desktop-id">dev.derekmwright.transit.desktop</launchable>
   <icon type="stock">transit</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
   <url type="homepage">https://getartcraft.com/apps/soundcraft</url>

@@ -4,18 +4,18 @@
 #
 #   curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
 #   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/linux/flatpak/cargo-sources.json
-#   flatpak-builder --user --install --force-clean build-flatpak packaging/linux/flatpak/ai.storyteller.soundcraft.yml
-#   flatpak run ai.storyteller.soundcraft
+#   flatpak-builder --user --install --force-clean build-flatpak packaging/linux/flatpak/dev.derekmwright.transit.yml
+#   flatpak run dev.derekmwright.transit
 #
 # For Flathub, replace the `dir` source with a `git` source pinned to a release tag and commit.
-# ai.storyteller.soundcraft.bundle.yml repackages the release tarball into the .flatpak attached
+# dev.derekmwright.transit.bundle.yml repackages the release tarball into the .flatpak attached
 # to each GitHub release; keep runtime-version, finish-args and add-extensions identical in both
 # (packaging-lint checks this).
 #
 # Audio: cpal talks to ALSA. alsa-lib (headers in the Sdk, the library in the Platform) and its
 # PulseAudio plugin ship with the freedesktop runtime, which routes ALSA through the PulseAudio
 # socket (PipeWire's pulse server on modern desktops), so no extra module is needed.
-id: ai.storyteller.soundcraft
+id: dev.derekmwright.transit
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
@@ -72,16 +72,16 @@ modules:
       - cargo --offline build --release --locked -p soundcraft -p soundcraft-cli
       - install -Dm755 target/release/soundcraft /app/bin/soundcraft
       - install -Dm755 target/release/soundcraft-cli /app/bin/soundcraft-cli
-      - install -Dm644 packaging/linux/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
-      - install -Dm644 packaging/linux/ai.storyteller.soundcraft.mime.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml
+      - install -Dm644 packaging/linux/transit.desktop /app/share/applications/dev.derekmwright.transit.desktop
+      - install -Dm644 packaging/linux/transit.mime.xml /app/share/mime/packages/dev.derekmwright.transit.xml
       - mkdir -p /app/share/icons && cp -R assets/app-icon/hicolor /app/share/icons/
       # Flatpak exports only icons named after the app ID, so rename the hicolor icons and point the desktop entry at them.
-      - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/ai.storyteller.soundcraft.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=ai.storyteller.soundcraft/' /app/share/applications/ai.storyteller.soundcraft.desktop
+      - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/dev.derekmwright.transit.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=dev.derekmwright.transit/' /app/share/applications/dev.derekmwright.transit.desktop
       - >-
         version=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml);
         install -d /app/share/metainfo;
-        sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" -e "s#>transit</icon>#>ai.storyteller.soundcraft</icon>#"
-        packaging/linux/ai.storyteller.soundcraft.metainfo.xml.in > /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml
+        sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" -e "s#>transit</icon>#>dev.derekmwright.transit</icon>#"
+        packaging/linux/transit.metainfo.xml.in > /app/share/metainfo/dev.derekmwright.transit.metainfo.xml
       # Mount point for the plugin extensions (add-extensions).
       - install -d /app/extensions/Plugins
     sources:

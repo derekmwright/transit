@@ -13,7 +13,7 @@
   <key>CFBundleExecutable</key>
   <string>SoundCraft</string>
   <key>CFBundleIdentifier</key>
-  <string>ai.storyteller.soundcraft</string>
+  <string>dev.derekmwright.transit</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundlePackageType</key>
@@ -53,7 +53,7 @@
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
-      <string>ai.storyteller.soundcraft.session</string>
+      <string>dev.derekmwright.transit.session</string>
       <key>UTTypeDescription</key>
       <string>SoundCraft Session</string>
       <key>UTTypeConformsTo</key>
@@ -85,7 +85,7 @@
       <key>CFBundleTypeIconFile</key>
       <string>SoundCraft</string>
       <key>LSItemContentTypes</key>
-      <array><string>ai.storyteller.soundcraft.session</string></array>
+      <array><string>dev.derekmwright.transit.session</string></array>
     </dict>
     <!-- Audio and MIDI: offered under "Open With" (imported into a session), never taking over
          the user's default player. -->

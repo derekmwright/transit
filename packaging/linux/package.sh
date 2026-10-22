@@ -21,7 +21,7 @@ set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 HERE="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.soundcraft
+APP_ID=dev.derekmwright.transit
 
 SKIP_BUILD=0
 FORMATS="appimage deb rpm tar"
@@ -62,11 +62,11 @@ rm -rf "$WORK"
 install -Dm755 "$BIN/soundcraft" "$STAGE/usr/bin/soundcraft"
 install -Dm755 "$BIN/soundcraft-cli" "$STAGE/usr/bin/soundcraft-cli"
 "${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/soundcraft" "$STAGE/usr/bin/soundcraft-cli" 2>/dev/null || true
-install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
-install -Dm644 "$HERE/$APP_ID.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
+install -Dm644 "$HERE/transit.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
+install -Dm644 "$HERE/transit.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
-  "$HERE/$APP_ID.metainfo.xml.in" >"$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
+  "$HERE/transit.metainfo.xml.in" >"$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
 mkdir -p "$STAGE/usr/share/icons"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
 mkdir -p "$STAGE/usr/share/doc/soundcraft"
@@ -107,7 +107,7 @@ if has appimage; then
   cp -R "$STAGE" "$APPDIR"
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
   ln -s usr/bin/soundcraft "$APPDIR/AppRun"
-  cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
+  cp "$HERE/transit.desktop" "$APPDIR/$APP_ID.desktop"
   cp "$ROOT/assets/app-icon/hicolor/256x256/apps/transit.png" "$APPDIR/transit.png"
   ln -s transit.png "$APPDIR/.DirIcon"
 

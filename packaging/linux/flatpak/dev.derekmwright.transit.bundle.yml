@@ -10,9 +10,9 @@
 # (plus alsa-lib's PulseAudio plugin), and the GPU driver comes from its
 # org.freedesktop.Platform.GL extension.
 #
-# ai.storyteller.soundcraft.yml (same directory) is the from-source manifest for Flathub. Keep
+# dev.derekmwright.transit.yml (same directory) is the from-source manifest for Flathub. Keep
 # runtime-version, finish-args and add-extensions identical in both (packaging-lint checks this).
-id: ai.storyteller.soundcraft
+id: dev.derekmwright.transit
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
@@ -60,14 +60,14 @@ modules:
     build-commands:
       - install -Dm755 bin/soundcraft /app/bin/soundcraft
       - install -Dm755 bin/soundcraft-cli /app/bin/soundcraft-cli
-      - install -Dm644 share/applications/ai.storyteller.soundcraft.desktop /app/share/applications/ai.storyteller.soundcraft.desktop
+      - install -Dm644 share/applications/dev.derekmwright.transit.desktop /app/share/applications/dev.derekmwright.transit.desktop
       # Session files; the runtime's shared-mime-info already knows WAV, AIFF, FLAC, MP3 and MIDI.
-      - install -Dm644 share/mime/packages/ai.storyteller.soundcraft.xml /app/share/mime/packages/ai.storyteller.soundcraft.xml
+      - install -Dm644 share/mime/packages/dev.derekmwright.transit.xml /app/share/mime/packages/dev.derekmwright.transit.xml
       # Already has the release's version and date substituted by package.sh.
-      - install -Dm644 share/metainfo/ai.storyteller.soundcraft.metainfo.xml /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml
+      - install -Dm644 share/metainfo/dev.derekmwright.transit.metainfo.xml /app/share/metainfo/dev.derekmwright.transit.metainfo.xml
       - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/soundcraft /app/share/doc/
       # Flatpak exports only icons named after the app ID, so rename the hicolor icons and point the desktop entry at them.
-      - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/ai.storyteller.soundcraft.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=ai.storyteller.soundcraft/' /app/share/applications/ai.storyteller.soundcraft.desktop; sed -i 's#<icon type="stock">transit<#<icon type="stock">ai.storyteller.soundcraft<#' /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml 2>/dev/null || true
+      - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/dev.derekmwright.transit.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=dev.derekmwright.transit/' /app/share/applications/dev.derekmwright.transit.desktop; sed -i 's#<icon type="stock">transit<#<icon type="stock">dev.derekmwright.transit<#' /app/share/metainfo/dev.derekmwright.transit.metainfo.xml 2>/dev/null || true
       # Mount point for the plugin extensions (add-extensions).
       - install -d /app/extensions/Plugins
     sources:

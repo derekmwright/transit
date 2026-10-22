@@ -192,6 +192,8 @@ pub struct Services {
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
     /// The app's settings folder; user presets live under `presets/` in it. `None`: factory presets only.
     pub config_dir: Option<std::path::PathBuf>,
+    /// Replaces the deferred launch open of the audio device (tests); `None`: the real open.
+    pub open_audio: Option<Box<dyn Fn(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player>>,
 }
 
 /// Ballistic meter display state (copied from `soundcraft-ui-egui`, see [`host::feed_meter`]).
@@ -858,6 +860,7 @@ impl StudioApp {
         if !keys::pane(self, ui) {
             mixer::panes(self, ui);
         }
+        splash::advance_open(self, &ctx);
         if splash::update(self, &ctx) {
             splash::show(self, ui);
         } else if self.ui.mixer_full {

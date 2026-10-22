@@ -173,3 +173,27 @@ fn a_click_or_skip_hides_the_splash_early_and_the_device_line_shows() {
     t.click(mid(skip));
     assert_eq!(t.inspect()["splash"]["visible"], false);
 }
+
+#[test]
+fn the_splash_reports_the_device_stage_before_the_scan_stage() {
+    let mut t = T::new();
+    let opened = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let seen = std::rc::Rc::clone(&opened);
+    t.app.services.open_audio = Some(Box::new(move |session, _| {
+        seen.set(seen.get() + 1);
+        soundcraft_playback::Player::prepare_device_free(session).unwrap()
+    }));
+    t.app.splash.arm();
+    t.app.splash.scan_override = Some(scanning(1, 4));
+    t.app.splash.defer_open(soundcraft_playback::AudioConfig { output: Some("Focusrite USB ASIO".into()), ..Default::default() });
+    t.frames(1);
+    assert_eq!(opened.get(), 0, "the first frame only announces the open");
+    assert_eq!(t.inspect()["splash"]["status"], "Opening Focusrite USB ASIO…");
+    t.frames(2);
+    assert_eq!(opened.get(), 1, "the next frame opens the device");
+    assert!(t.app.player.is_some());
+    let s = t.inspect()["splash"].clone();
+    assert!(s["status"].as_str().unwrap().starts_with("Scanning plug-ins…"), "{s}");
+    // The device-free player counts as not opened: its failure shows for exactly one frame.
+    assert_eq!(t.app.splash.stages, ["device", "failed", "scan"], "the device stage comes before the scan stage");
+}

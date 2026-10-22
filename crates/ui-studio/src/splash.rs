@@ -19,6 +19,17 @@ pub enum Watch {
     Scan(Option<ScanProgress>),
     /// The named audio device is being opened.
     Device(String),
+    /// The device did not open; shown for one frame, then the status line carries it.
+    Failed(String),
+}
+
+/// An audio device open deferred past the first frame, so the splash can say what is happening
+/// before the (synchronous) open blocks the UI thread.
+#[derive(Debug, Clone)]
+struct PendingOpen {
+    cfg: soundcraft_playback::AudioConfig,
+    /// The frame that says "Opening ..." has been drawn; the next one opens.
+    announced: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -29,6 +40,14 @@ pub struct SplashState {
     pub finished: bool,
     /// The device being opened right now, when the app is opening one.
     pub opening_device: Option<String>,
+    /// The open to run on the frame after the splash first shows it.
+    #[serde(skip)]
+    pending: Option<PendingOpen>,
+    /// Why the device did not open, for the one frame after the attempt.
+    pub failed: Option<String>,
+    /// The stage the splash reported on each frame, in order, without repeats (a test hook).
+    #[serde(skip)]
+    pub stages: Vec<&'static str>,
     /// Test hook: replaces the global scan state (`Some(None)` is a scan without counts).
     #[serde(skip)]
     pub scan_override: Option<Option<ScanProgress>>,
@@ -52,7 +71,16 @@ impl SplashState {
         self.visible = false;
     }
 
+    /// Open the audio device on a later frame: this one shows "Opening <device>…" first.
+    pub fn defer_open(&mut self, cfg: soundcraft_playback::AudioConfig) {
+        self.opening_device = Some(cfg.output.clone().unwrap_or_else(|| "the audio device".to_string()));
+        self.pending = Some(PendingOpen { cfg, announced: false });
+    }
+
     fn watching(&self) -> Option<Watch> {
+        if let Some(e) = &self.failed {
+            return Some(Watch::Failed(e.clone()));
+        }
         if let Some(d) = &self.opening_device {
             return Some(Watch::Device(d.clone()));
         }
@@ -72,7 +100,40 @@ pub fn describe(w: &Watch) -> (String, Option<f32>) {
         }
         Watch::Scan(None) => ("Scanning plug-ins…".to_string(), None),
         Watch::Device(name) => (format!("Opening {name}…"), None),
+        Watch::Failed(error) => (format!("Audio output unavailable: {error}"), None),
     }
+}
+
+fn stage_name(w: &Watch) -> &'static str {
+    match w {
+        Watch::Scan(_) => "scan",
+        Watch::Device(_) => "device",
+        Watch::Failed(_) => "failed",
+    }
+}
+
+/// Run the deferred device open, once the frame that announced it has been drawn. A failure
+/// stays on the splash for one frame.
+pub fn advance_open(app: &mut StudioApp, ctx: &egui::Context) {
+    // The failure of the previous frame has been shown.
+    app.splash.failed = None;
+    let Some(pending) = app.splash.pending.as_mut() else { return };
+    if !pending.announced {
+        pending.announced = true;
+        ctx.request_repaint();
+        return;
+    }
+    let Some(PendingOpen { cfg, .. }) = app.splash.pending.take() else { return };
+    app.splash.opening_device = None;
+    let session = app.engine.session_arc();
+    let open = app.services.open_audio.take();
+    let player = match &open {
+        Some(open) => open(session, &cfg),
+        None => soundcraft_playback::Player::with_config(session, &cfg),
+    };
+    app.splash.failed = player.silent.then(|| player.initial_error().unwrap_or("no device").to_string());
+    app.player = Some(player);
+    ctx.request_repaint();
 }
 
 /// Decide, once per frame before the panels are laid out, whether the splash shows. Returns it.
@@ -90,6 +151,10 @@ pub fn update(app: &mut StudioApp, ctx: &egui::Context) -> bool {
     match s.watching() {
         Some(w) => {
             (s.status, s.fraction) = describe(&w);
+            let name = stage_name(&w);
+            if s.stages.last() != Some(&name) {
+                s.stages.push(name);
+            }
             s.visible = true;
         }
         None => s.dismiss(),

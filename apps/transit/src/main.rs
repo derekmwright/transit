@@ -228,6 +228,7 @@ fn services() -> Services {
             d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
         })),
         config_dir: config::config_dir(),
+        open_audio: None,
     }
 }
 
@@ -323,9 +324,11 @@ fn main() -> eframe::Result {
         "transit",
         options,
         Box::new(move |cc| {
-            let player =
-                if no_audio { None } else { Some(soundcraft_playback::Player::with_config(Arc::new(engine.session().clone()), &prefs.audio)) };
-            let mut app = StudioApp::new(engine, player, services());
+            // The device opens on the frame after the splash first says so (`splash::advance_open`).
+            let mut app = StudioApp::new(engine, None, services());
+            if !no_audio {
+                app.splash.defer_open(prefs.audio.clone());
+            }
             // Our own autosave folder: the two apps must not recover each other's sessions. Runs
             // without preferences (agents' tests) autosave into a folder of their own, so they
             // neither offer the user's leftovers nor leave theirs for the user.

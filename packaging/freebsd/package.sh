@@ -17,7 +17,7 @@ set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
 LINUX="$ROOT/packaging/linux"
-APP_ID=ai.storyteller.soundcraft
+APP_ID=dev.derekmwright.transit
 
 SKIP_BUILD=0
 while [ $# -gt 0 ]; do
@@ -52,10 +52,10 @@ mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/mime/packages" "
 install -m 755 "$BIN/soundcraft" "$BIN/soundcraft-cli" "$STAGE/bin/"
 strip "$STAGE/bin/soundcraft" "$STAGE/bin/soundcraft-cli" 2>/dev/null || true
 # The desktop entry, MIME type and metainfo are the freedesktop files the Linux packages use.
-install -m 644 "$LINUX/$APP_ID.desktop" "$STAGE/share/applications/$APP_ID.desktop"
-install -m 644 "$LINUX/$APP_ID.mime.xml" "$STAGE/share/mime/packages/$APP_ID.xml"
+install -m 644 "$LINUX/transit.desktop" "$STAGE/share/applications/$APP_ID.desktop"
+install -m 644 "$LINUX/transit.mime.xml" "$STAGE/share/mime/packages/$APP_ID.xml"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
-  "$LINUX/$APP_ID.metainfo.xml.in" >"$STAGE/share/metainfo/$APP_ID.metainfo.xml"
+  "$LINUX/transit.metainfo.xml.in" >"$STAGE/share/metainfo/$APP_ID.metainfo.xml"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/share/icons/"
 copy_docs "$STAGE/share/doc/soundcraft"
 
