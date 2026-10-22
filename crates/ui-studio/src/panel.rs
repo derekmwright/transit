@@ -152,7 +152,7 @@ fn draw(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &Insert, i
         Key => return key_dropdown(app, ui, key),
     };
     let Some(p) = info.param(id) else { return };
-    let v = p.clamp(ins.params.get(id).copied().unwrap_or(p.default));
+    let v = p.clamp(app.followed_param(key, id).or_else(|| ins.params.get(id).copied()).unwrap_or(p.default));
     let (rect, new, shown) = match item {
         Knob(..) => {
             let k = knob::show(ui, egui::Id::new(("knob", ins.uid.get(), id)), label, p, v);

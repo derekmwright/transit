@@ -940,6 +940,8 @@ mod keys_tests;
 #[cfg(test)]
 mod midi_record_tests;
 #[cfg(test)]
+mod param_capture_tests;
+#[cfg(test)]
 mod recent_tests;
 #[cfg(test)]
 mod slice5_tests;

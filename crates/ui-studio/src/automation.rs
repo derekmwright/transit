@@ -104,8 +104,28 @@ impl Lane {
             Lane::SendLevel(i) => format!("send_{}_level", letter(*i)),
             Lane::SendPan(i) => format!("send_{}_pan", letter(*i)),
             Lane::SendMute(i) => format!("send_{}_mute", letter(*i)),
+            Lane::Plugin { slot, param } if *slot == AutoParam::INSTRUMENT_SLOT => format!("plugin:instrument:{param}"),
             Lane::Plugin { slot, param } => format!("plugin:{}:{param}", letter(*slot)),
         }
+    }
+
+    /// The lane of a plug-in parameter: an insert's (`slot` the insert index) or, for
+    /// [`soundcraft_mix::INSTRUMENT_SLOT`], the instrument's. (`fine::Target` is `Copy`, which a
+    /// parameter id is not, so plug-in gestures reach the write pass as [`ParamTouch`]es.)
+    pub fn of_param(track: TrackId, slot: usize, param: &str) -> Option<(TrackId, Lane)> {
+        let slot = if slot == soundcraft_mix::INSTRUMENT_SLOT {
+            AutoParam::INSTRUMENT_SLOT
+        } else {
+            u8::try_from(slot).ok().filter(|s| *s < u8::MAX - 1)?
+        };
+        // `AutoParam::parse` lowercases ids, so a lane can only address lowercase ones.
+        (param == param.to_ascii_lowercase()).then(|| (track, Lane::Plugin { slot, param: param.to_string() }))
+    }
+
+    /// The device a plug-in lane addresses.
+    fn device<'a>(&self, t: &'a Track) -> Option<&'a soundcraft_model::Insert> {
+        let Lane::Plugin { slot, .. } = self else { return None };
+        if *slot == AutoParam::INSTRUMENT_SLOT { t.instrument.as_ref() } else { t.mixer.inserts.get(usize::from(*slot))?.as_ref() }
     }
 
     /// The control a lane belongs to, for the write pass and the mixer link.
@@ -134,7 +154,7 @@ impl Lane {
     pub fn valid(&self, t: &Track) -> bool {
         match self {
             Lane::SendLevel(i) | Lane::SendPan(i) | Lane::SendMute(i) => t.mixer.sends.get(usize::from(*i)).is_some_and(Option::is_some),
-            Lane::Plugin { slot, .. } => t.mixer.inserts.get(usize::from(*slot)).is_some_and(Option::is_some),
+            Lane::Plugin { .. } => self.device(t).is_some(),
             _ => true,
         }
     }
@@ -144,9 +164,8 @@ impl Lane {
     }
 
     fn info(&self, t: &Track) -> Option<&'static soundcraft_dsp::ParamInfo> {
-        let Lane::Plugin { slot, param } = self else { return None };
-        let ins = t.mixer.inserts.get(usize::from(*slot))?.as_ref()?;
-        soundcraft_dsp::plugin_info(&ins.plugin)?.params.iter().find(|p| p.id == param)
+        let Lane::Plugin { param, .. } = self else { return None };
+        soundcraft_dsp::plugin_info(&self.device(t)?.plugin)?.params.iter().find(|p| p.id == param)
     }
 
     /// The value the parameter has without automation.
@@ -159,14 +178,9 @@ impl Lane {
             Lane::SendLevel(i) => send(i).map_or(fine::DB_MIN, |s| s.level_db),
             Lane::SendPan(i) => send(i).map_or(0.0, |s| s.pan),
             Lane::SendMute(i) => send(i).map_or(0.0, |s| f32::from(u8::from(s.mute))),
-            Lane::Plugin { slot, param } => t
-                .mixer
-                .inserts
-                .get(usize::from(*slot))
-                .and_then(Option::as_ref)
-                .and_then(|i| i.params.get(param).copied())
-                .or_else(|| self.info(t).map(|i| i.default))
-                .unwrap_or(0.0),
+            Lane::Plugin { param, .. } => {
+                self.device(t).and_then(|i| i.params.get(param).copied()).or_else(|| self.info(t).map(|i| i.default)).unwrap_or(0.0)
+            }
         }
     }
 
@@ -244,8 +258,8 @@ impl Lane {
             Lane::SendLevel(i) => format!("{} level", send(i)),
             Lane::SendPan(i) => format!("{} pan", send(i)),
             Lane::SendMute(i) => format!("{} mute", send(i)),
-            Lane::Plugin { slot, param } => {
-                let dev = t.mixer.inserts.get(usize::from(*slot)).and_then(Option::as_ref).map(|i| i.plugin.clone()).unwrap_or_default();
+            Lane::Plugin { param, .. } => {
+                let dev = self.device(t).map(|i| i.plugin.clone()).unwrap_or_default();
                 let name = self.info(t).map_or_else(|| param.clone(), |i| i.name.to_string());
                 format!("{} · {name}", app.plugin_name(&dev, false))
             }
@@ -293,9 +307,12 @@ pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, Stri
             v.push(("Sends".to_string(), l.label(app, s, t), l.id()));
         }
     }
-    for (slot, ins) in t.mixer.inserts.iter().enumerate() {
-        let Some(ins) = ins else { continue };
-        let slot = u8::try_from(slot).unwrap_or(0);
+    let devices = t
+        .instrument
+        .iter()
+        .map(|i| (AutoParam::INSTRUMENT_SLOT, i))
+        .chain(t.mixer.inserts.iter().enumerate().filter_map(|(slot, ins)| Some((u8::try_from(slot).unwrap_or(0), ins.as_ref()?))));
+    for (slot, ins) in devices {
         let dev = app.plugin_name(&ins.plugin, false);
         let ids: Vec<(String, String)> = match soundcraft_dsp::plugin_info(&ins.plugin) {
             Some(info) => info.params.iter().map(|p| (p.id.to_string(), p.name.to_string())).collect(),
@@ -423,9 +440,36 @@ pub struct AutoLayout {
     pub thin_after_write: bool,
 }
 
+/// How long after the last value a hosted editor sent its parameter counts as still held (seconds).
+/// The hosts forward values only, not the plug-in's begin/end-edit gestures, so a run of changes
+/// less than this far apart is one gesture.
+pub const HOSTED_HOLD_S: f64 = 0.15;
+
+/// How long a moved plug-in parameter counts as held.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hold {
+    /// While the pointer is down (a built-in panel or window).
+    Pointer,
+    /// Until this time (a hosted editor, which egui cannot see the pointer in).
+    Until(f64),
+}
+
+/// A plug-in parameter being moved: the plug-in counterpart of a mixer fader's `MixGesture`.
+/// `fresh` holds until a write pass has seen it, so a click (toggle, choice, double-click reset,
+/// preset recall: the pointer is already up) still writes its one point.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParamTouch {
+    pub track: TrackId,
+    pub lane: Lane,
+    hold: Hold,
+    fresh: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct AutoState {
     pub gesture: Option<AutoGesture>,
+    /// The plug-in parameters being moved (see [`StudioApp::touch_param`]).
+    pub(crate) touches: Vec<ParamTouch>,
     pub selection: Vec<PointRef>,
     /// The lane of the mixer control last clicked (the mixer link).
     pub highlight: Option<(TrackId, String)>,
@@ -472,11 +516,34 @@ impl StudioApp {
         if self.mixer.gesture.is_some_and(|g| Lane::of_target(g.target) == (t.id, lane.clone())) {
             return None;
         }
+        if self.auto.touches.iter().any(|x| x.track == t.id && x.lane == *lane) {
+            return None;
+        }
         if *lane == Lane::Volume && matches!(&self.arrange.gesture, Some(crate::arrange::Gesture::Volume { track, .. }) if *track == t.id) {
             return None;
         }
         lane.params(t).first().and_then(|p| t.lane(p)).filter(|l| !l.points.is_empty())?;
         Some(lane.value_at(t, self.position()))
+    }
+
+    /// The value a built-in plug-in control shows while its track reads automation (see
+    /// [`StudioApp::followed`]).
+    pub(crate) fn followed_param(&self, key: (TrackId, usize), param: &str) -> Option<f32> {
+        let (t, lane) = Lane::of_param(key.0, key.1, param)?;
+        self.followed(self.engine.session().track(t)?, &lane)
+    }
+
+    /// A plug-in parameter was moved by the user: a built-in panel's knob or slider (the pointer
+    /// holds it) or a hosted editor (it holds it `HOSTED_HOLD_S` after its latest value). The write
+    /// pass records it in Write, Touch and Latch like a fader move; Read only shows the lane's
+    /// value again afterwards.
+    pub(crate) fn touch_param(&mut self, track: TrackId, slot: usize, param: &str, hosted: bool) {
+        let Some((track, lane)) = Lane::of_param(track, slot, param) else { return };
+        let hold = if hosted { Hold::Until(self.last_frame.unwrap_or_default() + HOSTED_HOLD_S) } else { Hold::Pointer };
+        match self.auto.touches.iter_mut().find(|x| x.track == track && x.lane == lane) {
+            Some(x) => x.hold = hold,
+            None => self.auto.touches.push(ParamTouch { track, lane, hold, fresh: true }),
+        }
     }
 
     /// The A toggle: show or hide a track's lanes (Volume the first time). View state only.
@@ -1149,10 +1216,15 @@ pub fn mode_label(m: AutomationMode) -> &'static str {
 pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
     use AutomationMode as M;
     let playing = app.is_playing();
+    let held = ctx.input(|i| i.pointer.any_down());
+    let now = ctx.input(|i| i.time);
+    app.auto.touches.retain(|x| x.fresh || (x.hold == Hold::Pointer && held) || matches!(x.hold, Hold::Until(u) if now <= u));
     let any = app.engine.session().tracks.iter().any(|t| matches!(t.mixer.automation_mode, M::Write | M::Touch | M::Latch | M::TouchLatch));
     let may = playing && any;
     app.engine.hold_merge(may.then_some(PASS));
     if !may {
+        // Stopped: nothing is written, and a click leaves no pulse for the next Play.
+        app.auto.touches.iter_mut().for_each(|x| x.fresh = false);
         if app.auto.writing {
             app.auto.writing = false;
             let tracks = std::mem::take(&mut app.auto.passed);
@@ -1200,13 +1272,16 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         }
     }
     app.auto.last_at = Some(pos);
-    let held = ctx.input(|i| i.pointer.any_down());
     let header = match &app.arrange.gesture {
         Some(crate::arrange::Gesture::Volume { track, .. }) => Some((*track, Lane::Volume)),
         _ => None,
     };
     let touched: Option<(TrackId, Lane)> = app.mixer.gesture.map(|g| Lane::of_target(g.target)).or(header);
-    let touched = touched.filter(|_| held);
+    let mut touched: Vec<(TrackId, Lane)> = touched.filter(|_| held).into_iter().collect();
+    touched.extend(app.auto.touches.iter().map(|x| (x.track, x.lane.clone())));
+    for x in &mut app.auto.touches {
+        x.fresh = false;
+    }
     let s = app.engine.session_arc();
     // Touch stops writing on release: the next touch is a new segment, so the automation between
     // the touches is not cleared and the written span ends here.
@@ -1215,7 +1290,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         .last
         .keys()
         .filter(|(id, lane)| {
-            s.track(*id).is_some_and(|t| t.mixer.automation_mode == M::Touch) && !touched.as_ref().is_some_and(|(i, l)| i == id && l.id() == *lane)
+            s.track(*id).is_some_and(|t| t.mixer.automation_mode == M::Touch) && !touched.iter().any(|(i, l)| i == id && l.id() == *lane)
         })
         .cloned()
         .collect();
@@ -1226,20 +1301,18 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
     }
     let mut writes: Vec<(TrackId, Lane)> = Vec::new();
     for t in &s.tracks {
-        let mine = touched.as_ref().filter(|(id, _)| *id == t.id).map(|(_, l)| l.clone());
+        let mine: Vec<Lane> = touched.iter().filter(|(id, _)| *id == t.id).map(|(_, l)| l.clone()).collect();
         match t.mixer.automation_mode {
             M::Write => {
                 writes.push((t.id, Lane::Volume));
-                if let Some(l) = mine.filter(|l| *l != Lane::Volume) {
-                    writes.push((t.id, l));
-                }
+                writes.extend(mine.into_iter().filter(|l| *l != Lane::Volume).map(|l| (t.id, l)));
             }
-            M::Touch => writes.extend(mine.map(|l| (t.id, l))),
+            M::Touch => writes.extend(mine.into_iter().map(|l| (t.id, l))),
             M::Latch | M::TouchLatch => {
-                if let Some(l) = mine
-                    && !app.auto.latched.contains(&(t.id, l.id()))
-                {
-                    app.auto.latched.push((t.id, l.id()));
+                for l in mine {
+                    if !app.auto.latched.contains(&(t.id, l.id())) {
+                        app.auto.latched.push((t.id, l.id()));
+                    }
                 }
                 writes.extend(app.auto.latched.iter().filter(|(id, _)| *id == t.id).filter_map(|(id, l)| Lane::parse(l).map(|l| (*id, l))));
             }
@@ -1256,7 +1329,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
         let mut from = app.auto.last.get(&key).copied();
         let started = from.is_none();
         let v = lane.static_value(t);
-        let held_lane = touched.as_ref().is_some_and(|(i, l)| *i == id && *l == lane);
+        let held_lane = touched.iter().any(|(i, l)| *i == id && *l == lane);
         let mut ok = true;
         if let Some(old) = app.auto.last_v.get(&key).copied() {
             if !held_lane && (old - v).abs() <= f32::EPSILON {
@@ -1285,6 +1358,7 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
                 _ => segs.push((pos, pos)),
             }
             wrote = true;
+            open_plugin_lane(app, id, &lane);
             if !app.auto.passed.contains(&id) {
                 app.auto.passed.push(id);
             }
@@ -1294,6 +1368,15 @@ pub(crate) fn write_pass(app: &mut StudioApp, ctx: &egui::Context) {
     }
     if wrote {
         app.auto.pass_mark = app.engine.revision;
+    }
+}
+
+/// A plug-in lane that has just taken its first point opens under the track's other lanes, when
+/// the track's automation is showing.
+fn open_plugin_lane(app: &mut StudioApp, t: TrackId, lane: &Lane) {
+    let id = lane.id();
+    if matches!(lane, Lane::Plugin { .. }) && app.ui.auto_shown.contains(&t) && !app.ui.auto_lanes.iter().any(|v| v.track == t && v.lane == id) {
+        app.ui.auto_lanes.push(LaneView { track: t, lane: id, height: LANE_H });
     }
 }
 

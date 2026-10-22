@@ -2354,11 +2354,12 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
 }
 
 fn apply_params(slot: &mut PluginSlot, ins: &soundcraft_model::Insert, t: &Track, i: usize, pos: Samples) {
-    // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has none, so it
-    // must not pick up slot A's lanes.
-    let Ok(slot_u8) = u8::try_from(i) else {
+    // Automation lanes address insert slots; the instrument (`INSTRUMENT_SLOT`) has its own lane
+    // slot, so it never picks up slot A's lanes.
+    let slot_u8 = if i == INSTRUMENT_SLOT { AutoParam::INSTRUMENT_SLOT } else { u8::try_from(i).unwrap_or(u8::MAX) };
+    if slot_u8 == u8::MAX {
         return apply_values(slot, ins, |_, v| v);
-    };
+    }
     let automated = t.mixer.automation_mode.reads()
         && t.automation.iter().any(|l| matches!(&l.param, AutoParam::Plugin { slot, .. } if *slot == slot_u8) && !l.points.is_empty());
     apply_values(slot, ins, |k, val| {
@@ -3393,6 +3394,21 @@ mod tests {
         let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: 0, param: "level".into() });
         lane.set_point(0, -48.0);
         tr.automation.push(lane);
+        assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
+    }
+
+    #[test]
+    fn instrument_lane_automation_drives_the_instrument() {
+        let mut s = synth_session(-6.0);
+        let reference = render_range(&s, Range::new(0, 12_000), 512);
+        let tr = &mut s.tracks[0];
+        tr.mixer.automation_mode = soundcraft_model::AutomationMode::Read;
+        let mut lane = soundcraft_model::AutomationLane::new(AutoParam::Plugin { slot: AutoParam::INSTRUMENT_SLOT, param: "level".into() });
+        lane.set_point(0, -48.0);
+        tr.automation.push(lane);
+        assert_ne!(render_range(&s, Range::new(0, 12_000), 512), reference);
+        // Not in Read: the lane is ignored.
+        s.tracks[0].mixer.automation_mode = soundcraft_model::AutomationMode::Off;
         assert_eq!(render_range(&s, Range::new(0, 12_000), 512), reference);
     }
 

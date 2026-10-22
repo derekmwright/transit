@@ -122,6 +122,14 @@ impl StudioApp {
     pub(crate) fn apply_preset(&mut self, key: (TrackId, usize), info: &PluginInfo, name: &str, preset: &Preset) {
         let values = recall_values(info, preset);
         let (t, slot) = key;
+        // A recall is one instantaneous gesture on each parameter it changes (automation capture).
+        let current = self.builtin_at(key).map(|i| i.params).unwrap_or_default();
+        for (id, v) in &values {
+            let was = current.get(id).copied().or_else(|| info.param(id).map(|p| p.default));
+            if was.is_none_or(|c| (c - v).abs() > f32::EPSILON) {
+                self.touch_param(t, slot, id, false);
+            }
+        }
         let r = if slot == soundcraft_mix::INSTRUMENT_SLOT {
             // No batch command for the instrument: one merge key makes the writes one step.
             self.engine.end_merge();

@@ -345,10 +345,20 @@ impl StudioApp {
         if discard {
             return;
         }
+        self.apply_edits(edits);
+    }
+
+    /// Records plug-in parameter edits: into the session, and as a touch of the parameter's
+    /// automation lane. The hosts report values only (VST3 `performEdit` and CLAP parameter
+    /// events arrive without their begin/end-edit gestures), so a run of edits less than
+    /// `HOSTED_HOLD_S` apart is one gesture: Write, Touch and Latch record it like a fader move
+    /// and Touch lets go that long after the last value.
+    pub(crate) fn apply_edits(&mut self, edits: Vec<(soundcraft_model::TrackId, usize, String, f32)>) {
         for (t, slot, param, value) in edits {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
             }
+            self.touch_param(t, slot, &param, true);
             let key = format!("param:{}:{slot}:{param}", t.0);
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }

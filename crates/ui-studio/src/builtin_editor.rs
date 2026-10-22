@@ -119,6 +119,7 @@ impl StudioApp {
     pub(crate) fn set_builtin_param(&mut self, key: (TrackId, usize), param: &str, value: f32) {
         let (t, slot) = key;
         self.builtin_editor.gesture = true;
+        self.touch_param(t, slot, param, false);
         let r = if slot == soundcraft_mix::INSTRUMENT_SLOT {
             self.engine.execute_merged(
                 "mix.instrument_param",
@@ -263,7 +264,7 @@ pub(crate) fn double_clicked(ui: &Ui, r: &egui::Response) -> bool {
 }
 
 fn param_row(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &Insert, p: &ParamInfo, lay: &mut EditorLayout) {
-    let v = p.clamp(ins.params.get(p.id).copied().unwrap_or(p.default));
+    let v = p.clamp(app.followed_param(key, p.id).or_else(|| ins.params.get(p.id).copied()).unwrap_or(p.default));
     ui.label(RichText::new(p.name).color(TOKENS.text_dim));
     let mut x = v;
     let (resp, reset) = if p.unit == Unit::Choice && !p.choices.is_empty() {

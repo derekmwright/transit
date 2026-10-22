@@ -58,7 +58,9 @@ pub enum AutoParam {
     SendLevel(u8),
     SendPan(u8),
     SendMute(u8),
-    /// Insert slot + parameter id.
+    /// Insert slot + parameter id. `u8::MAX` is the track trim lane and [`AutoParam::INSTRUMENT_SLOT`]
+    /// the track's instrument. Both are plain slots, so a build that predates them reads the
+    /// lane and ignores it (no insert has that slot).
     Plugin {
         slot: u8,
         param: String,
@@ -66,6 +68,9 @@ pub enum AutoParam {
 }
 
 impl AutoParam {
+    /// The `Plugin` slot of a track's instrument.
+    pub const INSTRUMENT_SLOT: u8 = u8::MAX - 1;
+
     pub fn label(&self) -> String {
         match self {
             AutoParam::Volume => "volume".into(),
@@ -75,6 +80,7 @@ impl AutoParam {
             AutoParam::SendLevel(i) => format!("send {} level", slot_letter(*i)),
             AutoParam::SendPan(i) => format!("send {} pan", slot_letter(*i)),
             AutoParam::SendMute(i) => format!("send {} mute", slot_letter(*i)),
+            AutoParam::Plugin { slot, param } if *slot == Self::INSTRUMENT_SLOT => format!("instrument {param}"),
             AutoParam::Plugin { slot, param } => format!("insert {} {param}", slot_letter(*slot)),
         }
     }
@@ -100,7 +106,8 @@ impl AutoParam {
         }
         if let Some(rest) = s.strip_prefix("plugin:") {
             let (slot, param) = rest.split_once(':')?;
-            return Some(AutoParam::Plugin { slot: letter_slot(slot)?, param: param.to_string() });
+            let slot = if slot == "instrument" { Self::INSTRUMENT_SLOT } else { letter_slot(slot)? };
+            return Some(AutoParam::Plugin { slot, param: param.to_string() });
         }
         None
     }
@@ -307,8 +314,33 @@ mod tests {
     fn param_ids() {
         assert_eq!(AutoParam::parse("send_b_level"), Some(AutoParam::SendLevel(1)));
         assert_eq!(AutoParam::parse("plugin:a:threshold"), Some(AutoParam::Plugin { slot: 0, param: "threshold".into() }));
+        assert_eq!(
+            AutoParam::parse("plugin:instrument:cutoff"),
+            Some(AutoParam::Plugin { slot: AutoParam::INSTRUMENT_SLOT, param: "cutoff".into() })
+        );
         assert_eq!(AutoParam::parse("nope"), None);
         assert_eq!(AutomationMode::from_id("touch/latch"), Some(AutomationMode::TouchLatch));
+    }
+
+    /// The instrument's lane is a plain `Plugin` lane on a reserved slot, so no new variant is
+    /// written: a build without the constant reads the lane and ignores it (no insert has the slot).
+    #[test]
+    fn an_instrument_lane_keeps_the_plugin_lane_shape_and_old_lanes_load() {
+        let mut l = AutomationLane::new(AutoParam::Plugin { slot: AutoParam::INSTRUMENT_SLOT, param: "cutoff".into() });
+        l.set_point(10, 500.0);
+        let json = serde_json::to_value(&l).unwrap();
+        assert_eq!(json["param"], serde_json::json!({"Plugin": {"slot": 254, "param": "cutoff"}}));
+        // The previous build's shape: the same `Plugin { slot, param }`; unknown fields are not denied.
+        let old: AutomationLane = serde_json::from_value(serde_json::json!({
+            "param": {"Plugin": {"slot": 254, "param": "cutoff", "future": 1}}, "points": [{"at": 10, "value": 500.0}], "future": true
+        }))
+        .unwrap();
+        assert_eq!(old.param, l.param);
+        // A lane saved before the instrument existed loads unchanged.
+        let prior: AutomationLane =
+            serde_json::from_value(serde_json::json!({"param": {"Plugin": {"slot": 0, "param": "gain"}}, "points": []})).unwrap();
+        assert_eq!(prior.param, AutoParam::Plugin { slot: 0, param: "gain".into() });
+        assert_eq!(l.param.label(), "instrument cutoff");
     }
 
     #[test]
