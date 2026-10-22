@@ -114,6 +114,8 @@ struct Desc {
     main: Option<ChannelFormat>,
     /// The output paths the session routes to on this machine.
     sinks: Vec<SinkSpec>,
+    /// Resolved output/send sink indices, in strip render order.
+    sink_routes: Vec<Vec<Option<usize>>>,
     /// The machine's input paths (monitoring resolves input names through the active plan's copy).
     inputs: Vec<IoPath>,
     /// The hardware inserts: their sinks, return channels and measured latency (ADR 0015 section 5).
@@ -308,6 +310,7 @@ fn measure(
         let slots = add(add(t.mixer.inserts.iter().flatten().count(), usize::from(t.instrument.is_some()))?, mul(clips, 2)?)?;
         cells = add(add(cells, 1)?, slots)?;
         bytes = add(bytes, strip_bytes(ch, block, cap_of(t, ch), t.mixer.inserts.len(), clips)?)?;
+        bytes = add(bytes, mul(add(t.mixer.sends.len(), 1)?, size_of::<Option<usize>>())?)?;
         // Each keyed insert holds two delay lines (its signal's and the key's), as wide as the strip.
         let keyed = t.mixer.inserts.iter().flatten().filter(|i| i.key.is_some()).count();
         if keyed > 0 {
@@ -340,12 +343,31 @@ fn measure(
 /// A sidechain key edge the render honors: keyed track index, insert slot, source, pre-fader.
 type RawKey = (usize, usize, soundcraft_model::RouteNode, bool);
 
+struct RenderOrder {
+    rows: Vec<usize>,
+    phase1: usize,
+    aux_end: usize,
+    loops: Vec<RouteCycle>,
+    layers: Vec<u16>,
+    keys: Vec<RawKey>,
+}
+
+struct Description {
+    desc: Desc,
+    order: RenderOrder,
+    specs: HashMap<(TrackId, usize), InstanceSpec>,
+}
+
+struct BuiltPlan {
+    tables: PlanTables,
+    moves: Vec<CellMove>,
+    attach: Vec<Attach>,
+    shadow: Shadow,
+}
+
 /// The strip index of each track in render order (see below), the end of each phase-1 layer (a
 /// track keyed from another renders in a later layer than its source), and the key edges not cut.
-#[allow(clippy::type_complexity)]
-fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>, Vec<u16>, Vec<RawKey>) {
-    let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
-    let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
+fn render_rows(s: &Session) -> RenderOrder {
     let mut order = Vec::new();
     let mut route = RouteScratch::new();
     route.reserve(s);
@@ -373,7 +395,7 @@ fn render_rows(s: &Session) -> (Vec<usize>, usize, usize, Vec<RouteCycle>, Vec<u
             _ => None,
         })
         .collect();
-    (rows, phase1, aux_end, loops, layers, keys)
+    RenderOrder { rows, phase1, aux_end, loops, layers, keys }
 }
 
 impl PlanCompiler {
@@ -650,13 +672,14 @@ impl PlanCompiler {
         }
 
         let id = PlanIdentity { generation: next, base, target: self.target };
-        let (desc, rows, phase1, aux_end, specs, loops) = self.describe(&session, need, mode);
+        let mut description = self.describe(&session, need, mode);
+        let loops = std::mem::take(&mut description.order.loops);
         // A session loaded with a routing loop: say so once, not on every plan.
         if loops != self.loops {
             log_loops(&session, &loops);
             self.loops = loops;
         }
-        if mode == CompileMode::Update && self.active.desc.as_ref() == Some(&desc) {
+        if mode == CompileMode::Update && self.active.desc.as_ref() == Some(&description.desc) {
             let plan = PreparedPlan {
                 id,
                 session,
@@ -672,8 +695,8 @@ impl PlanCompiler {
             self.pending = Some(Pending { generation: next, shadow: None });
             return Ok(PlanEnvelope::new(plan));
         }
-        let built = self.build(&session, desc, &rows, phase1, aux_end, specs, make, need, mode);
-        let (tables, moves, attach, shadow) = match built {
+        let built = self.build(&session, description, make, need, mode);
+        let BuiltPlan { tables, moves, attach, shadow } = match built {
             Ok(b) => b,
             Err(e) => {
                 self.drop_pool();
@@ -707,28 +730,21 @@ impl PlanCompiler {
 
     /// The structure `s` needs: its description, the strips' tracks in render order (with the
     /// sizes of the first two groups), and the instance specs by slot.
-    #[allow(clippy::type_complexity)]
-    fn describe(
-        &self,
-        s: &Session,
-        need: usize,
-        mode: CompileMode,
-    ) -> (Desc, Vec<usize>, usize, usize, HashMap<(TrackId, usize), InstanceSpec>, Vec<RouteCycle>) {
+    fn describe(&self, s: &Session, need: usize, mode: CompileMode) -> Description {
         let main_ch = main_channels(s);
         // The tracks `render_rows` never processes: inactive, and not an aux, folder or master.
         let idle: Vec<TrackId> = if self.skip_inactive {
-            s.tracks
-                .iter()
-                .filter(|t| t.inactive && !matches!(t.kind, TrackKind::Aux | TrackKind::Folder | TrackKind::Master))
-                .map(|t| t.id)
-                .collect()
+            s.tracks.iter().filter(|t| t.inactive && !is_aux(t) && t.kind != TrackKind::Master).map(|t| t.id).collect()
         } else {
             Vec::new()
         };
         let specs: HashMap<(TrackId, usize), InstanceSpec> =
             realtime_instance_specs(s).into_iter().filter(|x| !idle.contains(&x.track)).map(|x| ((x.track, x.slot), x)).collect();
-        let (rows, phase1, aux_end, loops, layers, raw_keys) = render_rows(s);
-        let mut desc = Desc { main: Some(s.main_format()), layers, ..Desc::default() };
+        let mut order = render_rows(s);
+        let mut desc = Desc { main: Some(s.main_format()), layers: std::mem::take(&mut order.layers), ..Desc::default() };
+        let raw_keys = std::mem::take(&mut order.keys);
+        let RenderOrder { rows, phase1, aux_end, .. } = &order;
+        let (phase1, aux_end) = (*phase1, *aux_end);
         let table = |ti: usize| rows.iter().position(|&r| r == ti).and_then(|r| u16::try_from(r).ok());
         for (to, slot, from, pre) in raw_keys {
             let (Some(t), Some(keyed)) = (s.tracks.get(to), table(to)) else { continue };
@@ -780,13 +796,14 @@ impl PlanCompiler {
             desc.busses.push((b.id, b.format));
         }
         desc.sinks = plan_sinks(s, &self.io, self.target.out_channels).sinks;
+        desc.sink_routes = rows.iter().filter_map(|&ti| s.tracks.get(ti)).map(|t| sink::sink_routes(t, &desc.sinks)).collect();
         desc.inputs = self.io.paths_of(IoDirection::Input).cloned().collect();
         for t in rows.iter().filter_map(|&ti| s.tracks.get(ti)).filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) {
             for spec in crate::hardware::specs_of(t, &self.io, &desc.sinks, self.target.in_channels, self.target.sample_rate) {
                 desc.hardware.push((t.id, spec));
             }
         }
-        (desc, rows, phase1, aux_end, specs, loops)
+        Description { desc, order, specs }
     }
 
     /// Decides, for one slot, between moving the active one, leaving it absent, and a fresh one.
@@ -858,7 +875,7 @@ impl PlanCompiler {
         p.plan = SlotPlan::Fresh(Box::new(slot));
         let SlotPlan::Fresh(slot) = &mut p.plan else { return Ok(()) };
         slot.layout = layout;
-        if slot.applied.heap.len() != long || !slot.applied.fixed {
+        if slot.applied.heap.len() != long {
             slot.applied = Applied::prepared(if long > 0 { vec![f32::NAN; long] } else { Vec::new() });
         }
         // An instrument takes realtime events (F10): its queue and note table, sized here.
@@ -926,19 +943,16 @@ impl PlanCompiler {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn build(
         &mut self,
         s: &Session,
-        mut desc: Desc,
-        rows: &[usize],
-        phase1: usize,
-        aux_end: usize,
-        specs: HashMap<(TrackId, usize), InstanceSpec>,
+        description: Description,
         make: &mut dyn FnMut(&InstanceSpec, SlotGen) -> Option<NewInstance>,
         need0: usize,
         mode: CompileMode,
-    ) -> Result<(PlanTables, Vec<CellMove>, Vec<Attach>, Shadow), CompileError> {
+    ) -> Result<BuiltPlan, CompileError> {
+        let Description { mut desc, order, specs } = description;
+        let RenderOrder { rows, phase1, aux_end, .. } = order;
         let block = self.target.block();
         let main_ch = main_channels(s);
         let sr = self.target.sample_rate as f32;
@@ -946,7 +960,7 @@ impl PlanCompiler {
         let mut per_strip: Vec<PlannedStrip> = Vec::new();
         // The factory and the instances run plug-in code that may unwind: report what was made (or
         // taken from the pool) before the unwind drops it, then let it continue.
-        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_slots(s, rows, &specs, make, &mut per_strip, mode)));
+        let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_slots(s, &rows, &specs, make, &mut per_strip, mode)));
         match planned {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -1012,6 +1026,7 @@ impl PlanCompiler {
             st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
             st.hw = desc.hardware.iter().filter(|(id, _)| *id == t.id).map(|(_, sp)| crate::hardware::HwSlot::new(sp.clone(), block)).collect();
             st.clipbuf = vec![vec![0.0; block]; ch];
+            st.sink_routes = desc.sink_routes.get(si).cloned().unwrap_or_default();
             st.key_pre = desc.keys.iter().any(|k| k.pre && k.from == KeyEnd::Strip(si as u16));
             // A line for the strip's own signal before each keyed insert, in case its key arrives late.
             st.key_in = desc.keys.iter().filter(|k| usize::from(k.keyed) == si).map(|k| KeyIn::new(k.slot, ch, cap, block)).collect();
@@ -1131,7 +1146,7 @@ impl PlanCompiler {
         tables.cells = cells.into_boxed_slice();
         shadow.tracks = tables.tracks.clone();
         shadow.desc = Some(desc);
-        Ok((tables, moves, attach, shadow))
+        Ok(BuiltPlan { tables, moves, attach, shadow })
     }
 
     /// Takes back a returned, refused or never-serviced envelope (control thread) and drops what

@@ -259,7 +259,6 @@ impl MixEngine {
                 match a {
                     Attach::Applied { storage, .. } => {
                         std::mem::swap(&mut slot.applied.heap, storage);
-                        slot.applied.fixed = true;
                         // The next block treats the map as new: every value is pushed again.
                         slot.applied.len = usize::MAX;
                     }
@@ -380,12 +379,9 @@ impl MixEngine {
         };
         let ActivePlan { session, tables, status, .. } = plan;
         let s: &Session = session;
-        let PlanTables { strips, phase1, aux_end, layers, keys, busses, main, main_fmt, main_meter, sinks, io, .. } = tables;
-        let (phase1, aux_end) = (*phase1, *aux_end);
-        let main_fmt = *main_fmt;
         // A seek or loop wrap releases what the clips play; live sources keep sounding (F10).
         if pos != self.last_end && !self.monitor_only {
-            for st in strips.iter_mut() {
+            for st in tables.strips.iter_mut() {
                 if let Some(i) = &mut st.instrument {
                     match i.events.as_deref_mut() {
                         Some(e) => e.release_clips(&mut *i.plugin),
@@ -398,68 +394,13 @@ impl MixEngine {
         let frame = self.events.next_frame;
         self.events.next_frame = frame.saturating_add(frames as u64);
         self.last_end = pos.saturating_add(frames as i64);
-        for (_, b) in busses.0.iter_mut() {
-            b.clear(frames);
-        }
-        for c in main.iter_mut() {
-            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-        }
-        for k in sinks.iter_mut() {
-            k.clear(frames);
-        }
+        tables.clear_block(frames);
+        tables.align_keys(s, pos, !self.input.is_empty(), status);
+        let PlanTables { strips, phase1, aux_end, layers, keys, busses, main, main_fmt, main_meter, sinks, io, .. } = tables;
+        let (phase1, aux_end) = (*phase1, *aux_end);
+        let main_fmt = *main_fmt;
         let any_solo = s.tracks.iter().any(|t| t.mixer.solo && !t.inactive);
-        let live = |t: &Track| !(t.kind == TrackKind::Master || t.inactive || t.kind == TrackKind::Vca);
-        let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
         let track = |st: &Strip| s.tracks.get(usize::from(st.track));
-        // Sidechain keys (ADR 0015 section 4): a key and the signal it meets must come from the
-        // same source sample time, but a strip's output latency is known only after phase 1. So
-        // with keys in the plan, the latencies of this block (each strip's inserts, as the
-        // forward pass below counts them) are walked once before it, in render order, to give
-        // every key edge its delay (`KeyBank::align`). The busses' marks are cleared after.
-        if !keys.is_empty() {
-            let pdc = s.edit.delay_compensation;
-            let mut walked = 0usize;
-            for at in 0..aux_end.min(strips.len()) {
-                let (before, rest) = strips.split_at_mut(at);
-                let Some(st) = rest.first_mut() else { continue };
-                let Some(t) = track(st) else { continue };
-                let aux = is_aux(t);
-                let alive = live(t);
-                if at < phase1 && (!alive || aux) {
-                    continue;
-                }
-                let mut arrive = 0usize;
-                if aux && let Route::Bus(b) = &t.mixer.input {
-                    arrive = busses.bus(*b).map_or(0, |x| x.arrival);
-                }
-                if alive {
-                    let from = |sp: &KeySpec| match sp.from {
-                        KeyEnd::Strip(j) => before.get(usize::from(j)).filter(|b| track(b).is_some_and(live)).map_or(0, |b| b.pdc_out),
-                        KeyEnd::Bus(b) => {
-                            if aux {
-                                busses.bus(b).map_or(0, |x| x.arrival)
-                            } else {
-                                0
-                            }
-                        }
-                    };
-                    let short = keys.align(at, t, st, arrive, pos, pdc, !self.input.is_empty(), &from);
-                    if short > 0 {
-                        status.capacity_exceeded = status.capacity_exceeded.saturating_add(1);
-                        status.required_latency = status.required_latency.max(u32::try_from(short).unwrap_or(u32::MAX));
-                        status.affected = Some((st.id, st.generation));
-                    }
-                }
-                pdc_visit(t, st, at, alive, busses, sinks, &mut walked, pdc);
-            }
-            for (_, b) in busses.0.iter_mut() {
-                b.arrival = 0;
-                b.reader = usize::MAX;
-            }
-            for k in sinks.iter_mut() {
-                k.arrival = 0;
-            }
-        }
         let live_in = LiveInput {
             input: &self.input,
             monitor_only: self.monitor_only,
@@ -489,7 +430,7 @@ impl MixEngine {
                 let keys: &KeyBank = keys;
                 run_strips(cur.get_mut(..end - from).unwrap_or(&mut []), !self.serial, |st| {
                     if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                        guarded(st, |st| process_strip(s, t, st, busses, &live_in, pos, frames, any_solo, keys));
+                        guarded(st, |st| process_strip(t, st, &StripRender { s, busses, live: &live_in, pos, frames, any_solo, keys }));
                     }
                 });
                 from = end;
@@ -498,61 +439,17 @@ impl MixEngine {
         if let Some(panic) = p1.iter_mut().find_map(|st| st.panic.take()) {
             std::panic::resume_unwind(panic);
         }
-        let pdc = s.edit.delay_compensation;
-        if pdc {
-            for st in auxes.iter_mut() {
-                if let Some(t) = track(st).filter(|t| !t.inactive) {
-                    note_insert_latency(t, st, pos, !self.input.is_empty());
-                }
-            }
-        }
-        let mut lmax_m = 0usize;
-        if pdc {
-            for st in others.iter_mut() {
-                if let Some(t) = track(st).filter(|t| t.kind == TrackKind::Master && !t.inactive) {
-                    note_insert_latency(t, st, pos, !self.input.is_empty());
-                    lmax_m = lmax_m.saturating_add(st.latency);
-                }
-            }
-        }
-        // Forward pass in render order (the table order): phase-1 strips, then the auxes.
-        let mut main_arrival = 0usize;
-        for (at, st) in p1.iter_mut().enumerate() {
-            if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
-                pdc_visit(t, st, at, true, busses, sinks, &mut main_arrival, pdc);
-            }
-        }
-        // Inactive auxes still mark the bus they read (see `pdc_visit`).
-        for (k, st) in auxes.iter_mut().enumerate() {
-            if let Some(t) = track(st) {
-                pdc_visit(t, st, phase1.saturating_add(k), live(t), busses, sinks, &mut main_arrival, pdc);
-            }
-        }
-        // One device latency for every sink (ADR 0015 section 6): Main's (its sources' arrival plus
-        // the master inserts') or the slowest path's, whichever is longer. Each sink is padded to
-        // it, Main to it less its inserts, so stems and cue mixes leave the device with Main. With
-        // no sinks this is Main's own arrival, as before.
-        let device = sinks.iter().fold(main_arrival.saturating_add(lmax_m), |l, k| l.max(k.arrival));
-        main_arrival = device.saturating_sub(lmax_m);
-        for k in sinks.iter_mut() {
-            k.arrival = device;
-        }
+        let DeviceLatency { main: main_arrival, device } =
+            fold_latency(s, RenderPhases { p1, auxes, others, phase1 }, busses, sinks, pos, !self.input.is_empty());
         self.main_arrival = main_arrival;
         self.latency = device;
         let law = self.pan_law;
-        let mut exceeded = |need: usize, st: &Strip| {
-            if need > 0 {
-                status.capacity_exceeded = status.capacity_exceeded.saturating_add(1);
-                status.required_latency = status.required_latency.max(u32::try_from(need).unwrap_or(u32::MAX));
-                status.affected = Some((st.id, st.generation));
-            }
-        };
         for st in p1.iter_mut() {
             let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) else { continue };
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
             let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, sinks, law, main_arrival });
-            exceeded(need, st);
+            status.note_capacity(need, st);
         }
         // Phase 2: auxes in dependency order (they read busses).
         for k in 0..auxes.len() {
@@ -565,11 +462,11 @@ impl MixEngine {
                 Some(j) => before.get(j).filter(|b| track(b).is_some_and(live)),
             };
             keys.fill(at..at + 1, strip, busses, frames);
-            process_strip(s, t, st, &*busses, &live_in, pos, frames, any_solo, keys);
+            process_strip(t, st, &StripRender { s, busses, live: &live_in, pos, frames, any_solo, keys });
             st.meter.measure(&st.buf, frames, st.gr);
             st.meter.plugin_failures = st.failures;
             let need = route_into(t, st, pos, frames, MixOut { busses, main, main_fmt, sinks, law, main_arrival });
-            exceeded(need, st);
+            status.note_capacity(need, st);
         }
         // Master faders process the main mix, in track order.
         let transport = transport_at(s, pos, !self.monitor_only, self.recording);
@@ -609,4 +506,138 @@ impl MixEngine {
         }
         main_meter.measure(main, frames, 0.0);
     }
+}
+
+impl PlanTables {
+    fn clear_block(&mut self, frames: usize) {
+        let PlanTables { busses, main, sinks, .. } = self;
+        for (_, b) in busses.0.iter_mut() {
+            b.clear(frames);
+        }
+        for c in main.iter_mut() {
+            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
+        }
+        for k in sinks.iter_mut() {
+            k.clear(frames);
+        }
+    }
+
+    fn align_keys(&mut self, s: &Session, pos: Samples, duplex: bool, status: &mut PlanStatus) {
+        let PlanTables { strips, phase1, aux_end, keys, busses, sinks, .. } = self;
+        let (phase1, aux_end) = (*phase1, *aux_end);
+        let track = |st: &Strip| s.tracks.get(usize::from(st.track));
+        // Sidechain keys (ADR 0015 section 4): a key and the signal it meets must come from the
+        // same source sample time, but a strip's output latency is known only after phase 1. So
+        // with keys in the plan, the latencies of this block (each strip's inserts, as the
+        // forward pass below counts them) are walked once before it, in render order, to give
+        // every key edge its delay (`KeyBank::align`). The busses' marks are cleared after.
+        if !keys.is_empty() {
+            let pdc = s.edit.delay_compensation;
+            let mut walked = 0usize;
+            for at in 0..aux_end.min(strips.len()) {
+                let (before, rest) = strips.split_at_mut(at);
+                let Some(st) = rest.first_mut() else { continue };
+                let Some(t) = track(st) else { continue };
+                let aux = is_aux(t);
+                let alive = live(t);
+                if at < phase1 && (!alive || aux) {
+                    continue;
+                }
+                let mut arrive = 0usize;
+                if aux && let Route::Bus(b) = &t.mixer.input {
+                    arrive = busses.bus(*b).map_or(0, |x| x.arrival);
+                }
+                if alive {
+                    let from = |sp: &KeySpec| match sp.from {
+                        KeyEnd::Strip(j) => before.get(usize::from(j)).filter(|b| track(b).is_some_and(live)).map_or(0, |b| b.pdc_out),
+                        KeyEnd::Bus(b) => {
+                            if aux {
+                                busses.bus(b).map_or(0, |x| x.arrival)
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    let short = keys.align(t, st, key::KeyAlignment { at, arrive, pos, pdc, duplex }, &from);
+                    status.note_capacity(short, st);
+                }
+                pdc_visit(t, st, at, alive, PdcWalk { busses, sinks, main_arrival: &mut walked, pdc });
+            }
+            for (_, b) in busses.0.iter_mut() {
+                b.arrival = 0;
+                b.reader = usize::MAX;
+            }
+            for k in sinks.iter_mut() {
+                k.arrival = 0;
+            }
+        }
+    }
+}
+
+impl PlanStatus {
+    fn note_capacity(&mut self, need: usize, st: &Strip) {
+        if need > 0 {
+            self.capacity_exceeded = self.capacity_exceeded.saturating_add(1);
+            self.required_latency = self.required_latency.max(u32::try_from(need).unwrap_or(u32::MAX));
+            self.affected = Some((st.id, st.generation));
+        }
+    }
+}
+
+struct RenderPhases<'a> {
+    p1: &'a mut [Strip],
+    auxes: &'a mut [Strip],
+    others: &'a mut [Strip],
+    phase1: usize,
+}
+
+struct DeviceLatency {
+    main: usize,
+    device: usize,
+}
+
+/// Walk the rendered strips and pending aux/master inserts, then align every sink to the device.
+fn fold_latency(s: &Session, phases: RenderPhases<'_>, busses: &mut BusTable, sinks: &mut [Sink], pos: Samples, duplex: bool) -> DeviceLatency {
+    let RenderPhases { p1, auxes, others, phase1 } = phases;
+    let track = |st: &Strip| s.tracks.get(usize::from(st.track));
+    let pdc = s.edit.delay_compensation;
+    if pdc {
+        for st in auxes.iter_mut() {
+            if let Some(t) = track(st).filter(|t| !t.inactive) {
+                note_insert_latency(t, st, pos, duplex);
+            }
+        }
+    }
+    let mut lmax_m = 0usize;
+    if pdc {
+        for st in others.iter_mut() {
+            if let Some(t) = track(st).filter(|t| t.kind == TrackKind::Master && !t.inactive) {
+                note_insert_latency(t, st, pos, duplex);
+                lmax_m = lmax_m.saturating_add(st.latency);
+            }
+        }
+    }
+    // Forward pass in render order (the table order): phase-1 strips, then the auxes.
+    let mut main_arrival = 0usize;
+    for (at, st) in p1.iter_mut().enumerate() {
+        if let Some(t) = track(st).filter(|t| live(t) && !is_aux(t)) {
+            pdc_visit(t, st, at, true, PdcWalk { busses, sinks, main_arrival: &mut main_arrival, pdc });
+        }
+    }
+    // Inactive auxes still mark the bus they read (see `pdc_visit`).
+    for (k, st) in auxes.iter_mut().enumerate() {
+        if let Some(t) = track(st) {
+            pdc_visit(t, st, phase1.saturating_add(k), live(t), PdcWalk { busses, sinks, main_arrival: &mut main_arrival, pdc });
+        }
+    }
+    // One device latency for every sink (ADR 0015 section 6): Main's (its sources' arrival plus
+    // the master inserts') or the slowest path's, whichever is longer. Each sink is padded to
+    // it, Main to it less its inserts, so stems and cue mixes leave the device with Main. With
+    // no sinks this is Main's own arrival, as before.
+    let device = sinks.iter().fold(main_arrival.saturating_add(lmax_m), |l, k| l.max(k.arrival));
+    main_arrival = device.saturating_sub(lmax_m);
+    for k in sinks.iter_mut() {
+        k.arrival = device;
+    }
+    DeviceLatency { main: main_arrival, device }
 }

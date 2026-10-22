@@ -1,4 +1,4 @@
-//! The SoundCraft mix engine.
+//! The transit mix engine.
 //!
 //! [`MixEngine::render_active`] produces one block of the main output for a compiled session at a
 //! timeline position: clips (with clip gain and fades) → trim/phase → inserts → pre-fader sends → fader and
@@ -92,8 +92,8 @@ pub use plan::{
     RenderTarget, Retired, SlotBinding, SlotGen,
 };
 pub use scope::{INSTRUMENT_UID, SCOPE_FRAMES, ScopeHub, ScopeTap};
+use sink::Sink;
 pub use sink::{MAX_SINK_CHANNELS, SinkPlan, SinkSpec, plan_sinks, unresolved_routes};
-use sink::{Sink, sink_index};
 
 /// Default (stereo) main mix width. The actual width is [`main_channels`].
 pub const MAIN_CHANNELS: usize = 2;
@@ -121,8 +121,8 @@ pub fn is_third_party(id: &str) -> bool {
 /// [`INSTRUMENT_SLOT`] is never a clip-effect slot.
 const CLIP_FX_BIT: usize = 1 << (usize::BITS - 1);
 /// Built-in plugins a clip's effect chain is made of (Clip Effects).
-const CLIP_EQ: &str = "eq_7band";
-const CLIP_COMP: &str = "compressor";
+const CLIP_EQ: &str = soundcraft_dsp::plugins::eq::EQ7_INFO.id;
+const CLIP_COMP: &str = soundcraft_dsp::plugins::dynamics::COMP_INFO.id;
 
 /// Slot index of a clip's effect module in [`InstanceSpec`]: its EQ
 /// (`comp` false) or its compressor. `None` for a clip id too large to encode (not made by
@@ -287,9 +287,6 @@ impl PluginFailures {
 
 impl StripMeter {
     fn measure(&mut self, bufs: &[Vec<f32>], frames: usize, gr: f32) {
-        if self.peaks.len() != bufs.len() {
-            self.peaks.resize(bufs.len(), 0.0);
-        }
         for (p, b) in self.peaks.iter_mut().zip(bufs.iter()) {
             *p = peak(b.get(..frames).unwrap_or(&[]));
         }
@@ -346,26 +343,25 @@ const APPLIED_INLINE: usize = 64;
 
 /// The parameter values last pushed to a plugin, in the insert's parameter-map order. Up to
 /// [`APPLIED_INLINE`] values live inline, so a slot filled on the audio thread allocates nothing
-/// for them; a longer map (a hosted plugin's edited parameters) spills to the heap once.
+/// for them; longer maps use heap storage prepared by the compiler.
 struct Applied {
     len: usize,
     inline: [f32; APPLIED_INLINE],
-    heap: Vec<f32>,
     /// Plan mode: `heap` is prepared off the audio thread (see `Attach::Applied`) and never
     /// resized here. A map whose length does not match it pushes the values that fit.
-    fixed: bool,
-    /// Plan mode: how often a map did not match the prepared storage.
+    heap: Vec<f32>,
+    /// How often a map did not match the prepared storage.
     mismatch: u32,
 }
 
 impl Applied {
     const fn new() -> Self {
-        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap: Vec::new(), fixed: false, mismatch: 0 }
+        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap: Vec::new(), mismatch: 0 }
     }
 
     /// Plan mode: `heap` is the prepared storage (empty for a map that fits inline).
     fn prepared(heap: Vec<f32>) -> Self {
-        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap, fixed: true, mismatch: 0 }
+        Applied { len: 0, inline: [f32::NAN; APPLIED_INLINE], heap, mismatch: 0 }
     }
 
     /// The `n` values, all NaN ("never pushed") when the map's length changed. In plan mode a
@@ -375,13 +371,11 @@ impl Applied {
             self.len = n;
             if n <= APPLIED_INLINE {
                 self.inline.fill(f32::NAN);
-            } else if self.fixed {
+            } else {
                 self.heap.fill(f32::NAN);
                 if self.heap.len() != n {
                     self.mismatch = self.mismatch.saturating_add(1);
                 }
-            } else {
-                self.heap = vec![f32::NAN; n];
             }
         }
         if n <= APPLIED_INLINE { self.inline.get_mut(..n).unwrap_or_default() } else { &mut self.heap }
@@ -486,6 +480,8 @@ struct Strip {
     pdc_pos: usize,
     /// Each edge's read of the delay lines: 0 the output, 1 + i send i.
     edges: [EdgeTap; SEND_SLOTS + 1],
+    /// Compiled sink indices for output and send edges.
+    sink_routes: Vec<Option<usize>>,
     failures: PluginFailures,
     /// The strip's identity across plans. [`SlotGen::VACANT`] in a strip shell that waits for a
     /// move and in a strip whose state moved out.
@@ -628,7 +624,7 @@ impl DelayLine {
         let (sa, sb) = (base(a), base(b));
         for (c, out) in dst.iter_mut().enumerate() {
             out.clear();
-            out.resize(frames, 0.0);
+            out.resize(frames.min(out.capacity()), 0.0);
             let Some(ring) = self.bufs.get(c).filter(|_| self.live && size > 0) else { continue };
             for (i, x) in out.iter_mut().enumerate() {
                 let va = ring.get((sa + i) % size).copied().unwrap_or(0.0);
@@ -741,6 +737,7 @@ impl Strip {
             pdc_out: 0,
             pdc_pos: 0,
             edges: [EdgeTap::default(); SEND_SLOTS + 1],
+            sink_routes: Vec::new(),
             failures: PluginFailures::default(),
             generation: SlotGen::VACANT,
             track: 0,
@@ -793,7 +790,6 @@ pub struct MixEngine {
     /// A record count-in in progress: the click sounds while the transport is parked (see
     /// [`CountInClick`]), whatever Options > Click says.
     pub count_in: Option<CountInClick>,
-    /// Every plugin instance comes from [`MixEngine::adopt`] instead of being created in `sync`.
     /// Render every strip on the calling thread (tests compare it with the parallel render).
     serial: bool,
     /// The active plan [`MixEngine::render_active`] renders.
@@ -967,6 +963,13 @@ struct MixOut<'a> {
     main_arrival: usize,
 }
 
+struct PdcWalk<'a> {
+    busses: &'a mut BusTable,
+    sinks: &'a mut [Sink],
+    main_arrival: &'a mut usize,
+    pdc: bool,
+}
+
 /// Delay compensation, forward pass (F05): visits one live strip at render position `at`, after
 /// every strip before it. The strip's input arrives with the latency of the bus it reads; its
 /// output adds its own latency (when `pdc`); every bus and the main mix it feeds then waits for
@@ -974,9 +977,10 @@ struct MixOut<'a> {
 /// feedback, from an older session) does not count: [`route_into`] drops that edge. An inactive
 /// aux (`live` false) still marks the bus it reads, so the edges dropped are exactly the route
 /// graph's [`RouteScratch::dropped`] (render order is the graph's, inactive tracks included).
-fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut BusTable, sinks: &mut [Sink], main_arrival: &mut usize, pdc: bool) {
+fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, walk: PdcWalk<'_>) {
+    let PdcWalk { busses, sinks, main_arrival, pdc } = walk;
     let mut arrive = 0usize;
-    if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
+    if is_aux(t)
         && let Route::Bus(b) = &t.mixer.input
         && let Some(x) = busses.bus_mut(*b)
     {
@@ -989,7 +993,7 @@ fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut BusT
     let out = arrive.saturating_add(if pdc { st.latency } else { 0 });
     st.pdc_out = out;
     st.pdc_pos = at;
-    let mut feed = |r: &Route| match r {
+    let mut feed = |edge: usize, r: &Route| match r {
         Route::Main => *main_arrival = (*main_arrival).max(out),
         Route::Bus(b) => {
             if let Some(x) = busses.bus_mut(*b).filter(|x| at < x.reader) {
@@ -997,17 +1001,18 @@ fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut BusT
             }
         }
         // An output path is a sink with no readers: it waits for its slowest source too.
-        Route::Hardware(h) => {
-            if let Some(x) = sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
+        Route::Hardware(_) => {
+            if let Some(x) = st.sink_routes.get(edge).copied().flatten().and_then(|k| sinks.get_mut(k)) {
                 x.arrival = x.arrival.max(out);
             }
         }
         _ => {}
     };
-    feed(&t.mixer.output);
-    for snd in t.mixer.sends.iter().flatten() {
+    feed(0, &t.mixer.output);
+    for (i, snd) in t.mixer.sends.iter().enumerate() {
+        let Some(snd) = snd else { continue };
         if matches!(snd.target, Route::Bus(_) | Route::Hardware(_)) {
-            feed(&snd.target);
+            feed(i + 1, &snd.target);
         }
     }
 }
@@ -1024,13 +1029,13 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
     for h in &strip.hw {
         h.flush(sinks, frames);
     }
-    let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, .. } = strip;
+    let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, sink_routes, .. } = strip;
     let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
     // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
-    let delay_of = |busses: &BusTable, sinks: &[Sink], r: &Route| match r {
+    let delay_of = |busses: &BusTable, sinks: &[Sink], edge: usize, r: &Route| match r {
         Route::Main => Some(main_arrival.saturating_sub(o)),
         Route::Bus(b) => busses.bus(*b).filter(|x| at < x.reader).map(|x| x.arrival.saturating_sub(o)),
-        Route::Hardware(h) => sink_index(sinks, h).and_then(|k| sinks.get(k)).map(|x| x.arrival.saturating_sub(o)),
+        Route::Hardware(_) => sink_routes.get(edge).copied().flatten().and_then(|k| sinks.get(k)).map(|x| x.arrival.saturating_sub(o)),
         _ => None,
     };
     // Edge 0 is the output, edge 1 + i send i. Each line is written when any edge asks it for a
@@ -1039,7 +1044,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
     let (mut post, mut pre_max, mut held_post, mut held_pre) = (0usize, 0usize, held(0), 0usize);
     for (i, snd) in t.mixer.sends.iter().enumerate() {
         let Some(snd) = snd else { continue };
-        if let (Route::Bus(_) | Route::Hardware(_), Some(d)) = (&snd.target, delay_of(busses, sinks, &snd.target)) {
+        if let (Route::Bus(_) | Route::Hardware(_), Some(d)) = (&snd.target, delay_of(busses, sinks, i + 1, &snd.target)) {
             if snd.pre_fader {
                 pre_max = pre_max.max(d);
                 held_pre = held_pre.max(held(i + 1));
@@ -1049,7 +1054,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
             }
         }
     }
-    if let Some(d) = delay_of(busses, sinks, &t.mixer.output) {
+    if let Some(d) = delay_of(busses, sinks, 0, &t.mixer.output) {
         post = post.max(d);
     }
     let clamped = tap.fit(post).max(tap_pre.fit(pre_max));
@@ -1062,9 +1067,6 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
         tap_pre.write(pre, frames);
     } else {
         tap_pre.idle();
-    }
-    if outbuf.len() != buf.len() {
-        *outbuf = vec![Vec::new(); buf.len()];
     }
     // This block's read of edge `k` at delay `d`: `None` for the undelayed signal itself.
     let mut plan = |k: usize, d: usize, pre_fader: bool| {
@@ -1080,7 +1082,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
         if !matches!(snd.target, Route::Bus(_) | Route::Hardware(_)) {
             continue;
         }
-        let Some(d) = delay_of(busses, sinks, &snd.target) else { continue };
+        let Some(d) = delay_of(busses, sinks, i + 1, &snd.target) else { continue };
         let read = plan(i + 1, d, snd.pre_fader);
         if snd.mute || muted {
             continue;
@@ -1107,7 +1109,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
                 Some(d) => (&mut d.buf, d.fmt),
                 None => continue,
             },
-            Route::Hardware(h) => match sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
+            Route::Hardware(_) => match sink_routes.get(i + 1).copied().flatten().and_then(|k| sinks.get_mut(k)) {
                 Some(d) => (&mut d.buf, d.fmt),
                 None => continue,
             },
@@ -1119,7 +1121,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
         let m = build_matrix(src_fmt, src.len(), dst_fmt, dst_buf.len(), &PanSpec { stereo, surround }, law);
         apply_matrix(src, frames, dst_buf, &m, gain);
     }
-    let Some(d) = delay_of(busses, sinks, &t.mixer.output) else { return clamped };
+    let Some(d) = delay_of(busses, sinks, 0, &t.mixer.output) else { return clamped };
     let src: &[Vec<f32>] = match plan(0, d, false) {
         None => buf,
         Some((from, to, done)) => {
@@ -1133,7 +1135,7 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
             Some(d) => (&mut d.buf, d.fmt),
             None => return clamped,
         },
-        Route::Hardware(h) => match sink_index(sinks, h).and_then(|k| sinks.get_mut(k)) {
+        Route::Hardware(_) => match sink_routes.first().copied().flatten().and_then(|k| sinks.get_mut(k)) {
             Some(d) => (&mut d.buf, d.fmt),
             None => return clamped,
         },
@@ -1150,8 +1152,57 @@ fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: Mi
     clamped
 }
 
-/// Source → trim → inserts → (pre-fader copy) → mute/fader for one strip. Independent of other
-/// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
+/// Render and sum one clip, reusing the prepared FX buffer in bounded chunks.
+fn mix_clip_fx(
+    frames: usize,
+    out: &mut [Vec<f32>],
+    clipbuf: &mut [Vec<f32>],
+    fx: &mut ClipFx,
+    mut render: impl FnMut(usize, usize, &mut [Vec<f32>]),
+) {
+    let block = clipbuf.iter().map(Vec::len).min().unwrap_or(0);
+    if block == 0 || clipbuf.len() != out.len() {
+        return;
+    }
+    let mut done = 0;
+    while done < frames {
+        let n = (frames - done).min(block);
+        for c in clipbuf.iter_mut() {
+            c.iter_mut().take(n).for_each(|x| *x = 0.0);
+        }
+        render(done, n, clipbuf);
+        fx.process(clipbuf, n);
+        for (dst, src) in out.iter_mut().zip(clipbuf.iter()) {
+            for (x, y) in dst.iter_mut().skip(done).take(n).zip(src) {
+                *x += *y;
+            }
+        }
+        done += n;
+    }
+}
+
+fn render_audio_clips(s: &Session, t: &Track, strip: &mut Strip, pos: Samples, frames: usize) {
+    let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
+    for clip in t.clips() {
+        if clip.muted || !clip.is_audio() || !clip.range().overlaps(&block) {
+            continue;
+        }
+        let mut gain_only = ClipFx::new(s.sample_rate.as_f64() as f32, strip.buf.len(), false);
+        let fx = clip_fx_params(s, clip.id.0).map(|params| {
+            // Modules are prepared by the compiler; absent modules never instantiate here.
+            let fx = strip.clip_fx.get_mut(clip.id.0).unwrap_or(&mut gain_only);
+            fx.configure(params);
+            fx
+        });
+        match fx {
+            None => render_clip(s, clip, pos, frames, &mut strip.buf),
+            Some(fx) => mix_clip_fx(frames, &mut strip.buf, &mut strip.clipbuf, fx, |done, n, buf| {
+                render_clip(s, clip, pos.saturating_add(done as i64), n, buf);
+            }),
+        }
+    }
+}
+
 /// Live input routed to monitored tracks.
 struct LiveInput<'a> {
     input: &'a [Vec<f32>],
@@ -1165,22 +1216,30 @@ struct LiveInput<'a> {
     io: Option<&'a soundcraft_model::IoMap>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_strip(
-    s: &Session,
-    t: &Track,
-    strip: &mut Strip,
-    busses: &BusTable,
-    live: &LiveInput<'_>,
+struct StripRender<'a> {
+    s: &'a Session,
+    busses: &'a BusTable,
+    live: &'a LiveInput<'a>,
     pos: Samples,
     frames: usize,
     any_solo: bool,
-    keys: &KeyBank,
-) {
+    keys: &'a KeyBank,
+}
+
+/// Source → trim → inserts → (pre-fader copy) → mute/fader for one strip. Independent of other
+/// strips except that aux inputs read `busses`, so non-aux strips can run in parallel.
+fn process_strip(t: &Track, strip: &mut Strip, block: &StripRender<'_>) {
+    let transport = transport_at(block.s, block.pos, !block.live.monitor_only, block.live.recording);
+    process_strip_source(t, strip, block, &transport);
+    process_strip_inserts(t, strip, block, &transport);
+    process_strip_fader(t, strip, block);
+}
+
+fn process_strip_source(t: &Track, strip: &mut Strip, block: &StripRender<'_>, transport: &Transport) {
+    let StripRender { s, busses, live, pos, frames, .. } = *block;
     for c in strip.buf.iter_mut() {
         c.iter_mut().take(frames).for_each(|x| *x = 0.0);
     }
-    let transport = transport_at(s, pos, !live.monitor_only, live.recording);
     match t.kind {
         TrackKind::Audio if !live.input.is_empty() && (t.mixer.input_monitor || (t.mixer.record_arm && (live.monitor_only || live.recording))) => {
             // Input monitoring: the track hears its hardware input instead of its clips.
@@ -1199,44 +1258,7 @@ fn process_strip(
         }
         TrackKind::Audio if live.monitor_only => {}
         TrackKind::Audio => {
-            let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
-            for clip in t.clips() {
-                if clip.muted || !clip.is_audio() || !clip.range().overlaps(&block) {
-                    continue;
-                }
-                match clip_fx_params(s, clip.id.0) {
-                    None => render_clip(s, clip, pos, frames, &mut strip.buf, &mut strip.scratch),
-                    Some(params) => {
-                        let nch = strip.buf.len();
-                        if strip.clipbuf.len() != nch || strip.clipbuf.first().map_or(0, Vec::len) < frames {
-                            strip.clipbuf = vec![vec![0.0; frames.max(strip.scratch.len())]; nch];
-                        }
-                        for c in strip.clipbuf.iter_mut() {
-                            c.iter_mut().take(frames).for_each(|x| *x = 0.0);
-                        }
-                        render_clip(s, clip, pos, frames, &mut strip.clipbuf, &mut strip.scratch);
-                        let sr = s.sample_rate.as_f64() as f32;
-                        // The compiler placed the chain with its modules. A clip without
-                        // one (only a gain, or modules still on their way) uses a chain without
-                        // modules here, which allocates nothing.
-                        let mut gain_only;
-                        let fx = match strip.clip_fx.get_mut(clip.id.0) {
-                            Some(fx) => fx,
-                            None => {
-                                gain_only = ClipFx::new(sr, nch, false);
-                                &mut gain_only
-                            }
-                        };
-                        fx.configure(params);
-                        fx.process(&mut strip.clipbuf, frames);
-                        for (d, c) in strip.buf.iter_mut().zip(strip.clipbuf.iter()) {
-                            for (x, y) in d.iter_mut().zip(c.iter()).take(frames) {
-                                *x += *y;
-                            }
-                        }
-                    }
-                }
-            }
+            render_audio_clips(s, t, strip, pos, frames);
         }
         TrackKind::Aux | TrackKind::Folder => {
             if let Route::Bus(b) = &t.mixer.input
@@ -1269,7 +1291,7 @@ fn process_strip(
                 if let Some(ins) = &t.instrument {
                     apply_params(inst, ins, t, INSTRUMENT_SLOT, pos);
                 }
-                inst.plugin.set_transport(&transport);
+                inst.plugin.set_transport(transport);
                 if let Some(e) = inst.events.as_deref_mut() {
                     e.retry_releases(&mut *inst.plugin);
                 }
@@ -1311,6 +1333,10 @@ fn process_strip(
         }
         _ => {}
     }
+}
+
+fn process_strip_inserts(t: &Track, strip: &mut Strip, block: &StripRender<'_>, transport: &Transport) {
+    let StripRender { live, pos, frames, keys, .. } = *block;
     let trim = db_to_gain(t.mixer.trim_db) * if t.mixer.phase_invert { -1.0 } else { 1.0 };
     if (trim - 1.0).abs() > f32::EPSILON {
         for c in strip.buf.iter_mut() {
@@ -1351,7 +1377,7 @@ fn process_strip(
             k.line.apply(k.want, &mut strip.buf, &mut strip.outbuf, frames);
             latency = latency.saturating_add(k.want.min(k.line.cap()));
         }
-        if run_insert(slot, &mut strip.buf, key, frames, &transport, live.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
+        if run_insert(slot, &mut strip.buf, key, frames, transport, live.no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
             strip.failures.record(i);
             continue;
         }
@@ -1367,14 +1393,17 @@ fn process_strip(
     strip.key_in.iter_mut().filter(|k| !k.ran).for_each(|k| k.line.idle());
     strip.gr = gr;
     strip.latency = latency.min(MAX_LATENCY);
+}
+
+fn process_strip_fader(t: &Track, strip: &mut Strip, block: &StripRender<'_>) {
+    let StripRender { s, pos, frames, any_solo, .. } = *block;
     let auto_mute = t.mixer.automation_mode.reads() && t.lane(&AutoParam::Mute).is_some_and(|l| l.value_at(pos, 0.0) >= 0.5);
     let soloed_out = any_solo && !t.mixer.solo && !t.mixer.solo_safe && !receives_solo(s, t);
     strip.muted = t.mixer.mute || auto_mute || soloed_out;
     if strip.key_pre || t.mixer.sends.iter().flatten().any(|x| x.pre_fader) {
-        strip.pre.resize_with(strip.buf.len(), Vec::new);
         for (d, src) in strip.pre.iter_mut().zip(strip.buf.iter()) {
             d.clear();
-            d.extend_from_slice(src.get(..frames).unwrap_or(&[]));
+            d.extend_from_slice(src.get(..frames.min(d.capacity())).unwrap_or(&[]));
         }
     }
     // Endpoints are the first and last sample of this block. The next block starts on its own
@@ -1676,12 +1705,14 @@ pub const MAX_RENDER_WORKERS: usize = 8;
 ///
 /// Serial is the realtime default until the bounded render plan lands; measured
 /// 2026-10-18: promoted serial 0 late blocks vs promoted pool 1-5 per 2000 under load.
-pub const RENDER_POOL_ENV: &str = "SOUNDCRAFT_RENDER_POOL";
+/// `SOUNDCRAFT_RENDER_POOL` remains an alias when this variable is unset.
+pub const RENDER_POOL_ENV: &str = "TRANSIT_RENDER_POOL";
 
 /// Environment variable: `1` leaves the render pool's workers at the OS default priority instead
 /// of promoting them with [`transit_rt::promote_audio_thread`]. Read once, when the render
 /// pool is built. It does not affect the audio callback thread: this crate never promotes that.
-pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
+/// `SOUNDCRAFT_RENDER_NO_PRIORITY` remains an alias when this variable is unset.
+pub const RENDER_NO_PRIORITY_ENV: &str = "TRANSIT_RENDER_NO_PRIORITY";
 
 /// Audio-thread strips render serially when set ([`MixEngine::force_serial`]). On by default;
 /// [`RENDER_POOL_ENV`] clears it at startup.
@@ -1695,8 +1726,13 @@ static WORKER_PROMOTION: [std::sync::OnceLock<transit_rt::Promotion>; MAX_RENDER
 
 /// True when `name` is set to `1` (or `true`/`yes`, any case).
 #[cfg(not(target_arch = "wasm32"))]
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+fn env_flag(name: &str, alias: &str) -> bool {
+    flag_value(std::env::var(name).ok().as_deref(), std::env::var(alias).ok().as_deref())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn flag_value(value: Option<&str>, alias: Option<&str>) -> bool {
+    value.or(alias).is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// What each render pool worker's promotion achieved, by worker index (`None` for a worker that
@@ -1735,11 +1771,11 @@ static RENDER_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::
 fn init_render_pool() {
     if !on_audio_thread() {
         RENDER_POOL.get_or_init(|| {
-            if env_flag(RENDER_POOL_ENV) {
+            if env_flag(RENDER_POOL_ENV, "SOUNDCRAFT_RENDER_POOL") {
                 log::info!("mix: {RENDER_POOL_ENV} is set; audio-thread strips render on the pool");
                 FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            let promote = !env_flag(RENDER_NO_PRIORITY_ENV);
+            let promote = !env_flag(RENDER_NO_PRIORITY_ENV, "SOUNDCRAFT_RENDER_NO_PRIORITY");
             build_render_pool(promote)
         });
     }
@@ -1844,6 +1880,23 @@ fn strip_format(t: &Track, n: usize) -> ChannelFormat {
     if t.format.channels().min(MAX_CHANNELS) == n { t.format } else { ChannelFormat::for_channels(n) }
 }
 
+/// Whether this kind reads a bus in the second render phase.
+fn is_aux(t: &Track) -> bool {
+    match t.kind {
+        TrackKind::Aux | TrackKind::Folder => true,
+        TrackKind::Video | TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi | TrackKind::Master | TrackKind::Vca => false,
+    }
+}
+
+/// Whether a strip participates in routing this block (masters process Main separately).
+fn live(t: &Track) -> bool {
+    !t.inactive
+        && match t.kind {
+            TrackKind::Master | TrackKind::Vca => false,
+            TrackKind::Video | TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi | TrackKind::Aux | TrackKind::Folder => true,
+        }
+}
+
 /// Writes the processing order into `order`: every track other than an aux or folder in track
 /// order, then the auxes and folders in routing order (each after every strip feeding it, at any
 /// depth: by the depth of the session's route graph, then track order). Returns the loops the
@@ -1855,7 +1908,6 @@ fn strip_format(t: &Track, n: usize) -> ChannelFormat {
 /// audio thread): the engine logs loaded loops when it opens a session, the plan compiler when it
 /// compiles one.
 fn processing_order(s: &Session, route: &mut RouteScratch, order: &mut Vec<usize>) {
-    let is_aux = |t: &Track| matches!(t.kind, TrackKind::Aux | TrackKind::Folder);
     route.layer(s);
     order.clear();
     order.extend(s.tracks.iter().enumerate().filter(|(_, t)| !is_aux(t)).map(|(i, _)| i));
@@ -1890,7 +1942,7 @@ fn path_need(s: &Session, latency: &dyn Fn(&Track) -> usize) -> usize {
     for &i in route.order() {
         let Some(t) = s.tracks.get(i).filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) else { continue };
         let mut arrive = 0;
-        if matches!(t.kind, TrackKind::Aux | TrackKind::Folder)
+        if is_aux(t)
             && let Route::Bus(b) = &t.mixer.input
             && let Some(x) = route.bus_slot(*b).and_then(|k| bus.get_mut(k))
         {
@@ -2037,7 +2089,7 @@ mod click {
 /// layout-agnostic fold, not a speaker-aware surround matrix: six channels into stereo become
 /// (0 + 2 + 4) / 3 and (1 + 3 + 5) / 3, including LFE if present. Nothing is discarded.
 /// Equal widths map directly; narrower sources retain cyclic duplication (mono to both sides).
-fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>], _scratch: &mut [f32]) {
+fn render_clip(s: &Session, clip: &Clip, pos: Samples, frames: usize, buf: &mut [Vec<f32>]) {
     let ClipContent::Audio { source, offset } = clip.content else { return };
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
     let Some(isect) = clip.range().intersect(&block) else { return };
@@ -2978,29 +3030,26 @@ pub fn render_clips(s: &Session, track: TrackId, range: Range) -> Vec<Vec<f32>> 
     let Some(t) = s.track(track) else { return Vec::new() };
     let len = usize::try_from(range.len().max(0)).unwrap_or(0).min(MAX_RENDER_SAMPLES / t.channels().max(1));
     let mut out = vec![vec![0.0f32; len]; t.channels().max(1)];
-    let mut scratch = Vec::new();
+    let mut clipbuf = vec![vec![0.0; len.min(4096)]; out.len()];
     for c in t.clips().iter().filter(|c| !c.muted && c.range().overlaps(&range)) {
-        match clip_fx_params(s, c.id.0) {
-            None => render_clip(s, c, range.start, len, &mut out, &mut scratch),
-            Some(params) => {
-                let mut tmp = vec![vec![0.0f32; len]; out.len()];
-                render_clip(s, c, range.start, len, &mut tmp, &mut scratch);
-                let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, tmp.len(), true);
-                fx.configure(params);
-                let mut done = 0;
-                while done < len {
-                    let n = (len - done).min(4096);
-                    let mut block: Vec<Vec<f32>> = tmp.iter().map(|ch| ch.get(done..done + n).map(<[f32]>::to_vec).unwrap_or_default()).collect();
-                    fx.process(&mut block, n);
-                    for (o, b) in out.iter_mut().zip(block.iter()) {
-                        if let Some(dst) = o.get_mut(done..done + n) {
-                            for (x, y) in dst.iter_mut().zip(b.iter()) {
-                                *x += *y;
-                            }
+        let mut fx = ClipFx::new(s.sample_rate.as_f64() as f32, out.len(), true);
+        let fx = clip_fx_params(s, c.id.0).map(|params| {
+            fx.configure(params);
+            &mut fx
+        });
+        match fx {
+            None => render_clip(s, c, range.start, len, &mut out),
+            Some(fx) => {
+                // Render the full range first to preserve its fade-interpolation boundaries.
+                let mut raw = vec![vec![0.0; len]; out.len()];
+                render_clip(s, c, range.start, len, &mut raw);
+                mix_clip_fx(len, &mut out, &mut clipbuf, fx, |done, n, buf| {
+                    for (dst, src) in buf.iter_mut().zip(&raw) {
+                        if let (Some(dst), Some(src)) = (dst.get_mut(..n), src.get(done..done + n)) {
+                            dst.copy_from_slice(src);
                         }
                     }
-                    done += n;
-                }
+                });
             }
         }
     }
@@ -3459,7 +3508,9 @@ mod tests {
         assert!(a.values(3).iter().all(|x| x.is_nan()));
         a.values(3).fill(1.0);
         assert_eq!(a.values(3), [1.0; 3], "kept while the map's length stays");
-        assert_eq!(a.values(APPLIED_INLINE + 1).len(), APPLIED_INLINE + 1, "a longer map spills to the heap");
+        assert!(a.values(APPLIED_INLINE + 1).is_empty(), "unprepared long maps never allocate");
+        let mut a = Applied::prepared(vec![f32::NAN; APPLIED_INLINE + 1]);
+        assert_eq!(a.values(APPLIED_INLINE + 1).len(), APPLIED_INLINE + 1);
     }
 
     #[test]

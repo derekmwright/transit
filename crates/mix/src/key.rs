@@ -119,6 +119,14 @@ pub(crate) struct KeyBank {
     entries: Vec<KeyEntry>,
 }
 
+pub(crate) struct KeyAlignment {
+    pub at: usize,
+    pub arrive: usize,
+    pub pos: Samples,
+    pub pdc: bool,
+    pub duplex: bool,
+}
+
 impl KeyBank {
     /// The entries for `specs`, each with a silent buffer of `block` frames and a delay line
     /// holding up to `cap_of(keyed strip)` samples.
@@ -149,18 +157,8 @@ impl KeyBank {
     /// latency a key arrives with (its source's output). With `pdc` off nothing is delayed.
     /// `duplex`: the device has live input, so the strip's hardware inserts run and add their round trip.
     /// Returns the longest delay a line could not hold (0: none).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn align(
-        &mut self,
-        at: usize,
-        t: &Track,
-        st: &mut Strip,
-        arrive: usize,
-        pos: Samples,
-        pdc: bool,
-        duplex: bool,
-        source: &dyn Fn(&KeySpec) -> usize,
-    ) -> usize {
+    pub(crate) fn align(&mut self, t: &Track, st: &mut Strip, alignment: KeyAlignment, source: &dyn Fn(&KeySpec) -> usize) -> usize {
+        let KeyAlignment { at, arrive, pos, pdc, duplex } = alignment;
         for k in st.key_in.iter_mut() {
             k.want = 0;
         }

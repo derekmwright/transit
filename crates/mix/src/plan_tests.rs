@@ -1617,3 +1617,111 @@ fn the_session_as_played_replaces_a_frozen_track_by_its_render() {
     let none = Arc::new(audio_session().0);
     assert!(Arc::ptr_eq(&none, &none.with_frozen_audio()), "nothing frozen: the same session");
 }
+
+#[test]
+fn clip_fx_with_short_prepared_buffers_renders_every_sample_without_allocating() {
+    mark_audio_thread();
+    for modules in [false, true] {
+        for short_channel in [0, 1] {
+            let (mut s, a, _) = audio_session();
+            let clip = s.track(a).unwrap().clips()[0].id.0;
+            s.edit.values.insert(format!("clip_fx.{clip}.gain"), -6.0);
+            if modules {
+                s.edit.values.insert(format!("clip_fx.{clip}.eq.mid_gain"), 3.0);
+                s.edit.values.insert(format!("clip_fx.{clip}.comp.threshold"), -12.0);
+            }
+            let mut reference = Rig::new();
+            let mut short = Rig::new();
+            assert_eq!(reference.publish(&s), Adoption::Adopted);
+            assert_eq!(short.publish(&s), Adoption::Adopted);
+            let tables = &mut short.eng.plan.as_deref_mut().unwrap().tables;
+            let at = tables.strip_of(a).unwrap();
+            tables.strips[at].clipbuf[short_channel] = vec![0.0; 31];
+            let mut expected = vec![vec![0.0; BLOCK]; 2];
+            for block in 0..4 {
+                let pos = (block * BLOCK) as i64;
+                // The EQ updates smoothed coefficients per process chunk. Match the short
+                // buffer's chunk boundaries in the independently rendered reference.
+                for done in (0..BLOCK).step_by(31) {
+                    let n = (BLOCK - done).min(31);
+                    reference.eng.render_active(pos + done as i64, n, &mut reference.out);
+                    for (dst, src) in expected.iter_mut().zip(&reference.out) {
+                        dst[done..done + n].copy_from_slice(&src[..n]);
+                    }
+                }
+                let (_, stats) = transit_rt::testing::measure(|| short.eng.render_active(pos, BLOCK, &mut short.out));
+                assert!(stats.is_zero(), "short clip-FX buffer allocated or freed: {stats:?}");
+                assert!(expected.iter().flatten().any(|v| v.abs() > 0.01));
+                for (actual, expected) in short.out.iter().flatten().zip(expected.iter().flatten()) {
+                    assert!((actual - expected).abs() < 1e-6, "{actual} != {expected}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn render_flags_prefer_transit_values_and_accept_legacy_aliases() {
+    for (value, alias, expected) in [
+        (None, None, false),
+        (None, Some("1"), true),
+        (None, Some(" YES "), true),
+        (Some("true"), Some("0"), true),
+        (Some("0"), Some("1"), false),
+        (Some(""), Some("yes"), false),
+    ] {
+        assert_eq!(flag_value(value, alias), expected);
+    }
+    assert_eq!(RENDER_POOL_ENV, "TRANSIT_RENDER_POOL");
+    assert_eq!(RENDER_NO_PRIORITY_ENV, "TRANSIT_RENDER_NO_PRIORITY");
+}
+
+#[test]
+fn changed_sink_edges_refresh_cached_indices_even_when_sink_order_stays_the_same() {
+    use soundcraft_model::{IoDirection, IoPath, SendSlot};
+    mark_audio_thread();
+    let (mut s, a, b) = audio_session();
+    let io = IoMap {
+        outputs: 4,
+        paths: vec![
+            IoPath { name: "A".into(), direction: IoDirection::Output, channels: vec![0, 1], format: ChannelFormat::Stereo },
+            IoPath { name: "B".into(), direction: IoDirection::Output, channels: vec![2, 3], format: ChannelFormat::Stereo },
+        ],
+        ..IoMap::default()
+    };
+    // The silent first track pins sink order while the audible second track changes routes.
+    s.tracks.swap(0, 1);
+    let silent = s.track_mut(b).unwrap();
+    silent.mixer.output = Route::Hardware("A".into());
+    silent.mixer.sends[0] = Some(SendSlot {
+        target: Route::Hardware("B".into()),
+        level_db: 0.0,
+        pan: 0.0,
+        mute: false,
+        pre_fader: false,
+        follow_main_pan: true,
+        surround: None,
+    });
+    s.track_mut(a).unwrap().mixer.output = Route::Hardware("a".into());
+    let mut rig = Rig::new();
+    rig.comp.set_io(Arc::new(io));
+    rig.out = vec![vec![0.0; BLOCK]; 6];
+    assert_eq!(rig.publish(&s), Adoption::Adopted);
+    rig.eng.render_active(0, BLOCK, &mut rig.out);
+    assert!(rig.out[2].iter().any(|x| x.abs() > 0.1));
+    assert!(rig.out[4].iter().all(|x| *x == 0.0));
+    for (route, expected_sink) in [("b", Some(4)), ("missing", None), ("A", Some(2))] {
+        s.track_mut(a).unwrap().mixer.output = Route::Hardware(route.into());
+        let mut env = rig.compile(&s);
+        assert!(env.plan.tables.is_some(), "a different edge needs a fresh sink index");
+        assert_eq!(adopt_measured(&mut rig.eng, &mut env), Adoption::Adopted);
+        rig.comp.reclaim(env);
+        let (_, stats) = transit_rt::testing::measure(|| rig.eng.render_active(0, BLOCK, &mut rig.out));
+        assert!(stats.is_zero(), "cached sink render: {stats:?}");
+        for channel in [2, 4] {
+            let audible = rig.out[channel].iter().any(|x| x.abs() > 0.1);
+            assert_eq!(audible, expected_sink == Some(channel));
+        }
+    }
+}

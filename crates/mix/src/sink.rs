@@ -87,7 +87,6 @@ pub fn unresolved_routes(s: &Session, io: &IoMap, out_channels: u16) -> Vec<Stri
 
 /// A sink's buffers in a running plan.
 pub(crate) struct Sink {
-    pub(crate) name: String,
     pub(crate) fmt: ChannelFormat,
     pub(crate) buf: Vec<Vec<f32>>,
     /// The device latency every signal summed here is aligned to this block (see `pdc_visit`).
@@ -96,7 +95,7 @@ pub(crate) struct Sink {
 
 impl Sink {
     pub(crate) fn new(spec: &SinkSpec, block: usize) -> Self {
-        Sink { name: spec.name.clone(), fmt: spec.format, buf: vec![vec![0.0; block]; spec.dest.len()], arrival: 0 }
+        Sink { fmt: spec.format, buf: vec![vec![0.0; block]; spec.dest.len()], arrival: 0 }
     }
 
     pub(crate) fn clear(&mut self, frames: usize) {
@@ -107,7 +106,14 @@ impl Sink {
     }
 }
 
-/// The sink `route` names (`Route::Hardware`), if the plan has one. No allocation.
-pub(crate) fn sink_index(sinks: &[Sink], name: &str) -> Option<usize> {
-    sinks.iter().position(|s| s.name.eq_ignore_ascii_case(name))
+/// Resolve output and send edges once on the control thread. Entry 0 is the output;
+/// entry 1 + i is send i, matching the strip's delay taps.
+pub(crate) fn sink_routes(t: &super::Track, sinks: &[SinkSpec]) -> Vec<Option<usize>> {
+    std::iter::once(Some(&t.mixer.output))
+        .chain(t.mixer.sends.iter().map(|s| s.as_ref().map(|s| &s.target)))
+        .map(|r| match r {
+            Some(Route::Hardware(name)) => sinks.iter().position(|s| s.name.eq_ignore_ascii_case(name)),
+            _ => None,
+        })
+        .collect()
 }
