@@ -24,6 +24,15 @@ not permission.
 - **Plug-ins** are created, scanned and destroyed off the audio thread; only `process` runs on it.
 - Logging from the audio thread uses `on_audio_thread()` and defers the write to the UI thread.
 
+## First use allocates on macOS
+
+On macOS, `std::sync::Mutex` is a lazily boxed `pthread_mutex_t`: the first `lock` or `try_lock`
+allocates 64 bytes. A `thread_local!` whose type has a destructor allocates on first access per
+thread (Apple registers it through `_tlv_atexit`), and Apple's libunwind allocates on the first
+unwind. Windows and Linux do none of these, so a test can pass there and fail on macOS. Take each
+lock once at construction on the control thread (see `InputRing::new`), use `const`-initialized
+thread-locals of types without `Drop`, and keep destructor thread-locals off the audio path.
+
 ## Worker threads
 
 Pool workers are promoted at thread start (MMCSS, SCHED_FIFO or rtkit, time-constraint policy) by

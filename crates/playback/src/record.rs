@@ -1499,9 +1499,9 @@ impl InputRing {
         let wanted = if rate == 0 { 24_000 } else { (rate as usize / 2).max(1) };
         let frames = wanted.min((1 << 22) / ch);
         let (producer, queue) = rtrb::RingBuffer::new(frames * ch);
-        Arc::new(InputRing {
-            producer: Mutex::new(producer),
-            reader: Mutex::new(MonitorReader {
+        let (producer, reader) = (
+            Mutex::new(producer),
+            Mutex::new(MonitorReader {
                 queue,
                 left: vec![0.0; ch],
                 right: vec![0.0; ch],
@@ -1510,6 +1510,15 @@ impl InputRing {
                 phase: 0.0,
                 removed_frames: 0,
             }),
+        );
+        // On macOS `std::sync::Mutex` is a lazily boxed `pthread_mutex_t`: the first lock or
+        // `try_lock` allocates 64 bytes. Take each lock once here, on the control thread, so the
+        // audio callbacks that only `try_lock` never allocate on first use.
+        drop(producer.lock());
+        drop(reader.lock());
+        Arc::new(InputRing {
+            producer,
+            reader,
             channels: std::sync::atomic::AtomicUsize::new(ch),
             ch,
             fifo_frames: frames,
