@@ -164,7 +164,12 @@ fn run(bytes: &[u8], detected: FileFormat, count_only: bool) -> Result<(AudioInf
     let mut planar: Vec<Vec<f32>> = Vec::new();
     let mut frames: u64 = 0;
     let mut sbuf: Option<SampleBuffer<f32>> = None;
-    let mut errors = 0usize;
+    // Native FLAC timestamps and durations are exact sample counts. Other containers can
+    // omit packet durations (Matroska) or round timestamps, so do not infer gaps there.
+    let exact_packet_timing = detected == FileFormat::Flac
+        && params.codec == CODEC_TYPE_FLAC
+        && params.time_base.is_some_and(|base| base.numer == 1 && base.denom == info.sample_rate);
+    let mut next_packet_ts = None;
     loop {
         let packet = match reader.next_packet() {
             Ok(p) => p,
@@ -181,16 +186,17 @@ fn run(bytes: &[u8], detected: FileFormat, count_only: bool) -> Result<(AudioInf
         if packet.track_id() != track_id {
             continue;
         }
+        // Some demuxers discard corrupt packets internally. Their next timestamp still
+        // exposes the missing duration; never concatenate across that gap.
+        if exact_packet_timing && next_packet_ts.is_some_and(|expected| packet.ts > expected) {
+            return Err(AudioError::Malformed("audio packet timeline contains a gap".into()));
+        }
+        next_packet_ts = (packet.dur > 0).then(|| packet.ts.checked_add(packet.dur)).flatten();
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
-            Err(SymError::DecodeError(m)) => {
-                errors += 1;
-                log::debug!("skipping corrupt packet: {m}");
-                if errors > 1000 && frames == 0 {
-                    return Err(AudioError::Malformed(format!("no decodable packets: {m}")));
-                }
-                continue;
-            }
+            // A skipped packet would move all later audio earlier. Packet durations are not
+            // available for every codec, so refuse the import instead of returning a short clip.
+            Err(SymError::DecodeError(m)) => return Err(AudioError::Malformed(format!("corrupt audio packet: {m}"))),
             Err(SymError::IoError(_)) => break,
             Err(e) => return Err(map_err(e)),
         };
@@ -249,4 +255,33 @@ pub(crate) fn probe(bytes: &[u8], detected: FileFormat) -> Result<AudioInfo> {
 
 pub(crate) fn decode(bytes: &[u8], detected: FileFormat) -> Result<(AudioInfo, AudioBuffer)> {
     guarded(|| run(bytes, detected, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_corrupt_middle_packet_cannot_shorten_the_import() {
+        let audio = AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 3 * 4096]] };
+        let mut bytes = crate::encode(&audio, &crate::EncodeOptions { format: FileFormat::Flac, ..Default::default() }).unwrap();
+        let mut reader = open(&bytes).unwrap();
+        let _ = reader.next_packet().unwrap();
+        let packet = reader.next_packet().unwrap();
+        let at = bytes.windows(packet.data.len()).position(|w| w == packet.data.as_ref()).unwrap();
+        // Our fixed-block FLAC encoder emits an eight-byte header here. Subframe type 2 is reserved.
+        bytes[at + 8] = 0x04;
+        assert!(matches!(decode(&bytes, FileFormat::Flac), Err(AudioError::Malformed(_))), "demux gap must be refused");
+        // Repair the packet CRC so the demuxer accepts it and the decoder sees the invalid subframe.
+        let end = at + packet.data.len();
+        let crc = bytes[at..end - 2].iter().fold(0u16, |mut crc, &byte| {
+            crc ^= u16::from(byte) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x8005 } else { crc << 1 };
+            }
+            crc
+        });
+        bytes[end - 2..end].copy_from_slice(&crc.to_be_bytes());
+        assert!(matches!(decode(&bytes, FileFormat::Flac), Err(AudioError::Malformed(_))), "decoder error must be refused");
+    }
 }
