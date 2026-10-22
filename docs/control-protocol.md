@@ -12,6 +12,22 @@ input), and every command is reachable from:
 | MCP (headless) | `soundcraft-cli mcp [--demo]` |
 | MCP (bridged to the app) | `soundcraft-cli mcp --connect <port>` |
 
+## Authentication (transit)
+
+`transit --control <port>` (or `TRANSIT_CONTROL_PORT`) binds to `127.0.0.1` only. At start it
+generates a random 128-bit token (32 hex characters from the operating system's generator), writes
+it to `control-token` in the settings folder (`TRANSIT_CONFIG_DIR`; see the README) and logs the
+file's path. Set `TRANSIT_CONTROL_TOKEN_FILE` to use another path, for the app and for clients.
+The file is readable by the current user only where the platform allows (mode 0600 on Unix, the
+folder's per-user permissions on Windows), and a new token replaces it at every start.
+
+Every connection must send `auth <token>` as its first line. A connection whose first line is
+anything else, or whose token is wrong, is closed without a reply, and so is one that sends no
+first line within 10 seconds. After that the line protocol is unchanged, except that a line that
+is not JSON gets one error reply and then the connection is closed. `soundcraft-cli app` and
+`soundcraft-cli mcp --connect` read the token file (same path rule) and send the line themselves.
+By hand: `printf 'auth %s\n{"id":1,"method":"session.inspect"}\n' "$(cat "$TOKEN_FILE")" | nc 127.0.0.1 $P`.
+
 ## Isolated automation profiles
 
 Set `SOUNDCRAFT_CONFIG_DIR` to a fresh directory to isolate UI preferences, `Autosave`, `Presets`, and `logs`.

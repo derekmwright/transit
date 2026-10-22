@@ -121,6 +121,8 @@ Settings, autosaves and logs live in a per-user folder: `%APPDATA%\transit` on W
 `~/.config/transit`) elsewhere. Set `TRANSIT_CONFIG_DIR` to use another folder. An empty value
 disables saving settings.
 
+`transit --control <port>` (or `TRANSIT_CONTROL_PORT`; `0` picks a free port) starts a JSON-lines control server for scripts and the MCP server. It binds to `127.0.0.1` only. At start it writes a random per-run token to `control-token` in the settings folder (override the path with `TRANSIT_CONTROL_TOKEN_FILE`) and logs the path; each connection must send `auth <token>` as its first line or it is closed. `soundcraft-cli mcp --connect <port>` reads the file itself. The MCP tools are `list_commands`, `execute`, `batch`, `inspect_session`, `new_session`, `open_session`, `save_session`, `import_audio`, `bounce_mix`, and, with the app, `screenshot`, `ui_inspect`, `ui_set`, `click`, `drag` and `key`. See `docs/control-protocol.md` and `docs/mcp.md`.
+
 ## Status and known issues
 
 - Pre-alpha; the session format and UI change freely.

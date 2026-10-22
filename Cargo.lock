@@ -3862,6 +3862,7 @@ dependencies = [
 name = "soundcraft-automation"
 version = "0.8.0"
 dependencies = [
+ "getrandom 0.3.4",
  "log",
  "serde_json",
  "soundcraft-engine",
@@ -4565,6 +4566,7 @@ dependencies = [
  "log",
  "rfd",
  "serde_json",
+ "soundcraft-automation",
  "soundcraft-engine",
  "soundcraft-playback",
  "soundcraft-ui-egui",

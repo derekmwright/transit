@@ -11,6 +11,10 @@ soundcraft --control 7801 &           # the desktop app…
 soundcraft-cli mcp --connect 7801     # …driven over MCP: same tools plus screenshots and clicks
 ```
 
+`transit --control PORT` listens on loopback only and requires a per-run token: the app writes it to
+`control-token` in its settings folder (or `TRANSIT_CONTROL_TOKEN_FILE`), and `--connect` reads the
+same file and sends `auth <token>` first. See [control-protocol.md](control-protocol.md#authentication-transit).
+
 Claude Code:
 
 ```sh
@@ -95,8 +99,7 @@ files it was given rather than guarding against other software on the computer.
 | `new_session`, `open_session`, `save_session` | Session files (`.scraft`, audio in `Audio Files/`). `open_session` returns `missing`: the media files that could not be loaded (empty when all are found). `save_session` won't save over another existing file unless `replace` is true. |
 | `import_audio` | WAV, AIFF, FLAC, MP3, OGG, AAC/M4A, ALAC, CAF onto a new or existing track. |
 | `bounce_mix` | Render to WAV/AIFF/FLAC; returns peak dBFS and integrated LUFS. |
-| `parity` | Feature-parity report. |
-| `screenshot`, `ui_inspect`, `ui_set`, `menu_invoke`, `click`, `drag`, `key` | App only (with `--connect`). |
+| `screenshot`, `ui_inspect`, `ui_set`, `click`, `drag`, `key` | App only (with `--connect`). |
 
 Resources: `soundcraft://session` (full session JSON), `soundcraft://commands`.
 

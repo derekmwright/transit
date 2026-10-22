@@ -72,16 +72,9 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({"path": {"type": "string"}, "format": {"type": "string", "enum": ["wav", "aiff", "flac"]}, "bit_depth": {"type": "string"}, "start": {}, "end": {}, "normalize": {"type": "boolean"}}),
             &["path"],
         ),
-        tool("parity", "Feature-parity report against the incumbent's menu catalog.", json!({}), &[]),
         tool("screenshot", "APP_ONLY. Screenshot the app window (PNG).", json!({"path": {"type": "string"}}), &[]),
         tool("ui_inspect", "APP_ONLY. UI state: front window, panels, layout rectangles of tracks, dialogs.", json!({}), &[]),
         tool("ui_set", "APP_ONLY. Set UI state fields, e.g. {\"window\": \"Mix\"}.", json!({"state": {"type": "object"}}), &["state"]),
-        tool(
-            "menu_invoke",
-            "APP_ONLY. Invoke a menu item like a click (may open its dialog), e.g. \"Track > New...\".",
-            json!({"path": {"type": "string"}}),
-            &["path"],
-        ),
         tool(
             "click",
             "APP_ONLY. Click at window coordinates (points).",
@@ -168,7 +161,6 @@ impl<B: Backend> Server<B> {
             "save_session" => self.exec("session.save", args.clone()),
             "import_audio" => self.exec("file.import_audio", args.clone()),
             "bounce_mix" => self.exec("file.bounce_mix", args.clone()),
-            "parity" => self.backend.call("engine.parity", json!({})),
             "screenshot" => {
                 let r = self.backend.call("ui.screenshot", args.clone());
                 if let Ok(v) = &r
@@ -180,7 +172,6 @@ impl<B: Backend> Server<B> {
             }
             "ui_inspect" => self.backend.call("ui.inspect", json!({})),
             "ui_set" => self.backend.call("ui.set", a("state").unwrap_or(json!({}))),
-            "menu_invoke" => self.backend.call("ui.menu.invoke", args.clone()),
             "click" => self.backend.call("ui.click", args.clone()),
             "drag" => self.backend.call("ui.drag", args.clone()),
             "key" => self.backend.call("ui.key", args.clone()),

@@ -3,7 +3,8 @@
 //! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.scraft]`
 //!
 //! `--control <port>` (or `TRANSIT_CONTROL_PORT`) starts a localhost JSON-lines control server
-//! (`0` picks a free port and prints it). See `transit_ui_studio::control` for the methods.
+//! (`0` picks a free port and prints it). Connections must start with `auth <token>`, the token in the
+//! `control-token` file of the settings folder (`TRANSIT_CONTROL_TOKEN_FILE` overrides). See `transit_ui_studio::control` for the methods.
 //!
 //! Structure copied from `apps/soundcraft/src/main.rs` at `transit` 2af868e (file last changed
 //! 04e1fe8): the scan child answered first in `main`, the logger, prefs, `--control`, `--no-audio`,
