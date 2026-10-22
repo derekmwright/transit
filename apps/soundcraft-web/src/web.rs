@@ -67,7 +67,7 @@ enum Purpose {
     Midi,
 }
 
-const SESSION_EXTS: &[&str] = &[io::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION, soundcraft_model::LEGACY_SESSION_EXTENSION];
+const SESSION_EXTS: &[&str] = &[soundcraft_model::BUNDLE_EXTENSION, soundcraft_model::SESSION_EXTENSION];
 const AUDIO_EXTS: &[&str] =
     &["wav", "wave", "bwf", "aif", "aiff", "aifc", "flac", "mp3", "ogg", "oga", "m4a", "m4b", "aac", "mp4", "caf", "mkv", "webm"];
 const MIDI_EXTS: &[&str] = &["mid", "midi", "smf"];
@@ -234,14 +234,14 @@ fn download(name: &str, bytes: &[u8]) -> Result<(), String> {
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
     let opts = web_sys::BlobPropertyBag::new();
     opts.set_type(match name.rsplit_once('.').map(|(_, x)| x.to_ascii_lowercase()).as_deref() {
-        Some("scraftz") => "application/zip",
+        Some("transitz") => "application/zip",
         Some("wav") => "audio/wav",
         Some("aif" | "aiff") => "audio/aiff",
         Some("flac") => "audio/flac",
         Some("mid" | "midi") => "audio/midi",
         Some("svg") => "image/svg+xml",
         Some("txt") => "text/plain",
-        Some("json" | "transit" | "scraft") => "application/json",
+        Some("json" | "transit") => "application/json",
         Some("musicxml") => "application/vnd.recordare.musicxml+xml",
         _ => "application/octet-stream",
     });

@@ -8,7 +8,5 @@
     <sub-class-of type="application/json"/>
     <icon name="transit"/>
     <glob pattern="*.transit"/>
-    <!-- Sessions saved before the .transit extension. -->
-    <glob pattern="*.scraft"/>
   </mime-type>
 </mime-info>

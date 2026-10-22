@@ -10,19 +10,12 @@ use soundcraft_time::{FrameRate, GridValue, Range, SampleRate, Samples, TempoMap
 /// Native session file extension.
 pub const SESSION_EXTENSION: &str = "transit";
 
-/// The extension sessions had before `.transit`. Files with it still open; nothing writes it.
-pub const LEGACY_SESSION_EXTENSION: &str = "scraft";
+/// Extension of a session bundle: one zip holding a `.transit` session and its `Audio Files/`.
+pub const BUNDLE_EXTENSION: &str = "transitz";
 
-/// True when `path` names a session file: `.transit`, or a `.scraft` from before the rename.
+/// True when `path` names a session file (`.transit`).
 pub fn is_session_file(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|x| x.to_str())
-        .is_some_and(|x| x.eq_ignore_ascii_case(SESSION_EXTENSION) || x.eq_ignore_ascii_case(LEGACY_SESSION_EXTENSION))
-}
-
-/// True when `path` is a `.scraft` file, which Save never writes (it writes a `.transit` beside it).
-pub fn is_legacy_session_file(path: &std::path::Path) -> bool {
-    path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(LEGACY_SESSION_EXTENSION))
+    path.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case(SESSION_EXTENSION))
 }
 
 /// `EditState::values` key holding the feet+frames reading of sample 0, in frames.

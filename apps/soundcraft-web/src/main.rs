@@ -9,7 +9,7 @@
 //! - no TCP control channel (browsers can't listen on sockets);
 //! - no file system: File > Open Session…, Import > Audio…/MIDI… and files dropped on the page are
 //!   read as bytes through the browser's file picker; a session is saved as ONE bundle file
-//!   (`<name>.scraftz`: the `.transit` and its `Audio Files/`), and every save or export arrives as a
+//!   (`<name>.transitz`: the `.transit` and its `Audio Files/`), and every save or export arrives as a
 //!   download (the demo session is still loaded on start);
 //! - browsers only start audio after a user gesture, so the first click may be needed before
 //!   playback is heard.

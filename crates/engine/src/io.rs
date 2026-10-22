@@ -1036,7 +1036,7 @@ pub fn sanitize_name(n: &str) -> String {
 /// as 32-bit float WAV into `Audio Files/` next to it. Returns how many audio files were written.
 ///
 /// In the browser there are no folders: the session and all its audio go out as one bundle file
-/// (`<name>.scraftz`, see [`session_bundle`]) through the host's delivery hook ([`set_deliver`]).
+/// (`<name>.transitz`, see [`session_bundle`]) through the host's delivery hook ([`set_deliver`]).
 pub fn save_session(e: &mut Engine, path: &str) -> Result<usize> {
     if cfg!(target_arch = "wasm32") {
         return save_session_bundle(e, path);
@@ -1211,13 +1211,9 @@ fn back_up(file: &Path) {
 }
 
 /// The file a session saved to `path` goes to: `path`, with `.transit` added when it has no
-/// extension and isn't an existing file. A `.transit` path (the extension before `.transit`) goes
-/// to the sibling `.transit` file instead, so saving never rewrites an old file.
+/// extension and isn't an existing file.
 pub fn session_file(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
-    if soundcraft_model::is_legacy_session_file(&p) {
-        return p.with_extension(soundcraft_model::SESSION_EXTENSION);
-    }
     // Only a path the write root allows is probed, so a refused one can't be used to test for files.
     let is_file = crate::file_access::check_write(&p).is_ok() && p.is_file();
     if p.extension().is_none() && !is_file { p.with_extension(soundcraft_model::SESSION_EXTENSION) } else { p }
@@ -1332,7 +1328,7 @@ pub(crate) fn decode_file(files: &mut DecodedFiles, p: &Path, rate: u32) -> std:
 /// Extension of a session bundle: one zip file holding the `.transit` session and its
 /// `Audio Files/`, the same layout as a saved session folder. The browser has no folders, so it
 /// saves and opens sessions as bundles.
-pub const BUNDLE_EXTENSION: &str = "scraftz";
+pub use soundcraft_model::BUNDLE_EXTENSION;
 
 /// Most entries and bytes a bundle may unpack to (bundles are hostile input).
 const MAX_BUNDLE_ENTRIES: usize = 10_000;
@@ -1448,7 +1444,7 @@ pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Ve
     Ok(missing)
 }
 
-/// Unpack a bundle: the one `.transit` (or `.transit`) at its top level and the files beside it, by relative path.
+/// Unpack a bundle: the one `.transit` at its top level and the files beside it, by relative path.
 fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String, Vec<u8>>)> {
     use std::io::Read as _;
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
@@ -2000,30 +1996,6 @@ mod save_tests {
     }
 
     #[test]
-    fn a_scraft_session_opens_and_saves_beside_itself_as_transit() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-legacy-ext-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = dir.join("Song.scraft");
-        let mut first = crate::demo::demo_engine();
-        save_session(&mut first, &old.to_string_lossy()).unwrap();
-        // The extension decides nothing on the way in, and nothing writes `.scraft`.
-        assert!(!old.exists() && dir.join("Song.transit").is_file());
-        std::fs::rename(dir.join("Song.transit"), &old).unwrap();
-        let before = std::fs::read(&old).unwrap();
-        let mut e = Engine::default();
-        open_session(&mut e, &old.to_string_lossy()).unwrap();
-        let out = e.execute("session.save", &json!({})).unwrap();
-        assert_eq!(out["kept_scraft"], old.to_string_lossy().as_ref());
-        assert_eq!(e.path.as_deref(), Some(dir.join("Song.transit").to_string_lossy().as_ref()));
-        assert_eq!(std::fs::read(&old).unwrap(), before, "the .scraft file is untouched");
-        assert!(dir.join("Song.transit").is_file());
-        // A second Save is a plain save: no note.
-        assert!(e.execute("session.save", &json!({})).unwrap().get("kept_scraft").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn saving_keeps_the_last_ten_versions_as_backups() {
         let dir = std::env::temp_dir().join(format!("soundcraft-backups-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2323,7 +2295,7 @@ mod bundle_tests {
         assert!(bytes.starts_with(b"PK\x03\x04"));
         assert!(fresh.sources.iter().all(|s| s.path.starts_with("Audio Files/") && !s.unsaved));
         let mut r = Engine::default();
-        let missing = open_session_bytes(&mut r, "Midnight Groove.scraftz", &bytes).unwrap();
+        let missing = open_session_bytes(&mut r, "Midnight Groove.transitz", &bytes).unwrap();
         assert!(missing.is_empty(), "{missing:?}");
         assert_eq!(r.session().track_by_name("Kick").unwrap().mixer.volume_db, -7.0);
         assert_eq!(r.session().tracks.len(), e.session().tracks.len());
@@ -2332,7 +2304,7 @@ mod bundle_tests {
             assert_eq!(a.buffer.channels, b.buffer.channels, "{}: float WAV keeps every sample", src.name);
         }
         assert!(!r.is_dirty());
-        assert_eq!(r.path.as_deref(), Some("Midnight Groove.scraftz"));
+        assert_eq!(r.path.as_deref(), Some("Midnight Groove.transitz"));
     }
 
     #[test]
@@ -2346,7 +2318,7 @@ mod bundle_tests {
         let paths: std::collections::HashSet<_> = fresh.sources.iter().map(|s| s.path.clone()).collect();
         assert_eq!(paths.len(), n);
         let mut r = Engine::default();
-        assert!(open_session_bytes(&mut r, "x.scraftz", &bytes).unwrap().is_empty());
+        assert!(open_session_bytes(&mut r, "x.transitz", &bytes).unwrap().is_empty());
     }
 
     #[test]
@@ -2364,13 +2336,13 @@ mod bundle_tests {
     fn hostile_bundles_are_errors_not_panics() {
         let mut r = Engine::default();
         for bad in [&b"PK\x03\x04 not really a zip"[..], b"", b"{ not json", b"\xff\xfe\x00"] {
-            assert!(open_session_bytes(&mut r, "bad.scraftz", bad).is_err());
+            assert!(open_session_bytes(&mut r, "bad.transitz", bad).is_err());
         }
         // A valid zip without a session inside.
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         w.start_file("Audio Files/a.wav", zip::write::SimpleFileOptions::default()).unwrap();
         let only_audio = w.finish().unwrap().into_inner();
-        assert!(open_session_bytes(&mut r, "a.scraftz", &only_audio).is_err());
+        assert!(open_session_bytes(&mut r, "a.transitz", &only_audio).is_err());
         assert_eq!(r.session().tracks.len(), 0, "a failed open leaves the document alone");
     }
 

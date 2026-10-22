@@ -145,7 +145,7 @@ impl eframe::App for App {
 
 fn open_path(app: &mut StudioApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    if lower.ends_with(".transit") || lower.ends_with(".scraft") {
+    if lower.ends_with(".transit") {
         app.run_or_ask("session.open", serde_json::json!({"path": p}));
         return;
     }
@@ -214,7 +214,7 @@ fn services() -> Services {
                 return d.pick_folder().map(|p| p.to_string_lossy().into_owned());
             }
             let d = match purpose {
-                "session.open" => d.add_filter("Session", &["transit", "scraft"]),
+                "session.open" => d.add_filter("Session", &["transit"]),
                 _ => d.add_filter("Audio", &["wav", "wave", "aif", "aiff", "flac", "mp3", "ogg"]),
             };
             d.pick_file().map(|p| p.to_string_lossy().into_owned())

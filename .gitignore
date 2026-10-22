@@ -14,8 +14,6 @@ plans/
 # Local sessions, audio and tool output (fixtures live under tests/)
 *.transit
 !/crates/**/tests/**/*.transit
-*.scraft
-!/crates/**/tests/**/*.scraft
 Audio Files/
 Backups/
 __pycache__/

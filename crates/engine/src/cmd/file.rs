@@ -18,16 +18,14 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "session.save", "Save Session", ["File"], Some("Cmd+S"), "{path?, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").map(str::to_string).or_else(|| e.path.clone()).ok_or_else(|| bad("session.save", "no path yet: pass `path` (Save As)"))?;
             refuse_replacing(e, "session.save", &crate::io::session_file(&path), p)?;
-            let file = crate::io::session_file(&path);
             let written = crate::io::save_session(e, &path)?;
-            Ok(save_result(&path, &file, written))
+            Ok(json!({"path": path, "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_as", "Save Session As...", ["File"], Some("Cmd+Shift+S"), "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_as", "`path` required"))?.to_string();
             refuse_replacing(e, "session.save_as", &crate::io::session_file(&path), p)?;
-            let file = crate::io::session_file(&path);
             let written = crate::io::save_session(e, &path)?;
-            Ok(save_result(&path, &file, written))
+            Ok(json!({"path": path, "audio_files_written": written}))
         }),
         cmd!(noundo "session.save_copy", "Save Session Copy In...", ["File"], None, "{path, replace?: false}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("session.save_copy", "`path` required"))?.to_string();
@@ -212,16 +210,6 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// Writing a session over an existing file needs `replace: true` (see `io::replaces`).
-/// The reply of Save and Save As. A `.transit` path was saved as the `.transit` file beside it;
-/// `kept_scraft` then names the old file, which is left as it was.
-fn save_result(asked: &str, file: &std::path::Path, written: usize) -> Value {
-    if soundcraft_model::is_legacy_session_file(std::path::Path::new(asked)) {
-        json!({"path": file, "audio_files_written": written, "kept_scraft": asked})
-    } else {
-        json!({"path": asked, "audio_files_written": written})
-    }
-}
-
 fn refuse_replacing(e: &Engine, id: &str, file: &std::path::Path, p: &Value) -> Result<()> {
     // First, so a path outside the write root is refused as such and never reported as existing.
     crate::file_access::check_write(file).map_err(EngineError::Io)?;

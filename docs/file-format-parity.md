@@ -24,7 +24,7 @@ Legend: ✅ supported and tested · 🟡 partial · ❌ missing · — not appli
 | Media Composer–compatible session | export | ❌ | ❌ | AAF variant |
 | ADM BWF (Dolby Atmos master) | import/export | ❌ | ❌ | G-12 |
 | SoundCraft session `.transit` + `Audio Files/` | — | ✅ | ✅ | JSON (serde); mutated-file property test loads or fails cleanly; plugin state embedded. Fades save optional `curvature` (-1..1); missing values default to 0 and preserve legacy envelopes |
-| Import Session Data (from another session) | Pro Tools sessions | 🟡 | — | From `.transit` (or older `.scraft`) only |
+| Import Session Data (from another session) | Pro Tools sessions | 🟡 | — | From `.transit` only |
 | Session info as text | export | — | ✅ | `file.export_session_text` |
 | Clip groups `.rgrp` / ours `.scgrp` | read/write | 🟡 | 🟡 | Our own `.scgrp` format; Pro Tools' clip-group files not read |
 | Track presets, fade presets, I/O settings, workspace, sync settings | read/write | ❌ | ❌ | Their equivalents don't exist yet (G-16) |

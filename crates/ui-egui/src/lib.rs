@@ -453,14 +453,6 @@ impl SoundApp {
                 if id == "app.quit" {
                     self.quit_requested = true;
                 }
-                if id.starts_with("session.save") && v.get("kept_scraft").is_some() {
-                    let name = v
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .and_then(|p| std::path::Path::new(p).file_name())
-                        .map(|n| n.to_string_lossy().into_owned());
-                    self.ui.status = format!("saved as {}; the .scraft file is kept", name.unwrap_or_default());
-                }
                 if id == "options.scrolling" {
                     // Re-selecting a scrolling mode resumes the playhead follow.
                     self.edit_layout.follow_hold = false;

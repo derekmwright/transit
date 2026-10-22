@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 const SESSION: &str = "session.transit";
-/// The name autosave folders written before `.transit` use for the session.
-const LEGACY_SESSION: &str = "session.transit";
 const ORIGIN: &str = "origin";
 const LOCK: &str = "lock";
 /// The plan of a recording still running when the folder was written.
@@ -317,11 +315,9 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
     out
 }
 
-/// The session file of an autosave folder: the `.transit` one, or an older folder's `.transit`.
+/// The session file of an autosave folder.
 fn session_in(dir: &Path) -> PathBuf {
-    let current = dir.join(SESSION);
-    let legacy = dir.join(LEGACY_SESSION);
-    if !current.exists() && legacy.exists() { legacy } else { current }
+    dir.join(SESSION)
 }
 
 /// Open `left` as an unsaved version of the session it came from, so Save writes it back there,
