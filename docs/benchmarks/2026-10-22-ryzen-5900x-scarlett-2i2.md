@@ -48,3 +48,16 @@ Calibrations, in the same order:
 - calibration: round trip 12096 frames (252.000 ms) +-9265 frames (193.021 ms), 4 of 6 clicks paired
 
 Exclusive mode at the 10 ms default period is clean (no xruns, 12 of 12 clicks) but its round trip is still 223 ms, against 248 ms shared and 23 ms through ASIO, so the latency sits inside the Focusrite WDM driver, not the Windows audio engine. Below the default the driver signals only every other period (6 ms intervals at a 3 ms period), which shows as hundreds of xruns and invalid stamps; see known issue K25.
+
+## ASIO buffer sweep (Safe Mode off)
+
+The same cable (output 2 to input 2) through cpal's ASIO host with Focusrite Control's Safe Mode turned off, at the driver's 256-frame default and with `--period 128`, `64` and `32` requested (the driver honored each).
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| cpal | ASIO | Focusrite USB ASIO | default | 256 fr / 5.333 ms | 48000 | 0.667 / 5.318 / 5.321 | 0/0 | 0.00 | 1.0 / 1.1 | 21.433 / 22.133 / 28.121 (20 of 20) | 1029 / 1062 / 1350 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | Safe Mode off |
+| cpal | ASIO | Focusrite USB ASIO | 128 | 128 fr / 2.667 ms | 48000 | 0.333 / 2.658 / 2.660 | 0/0 | 0.00 | 0.6 / 0.8 | 12.237 / 12.253 / 15.242 (20 of 20) | 587 / 588 / 732 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | Safe Mode off |
+| cpal | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.669 / 1.329 / 1.329 | 1666/1617 | 10008.33 | 0.4 / 0.6 | 6.101 / 6.122 / 6.136 (20 of 20) | 293 / 294 / 295 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | Safe Mode off; gap counts are burst delivery, see Reading |
+| cpal | ASIO | Focusrite USB ASIO | 32 | 32 fr / 0.667 ms | 48000 | 0.336 / 0.663 / 0.664 | 3784/3653 | 22703.81 | 0.2 / 0.5 | 4.361 / 4.458 / 4.467 (20 of 20) | 209 / 214 / 214 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | Safe Mode off; gap counts are burst delivery, see Reading |
+
+Reading: Safe Mode off saved about 1 ms at 256 frames (22.1 ms against 23.3 ms earlier that day). The round trip scales with the buffer: about 12.3 ms at 128, 6.1 ms at 64 and 4.5 ms at 32, so the driver's fixed overhead is roughly 3 ms plus two buffers. The xrun column on the cpal path is not a driver report: `audio-bench` counts every gap between callbacks longer than 1.5 periods (`XRUN_PERIODS` in `tools/audio-bench/src/analysis.rs`). At 64 and 32 frames the Focusrite ASIO driver delivers callbacks in bursts (jitter p95 equals exactly one period), so about a fifth of the callbacks follow a two-period gap and are counted, while the round trip stays within 0.03 ms and every click pairs; real dropouts on that scale would lose clicks and spread the round trip. Treat those counts as delivery cadence, not glitches, and note that the shared-mode input xruns of known issue K24 come from the same heuristic and may have the same explanation.

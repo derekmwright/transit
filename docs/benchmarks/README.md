@@ -23,7 +23,7 @@ Windows) taken at callback entry, as the backend reports it in `Stamp::host_call
   counted on the render stream and on the capture stream (`out/in`). "Xruns/min" is the render count
   over the measured span. The Notes column counts calls of the backends' error callbacks, invalid
   stamps and any log entries lost to a full log. A gap is evidence of a late callback, not proof of an
-  audible glitch, and a backend that buffers more deeply may hide an underrun from this method.
+  audible glitch, and a backend that buffers more deeply may hide an underrun from this method. On the cpal backend the column is this gap heuristic (known issue K26); the native WASAPI backend's "render backend:" and "capture backend:" lines are the direct figures.
 - **Callback time.** Wall time spent in the harness's render callback (p50, p95, in us). The harness
   callback does almost nothing, so this is the floor of the backend's own overhead as seen from
   inside the callback, not a CPU load figure.
@@ -140,7 +140,7 @@ Also record, once per interface, `GetSharedModeEnginePeriod` (default, fundament
 maximum period in frames) from the Windows audio engine and paste it under the table; the harness
 does not read it yet (it arrives with the native backend).
 
-Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal)](2026-10-22-ryzen-5900x-scarlett-2i2.md).
+Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal), WASAPI exclusive, ASIO buffer sweep](2026-10-22-ryzen-5900x-scarlett-2i2.md).
 
 ## Results
 
