@@ -131,29 +131,41 @@ pub(crate) fn open<A: ExclusiveApi>(api: &mut A, requested: &ab::Format, period:
             let client = api.activate().map_err(|e| open_error("Activate(IAudioClient) for the aligned period", &e))?;
             let duration = frames_to_100ns(aligned, format.rate);
             log::info!("WASAPI exclusive: the period is not aligned; retrying at {aligned} frames");
-            api.initialize(&client, &format, duration).map_err(|e| initialize_error(&e, format.rate, default_100ns, min_100ns))?;
+            api.initialize(&client, &format, duration).map_err(|e| initialize_error(&e, format.rate, duration, default_100ns, min_100ns))?;
             client
         }
-        Err(e) => return Err(initialize_error(&e, format.rate, default_100ns, min_100ns)),
+        Err(e) => return Err(initialize_error(&e, format.rate, duration, default_100ns, min_100ns)),
     };
     let buffer_frames = api.buffer_size(&client).map_err(|e| open_error("GetBufferSize", &e))?;
     Ok(Opened { client, format, buffer_frames, min_period: frames_of_100ns(min_100ns, format.rate) })
 }
 
-/// A failed exclusive `Initialize`; an out-of-range period names the range the device reported.
-fn initialize_error(error: &ApiError, rate: u32, default_100ns: i64, min_100ns: i64) -> ab::OpenError {
-    if error.code == E_BUFFER_SIZE_ERROR {
-        return ab::OpenError::Other(format!(
-            "Initialize(exclusive): the period is outside the range the device accepts: at least {} frames ({:.2} ms) at {rate} Hz, \
-             default {} frames ({:.2} ms) ({})",
-            frames_of_100ns(min_100ns, rate),
-            min_100ns as f64 / 10_000.0,
-            frames_of_100ns(default_100ns, rate),
-            default_100ns as f64 / 10_000.0,
+/// "128 frames (2.67 ms)": a 100 ns duration at `rate`.
+fn period_text(duration_100ns: i64, rate: u32) -> String {
+    format!("{} frames ({:.2} ms)", frames_of_100ns(duration_100ns, rate), duration_100ns as f64 / 10_000.0)
+}
+
+/// A failed exclusive `Initialize` at `requested_100ns`. An out-of-range period names the
+/// requested period and the range the device reported; endpoint-create-failed names the requested
+/// period too, because some USB drivers answer an unsupported period with it.
+fn initialize_error(error: &ApiError, rate: u32, requested_100ns: i64, default_100ns: i64, min_100ns: i64) -> ab::OpenError {
+    let requested = period_text(requested_100ns, rate);
+    match error.code {
+        E_BUFFER_SIZE_ERROR => ab::OpenError::Other(format!(
+            "Initialize(exclusive): the period of {requested} is outside the range the device accepts: at least {} at {rate} Hz, \
+             default {} ({})",
+            period_text(min_100ns, rate),
+            period_text(default_100ns, rate),
             error.text
-        ));
+        )),
+        E_ENDPOINT_CREATE_FAILED => ab::OpenError::DeviceNotAvailable(format!(
+            "Initialize(exclusive) at a period of {requested}, {rate} Hz: {} (some drivers answer an unsupported period this way; \
+             the device default is {})",
+            error.text,
+            period_text(default_100ns, rate)
+        )),
+        _ => open_error("Initialize(exclusive)", error),
     }
-    open_error("Initialize(exclusive)", error)
 }
 
 #[cfg(test)]
@@ -313,7 +325,18 @@ mod tests {
         fake.inits.push_back(Err(E_BUFFER_SIZE_ERROR));
         let error = open(&mut fake, &i32_24(48_000), ab::Period::Frames(16)).err().unwrap();
         let ab::OpenError::Other(text) = error else { panic!("{error:?}") };
+        assert!(text.contains("the period of 16 frames (0.33 ms) is outside"), "{text}");
         assert!(text.contains("at least 144 frames (3.00 ms) at 48000 Hz, default 480 frames (10.00 ms)"), "{text}");
+    }
+
+    #[test]
+    fn endpoint_create_failed_on_initialize_names_the_requested_period() {
+        let mut fake = scarlett();
+        fake.inits.push_back(Err(E_ENDPOINT_CREATE_FAILED));
+        let error = open(&mut fake, &i32_24(48_000), ab::Period::Frames(64)).err().unwrap();
+        let ab::OpenError::DeviceNotAvailable(text) = error else { panic!("{error:?}") };
+        assert!(text.contains("at a period of 64 frames (1.33 ms), 48000 Hz"), "{text}");
+        assert!(text.contains("the device default is 480 frames (10.00 ms)"), "{text}");
     }
 
     #[test]

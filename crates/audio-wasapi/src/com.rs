@@ -10,7 +10,7 @@ use crate::convert::Wire;
 use crate::exclusive::{self, ApiError, E_UNSUPPORTED_FORMAT, ExclusiveApi};
 use crate::lifecycle::Lifecycle;
 use crate::pairing::{self, Candidate};
-use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, Fill, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
+use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, Fill, LoopConfig, Position, RenderDevice, RenderStats, Stamper, UnwindGuard, Wake};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -744,12 +744,16 @@ impl RenderDevice for Live {
 
     fn write(&mut self, frames: u32, fill: &mut dyn FnMut(&mut [u8])) -> Result<(), Fault> {
         let mut data: *mut u8 = std::ptr::null_mut();
-        // SAFETY: `GetBuffer(frames)` with `frames <= buffer size - padding` returns a pointer to
-        // `frames * nBlockAlign` writable bytes that stay valid and exclusively ours until the
-        // paired `ReleaseBuffer(frames)`, called exactly once before any other `GetBuffer` (on
-        // the normal path, or by the unwind guard below, never both). The
-        // slice length is `frames * channels * bytes`, which `parse_format` proved equal to
-        // `frames * nBlockAlign`. Raw vtable calls keep failures as bare `HRESULT`s.
+        // SAFETY: the pointer is used only when `GetBuffer(frames)` succeeds, and a successful
+        // `GetBuffer(frames)` returns a pointer to `frames * nBlockAlign` writable bytes that stay
+        // valid and exclusively ours until the paired `ReleaseBuffer(frames)`, called exactly once
+        // before any other `GetBuffer` (on the normal path, or by the unwind guard below, never
+        // both). The loop's fill rule (free frames in shared mode, the whole buffer in exclusive
+        // mode) only chooses `frames`; a request the buffer cannot take fails here with an
+        // `HRESULT` and nothing is touched. The slice length is `frames * channels * bytes`, which
+        // equals `frames * nBlockAlign` (`parse_format` checks it for the mix format and
+        // `exclusive_format` builds `nBlockAlign` as `channels * bytes`). Raw vtable calls keep
+        // failures as bare `HRESULT`s.
         unsafe {
             let hr = (Interface::vtable(&self.render).GetBuffer)(Interface::as_raw(&self.render), frames, &mut data);
             if hr.is_err() {
@@ -1123,8 +1127,12 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
                 // Stops and resets the client when the loop ends, even by a panic in the callback.
-                let exit = render_loop::serve(&mut live, &config, &mut scratch, &mut render, &mut error);
-                log::debug!("WASAPI render loop ended: {exit:?}");
+                let mut stats = RenderStats::default();
+                let exit = render_loop::serve(&mut live, &config, &mut scratch, &mut render, &mut error, &mut stats);
+                log::debug!("WASAPI render loop ended: {exit:?}, {stats:?}");
+                if stats.skipped_wakes > 0 {
+                    log::info!("WASAPI exclusive render skipped {} of {} wakes whose buffer was not free yet", stats.skipped_wakes, stats.wakes);
+                }
             }
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -1379,6 +1387,7 @@ mod tests {
         assert_eq!(exclusive::E_BUFFER_SIZE_ERROR, a::AUDCLNT_E_BUFFER_SIZE_ERROR.0);
         assert_eq!(exclusive::E_BUFFER_SIZE_NOT_ALIGNED, a::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED.0);
         assert_eq!(E_DEVICE_IN_USE, a::AUDCLNT_E_DEVICE_IN_USE.0);
+        assert_eq!(render_loop::E_BUFFER_TOO_LARGE, a::AUDCLNT_E_BUFFER_TOO_LARGE.0);
         assert_eq!(exclusive::E_NOTFOUND, windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NOT_FOUND.0).0);
     }
 

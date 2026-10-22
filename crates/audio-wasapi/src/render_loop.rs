@@ -221,6 +221,20 @@ pub(crate) enum Exit {
     Panicked,
 }
 
+/// `AUDCLNT_E_BUFFER_TOO_LARGE`: `GetBuffer` asked for more frames than are free. In exclusive
+/// mode a driver can signal the event before the buffer it ping-pongs is free; that wake is skipped.
+pub(crate) const E_BUFFER_TOO_LARGE: i32 = 0x8889_0006_u32 as i32;
+
+/// What the render loop saw, for the log and the tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RenderStats {
+    /// Buffer events (wakes that were not a stop, timeout or failure).
+    pub(crate) wakes: u64,
+    /// Exclusive-mode wakes whose buffer was not free yet (`AUDCLNT_E_BUFFER_TOO_LARGE`), skipped.
+    pub(crate) skipped_wakes: u64,
+    pub(crate) timeouts: u64,
+}
+
 /// Serve the device until it stops or fails. A fault or timeout is reported once through
 /// `error` before this returns. `scratch` is the preallocated `f32` chunk buffer.
 pub(crate) fn run(
@@ -229,13 +243,15 @@ pub(crate) fn run(
     scratch: &mut [f32],
     render: &mut RenderCallback,
     error: &mut ErrorCallback,
+    stats: &mut RenderStats,
 ) -> Exit {
     let mut stamper = config.stamper;
     loop {
         match device.wait(config.timeout_ms) {
-            Wake::Event => {}
+            Wake::Event => stats.wakes += 1,
             Wake::Stop => return Exit::Stopped,
             Wake::Timeout => {
+                stats.timeouts += 1;
                 error(StreamError::DeviceNotAvailable);
                 return Exit::Timeout;
             }
@@ -260,8 +276,12 @@ pub(crate) fn run(
             block.device_position = position.map(|p| p.frames);
             render(&mut block);
         });
-        if let Err(fault) = written {
-            return fail(error, fault);
+        match written {
+            Ok(()) => {}
+            // The early event of an exclusive driver: `GetBuffer` acquired nothing and the
+            // callback did not run; the next event brings the free buffer.
+            Err(Fault::Other(E_BUFFER_TOO_LARGE)) if config.fill == Fill::Whole => stats.skipped_wakes += 1,
+            Err(fault) => return fail(error, fault),
         }
     }
 }
@@ -275,8 +295,9 @@ pub(crate) fn serve(
     scratch: &mut [f32],
     render: &mut RenderCallback,
     error: &mut ErrorCallback,
+    stats: &mut RenderStats,
 ) -> Exit {
-    let exit = contain(error, |error| run(&mut *device, config, scratch, render, error));
+    let exit = contain(error, |error| run(&mut *device, config, scratch, render, error, stats));
     device.halt();
     exit
 }
@@ -324,6 +345,9 @@ mod tests {
         origin_qpc: u64,
         clock_ok: bool,
         fail_write: Option<Fault>,
+        /// `GetBuffer` fails once with this fault on the write attempt of this index (0-based).
+        fail_once: Option<(u32, Fault)>,
+        attempts: u32,
         buffer: Vec<u8>,
         writes: u32,
         halts: u32,
@@ -344,6 +368,8 @@ mod tests {
                 origin_qpc: 5_000_000,
                 clock_ok: true,
                 fail_write: None,
+                fail_once: None,
+                attempts: 0,
                 buffer: vec![0; 4 * 2 * 4 * PERIOD as usize],
                 writes: 0,
                 halts: 0,
@@ -373,6 +399,13 @@ mod tests {
         }
         fn write(&mut self, frames: u32, fill: &mut dyn FnMut(&mut [u8])) -> Result<(), Fault> {
             if let Some(fault) = self.fail_write {
+                return Err(fault);
+            }
+            let attempt = self.attempts;
+            self.attempts += 1;
+            if let Some((at, fault)) = self.fail_once
+                && at == attempt
+            {
                 return Err(fault);
             }
             self.writes += 1;
@@ -414,6 +447,11 @@ mod tests {
     }
 
     fn drive(device: &mut Fake, config: &LoopConfig) -> (Exit, Vec<Seen>, Vec<StreamError>) {
+        let (exit, seen, errors, _) = drive_stats(device, config);
+        (exit, seen, errors)
+    }
+
+    fn drive_stats(device: &mut Fake, config: &LoopConfig) -> (Exit, Vec<Seen>, Vec<StreamError>, RenderStats) {
         let seen = Arc::new(Mutex::new(Vec::with_capacity(64)));
         let errors = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let (log, faults) = (Arc::clone(&seen), Arc::clone(&errors));
@@ -423,9 +461,10 @@ mod tests {
         });
         let mut error: ErrorCallback = Box::new(move |e| faults.lock().unwrap().push(e));
         let mut scratch = vec![0.0f32; 64];
-        let exit = run(device, config, &mut scratch, &mut render, &mut error);
+        let mut stats = RenderStats::default();
+        let exit = run(device, config, &mut scratch, &mut render, &mut error, &mut stats);
         let (seen, errors) = (seen.lock().unwrap().clone(), errors.lock().unwrap().clone());
-        (exit, seen, errors)
+        (exit, seen, errors, stats)
     }
 
     #[test]
@@ -546,16 +585,50 @@ mod tests {
     }
 
     #[test]
+    fn an_exclusive_early_event_with_no_free_buffer_is_skipped_and_the_stream_continues() {
+        let mut device = Fake::new([Wake::Event; 6]);
+        device.fail_once = Some((2, Fault::from_hresult(E_BUFFER_TOO_LARGE)));
+        let (exit, seen, errors, stats) = drive_stats(&mut device, &exclusive(0));
+        assert_eq!((exit, errors.len()), (Exit::Stopped, 0), "the stream did not end");
+        assert_eq!((seen.len(), device.writes), (5, 5), "the third wake rendered nothing, the rest rendered");
+        assert_eq!(stats, RenderStats { wakes: 6, skipped_wakes: 1, timeouts: 0 });
+        assert_eq!((device.gets, device.releases.get()), (5, 5), "nothing was acquired on the skipped wake");
+    }
+
+    #[test]
+    fn too_large_stays_fatal_in_shared_mode_and_other_faults_stay_fatal_in_exclusive() {
+        let mut shared = Fake::new([Wake::Event; 3]);
+        shared.fail_once = Some((0, Fault::from_hresult(E_BUFFER_TOO_LARGE)));
+        let (exit, _, errors, _) = drive_stats(&mut shared, &config(0, 0));
+        assert_eq!((exit, errors), (Exit::Faulted(Fault::Other(E_BUFFER_TOO_LARGE)), vec![StreamError::Other]));
+        let mut gone = Fake::new([Wake::Event; 3]);
+        gone.fail_once = Some((1, Fault::from_hresult(E_DEVICE_INVALIDATED)));
+        let (exit, seen, errors, stats) = drive_stats(&mut gone, &exclusive(0));
+        assert_eq!((exit, seen.len(), errors), (Exit::Faulted(Fault::DeviceGone), 1, vec![StreamError::DeviceNotAvailable]));
+        assert_eq!(stats.skipped_wakes, 0);
+    }
+
+    #[test]
+    fn a_timeout_is_counted() {
+        let mut device = Fake::new([Wake::Event, Wake::Timeout]);
+        let (_, _, _, stats) = drive_stats(&mut device, &exclusive(0));
+        assert_eq!(stats, RenderStats { wakes: 1, skipped_wakes: 0, timeouts: 1 });
+    }
+
+    #[test]
     fn the_exclusive_loop_body_allocates_nothing() {
         let mut device = Fake::new([Wake::Event; 200]);
+        // One early event on the way: the skip path is allocation-free too.
+        device.fail_once = Some((50, Fault::from_hresult(E_BUFFER_TOO_LARGE)));
         let config = exclusive(10_000);
         let mut render: RenderCallback = Box::new(|block| block.render(&mut |chunk| chunk.fill(0.1)));
         let mut error: ErrorCallback = Box::new(|_| {});
         let mut scratch = vec![0.0f32; 64];
-        let (exit, stats) = measure(|| run(&mut device, &config, &mut scratch, &mut render, &mut error));
+        let mut render_stats = RenderStats::default();
+        let (exit, stats) = measure(|| run(&mut device, &config, &mut scratch, &mut render, &mut error, &mut render_stats));
         assert_eq!(exit, Exit::Stopped);
         assert!(stats.is_zero(), "the loop allocated: {stats:?}");
-        assert_eq!(device.writes, 200);
+        assert_eq!((device.writes, render_stats.skipped_wakes), (199, 1));
     }
 
     #[test]
@@ -565,7 +638,8 @@ mod tests {
         let mut render: RenderCallback = Box::new(|block| block.render(&mut |chunk| chunk.fill(0.1)));
         let mut error: ErrorCallback = Box::new(|_| {});
         let mut scratch = vec![0.0f32; 64];
-        let (exit, stats) = measure(|| run(&mut device, &config, &mut scratch, &mut render, &mut error));
+        let mut render_stats = RenderStats::default();
+        let (exit, stats) = measure(|| run(&mut device, &config, &mut scratch, &mut render, &mut error, &mut render_stats));
         assert_eq!(exit, Exit::Stopped);
         assert!(stats.is_zero(), "the loop allocated: {stats:?}");
         assert_eq!(device.writes, 200);
@@ -576,7 +650,7 @@ mod tests {
         let faults = Arc::clone(&errors);
         let mut error: ErrorCallback = Box::new(move |e| faults.lock().unwrap().push(e));
         let mut scratch = vec![0.0f32; 64];
-        let exit = serve(device, &config(0, 0), &mut scratch, &mut render, &mut error);
+        let exit = serve(device, &config(0, 0), &mut scratch, &mut render, &mut error, &mut RenderStats::default());
         let errors = errors.lock().unwrap().clone();
         (exit, errors)
     }
@@ -605,7 +679,7 @@ mod tests {
         let render: RenderCallback = Box::new(|_| panic!("render"));
         let mut error: ErrorCallback = Box::new(|_| panic!("error"));
         let mut scratch = vec![0.0f32; 64];
-        let exit = serve(&mut device, &config(0, 0), &mut scratch, &mut { render }, &mut error);
+        let exit = serve(&mut device, &config(0, 0), &mut scratch, &mut { render }, &mut error, &mut RenderStats::default());
         assert_eq!((exit, device.halts), (Exit::Panicked, 1));
     }
 
