@@ -12,7 +12,7 @@ pub struct DecodeOptions {
     /// Output bit depth (8..=16). `None`: 10 for 4:2:2, 12 for 4:4:4 (the precision ProRes
     /// codes each format at).
     pub bit_depth: Option<u8>,
-    /// Decode slices in parallel (requires the `threads` feature).
+    /// Accepted for API compatibility; slices decode serially.
     pub threads: bool,
 }
 
@@ -218,15 +218,6 @@ pub fn decode_frame_into(data: &[u8], opts: &DecodeOptions, out: &mut Frame) -> 
         Ok(())
     };
 
-    #[cfg(feature = "threads")]
-    if opts.threads {
-        use rayon::prelude::*;
-        bands.par_iter_mut().enumerate().try_for_each_init(Scratch::new, |s, b| run_band(b, s))?;
-    } else {
-        let mut s = Scratch::new();
-        bands.iter_mut().enumerate().try_for_each(|b| run_band(b, &mut s))?;
-    }
-    #[cfg(not(feature = "threads"))]
     {
         let mut s = Scratch::new();
         bands.iter_mut().enumerate().try_for_each(|b| run_band(b, &mut s))?;

@@ -187,8 +187,6 @@ pub(crate) fn parse_box_header(buf: &[u8]) -> Result<BoxHeader> {
 pub(crate) struct RawBox<'a> {
     pub kind: FourCc,
     pub payload: &'a [u8],
-    #[allow(dead_code)]
-    pub uuid: Option<[u8; 16]>,
 }
 
 /// Iterator over the child boxes of a payload. Yields an error for a malformed box and then stops.
@@ -236,7 +234,7 @@ impl<'a> Iterator for Boxes<'a> {
         let size = size as usize;
         let payload = &rest[h.header_len as usize..size];
         self.pos += size;
-        Some(Ok(RawBox { kind: h.kind, payload, uuid: h.uuid }))
+        Some(Ok(RawBox { kind: h.kind, payload }))
     }
 }
 

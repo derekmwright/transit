@@ -1,9 +1,8 @@
 //! Clean-room Apple ProRes codec (implemented from SMPTE RDD 36).
 //!
 //! - **Decoder** ([`decode_frame`], [`decode_frame_with`]): ProRes 422 Proxy/LT/Standard/HQ and
-//!   4444/4444 XQ including the alpha channel; progressive and interlaced frames; slice-parallel
-//!   with the `threads` feature (rayon). Output is planar `u16` at 10 bits for 4:2:2 and 12 bits
-//!   for 4:4:4 by default (any depth 8..=16 on request).
+//!   4444/4444 XQ including the alpha channel; progressive and interlaced frames. Output is planar `u16` at 10 bits for 4:2:2 and
+//!   12 bits for 4:4:4 by default (any depth 8..=16 on request).
 //! - **Encoder** ([`Encoder`]): ProRes 422 (all four flavours) and 4444/4444 XQ (optionally with
 //!   alpha), progressive, with per-slice quantiser rate control targeting Apple's nominal rates.
 //!

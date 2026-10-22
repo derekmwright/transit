@@ -488,12 +488,6 @@ fn midi_events(queue: &mut Vec<Event>, voices: &mut [Option<MidiVoice>; EVENT_CA
 }
 
 impl ClapPlugin {
-    /// Note-offs absorbed because another host identity still held the MIDI channel/key.
-    #[must_use]
-    pub fn deferred_midi_offs(&self) -> u64 {
-        self.deferred_midi_offs
-    }
-
     fn prepare_midi_events(&mut self) {
         if self.notes == NoteMode::Midi {
             midi_events(&mut self.queue, &mut self.midi_voices, &mut self.held, &mut self.deferred_midi_offs);

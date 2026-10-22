@@ -21,7 +21,7 @@ pub struct EncoderConfig {
     pub frame_rate_code: u8,
     /// Encode the frame's alpha plane (4444 profiles only; 16-bit alpha coding).
     pub encode_alpha: bool,
-    /// Encode slices in parallel (requires the `threads` feature).
+    /// Accepted for API compatibility; slices encode serially.
     pub threads: bool,
     /// Four-character encoder identifier written into the frame header.
     pub encoder_id: [u8; 4],
@@ -292,11 +292,6 @@ impl SliceData {
 }
 
 fn par_map<T: Sync, R: Send>(threads: bool, items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
-    #[cfg(feature = "threads")]
-    if threads {
-        use rayon::prelude::*;
-        return items.par_iter().map(f).collect();
-    }
     let _ = threads;
     items.iter().map(f).collect()
 }

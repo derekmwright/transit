@@ -129,7 +129,6 @@ pub struct FrameRow {
 
 impl FrameRow {
     /// A mid-grey intra row with no motion, `mb_w` macroblocks wide.
-    #[cfg(not(feature = "threads"))]
     fn grey(mb_w: usize) -> FrameRow {
         FrameRow {
             y: vec![128u8; mb_w * 16 * 16].into(),
@@ -188,16 +187,9 @@ impl Frame {
     /// MB row `r`, waiting until it has been published.
     #[inline]
     pub fn row(&self, r: usize) -> &FrameRow {
-        #[cfg(feature = "threads")]
-        {
-            self.rows[r].wait()
-        }
-        #[cfg(not(feature = "threads"))]
-        {
-            // Rows are decoded before use on the calling thread; a missing one (never expected)
-            // reads as mid-grey intra rather than aborting. (SoundCraft change: was `expect`.)
-            self.rows[r].get_or_init(|| FrameRow::grey(self.mb_w))
-        }
+        // Rows are decoded before use on the calling thread; a missing one (never expected)
+        // reads as mid-grey intra rather than aborting. (SoundCraft change: was `expect`.)
+        self.rows[r].get_or_init(|| FrameRow::grey(self.mb_w))
     }
 
     /// Wait until the whole frame is available.

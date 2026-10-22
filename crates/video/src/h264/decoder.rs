@@ -1,10 +1,8 @@
 //! Top-level decoder: NAL dispatch, picture boundaries, POC, DPB and output.
 //!
 //! The calling thread parses headers and does all DPB / reference list bookkeeping (which only needs
-//! header information). Macroblock decoding of each picture runs as a job — on a thread pool with the
-//! `threads` feature — that publishes finished macroblock rows into the picture's shared [`Frame`];
-//! jobs of later pictures block per row on the reference data they need, so several pictures decode
-//! concurrently (frame-level parallelism).
+//! header information). Macroblock decoding of each picture runs as a job on the calling thread that
+//! publishes finished macroblock rows into the picture's shared [`Frame`].
 
 use crate::bitstream::{BitReader, annexb_nals, length_prefixed_nals, unescape_rbsp};
 use crate::h264::dpb::{Dpb, Output, OutputMeta};
@@ -91,8 +89,6 @@ pub struct Decoder {
     /// Pictures leaving the DPB, converted once their decoding job has finished.
     out_queue: VecDeque<Output>,
     shared: Arc<Shared>,
-    #[cfg(feature = "threads")]
-    pool: Option<rayon::ThreadPool>,
     in_flight: VecDeque<FrameRef>,
     max_in_flight: usize,
     threads: usize,
@@ -129,21 +125,13 @@ fn is_new_picture(prev: &SliceHeader, sh: &SliceHeader, sps: &Sps) -> bool {
     false
 }
 
-/// The worker threads [`Decoder::new`] uses: the available cores (at most 16) with the `threads`
-/// feature on native targets, 1 otherwise.
+/// The worker threads [`Decoder::new`] uses: always 1 (decoding runs on the calling thread).
 pub fn default_threads() -> usize {
-    #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
-    {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16)
-    }
-    #[cfg(not(all(feature = "threads", not(target_arch = "wasm32"))))]
-    {
-        1
-    }
+    1
 }
 
 impl Decoder {
-    /// A decoder using all available cores (with the `threads` feature).
+    /// A decoder that decodes on the calling thread.
     pub fn new() -> Self {
         Self::with_threads(default_threads())
     }
@@ -151,15 +139,6 @@ impl Decoder {
     /// A decoder using up to `threads` worker threads (1 = decode on the calling thread).
     pub fn with_threads(threads: usize) -> Self {
         crate::h264::cavlc::init_tables();
-        #[cfg(feature = "threads")]
-        let pool = if threads > 1 && cfg!(not(target_arch = "wasm32")) {
-            rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("h264-{i}")).build().ok()
-        } else {
-            None
-        };
-        #[cfg(feature = "threads")]
-        let workers = if pool.is_some() { threads } else { 1 };
-        #[cfg(not(feature = "threads"))]
         let workers = 1;
         Decoder {
             spss: vec![None; 32],
@@ -174,8 +153,6 @@ impl Decoder {
             ls_cache: Vec::new(),
             out_queue: VecDeque::new(),
             shared: Arc::new(Shared::default()),
-            #[cfg(feature = "threads")]
-            pool,
             in_flight: VecDeque::new(),
             max_in_flight: threads.max(1) + 2,
             threads: workers,
@@ -503,18 +480,6 @@ impl Decoder {
 
     fn dispatch(&mut self, frame: FrameRef, slices: Vec<SliceJob>, draft: bool) {
         let shared = self.shared.clone();
-        #[cfg(feature = "threads")]
-        if let Some(pool) = &self.pool {
-            self.in_flight.retain(|f| !f.is_published(f.mb_h() - 1));
-            while self.in_flight.len() >= self.max_in_flight {
-                if let Some(f) = self.in_flight.pop_front() {
-                    f.wait_complete();
-                }
-            }
-            self.in_flight.push_back(frame.clone());
-            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft));
-            return;
-        }
         run_job(frame, slices, &shared, draft);
     }
 

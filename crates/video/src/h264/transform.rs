@@ -126,17 +126,6 @@ pub fn idct4_add(d: &[i32; 16], dst: &mut [u8], stride: usize) {
     }
 }
 
-/// DC-only shortcut: all AC coefficients zero.
-#[allow(dead_code)]
-pub fn idct4_dc_add(dc: i32, dst: &mut [u8], stride: usize) {
-    let v = (dc + 32) >> 6;
-    for i in 0..4 {
-        for p in &mut dst[i * stride..i * stride + 4] {
-            *p = clip_u8(*p as i32 + v);
-        }
-    }
-}
-
 #[inline(always)]
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
     let a0 = d[0] + d[4];
@@ -230,18 +219,6 @@ mod tests {
             reference_add(&d8, 8, &mut b[5..], 24);
             assert_eq!(a, b, "8x8 iteration {iter}");
         }
-    }
-
-    #[test]
-    fn idct4_dc_only_matches_shortcut() {
-        let mut d = [0i32; 16];
-        d[0] = 640; // -> +10 everywhere
-        let mut a = [100u8; 16];
-        let mut b = [100u8; 16];
-        idct4_add(&d, &mut a, 4);
-        idct4_dc_add(640, &mut b, 4);
-        assert_eq!(a, b);
-        assert!(a.iter().all(|&v| v == 110));
     }
 
     #[test]
