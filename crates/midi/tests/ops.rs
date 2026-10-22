@@ -197,7 +197,6 @@ fn sequence_helpers() {
     assert_eq!(starts(&seq.notes), vec![0, 0, 100, 100, 100]);
     assert_eq!(seq.notes[2].pitch, 60);
     assert_eq!(seq.notes_in(0, 100).count(), 2);
-    assert_eq!(seq.notes_overlapping(105, 106).count(), 3);
 
     let removed = seq.remove_duplicates();
     assert_eq!(removed, 2);

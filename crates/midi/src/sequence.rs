@@ -91,11 +91,6 @@ impl Sequence {
         self.notes.iter().filter(move |n| n.start >= start && n.start < end)
     }
 
-    /// Notes that sound anywhere inside the half-open range `[start, end)`.
-    pub fn notes_overlapping(&self, start: i64, end: i64) -> impl Iterator<Item = &Note> + '_ {
-        self.notes.iter().filter(move |n| n.start < end && n.end() > start)
-    }
-
     /// Removes duplicate notes (same channel, pitch and start; the longest one is kept) and
     /// duplicate controller events (same tick, channel and kind; the last one is kept, matching
     /// what a synth would end up with). Returns how many events were removed. The sequence is

@@ -25,13 +25,6 @@ pub struct MidiInput {
     pub channel: Option<u8>,
 }
 
-impl MidiInput {
-    /// Invalid saved channels disable input rather than silently selecting another channel.
-    pub fn accepts_channel(&self, channel: u8) -> bool {
-        channel < 16 && self.channel.is_none_or(|selected| selected < 16 && selected == channel)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,23 +47,12 @@ mod tests {
             channel: Some(15),
         };
         assert_eq!(serde_json::from_str::<MidiInput>(&serde_json::to_string(&input).unwrap()).unwrap(), input);
-        for selected in 0..16 {
-            let input = MidiInput { channel: Some(selected), ..MidiInput::default() };
-            for incoming in 0..16 {
-                assert_eq!(input.accepts_channel(incoming), selected == incoming);
-            }
-        }
     }
 
     #[test]
-    fn malformed_channels_never_wrap_or_match() {
-        for channel in 16..=255 {
-            let input: MidiInput = serde_json::from_value(serde_json::json!({"channel": channel})).unwrap();
-            assert!((0..=255).all(|incoming| !input.accepts_channel(incoming)));
-        }
+    fn malformed_channels_are_rejected() {
         for channel in [serde_json::json!(-1), serde_json::json!(256), serde_json::json!(1.5), serde_json::json!("1")] {
             assert!(serde_json::from_value::<MidiInput>(serde_json::json!({"channel": channel})).is_err());
         }
-        assert!(!MidiInput::default().accepts_channel(16));
     }
 }

@@ -41,7 +41,6 @@ pub enum TimeError {
 pub struct SampleRate(u32);
 
 impl SampleRate {
-    pub const HZ_44100: SampleRate = SampleRate(44_100);
     pub const HZ_48000: SampleRate = SampleRate(48_000);
     pub const COMMON: [u32; 8] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000];
 
@@ -132,7 +131,7 @@ mod tests {
 
     #[test]
     fn seconds_round_trip() {
-        let sr = SampleRate::HZ_44100;
+        let sr = SampleRate::new(44_100).unwrap();
         assert_eq!(sr.samples(1.0), 44_100);
         assert!((sr.seconds(22_050) - 0.5).abs() < 1e-12);
     }

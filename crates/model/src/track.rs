@@ -1,7 +1,7 @@
 //! Tracks and playlists.
 
 use crate::{AutoParam, AutomationLane, ChannelFormat, Clip, ClipId, Insert, Mixer, SourceId, TrackId};
-use soundcraft_time::{Range, Samples};
+use soundcraft_time::Samples;
 
 /// Track types (Track › New).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
@@ -192,9 +192,6 @@ impl Playlist {
     }
     pub fn clip_mut(&mut self, id: ClipId) -> Option<&mut Clip> {
         self.clips.iter_mut().find(|c| c.id == id)
-    }
-    pub fn clips_in(&self, r: Range) -> impl Iterator<Item = &Clip> {
-        self.clips.iter().filter(move |c| c.range().overlaps(&r))
     }
     pub fn clip_at(&self, at: Samples) -> Option<&Clip> {
         self.clips.iter().rev().find(|c| c.range().contains(at))

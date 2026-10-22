@@ -186,9 +186,6 @@ impl ChannelFormat {
     pub fn is_ambisonic(self) -> bool {
         matches!(self, ChannelFormat::Ambisonics(_))
     }
-    pub fn has_lfe(self) -> bool {
-        self.speakers().contains(&Speaker::Lfe)
-    }
     pub fn has_height(self) -> bool {
         self.speakers().iter().any(|s| s.is_height())
     }

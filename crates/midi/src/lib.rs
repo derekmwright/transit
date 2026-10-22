@@ -6,7 +6,7 @@
 //!   export (format 1, 960 PPQ). The reader treats its input as hostile: every length is checked,
 //!   variable-length quantities are bounded and event counts are capped.
 //! - [`ops`]: MIDI editing operations (quantize, transpose, velocity, duration, split).
-//! - [`note_name`], [`gm_drum_name`], [`gm_program_name`]: display names.
+//! - [`note_name`]: display names.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod names;
@@ -15,7 +15,7 @@ mod rng;
 mod sequence;
 mod smf;
 
-pub use names::{gm_drum_name, gm_program_name, note_name};
+pub use names::note_name;
 pub use rng::XorShift;
 pub use sequence::{CtrlEvent, CtrlKind, Note, Sequence};
 pub use smf::{MAX_EVENTS, MAX_TRACKS, Smf, SmfTrack, read_smf, write_smf};

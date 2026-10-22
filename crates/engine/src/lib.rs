@@ -47,11 +47,7 @@ pub enum EngineError {
     #[error("bad parameters for `{0}`: {1}")]
     BadParams(String, String),
     #[error("{0}")]
-    NotFound(String),
-    #[error("{0}")]
     Io(String),
-    #[error("unsupported: {0}")]
-    Unsupported(String),
     #[error("internal error in `{0}`: {1}")]
     Internal(String, String),
     #[error("Track is frozen; unfreeze to edit")]

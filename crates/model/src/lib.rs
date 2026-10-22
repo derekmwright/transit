@@ -34,7 +34,7 @@ pub use route_graph::{
 };
 pub use session::{
     BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,
-    TrackView, ZoomState, ZoomToggle, truncate_chars,
+    ZoomState, ZoomToggle, truncate_chars,
 };
 pub use source::{Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Frozen, Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};

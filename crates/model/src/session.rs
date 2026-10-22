@@ -123,16 +123,6 @@ impl Tool {
     }
 }
 
-/// Track view lanes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum TrackView {
-    Waveform,
-    Blocks,
-    Volume,
-    Pan,
-    Mute,
-}
-
 /// Horizontal zoom + scroll.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ZoomState {
