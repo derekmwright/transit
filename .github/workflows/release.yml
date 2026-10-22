@@ -128,7 +128,7 @@ jobs:
           - The program and the installer are unsigned. If SmartScreen blocks them, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
           - audio-bench.exe and BENCH-README.txt measure your interface; see that file.
-          - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
+          - Forked from SoundCraft by storytold (October 2026): https://github.com/storytold/soundcraft
 
           ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
