@@ -27,6 +27,15 @@ transit keeps `ui.json`, `Autosave/` and `logs/` in its own settings folder:
 Set `TRANSIT_CONFIG_DIR` to use a different folder, for example to keep a test build away from your
 real settings. The plug-in scan cache is shared with SoundCraft (`SOUNDCRAFT_CONFIG_DIR` overrides).
 
+## Packaging
+
+`packaging/` holds the per-platform scripts, all building `-p transit` and reading the version from
+`apps/transit/Cargo.toml`: `linux/package.sh` (AppImage, deb, rpm, tar.gz; `flatpak-bundle.sh` and
+the `dev.derekmwright.transit*.yml` manifests for Flatpak), `macos/package.sh` (`transit.app` in a DMG
+named `transit`; the icon is `assets/app-icon/transit.icns`), `windows/package.ps1` (MSI and portable zip),
+and `freebsd/package.sh`. Outputs land in `dist/release/` as `transit-<version>-<platform>-<arch>.*`.
+The tagged GitHub release (`.github/workflows/release.yml`) is separate and ships plain archives.
+
 ## Building with ASIO (Windows)
 
 The published releases use WASAPI only. If you have an ASIO audio interface and want ASIO in your

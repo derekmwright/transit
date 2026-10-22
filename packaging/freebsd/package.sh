@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build and package SoundCraft for FreeBSD:
+# Build and package transit for FreeBSD:
 #
-#   $DIST/soundcraft-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
-#       soundcraft-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
-#       share/metainfo, share/doc/soundcraft}
+#   $DIST/transit-<version>-freebsd-x86_64.tar.gz   a /usr/local-style tree:
+#       transit-<version>-freebsd-x86_64/{bin, share/applications, share/icons, share/mime,
+#       share/metainfo, share/doc/transit}
 #
 # Install by copying the tree's contents into /usr/local, e.g.
-#   tar -xzf soundcraft-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
+#   tar -xzf transit-*-freebsd-x86_64.tar.gz --strip-components 1 -C /usr/local
 #
 # Usage: packaging/freebsd/package.sh [--skip-build]
 #
@@ -34,12 +34,12 @@ case "$(uname -m)" in
   arm64 | aarch64) ARCH=aarch64 ;;
   *) echo "unsupported architecture $(uname -m)" >&2; exit 2 ;;
 esac
-BASENAME="soundcraft-$VERSION-freebsd-$ARCH"
+BASENAME="transit-$VERSION-freebsd-$ARCH"
 
-echo "==> SoundCraft $VERSION for FreeBSD $ARCH"
+echo "==> transit $VERSION for FreeBSD $ARCH"
 
 if [ "$SKIP_BUILD" = 0 ]; then
-  (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli)
+  (cd "$ROOT" && cargo build --release --locked -p transit)
 fi
 BIN="$CARGO_TARGET_DIR/release"
 WORK="$CARGO_TARGET_DIR/freebsd-package"
@@ -48,21 +48,21 @@ rm -rf "$WORK"
 
 # ---- stage a /usr/local-style tree ---------------------------------------------------------------
 mkdir -p "$STAGE/bin" "$STAGE/share/applications" "$STAGE/share/mime/packages" "$STAGE/share/metainfo" \
-  "$STAGE/share/icons" "$STAGE/share/doc/soundcraft"
-install -m 755 "$BIN/soundcraft" "$BIN/soundcraft-cli" "$STAGE/bin/"
-strip "$STAGE/bin/soundcraft" "$STAGE/bin/soundcraft-cli" 2>/dev/null || true
+  "$STAGE/share/icons" "$STAGE/share/doc/transit"
+install -m 755 "$BIN/transit" "$STAGE/bin/"
+strip "$STAGE/bin/transit" 2>/dev/null || true
 # The desktop entry, MIME type and metainfo are the freedesktop files the Linux packages use.
 install -m 644 "$LINUX/transit.desktop" "$STAGE/share/applications/$APP_ID.desktop"
 install -m 644 "$LINUX/transit.mime.xml" "$STAGE/share/mime/packages/$APP_ID.xml"
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$TRANSIT_BUILD_DATE/g" \
   "$LINUX/transit.metainfo.xml.in" >"$STAGE/share/metainfo/$APP_ID.metainfo.xml"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/share/icons/"
-copy_docs "$STAGE/share/doc/soundcraft"
+copy_docs "$STAGE/share/doc/transit"
 
 # ---- .tar.gz -------------------------------------------------------------------------------------
 tar -C "$WORK" -czf "$DIST/$BASENAME.tar.gz" "$BASENAME"
 echo "wrote $DIST/$BASENAME.tar.gz"
 
-"$STAGE/bin/soundcraft-cli" --version
+"$STAGE/bin/transit" --version
 echo "==> done"
 ls -lh "$DIST"

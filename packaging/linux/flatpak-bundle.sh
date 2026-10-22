@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Repackage a SoundCraft Linux tarball as a single-file Flatpak bundle:
+# Repackage a transit Linux tarball as a single-file Flatpak bundle:
 #
-#   $DIST/soundcraft-<version>-linux-<arch>.flatpak
+#   $DIST/transit-<version>-linux-<arch>.flatpak
 #
 # Usage: packaging/linux/flatpak-bundle.sh [--no-test] [TARBALL]
 #
-# TARBALL defaults to $DIST/soundcraft-<version>-linux-<arch>.tar.gz from package.sh. The bundle
+# TARBALL defaults to $DIST/transit-<version>-linux-<arch>.tar.gz from package.sh. The bundle
 # is built for the host architecture (x86_64 or aarch64), which must match the tarball's.
 # Needs flatpak, flatpak-builder and the SVG pixbuf loader (librsvg2-common) for the host's
 # `appstreamcli compose`; the freedesktop runtime and SDK named in the manifest are
 # installed per-user from Flathub. Unless --no-test, the bundle is then installed per-user and
-# `soundcraft-cli --version` is run inside the sandbox as a smoke test.
+# `transit --version` is run inside the sandbox as a smoke test.
 # Manifest: packaging/linux/flatpak/dev.derekmwright.transit.bundle.yml.
 set -euo pipefail
 # shellcheck source=../env.sh
@@ -36,20 +36,20 @@ case "$ARCH" in
   aarch64 | arm64) ARCH=aarch64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-BASENAME="soundcraft-$VERSION-linux-$ARCH"
+BASENAME="transit-$VERSION-linux-$ARCH"
 TARBALL="${TARBALL:-$DIST/$BASENAME.tar.gz}"
 [ -f "$TARBALL" ] || { echo "error: $TARBALL not found (run packaging/linux/package.sh --formats tar first)" >&2; exit 1; }
 for tool in flatpak flatpak-builder; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found (apt install flatpak flatpak-builder librsvg2-common)" >&2; exit 1; }
 done
 
-echo "==> SoundCraft $VERSION Flatpak bundle for $ARCH from $(basename "$TARBALL")"
+echo "==> transit $VERSION Flatpak bundle for $ARCH from $(basename "$TARBALL")"
 
 WORK="$CARGO_TARGET_DIR/flatpak-bundle"
 rm -rf "$WORK"
 mkdir -p "$WORK/stage"
 tar -xzf "$TARBALL" -C "$WORK/stage" --strip-components=1
-[ -x "$WORK/stage/bin/soundcraft" ] || { echo "error: $TARBALL has no bin/soundcraft" >&2; exit 1; }
+[ -x "$WORK/stage/bin/transit" ] || { echo "error: $TARBALL has no bin/transit" >&2; exit 1; }
 cp "$HERE/flatpak/$APP_ID.bundle.yml" "$WORK/$APP_ID.yml"
 
 flatpak remote-add --user --if-not-exists flathub "$FLATHUB"
@@ -65,7 +65,7 @@ echo "wrote $OUT"
 if [ "$TEST" = 1 ]; then
   flatpak install --user -y --noninteractive --reinstall "$OUT"
   flatpak info --user "$APP_ID"
-  flatpak run --command=soundcraft-cli "$APP_ID" --version
+  flatpak run --command=transit "$APP_ID" --version
   flatpak run --command=sh "$APP_ID" -c 'ls /app/share/applications /app/share/metainfo /app/share/mime/packages /app/share/icons/hicolor/scalable/apps'
 fi
 echo "==> done"

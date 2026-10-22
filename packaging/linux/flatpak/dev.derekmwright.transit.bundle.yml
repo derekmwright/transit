@@ -1,7 +1,7 @@
 # Flatpak manifest for the single-file bundle attached to every GitHub release
-# (soundcraft-<version>-linux-<arch>.flatpak). Build it with packaging/linux/flatpak-bundle.sh.
+# (transit-<version>-linux-<arch>.flatpak). Build it with packaging/linux/flatpak-bundle.sh.
 #
-# It repackages the release's own Linux tarball (soundcraft-<version>-linux-<arch>.tar.gz,
+# It repackages the release's own Linux tarball (transit-<version>-linux-<arch>.tar.gz,
 # built on Ubuntu 22.04 by package.sh) instead of compiling Rust inside flatpak-builder: no
 # network and no vendored crate sources during the build, a few seconds instead of 20+ minutes,
 # and byte-for-byte the same binaries as the AppImage/deb/rpm. The script unpacks the tarball
@@ -16,7 +16,7 @@ id: dev.derekmwright.transit
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
-command: soundcraft
+command: transit
 finish-args:
   # Display: Wayland first; X11 only when no Wayland compositor is running.
   - --socket=wayland
@@ -29,7 +29,7 @@ finish-args:
   # PulseAudio plugin to this socket, which PipeWire's pulse server provides on modern desktops
   # (and PulseAudio itself on older ones). Deliberately not granted: --device=all (raw /dev/snd
   # for direct ALSA hardware access, which would bypass the sound server) and JACK, which
-  # SoundCraft doesn't use (cpal's jack feature is off; there is no live MIDI I/O either).
+  # transit doesn't use (cpal's jack feature is off; there is no live MIDI I/O either).
   - --socket=pulseaudio
   # Open/Save dialogs use the file-chooser portal (rfd) and drag-and-drop the document portal,
   # so broad filesystem access isn't needed. Music is granted for sessions and their
@@ -55,17 +55,16 @@ add-extensions:
     subdirectories: true
     no-autodownload: true
 modules:
-  - name: soundcraft
+  - name: transit
     buildsystem: simple
     build-commands:
-      - install -Dm755 bin/soundcraft /app/bin/soundcraft
-      - install -Dm755 bin/soundcraft-cli /app/bin/soundcraft-cli
+      - install -Dm755 bin/transit /app/bin/transit
       - install -Dm644 share/applications/dev.derekmwright.transit.desktop /app/share/applications/dev.derekmwright.transit.desktop
       # Session files; the runtime's shared-mime-info already knows WAV, AIFF, FLAC, MP3 and MIDI.
       - install -Dm644 share/mime/packages/dev.derekmwright.transit.xml /app/share/mime/packages/dev.derekmwright.transit.xml
       # Already has the release's version and date substituted by package.sh.
       - install -Dm644 share/metainfo/dev.derekmwright.transit.metainfo.xml /app/share/metainfo/dev.derekmwright.transit.metainfo.xml
-      - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/soundcraft /app/share/doc/
+      - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/transit /app/share/doc/
       # Flatpak exports only icons named after the app ID, so rename the hicolor icons and point the desktop entry at them.
       - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/dev.derekmwright.transit.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=dev.derekmwright.transit/' /app/share/applications/dev.derekmwright.transit.desktop; sed -i 's#<icon type="stock">transit<#<icon type="stock">dev.derekmwright.transit<#' /app/share/metainfo/dev.derekmwright.transit.metainfo.xml 2>/dev/null || true
       # Mount point for the plugin extensions (add-extensions).

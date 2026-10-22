@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=SoundCraft
+Name=transit
 GenericName=Digital Audio Workstation
-Comment=Record, edit and mix audio and MIDI
-Exec=soundcraft %F
-TryExec=soundcraft
+Comment=transit DAW
+Exec=transit %F
+TryExec=transit
 Icon=transit
 Terminal=false
 StartupNotify=true

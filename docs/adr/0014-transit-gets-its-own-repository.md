@@ -77,6 +77,7 @@ Sweep checklist for the inherited crates, so the rest is one mechanical job late
 - Workflow files under `.github/workflows`.
 - `docs/adr` and `docs/contributing` mentions; `ATTRIBUTION.md`.
 - `packaging/` ids `ai.storyteller.soundcraft.*`, desktop and metainfo file names, and the Flatpak manifests. Done: app id `dev.derekmwright.transit`, files `transit.*`.
+- [x] Packaging builds the transit app (`-p transit`, binary `transit`, `transit.app`, volume "transit"); the inherited `apps/soundcraft` is not shipped.
 - The `SOUNDCRAFT_CONFIG_DIR` and scan-cache compatibility shim: keep reading the old cache dir.
 - The "Based on SoundCraft by storytold" credit stays (nominative use).
 - The private notes.

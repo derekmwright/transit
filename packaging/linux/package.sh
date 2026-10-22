@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Build and package SoundCraft for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
+# Build and package transit for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
 #
-#   $DIST/soundcraft-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
-#   $DIST/soundcraft-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
-#   $DIST/soundcraft-<version>-linux-<arch>.deb       Debian, Ubuntu, Mint, Pop!_OS, ...
-#   $DIST/soundcraft-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
-#   $DIST/soundcraft-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
+#   $DIST/transit-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
+#   $DIST/transit-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
+#   $DIST/transit-<version>-linux-<arch>.deb       Debian, Ubuntu, Mint, Pop!_OS, ...
+#   $DIST/transit-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
+#   $DIST/transit-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
+#
+# <version> is the [package] version in apps/transit/Cargo.toml.
 #
 # Usage: packaging/linux/package.sh [--skip-build] [--formats "appimage deb rpm tar"]
 #
@@ -16,7 +18,7 @@
 #
 # Cross-compiling (CI's linux-riscv64 job, tar.gz only): set CROSS_ARCH (riscv64), CROSS_TARGET
 # (the Rust target), CROSS_COMPILE (the binutils prefix, for strip) and optionally EMULATOR
-# (e.g. qemu-riscv64) to smoke-test the CLI.
+# (e.g. qemu-riscv64) to smoke-test the binary (`transit --version`).
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -29,7 +31,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --skip-build) SKIP_BUILD=1; shift ;;
     --formats) FORMATS="$2"; shift 2 ;;
-    -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -41,16 +43,16 @@ case "$ARCH" in
   riscv64) DEB_ARCH=riscv64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
-export SOUNDCRAFT_MAINTAINER="${SOUNDCRAFT_MAINTAINER:-SoundCraft maintainers <soundcraft@storyteller.ai>}"
-BASENAME="soundcraft-$VERSION-linux-$ARCH"
+export TRANSIT_MAINTAINER="${TRANSIT_MAINTAINER:-transit maintainers <derekmwright@users.noreply.github.com>}"
+BASENAME="transit-$VERSION-linux-$ARCH"
 
-echo "==> SoundCraft $VERSION for Linux $ARCH ($FORMATS)"
+echo "==> transit $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   if [ -n "${CROSS_TARGET:-}" ]; then
-    (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli --target "$CROSS_TARGET")
+    (cd "$ROOT" && cargo build --release --locked -p transit --target "$CROSS_TARGET")
   else
-    (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli)
+    (cd "$ROOT" && cargo build --release --locked -p transit)
   fi
 fi
 BIN="$CARGO_TARGET_DIR/${CROSS_TARGET:+$CROSS_TARGET/}release"
@@ -59,18 +61,17 @@ STAGE="$WORK/root"
 rm -rf "$WORK"
 
 # ---- stage an FHS tree (shared by every format) -------------------------------------------------
-install -Dm755 "$BIN/soundcraft" "$STAGE/usr/bin/soundcraft"
-install -Dm755 "$BIN/soundcraft-cli" "$STAGE/usr/bin/soundcraft-cli"
-"${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/soundcraft" "$STAGE/usr/bin/soundcraft-cli" 2>/dev/null || true
+install -Dm755 "$BIN/transit" "$STAGE/usr/bin/transit"
+"${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/transit" 2>/dev/null || true
 install -Dm644 "$HERE/transit.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "$HERE/transit.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$SOUNDCRAFT_BUILD_DATE/g" \
+sed -e "s/@VERSION@/$VERSION/g" -e "s/@DATE@/$TRANSIT_BUILD_DATE/g" \
   "$HERE/transit.metainfo.xml.in" >"$STAGE/usr/share/metainfo/$APP_ID.metainfo.xml"
 mkdir -p "$STAGE/usr/share/icons"
 cp -R "$ROOT/assets/app-icon/hicolor" "$STAGE/usr/share/icons/"
-mkdir -p "$STAGE/usr/share/doc/soundcraft"
-copy_docs "$STAGE/usr/share/doc/soundcraft"
+mkdir -p "$STAGE/usr/share/doc/transit"
+copy_docs "$STAGE/usr/share/doc/transit"
 
 if command -v desktop-file-validate >/dev/null; then
   desktop-file-validate "$STAGE/usr/share/applications/$APP_ID.desktop"
@@ -103,10 +104,10 @@ fi
 
 # ---- AppImage -----------------------------------------------------------------------------------
 if has appimage; then
-  APPDIR="$WORK/SoundCraft.AppDir"
+  APPDIR="$WORK/transit.AppDir"
   cp -R "$STAGE" "$APPDIR"
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
-  ln -s usr/bin/soundcraft "$APPDIR/AppRun"
+  ln -s usr/bin/transit "$APPDIR/AppRun"
   cp "$HERE/transit.desktop" "$APPDIR/$APP_ID.desktop"
   cp "$ROOT/assets/app-icon/hicolor/256x256/apps/transit.png" "$APPDIR/transit.png"
   ln -s transit.png "$APPDIR/.DirIcon"
@@ -130,8 +131,8 @@ if has appimage; then
   # fetch only the blocks that changed in a newer release, through the .zsync published next to
   # each AppImage on GitHub Releases. `latest` is the newest published release that is not a
   # pre-release. A fork's builds point at its own releases through GITHUB_REPOSITORY.
-  REPO="${GITHUB_REPOSITORY:-storytold/soundcraft}"
-  UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|soundcraft-*-linux-$ARCH.AppImage.zsync"
+  REPO="${GITHUB_REPOSITORY:-derekmwright/transit}"
+  UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|transit-*-linux-$ARCH.AppImage.zsync"
   # Extract-and-run: works without FUSE (containers, CI). The output embeds the static runtime,
   # so users don't need libfuse2 either. With zsyncmake on the host (CI installs the zsync
   # package) appimagetool also writes the .zsync, into its working directory, hence the cd.
@@ -145,9 +146,9 @@ if has appimage; then
 fi
 
 if [ -z "${CROSS_TARGET:-}" ]; then
-  "$STAGE/usr/bin/soundcraft-cli" --version
+  "$STAGE/usr/bin/transit" --version
 elif [ -n "${EMULATOR:-}" ]; then
-  "$EMULATOR" "$STAGE/usr/bin/soundcraft-cli" --version
+  "$EMULATOR" "$STAGE/usr/bin/transit" --version
 fi
 echo "==> done"
 ls -lh "$DIST"

@@ -3,27 +3,27 @@
 #
 # Exports:
 #   ROOT                    workspace root
-#   VERSION                 [workspace.package] version from Cargo.toml (override: SOUNDCRAFT_VERSION)
+#   VERSION                 [package] version from apps/transit/Cargo.toml (override: TRANSIT_VERSION)
 #   DIST                    output directory for release artifacts (default: $ROOT/dist/release)
-#   SOUNDCRAFT_BUILD_SHA    git commit (recorded in the macOS Info.plist and the job summary)
-#   SOUNDCRAFT_BUILD_DATE   UTC build date, YYYY-MM-DD (AppStream release date)
+#   TRANSIT_BUILD_SHA       git commit (recorded in the macOS Info.plist and the job summary)
+#   TRANSIT_BUILD_DATE      UTC build date, YYYY-MM-DD (AppStream release date)
 #   CARGO_TARGET_DIR        cargo's target dir (default: $ROOT/target)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROOT
 
-# The version lives in exactly one place: `[workspace.package] version` in the root Cargo.toml.
-# (`cargo xtask version` prints the same thing; awk avoids compiling xtask here.)
-workspace_version() {
+# The version lives in exactly one place for the app we ship: `[package] version` in
+# apps/transit/Cargo.toml. (awk avoids compiling anything here.)
+app_version() {
   awk '
-    /^\[/ { in_pkg = ($0 == "[workspace.package]") ; next }
+    /^\[/ { in_pkg = ($0 == "[package]") ; next }
     in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }
-  ' "$ROOT/Cargo.toml"
+  ' "$ROOT/apps/transit/Cargo.toml"
 }
 
-VERSION="${SOUNDCRAFT_VERSION:-$(workspace_version)}"
+VERSION="${TRANSIT_VERSION:-$(app_version)}"
 if [ -z "$VERSION" ]; then
-  echo "error: could not read [workspace.package] version from $ROOT/Cargo.toml" >&2
+  echo "error: could not read [package] version from $ROOT/apps/transit/Cargo.toml" >&2
   exit 1
 fi
 export VERSION
@@ -32,11 +32,11 @@ DIST="${DIST:-$ROOT/dist/release}"
 mkdir -p "$DIST"
 export DIST
 
-if [ -z "${SOUNDCRAFT_BUILD_SHA:-}" ]; then
-  SOUNDCRAFT_BUILD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+if [ -z "${TRANSIT_BUILD_SHA:-}" ]; then
+  TRANSIT_BUILD_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 fi
-export SOUNDCRAFT_BUILD_SHA
-export SOUNDCRAFT_BUILD_DATE="${SOUNDCRAFT_BUILD_DATE:-$(date -u +%Y-%m-%d)}"
+export TRANSIT_BUILD_SHA
+export TRANSIT_BUILD_DATE="${TRANSIT_BUILD_DATE:-$(date -u +%Y-%m-%d)}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 
 # Emit a GitHub Actions warning (plain stderr outside Actions).

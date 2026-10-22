@@ -314,7 +314,7 @@ fn main() -> eframe::Result {
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("transit"),
+            .with_app_id("dev.derekmwright.transit"),
         ..Default::default()
     };
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).

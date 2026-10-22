@@ -267,7 +267,7 @@ fn main() -> eframe::Result {
             .with_maximized(prefs.window_maximized)
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("dev.derekmwright.transit"),
+            .with_app_id("ai.storyteller.soundcraft"),
         ..Default::default()
     };
     if let Some(icon) = app_icon() {

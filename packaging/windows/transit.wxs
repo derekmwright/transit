@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  transit MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
+
+    wix build transit.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
+
+  Per-machine install into Program Files, a Start Menu shortcut, `.scraft` sessions owned by
+  transit, and transit offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
+  (without taking over the user's default player for them).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="transit"
+      Manufacturer="Derek Wright"
+      Version="$(var.Version)"
+      UpgradeCode="B34597F8-4EF3-45FA-9B07-0F966B4BF1F2"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="transit DAW" Manufacturer="Derek Wright" />
+    <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
+         (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of transit is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="TransitIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="TransitIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/derekmwright/transit" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/derekmwright/transit" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/derekmwright/transit/issues" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="transit" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="transit" Level="1">
+      <ComponentGroupRef Id="TransitFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="TransitFiles" Directory="INSTALLFOLDER">
+      <Component Id="TransitApp" Guid="2B53B245-0B13-483B-B0DB-33BA1D1C09BE">
+        <File Id="TransitExe" Source="$(var.BinDir)\transit.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="transit"
+              Description="transit DAW" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
+              Icon="TransitIcon.ico" IconIndex="0" />
+        </File>
+
+        <!-- .scraft: transit's session format (extension and MIME type unchanged); transit is its default app. -->
+        <ProgId Id="transit.Session" Description="transit Session" Icon="TransitExe" IconIndex="0">
+          <Extension Id="scraft" ContentType="application/x-soundcraft-session">
+            <Verb Id="open" Command="Open" TargetFile="TransitExe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
+        <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
+             as the default. -->
+        <ProgId Id="transit.Audio" Description="Audio File" Icon="TransitExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\transit.Audio\shell\open\command" Value="&quot;[#TransitExe]&quot; &quot;%1&quot;" Type="string" />
+        <ProgId Id="transit.Midi" Description="MIDI File" Icon="TransitExe" IconIndex="0" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\transit.Midi\shell\open\command" Value="&quot;[#TransitExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.wav\OpenWithProgids" Name="transit.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aif\OpenWithProgids" Name="transit.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.aiff\OpenWithProgids" Name="transit.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.flac\OpenWithProgids" Name="transit.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mp3\OpenWithProgids" Name="transit.Audio" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.mid\OpenWithProgids" Name="transit.Midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.midi\OpenWithProgids" Name="transit.Midi" Value="" Type="string" />
+
+        <!-- "Open with" app list and the Run dialog (Win+R "transit"). -->
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe" Name="FriendlyAppName" Value="transit" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\shell\open\command" Value="&quot;[#TransitExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".scraft" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".aiff" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".flac" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".mp3" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".mid" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".midi" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\transit.exe" Value="[#TransitExe]" Type="string" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

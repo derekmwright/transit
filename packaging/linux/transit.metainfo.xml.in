@@ -5,31 +5,30 @@
   <id>dev.derekmwright.transit</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
-  <name>SoundCraft</name>
-  <summary>Record, edit and mix audio and MIDI</summary>
-  <developer id="ai.storyteller">
-    <name>Learning Machines LLC</name>
+  <name>transit</name>
+  <summary>transit DAW</summary>
+  <developer id="dev.derekmwright">
+    <name>Derek Wright</name>
   </developer>
   <description>
     <p>
-      SoundCraft is an open-source, native digital audio workstation. Record, edit and mix
-      multitrack audio and MIDI in Edit and Mix windows that work the way studio engineers expect.
+      transit is a native digital audio workstation. Record, edit and mix multitrack audio and
+      MIDI in Edit and Mix windows that work the way studio engineers expect.
     </p>
     <ul>
       <li>Non-destructive clip editing with fades, playlists, grids and markers</li>
       <li>A mixer with inserts, sends, buses, automation and metering</li>
       <li>Built-in EQ, dynamics, reverb, delay, modulation and instruments</li>
       <li>Imports WAV, AIFF, FLAC, MP3 and MIDI; bounces to disk</li>
-      <li>A headless command line and an MCP server for scripting and agents</li>
     </ul>
+    <p>Based on SoundCraft by storytold.</p>
   </description>
   <launchable type="desktop-id">dev.derekmwright.transit.desktop</launchable>
   <icon type="stock">transit</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
-  <url type="homepage">https://getartcraft.com/apps/soundcraft</url>
-  <url type="bugtracker">https://github.com/storytold/soundcraft/issues</url>
-  <url type="help">https://github.com/storytold/soundcraft</url>
-  <url type="contact">https://discord.gg/artcraft</url>
+  <url type="homepage">https://github.com/derekmwright/transit</url>
+  <url type="bugtracker">https://github.com/derekmwright/transit/issues</url>
+  <url type="help">https://github.com/derekmwright/transit</url>
   <categories>
     <category>AudioVideo</category>
     <category>Audio</category>
@@ -53,7 +52,7 @@
     <control>pointing</control>
   </supports>
   <provides>
-    <binary>soundcraft</binary>
+    <binary>transit</binary>
     <mediatype>application/x-soundcraft-session</mediatype>
   </provides>
   <content_rating type="oars-1.1"/>

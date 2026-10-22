@@ -3,7 +3,7 @@
 # exports VERSION and NFPM_ARCH.
 #
 #   nfpm package -f packaging/linux/nfpm.yaml -p deb -t dist/release/
-name: soundcraft
+name: transit
 arch: ${NFPM_ARCH}
 platform: linux
 version: ${VERSION}
@@ -12,15 +12,15 @@ version_schema: semver
 release: 1
 section: sound
 priority: optional
-maintainer: ${SOUNDCRAFT_MAINTAINER}
-vendor: Learning Machines LLC
-homepage: https://getartcraft.com/apps/soundcraft
+maintainer: ${TRANSIT_MAINTAINER}
+vendor: Derek Wright
+homepage: https://github.com/derekmwright/transit
 license: MIT OR Apache-2.0
 description: |-
-  Open-source, native digital audio workstation. Record, edit and mix
+  transit DAW: a native digital audio workstation. Record, edit and mix
   multitrack audio and MIDI in Edit and Mix windows; built-in EQ, dynamics,
   reverb, delay and instruments; imports WAV, AIFF, FLAC, MP3 and MIDI.
-  Includes soundcraft-cli, a headless editor, bounce tool and MCP server.
+  Based on SoundCraft by storytold.
 
 # The app links glibc, libgcc_s and ALSA (libasound, for audio I/O through cpal; PulseAudio and
 # PipeWire are reached through their ALSA plugins). Windowing (X11/Wayland, xkbcommon) and the GPU
@@ -60,11 +60,8 @@ overrides:
       - (pipewire-alsa or alsa-plugins-pulseaudio)
 
 contents:
-  - src: ${STAGE}/usr/bin/soundcraft
-    dst: /usr/bin/soundcraft
-    file_info: { mode: 0755 }
-  - src: ${STAGE}/usr/bin/soundcraft-cli
-    dst: /usr/bin/soundcraft-cli
+  - src: ${STAGE}/usr/bin/transit
+    dst: /usr/bin/transit
     file_info: { mode: 0755 }
   - src: ${STAGE}/usr/share/
     dst: /usr/share/
