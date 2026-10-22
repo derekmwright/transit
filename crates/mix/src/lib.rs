@@ -1340,7 +1340,7 @@ fn process_strip(
                 && let Some(h) = strip.hw.iter_mut().find(|h| usize::from(h.spec.slot) == i)
                 && h.run(&mut strip.buf, live.input, frames)
             {
-                latency = latency.saturating_add(h.spec.latency as usize);
+                latency = latency.saturating_add(h.round_trip());
             }
             continue;
         }
@@ -2360,14 +2360,8 @@ fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples, duplex: bool)
     let mut latency = frozen_latency(t);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
         // As `process_strip`: a hardware insert that runs (live input, resolved paths) adds its round trip.
-        if let Some(ins) = ins.as_ref().filter(|x| x.hardware.is_some()) {
-            if duplex
-                && ins.active
-                && !ins.bypass
-                && let Some(h) = strip.hw.iter().find(|h| usize::from(h.spec.slot) == i && h.spec.runs())
-            {
-                latency = latency.saturating_add(h.spec.latency as usize);
-            }
+        if let Some(l) = hardware::slot_latency(ins, &strip.hw, i, duplex) {
+            latency = latency.saturating_add(l);
             continue;
         }
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };

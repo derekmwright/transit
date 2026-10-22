@@ -425,6 +425,77 @@ fn a_key_through_a_latent_bus_chain_is_aligned() {
     assert_aligned(&chain(64, 32), &chain(0, 0), 96);
 }
 
+/// The main mix (left channel) and the latency on a fake duplex device that plays the sinks back on
+/// its input `delay` frames later, with `io`'s measured round trips.
+fn render_duplex(s: &Session, io: &soundcraft_model::IoMap, delay: usize) -> (Vec<f32>, usize) {
+    let (s, io) = (s.clone(), io.clone());
+    std::thread::spawn(move || {
+        MixEngine::force_serial(true);
+        soundcraft_mix::mark_audio_thread();
+        let t = RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 4, in_channels: 4 };
+        let mut mix = MixEngine::realtime(t);
+        let mut compiler = PlanCompiler::new(t, PlanLimits::default());
+        compiler.set_io(Arc::new(io.clone()));
+        let mut maker = |spec: &InstanceSpec, _: soundcraft_mix::SlotGen| instance(spec);
+        let mut env = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut maker).unwrap();
+        assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
+        compiler.reclaim(env);
+        let sinks = soundcraft_mix::plan_sinks(&s, &io, 4);
+        let dest = sinks.destinations();
+        let main_w = soundcraft_mix::main_channels(&s);
+        let mut out = vec![vec![0.0f32; BLOCK]; main_w + sinks.channels()];
+        let mut device: Vec<Vec<f32>> = vec![Vec::new(); 4];
+        let (mut all, mut pos) = (Vec::new(), 0usize);
+        while all.len() < LEN {
+            mix.input = (0..4)
+                .map(|c| (0..BLOCK).map(|i| (pos + i).checked_sub(delay).and_then(|k| device[c].get(k)).copied().unwrap_or(0.0)).collect())
+                .collect();
+            mix.render_active(pos as i64, BLOCK, &mut out);
+            all.extend_from_slice(&out[0]);
+            for c in &mut device {
+                c.extend(std::iter::repeat_n(0.0, BLOCK));
+            }
+            for (k, &d) in dest.iter().enumerate() {
+                for i in 0..BLOCK {
+                    device[usize::from(d)][pos + i] += out[main_w + k][i];
+                }
+            }
+            pos += BLOCK;
+        }
+        assert_eq!(mix.status().capacity_exceeded, 0, "the plan's delay lines hold every key's delay");
+        (all, mix.latency)
+    })
+    .join()
+    .unwrap()
+}
+
+#[test]
+fn a_key_after_a_hardware_insert_is_aligned() {
+    // The bass goes out to an outboard unit and back (a measured 700 frames round trip) in slot 0,
+    // then its compressor in slot 1 is keyed by a kick with no latency. The key waits for the bass.
+    const D: usize = 700;
+    let (send, ret) = ("Out 3-4", "In 3-4");
+    let mut io = soundcraft_model::IoMap::for_device("test", "fake duplex", 4, 4);
+    io.set_hardware_latency(soundcraft_model::HardwareLatency {
+        send: send.into(),
+        ret: ret.into(),
+        round_trip_frames: D as u32,
+        rate: SR,
+        measured_at: 1,
+    });
+    let reference = latent_kick_to_bass(0, 0, 0, Tap::Post, 0.0);
+    let (base, base_latency) = render_latent(&reference);
+    assert_eq!(base_latency, 0);
+    let want = onset(&base, 0);
+    assert!((KICKS[0]..KICKS[0] + 200).contains(&want), "the reference ducks right at the kick: {want}");
+    let mut s = reference.clone();
+    let bass = s.tracks.iter().find(|t| t.name == "Bass").unwrap().id;
+    s.track_mut(bass).unwrap().mixer.inserts[0] = Some(Insert::hardware(send, ret));
+    let (out, latency) = render_duplex(&s, &io, D);
+    assert_eq!(latency, D, "the device latency is the hardware round trip");
+    assert_eq!(onset(&out, latency), want, "the duck starts on the kick's own sample");
+}
+
 #[test]
 fn keys_do_not_change_a_session_without_latency_or_delay_compensation() {
     // No latency anywhere: the key edge adds no delay, the output is what part 1 rendered.

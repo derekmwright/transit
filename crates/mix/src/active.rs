@@ -443,7 +443,7 @@ impl MixEngine {
                             }
                         }
                     };
-                    let short = keys.align(at, t, st, arrive, pos, pdc, &from);
+                    let short = keys.align(at, t, st, arrive, pos, pdc, !self.input.is_empty(), &from);
                     if short > 0 {
                         status.capacity_exceeded = status.capacity_exceeded.saturating_add(1);
                         status.required_latency = status.required_latency.max(u32::try_from(short).unwrap_or(u32::MAX));

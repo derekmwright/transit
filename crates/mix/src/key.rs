@@ -147,6 +147,7 @@ impl KeyBank {
     /// of each key and of the strip's input before each keyed insert, and the strip's latency
     /// with them. `arrive` is the latency the strip's input arrives with; `source` gives the
     /// latency a key arrives with (its source's output). With `pdc` off nothing is delayed.
+    /// `duplex`: the device has live input, so the strip's hardware inserts run and add their round trip.
     /// Returns the longest delay a line could not hold (0: none).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn align(
@@ -157,6 +158,7 @@ impl KeyBank {
         arrive: usize,
         pos: Samples,
         pdc: bool,
+        duplex: bool,
         source: &dyn Fn(&KeySpec) -> usize,
     ) -> usize {
         for k in st.key_in.iter_mut() {
@@ -170,6 +172,11 @@ impl KeyBank {
         let mut own = frozen_latency(t).saturating_add(st.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency()));
         let mut short = 0usize;
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
+            // A hardware insert has no plug-in: its round trip is the latency before the next slot.
+            if let Some(l) = crate::hardware::slot_latency(ins, &st.hw, i, duplex) {
+                own = own.saturating_add(l);
+                continue;
+            }
             let (Some(ins), Some(Some(slot))) = (ins, st.plugins.get_mut(i)) else { continue };
             if !ins.active || ins.bypass || slot.failed {
                 continue;

@@ -13,7 +13,7 @@
 //! (the device is not duplex, or this is an offline render) or a path is unresolved.
 
 use super::{MAX_LATENCY, Session, Sink, Track, TrackId, TrackKind, sink::SinkSpec};
-use soundcraft_model::{IoDirection, IoMap};
+use soundcraft_model::{Insert, IoDirection, IoMap};
 
 /// What a hardware insert slot will do on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +81,16 @@ pub(crate) fn latency_of(t: &Track, io: &IoMap, rate: u32) -> usize {
         .filter(|h| h.disabled.is_none())
         .fold(0usize, |a, h| a.saturating_add(io.hardware_latency(&h.send, &h.ret, rate).unwrap_or(0) as usize))
         .min(MAX_LATENCY)
+}
+
+/// The round trip, in frames, that the insert in slot `slot` adds to its strip: `None` when it is
+/// not a hardware insert (the caller handles it as a plug-in), `Some(0)` when it is one that passes
+/// the signal through dry (inactive, bypassed, no live input `duplex`, or an unresolved path).
+/// `process_strip`, `note_insert_latency` and `KeyBank::align` all read the latency here.
+pub(crate) fn slot_latency(ins: &Option<Insert>, hw: &[HwSlot], slot: usize, duplex: bool) -> Option<usize> {
+    let ins = ins.as_ref().filter(|x| x.hardware.is_some())?;
+    let h = hw.iter().find(|h| usize::from(h.spec.slot) == slot);
+    Some(h.filter(|_| duplex && ins.active && !ins.bypass).map_or(0, HwSlot::round_trip))
 }
 
 /// The hardware inserts of `t` for a plan with `sinks`, an `in_channels`-wide device input, at `rate`.
@@ -151,6 +161,11 @@ impl HwSlot {
     pub(crate) fn new(spec: HwSpec, block: usize) -> Self {
         let send = vec![vec![0.0; block]; usize::from(spec.sink_width)];
         HwSlot { spec, send, live: false }
+    }
+
+    /// The frames this slot adds when it runs: its measured round trip, 0 while a path is unresolved.
+    pub(crate) fn round_trip(&self) -> usize {
+        if self.spec.runs() { self.spec.latency as usize } else { 0 }
     }
 
     pub(crate) fn rest(&mut self) {
