@@ -1,4 +1,4 @@
-//! Level meters: DAW-style peak meter, RMS meter, and an ITU-R BS.1770 loudness meter
+//! Level meters: an ITU-R BS.1770 loudness meter
 //! (momentary, short-term and gated integrated LUFS plus 4× oversampled true peak).
 //!
 //! None of the `process` methods allocate.
@@ -6,128 +6,6 @@
 use crate::biquad::{Biquad, Coeffs};
 use crate::util::sane_sr;
 use crate::{MIN_DB, gain_to_db};
-
-/// Peak meter with instant attack, linear-in-dB release, peak hold and a clip latch.
-#[derive(Debug, Clone)]
-pub struct PeakMeter {
-    sr: f32,
-    level_db: f32,
-    hold_db: f32,
-    hold_left: f32,
-    hold_secs: f32,
-    release_db_per_sec: f32,
-    clipped: bool,
-}
-
-impl PeakMeter {
-    /// A meter with 20 dB/s release and a 2 s peak hold.
-    pub fn new(sample_rate: f32) -> Self {
-        Self { sr: sane_sr(sample_rate), level_db: MIN_DB, hold_db: MIN_DB, hold_left: 0.0, hold_secs: 2.0, release_db_per_sec: 20.0, clipped: false }
-    }
-
-    pub fn set_release_db_per_sec(&mut self, rate: f32) {
-        if rate.is_finite() {
-            self.release_db_per_sec = rate.clamp(0.1, 1000.0);
-        }
-    }
-
-    pub fn set_hold_secs(&mut self, secs: f32) {
-        if secs.is_finite() {
-            self.hold_secs = secs.clamp(0.0, 60.0);
-        }
-    }
-
-    /// Feeds one block of samples.
-    pub fn process(&mut self, samples: &[f32]) {
-        let peak = samples.iter().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
-        self.feed(peak, samples.len());
-    }
-
-    /// Feeds an already-computed block peak (linear) covering `frames` samples.
-    pub fn feed(&mut self, peak: f32, frames: usize) {
-        let dt = frames as f32 / self.sr;
-        if peak >= 1.0 {
-            self.clipped = true;
-        }
-        let peak_db = gain_to_db(peak);
-        let decayed = (self.level_db - self.release_db_per_sec * dt).max(MIN_DB);
-        self.level_db = decayed.max(peak_db);
-        if peak_db >= self.hold_db {
-            self.hold_db = peak_db;
-            self.hold_left = self.hold_secs;
-        } else if self.hold_left > 0.0 {
-            self.hold_left -= dt;
-        } else {
-            self.hold_db = (self.hold_db - self.release_db_per_sec * dt).max(self.level_db);
-        }
-    }
-
-    /// Displayed level in dBFS.
-    pub fn level_db(&self) -> f32 {
-        self.level_db
-    }
-
-    /// Held peak in dBFS.
-    pub fn peak_hold_db(&self) -> f32 {
-        self.hold_db
-    }
-
-    /// True once any sample reached full scale, until [`PeakMeter::reset_clip`].
-    pub fn clipped(&self) -> bool {
-        self.clipped
-    }
-
-    pub fn reset_clip(&mut self) {
-        self.clipped = false;
-    }
-
-    pub fn reset(&mut self) {
-        self.level_db = MIN_DB;
-        self.hold_db = MIN_DB;
-        self.hold_left = 0.0;
-        self.clipped = false;
-    }
-}
-
-/// Exponentially averaged RMS meter (300 ms time constant by default).
-#[derive(Debug, Clone)]
-pub struct RmsMeter {
-    sr: f32,
-    coef: f32,
-    ms: f64,
-}
-
-impl RmsMeter {
-    pub fn new(sample_rate: f32) -> Self {
-        let mut m = Self { sr: sane_sr(sample_rate), coef: 0.0, ms: 0.0 };
-        m.set_window_ms(300.0);
-        m
-    }
-
-    pub fn set_window_ms(&mut self, ms: f32) {
-        self.coef = crate::util::time_coef(if ms.is_finite() { ms.clamp(1.0, 10_000.0) } else { 300.0 }, self.sr);
-    }
-
-    pub fn process(&mut self, samples: &[f32]) {
-        let k = f64::from(1.0 - self.coef);
-        for &x in samples {
-            let x = if x.is_finite() { f64::from(x) } else { 0.0 };
-            self.ms += (x * x - self.ms) * k;
-        }
-        if self.ms < 1e-30 {
-            self.ms = 0.0;
-        }
-    }
-
-    /// Current RMS level in dBFS (sine-referenced: an RMS of 0.707 reads -3 dB).
-    pub fn rms_db(&self) -> f32 {
-        gain_to_db(self.ms.sqrt() as f32)
-    }
-
-    pub fn reset(&mut self) {
-        self.ms = 0.0;
-    }
-}
 
 const SUB_BLOCKS: usize = 30; // 3 s of 100 ms sub-blocks
 const HIST_MIN: f32 = -70.0;
@@ -347,11 +225,6 @@ impl LoudnessMeter {
     /// Short-term loudness (3 s window, or what is available so far), LUFS.
     pub fn short_term_lufs(&self) -> f32 {
         if self.sub_filled < 4 { MIN_DB } else { lufs(self.recent_energy(SUB_BLOCKS)) }
-    }
-
-    /// Highest momentary loudness seen.
-    pub fn max_momentary_lufs(&self) -> f32 {
-        self.max_momentary
     }
 
     /// Gated integrated loudness (absolute gate -70 LUFS, relative gate -10 LU), LUFS.

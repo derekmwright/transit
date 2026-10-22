@@ -286,14 +286,6 @@ impl PluginFailures {
 }
 
 impl StripMeter {
-    /// Copy another meter without reallocating once the channel count is stable.
-    pub fn copy_from(&mut self, o: &StripMeter) {
-        self.peak = o.peak;
-        self.peaks.clone_from(&o.peaks);
-        self.gain_reduction_db = o.gain_reduction_db;
-        self.plugin_failures = o.plugin_failures;
-    }
-
     fn measure(&mut self, bufs: &[Vec<f32>], frames: usize, gr: f32) {
         if self.peaks.len() != bufs.len() {
             self.peaks.resize(bufs.len(), 0.0);

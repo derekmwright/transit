@@ -369,16 +369,6 @@ impl PlanEnvelope {
     pub fn torn(&self) -> bool {
         self.committing && self.state == EnvelopeState::Pending
     }
-
-    /// Control thread only: what came back. `Ok` holds everything the adopted plan displaced;
-    /// `Err` holds the whole refused (or never serviced) input. Dropping either frees it here.
-    pub fn into_outcome(self) -> Result<Retired, Rejected> {
-        match self.state {
-            EnvelopeState::Returned { .. } => Ok(Retired::from_plan(self.plan)),
-            EnvelopeState::Rejected { reason, active } => Err(Rejected { reason: Some(reason), active, plan: Box::new(self.plan) }),
-            EnvelopeState::Pending => Err(Rejected { reason: None, active: self.plan.id.base, plan: Box::new(self.plan) }),
-        }
-    }
 }
 
 /// Plan-mode problems the audio thread noticed, in fixed storage. `Copy`; playback copies it to
@@ -405,10 +395,6 @@ pub struct Retired {
 }
 
 impl Retired {
-    pub(crate) fn from_plan(p: PreparedPlan) -> Self {
-        Retired { session: Some(p.session), tables: p.tables, _attach: p.attach }
-    }
-
     /// The plug-in instances inside.
     pub fn plugins(&self) -> impl Iterator<Item = &dyn Plugin> {
         self.tables.iter().flat_map(PlanTables::plugins).map(|s| &*s.plugin)

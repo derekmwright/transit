@@ -211,13 +211,6 @@ impl<const S: usize> Eq<S> {
             }
         }
     }
-
-    /// Magnitude response (dB, including input/output gain) of the current settings.
-    pub fn response_db(&self, freqs: &[f32], sample_rate: f32) -> Vec<f32> {
-        let coeffs = (self.design)(&(0..self.info.params.len()).map(|i| self.p.v(i)).collect::<Vec<_>>(), sample_rate);
-        let g = self.total_gain_db(|i| self.p.v(i));
-        freqs.iter().map(|&f| g + coeffs.iter().map(|c| c.magnitude_db(f, sample_rate)).sum::<f32>()).collect()
-    }
 }
 
 impl<const S: usize> Plugin for Eq<S> {

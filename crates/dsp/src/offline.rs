@@ -94,18 +94,6 @@ pub fn reverse(ch: &mut [Vec<f32>]) {
     ch.iter_mut().for_each(|c| c.reverse());
 }
 
-/// Removes each channel's DC offset (subtracts its mean).
-pub fn remove_dc(ch: &mut [Vec<f32>]) {
-    for c in ch.iter_mut() {
-        if c.is_empty() {
-            continue;
-        }
-        let mean = c.iter().filter(|v| v.is_finite()).map(|&v| f64::from(v)).sum::<f64>() / c.len() as f64;
-        let m = mean as f32;
-        c.iter_mut().for_each(|s| *s -= m);
-    }
-}
-
 /// Fades in over the first `fade_in` samples and out over the last `fade_out` samples.
 pub fn fade(ch: &mut [Vec<f32>], fade_in: usize, fade_out: usize, shape: FadeShape) {
     for c in ch.iter_mut() {

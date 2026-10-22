@@ -2,7 +2,7 @@
 //! SoundCraft DSP.
 //!
 //! Realtime plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utilities and three
-//! instruments), metering (peak, RMS, ITU-R BS.1770 loudness), spectrum analysis and offline
+//! instruments), metering (ITU-R BS.1770 loudness), spectrum analysis and offline
 //! AudioSuite-style whole-buffer processing.
 //!
 //! Every algorithm here is an original implementation of textbook DSP (RBJ cookbook biquads,

@@ -1,6 +1,6 @@
 use std::f32::consts::TAU;
 
-use soundcraft_dsp::meter::{LoudnessMeter, PeakMeter, RmsMeter};
+use soundcraft_dsp::meter::LoudnessMeter;
 use soundcraft_dsp::offline::{self, FadeShape, Waveform};
 use soundcraft_dsp::spectrum::{bin_hz, magnitude_db};
 use soundcraft_dsp::{create, db_to_gain, gain_to_db, pan};
@@ -105,24 +105,6 @@ fn true_peak_catches_intersample_overs() {
 }
 
 #[test]
-fn peak_meter_ballistics() {
-    let mut m = PeakMeter::new(48_000.0);
-    m.process(&[0.5; 480]);
-    assert!((m.level_db() + 6.02).abs() < 0.01);
-    m.process(&vec![0.0; 48_000]);
-    assert!((m.level_db() - (-6.02 - 20.0)).abs() < 0.1, "{}", m.level_db());
-    assert!((m.peak_hold_db() + 6.02).abs() < 0.01);
-    assert!(!m.clipped());
-    m.process(&[1.0]);
-    assert!(m.clipped());
-    m.reset_clip();
-    assert!(!m.clipped());
-    let mut r = RmsMeter::new(48_000.0);
-    r.process(&sine(1000.0, 1.0, 48_000.0, 48_000));
-    assert!((r.rms_db() + 3.01).abs() < 0.2, "{}", r.rms_db());
-}
-
-#[test]
 fn resample_preserves_frequency_and_length() {
     let x = sine(1000.0, 0.5, 48_000.0, 48_000);
     let out = offline::resample(std::slice::from_ref(&x), 48_000, 44_100);
@@ -203,8 +185,6 @@ fn simple_offline_ops() {
     assert_eq!(ch[0], vec![3.0, 2.0, 1.0]);
     offline::invert(&mut ch);
     assert_eq!(ch[0], vec![-3.0, -2.0, -1.0]);
-    offline::remove_dc(&mut ch);
-    assert!(ch[0].iter().sum::<f32>().abs() < 1e-5);
     offline::gain(&mut ch, f32::NAN);
     offline::fade(&mut ch, 2, 2, FadeShape::EqualPower);
     assert_eq!(ch[0][0], 0.0);
