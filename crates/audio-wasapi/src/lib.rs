@@ -293,6 +293,27 @@ mod hardware {
         faults: AtomicU64,
         /// `host_callback_ns - backend_callback_ns` of each valid block: the host/backend offset.
         offsets: std::sync::Mutex<Vec<i64>>,
+        /// Per capture block, in order: `GetBuffer` device position, frames, and whether the stamp was invalid.
+        positions: std::sync::Mutex<Vec<(Option<u64>, usize, bool)>>,
+    }
+
+    /// The gap fill sizes a dropout from the `GetBuffer` device position, so it must advance with the frames.
+    fn assert_position_advances(tally: &Tally) {
+        let blocks = tally.positions.lock().expect("positions").clone();
+        assert!(!blocks.is_empty(), "no capture blocks were seen");
+        let zeros = blocks.iter().filter(|b| b.0 == Some(0)).count();
+        let good: Vec<(u64, usize)> =
+            blocks.iter().filter(|b| !b.2).map(|b| (b.0.expect("a block without a timestamp error has no device position"), b.1)).collect();
+        assert!(!good.is_empty(), "every block had a timestamp error");
+        let (first, last) = (good[0].0, good[good.len() - 1].0);
+        // Frames delivered from the first block's start to the last block's start.
+        let delivered: u64 = good[..good.len() - 1].iter().map(|b| b.1 as u64).sum();
+        eprintln!("device_position: first {first}, last {last}, frames delivered {delivered}, blocks {}, blocks at Some(0) {zeros}", blocks.len());
+        assert!(good.windows(2).all(|w| w[0].0 <= w[1].0), "device position went backwards");
+        assert!(
+            (last - first) as f64 >= delivered as f64 * 0.8,
+            "device position did not advance with the frames: {first} to {last} over {delivered} frames"
+        );
     }
 
     fn median(values: &mut [i64]) -> i64 {
@@ -305,6 +326,9 @@ mod hardware {
         Box::new(move |block| {
             tally.blocks.fetch_add(1, Ordering::Relaxed);
             tally.frames.fetch_add(block.frames as u64, Ordering::Relaxed);
+            if let Ok(mut positions) = tally.positions.lock() {
+                positions.push((block.device_position, block.frames, block.stamp.quality == ab::Quality::Invalid));
+            }
             if block.stamp.quality == ab::Quality::Invalid {
                 tally.invalid.fetch_add(1, Ordering::Relaxed);
             } else if let Ok(mut offsets) = tally.offsets.lock() {
@@ -355,6 +379,7 @@ mod hardware {
         assert!(blocks > 0 && tally.faults.load(Ordering::Relaxed) == 0);
         assert!((frames as f64 - expected).abs() < expected * 0.1, "captured frames are not the elapsed time at the rate");
         assert_eq!(tally.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+        assert_position_advances(&tally);
     }
 
     #[test]
@@ -500,6 +525,7 @@ mod hardware {
         assert_eq!(tally.faults.load(Ordering::Relaxed), 0, "stream faults");
         assert!((frames as f64 - expected).abs() < expected * 0.1, "captured frames are not the elapsed time at the rate");
         assert_eq!(tally.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+        assert_position_advances(&tally);
     }
 
     #[test]
