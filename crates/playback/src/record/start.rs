@@ -3,7 +3,7 @@
 use crate::timeline_map::Position;
 use soundcraft_mix::EngineEpoch;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 pub(crate) mod mapping;
 
@@ -42,6 +42,39 @@ struct Shared {
     sample: AtomicI64,
     fraction: AtomicU64,
     denominator: AtomicU64,
+    /// Audio input takes are part of this pass (set by Main when it prepares them).
+    audio: AtomicBool,
+    /// The input stream's next device frame and last block length, published by its callback.
+    /// `u64::MAX` until the stream has delivered a block, and always for a separate input device.
+    input_next: AtomicU64,
+    input_block: AtomicU64,
+    /// Input frame the audio thread chose for the origin without a host-time map (`NO_FRAME`: none).
+    fallback_frame: AtomicU64,
+    /// The take is placed by the degraded policy rather than a validated clock map.
+    approximate: AtomicBool,
+}
+
+const NO_FRAME: u64 = u64::MAX;
+
+/// What a pass without a validated device clock falls back to, once started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fallback {
+    pub input_frame: Option<u64>,
+    pub approximate: bool,
+}
+
+/// The input callback's handle for publishing its position to the output's audio thread.
+#[derive(Clone)]
+pub struct InputProgress {
+    shared: Arc<Shared>,
+}
+
+impl InputProgress {
+    /// Two relaxed-order stores; callable from the audio thread.
+    pub fn publish(&self, next_frame: u64, block_frames: u64) {
+        self.shared.input_block.store(block_frames, Ordering::Relaxed);
+        self.shared.input_next.store(next_frame, Ordering::Release);
+    }
 }
 
 /// Main-side ticket issuer. Keep one issuer for the lifetime of the audio runtime.
@@ -71,6 +104,11 @@ pub fn pair(engine: EngineEpoch) -> (Control, Publisher) {
         sample: AtomicI64::new(0),
         fraction: AtomicU64::new(0),
         denominator: AtomicU64::new(0),
+        audio: AtomicBool::new(false),
+        input_next: AtomicU64::new(NO_FRAME),
+        input_block: AtomicU64::new(0),
+        fallback_frame: AtomicU64::new(NO_FRAME),
+        approximate: AtomicBool::new(false),
     });
     (Control { shared: Arc::clone(&shared), next: 0 }, Publisher { shared })
 }
@@ -80,8 +118,16 @@ impl Control {
     pub fn prepare(&mut self) -> Option<Reader> {
         let next = self.next.checked_add(FLAGS + 1)?;
         self.next = next;
+        self.shared.audio.store(false, Ordering::Relaxed);
+        self.shared.fallback_frame.store(NO_FRAME, Ordering::Relaxed);
+        self.shared.approximate.store(false, Ordering::Relaxed);
         self.shared.state.store(next | PENDING, Ordering::Release);
         Some(Reader { shared: Arc::clone(&self.shared), ticket: Ticket { engine: self.shared.engine, sequence: next } })
+    }
+
+    /// The handle a duplex device's input callback publishes its position through.
+    pub fn input_progress(&self) -> InputProgress {
+        InputProgress { shared: Arc::clone(&self.shared) }
     }
 
     /// Cancel a still-pending start before submitting Stop. An already applied
@@ -97,18 +143,41 @@ impl Publisher {
     /// The mutable endpoint is the sole payload writer. Main may cancel/rearm
     /// between its check and CAS, but the older action then cannot publish.
     pub fn start(&mut self, ticket: Ticket, point: Point) -> bool {
+        self.start_placed(ticket, point, None, false)
+    }
+
+    /// As [`Publisher::start`], also publishing the input frame chosen without a host-time map
+    /// and whether the placement is approximate.
+    pub fn start_placed(&mut self, ticket: Ticket, point: Point, input_frame: Option<u64>, approximate: bool) -> bool {
         if point.position.denominator == 0 || point.position.fraction >= point.position.denominator {
             return false;
         }
         if ticket.engine != self.shared.engine || self.shared.state.load(Ordering::Acquire) != ticket.sequence | PENDING {
             return false;
         }
+        self.shared.fallback_frame.store(input_frame.unwrap_or(NO_FRAME), Ordering::Release);
+        self.shared.approximate.store(approximate, Ordering::Release);
         self.shared.host_ns.store(point.host_ns, Ordering::Release);
         self.shared.output_frame.store(point.output_frame, Ordering::Release);
         self.shared.sample.store(point.position.sample, Ordering::Release);
         self.shared.fraction.store(point.position.fraction, Ordering::Release);
         self.shared.denominator.store(point.position.denominator, Ordering::Release);
         self.shared.state.compare_exchange(ticket.sequence | PENDING, ticket.sequence | STARTED, Ordering::Release, Ordering::Relaxed).is_ok()
+    }
+
+    /// Does this pass record audio input (so the take needs the input aligned to the output)?
+    pub fn audio_pass(&self) -> bool {
+        self.shared.audio.load(Ordering::Relaxed)
+    }
+
+    /// The input frame that coincides with the output block about to render when the
+    /// duplex device's two streams share one callback but count frames independently, or `None`
+    /// without a duplex input. The input callback of the same driver block may or may not have run
+    /// yet, so the estimate is the earlier alternative: at most one block of extra pre-roll, never
+    /// a clipped start.
+    pub fn duplex_input_frame(&self) -> Option<u64> {
+        let next = self.shared.input_next.load(Ordering::Acquire);
+        (next != NO_FRAME).then(|| next.saturating_sub(self.shared.input_block.load(Ordering::Relaxed)))
     }
 
     /// Cancel this exact pending operation, including an action refused before Play.
@@ -133,6 +202,29 @@ impl Reader {
     pub fn cancel(&self) {
         cancel(&self.shared, self.ticket);
     }
+    /// Mark the pass as carrying audio input takes. Main only, before the start is applied.
+    pub(crate) fn mark_audio(&self) {
+        self.shared.audio.store(true, Ordering::Relaxed);
+    }
+
+    /// Record that this started pass is placed by the degraded policy. A no-op once rearmed.
+    pub(crate) fn mark_approximate(&self) {
+        if self.shared.state.load(Ordering::Acquire) == self.ticket.sequence | STARTED {
+            self.shared.approximate.store(true, Ordering::Release);
+        }
+    }
+
+    /// The degraded-placement data of a started pass, validated against a concurrent rearm.
+    pub fn fallback(&self) -> Option<Fallback> {
+        let before = self.shared.state.load(Ordering::Acquire);
+        if before != self.ticket.sequence | STARTED {
+            return None;
+        }
+        let frame = self.shared.fallback_frame.load(Ordering::Acquire);
+        let approximate = self.shared.approximate.load(Ordering::Acquire);
+        (self.shared.state.load(Ordering::Acquire) == before).then_some(Fallback { input_frame: (frame != NO_FRAME).then_some(frame), approximate })
+    }
+
     /// At most two state reads. An intervening rearm discards the payload.
     /// Payload words use Release/Acquire: seeing a word from the next publisher
     /// establishes happens-before from its pending-state check to our validation.

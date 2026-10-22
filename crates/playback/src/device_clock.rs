@@ -527,6 +527,16 @@ impl MaintainedClock {
     ) -> Result<crate::record::start::mapping::InputStart, &'static str> {
         self.service.prepare_recording(start)
     }
+    pub(crate) fn key(&self) -> ClockKey {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.service.key()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.reader.key()
+        }
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn take_audio_reader(&mut self) -> Option<service::SnapshotReader> {
         self.service.take_audio_reader()

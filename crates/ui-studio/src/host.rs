@@ -1197,6 +1197,37 @@ fn failed_plugin_status(s: &soundcraft_model::Session, track: TrackId, slot: usi
     Some(format!("{} on {} put out invalid audio, so it is bypassed until playback stops or starts again.", ins.plugin, t.name))
 }
 
+/// A refused audio action as a sentence for the status line; the raw variants go to the log only.
+pub(crate) fn refusal_text(outcome: soundcraft_playback::action_lane::Outcome, result: Option<soundcraft_playback::ActionResult>) -> String {
+    use soundcraft_playback::{ActionResult, action_lane::Outcome, device_clock::Unavailable};
+    match result {
+        Some(ActionResult::RecordingClock(why)) => {
+            let reason = match why {
+                Unavailable::WarmingUp => "the audio clock is still warming up; try again in a moment",
+                Unavailable::Stale | Unavailable::OutsideWindow => "the audio clock lost track of the device; try again in a moment",
+                Unavailable::WrongClock => "no audio input is open on this device",
+                Unavailable::Invalid | Unavailable::Reordered | Unavailable::Discontinuity | Unavailable::Arithmetic => {
+                    "the audio device's clock is not usable right now"
+                }
+            };
+            format!("Recording can't start: {reason}.")
+        }
+        Some(ActionResult::RecordingNotPlaying) => "Recording can't start: the transport is not playing.".into(),
+        Some(ActionResult::RecordingCancelled) => "Recording was canceled before it could start.".into(),
+        Some(ActionResult::InvalidPosition) => "The audio engine can't go there: the position is out of range.".into(),
+        Some(ActionResult::Timeline(_) | ActionResult::MidiTimeline(_)) => {
+            "The audio engine couldn't follow the timeline change; playback may need to be restarted.".into()
+        }
+        Some(ActionResult::MidiClock(_)) => "A MIDI note was dropped: the audio clock is not ready yet.".into(),
+        Some(ActionResult::MidiFull) => "A MIDI note was dropped: the audio engine is busy.".into(),
+        _ => match outcome {
+            Outcome::PlanSuperseded | Outcome::PlanRejected => "The audio engine rejected that change because the session changed under it.".into(),
+            Outcome::Faulted | Outcome::Shutdown => "The audio engine stopped before it could apply that.".into(),
+            _ => "The audio engine couldn't apply that action.".into(),
+        },
+    }
+}
+
 /// Admission is separate from callback application. Storage is reused every frame,
 /// including idle frames, so terminal results always return admission credits.
 pub(crate) struct PlayerRequests {
@@ -1299,7 +1330,8 @@ impl PlayerRequests {
                     }
                 }
                 if !applied && !matches!(r.outcome, Outcome::Stopped | Outcome::NotesReleased) {
-                    self.fail(status, format!("Audio action {} refused: {:?} ({:?})", r.sequence.get(), r.outcome, r.handler_result));
+                    log::warn!("Audio action {} refused: {:?} ({:?})", r.sequence.get(), r.outcome, r.handler_result);
+                    self.fail(status, refusal_text(r.outcome, r.handler_result));
                 }
                 return (play || record) && !applied && self.stop.is_none();
             }

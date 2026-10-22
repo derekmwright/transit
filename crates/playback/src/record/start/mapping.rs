@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 const PENDING: u8 = 0;
 const READY: u8 = 1;
 const FAILED: u8 = 2;
+/// Placed by the degraded policy: the audio thread's own frame choice, no host-time map.
+const READY_APPROXIMATE: u8 = 4;
 
 struct Shared {
     state: AtomicU8,
@@ -44,12 +46,21 @@ impl Mapping {
                 return true;
             }
         };
-        match map.zip(now).and_then(|(map, now)| map.host_to_frame(self.input, point.host_ns, now).ok()) {
-            Some(frame) => {
+        // A zero host time means the output had no validated map at the latch.
+        let mapped =
+            (point.host_ns != 0).then(|| map.zip(now)).flatten().and_then(|(map, now)| map.host_to_frame(self.input, point.host_ns, now).ok());
+        match (mapped, self.start.fallback().and_then(|f| f.input_frame)) {
+            (Some(frame), _) => {
                 self.shared.frame.store(frame, Ordering::Relaxed);
                 self.shared.state.store(READY, Ordering::Release);
             }
-            None => self.shared.state.store(FAILED, Ordering::Release),
+            (None, Some(frame)) => {
+                log::warn!("recording input placed by input frame ordinal (no validated device clock); the take is approximate");
+                self.start.mark_approximate();
+                self.shared.frame.store(frame, Ordering::Relaxed);
+                self.shared.state.store(READY_APPROXIMATE, Ordering::Release);
+            }
+            (None, None) => self.shared.state.store(FAILED, Ordering::Release),
         }
         true
     }
@@ -79,7 +90,7 @@ impl InputStart {
             }
         }
         match state {
-            READY => Ok(Some(self.shared.frame.load(Ordering::Relaxed))),
+            READY | READY_APPROXIMATE => Ok(Some(self.shared.frame.load(Ordering::Relaxed))),
             PENDING => Ok(None),
             _ => Err("recording start could not be mapped by the input clock worker"),
         }

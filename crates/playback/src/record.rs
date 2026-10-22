@@ -231,6 +231,7 @@ fn capture_callbacks(
     shared: &Arc<Shared>,
     monitor: &Arc<InputRing>,
     mut clock: crate::device_clock::CallbackClock,
+    progress: Option<start::InputProgress>,
 ) -> (ab::CaptureCallback, ab::ErrorCallback) {
     let (sh, errors) = (Arc::clone(shared), Arc::clone(shared));
     let mon = Arc::clone(monitor);
@@ -238,6 +239,9 @@ fn capture_callbacks(
         crate::mark_audio_thread();
         let first_frame = clock.observer.next_frame();
         clock.observer.record(block.frames, block.stamp);
+        if let Some(progress) = &progress {
+            progress.publish(clock.observer.next_frame(), block.frames as u64);
+        }
         sh.guarded(|| {
             // One admission covers the entire device callback, including its chunks.
             let capture = sh.begin_capture();
@@ -287,7 +291,7 @@ impl Recorder {
         let mut failure = "no usable input stream".to_string();
         let mut opened = None;
         for (index, request) in plan.attempts.iter().enumerate() {
-            match Recorder::build(&*backend, &plan.endpoint, request) {
+            match Recorder::build(&*backend, &plan.endpoint, request, None) {
                 Ok(recorder) => {
                     opened = Some(recorder);
                     break;
@@ -310,17 +314,28 @@ impl Recorder {
     /// the driver creates both directions' buffers once, then starts both ([`Recorder::start`]).
     /// The buffer must be the output's: cpal sizes the input's scratch buffer at build time,
     /// and the output's build recreates the buffers at its own size.
-    pub(crate) fn build_on(backend: &dyn ab::Backend, endpoint: &ab::Endpoint, rate: u32, period: ab::Period) -> Result<Recorder, String> {
+    pub(crate) fn build_on(
+        backend: &dyn ab::Backend,
+        endpoint: &ab::Endpoint,
+        rate: u32,
+        period: ab::Period,
+        progress: start::InputProgress,
+    ) -> Result<Recorder, String> {
         let format = backend.capture_format(endpoint, Some(rate))?;
         if format.rate != rate {
             return Err(format!("the input does not run at {rate} Hz"));
         }
         let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default() };
-        Recorder::build(backend, endpoint, &request).map_err(|e| e.to_string())
+        Recorder::build(backend, endpoint, &request, Some(progress)).map_err(|e| e.to_string())
     }
 
     /// The recorder around a new, not yet started input stream on `endpoint`.
-    fn build(backend: &dyn ab::Backend, endpoint: &ab::Endpoint, request: &ab::OpenRequest) -> Result<Recorder, ab::OpenError> {
+    fn build(
+        backend: &dyn ab::Backend,
+        endpoint: &ab::Endpoint,
+        request: &ab::OpenRequest,
+        progress: Option<start::InputProgress>,
+    ) -> Result<Recorder, ab::OpenError> {
         let format = request.format;
         let channels = usize::from(format.channels).max(1);
         let ring = CaptureRing::new((format.rate as usize).saturating_mul(channels * RING_SECONDS).min(1 << 25));
@@ -328,7 +343,7 @@ impl Recorder {
         let monitor = InputRing::new(usize::from(format.channels), format.rate);
         let (callback_clock, clock) = crate::device_clock::stream_clock(crate::device_clock::Direction::Input, format.rate)
             .map_err(|error| ab::OpenError::Other(error.into()))?;
-        let (capture, on_error) = capture_callbacks(&shared, &monitor, callback_clock);
+        let (capture, on_error) = capture_callbacks(&shared, &monitor, callback_clock, progress);
         let (stream, _) = backend.open_capture(endpoint, request, capture, on_error)?;
         let clock = crate::device_clock::MaintainedClock::start(clock)
             .map_err(|error| {
@@ -390,7 +405,10 @@ impl Recorder {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let clock = self.clock.as_mut().ok_or("input clock is unavailable for recording")?;
-            let input = clock.report().map.ok_or("input clock is not ready for recording")?.key;
+            // The key, not a validated map: the audio thread falls back to the degraded policy
+            // when the clock has not fitted, and says why when there is no fallback.
+            let input = clock.key();
+            start.mark_audio();
             if input.direction != crate::device_clock::Direction::Input {
                 return Err("recording requires this input device's clock".into());
             }
@@ -419,6 +437,12 @@ impl Recorder {
     /// The applied origin survives Stop until the caller has collected the take.
     pub(crate) fn prepared_start(&self) -> Option<start::Ticket> {
         self.record_start.as_ref().map(start::Reader::ticket)
+    }
+
+    /// Was the applied start placed without a validated device clock (see
+    /// [`start::Reader::fallback`])? Such a take is approximate by up to one audio block.
+    pub fn start_approximate(&self) -> bool {
+        self.record_start.as_ref().and_then(start::Reader::fallback).is_some_and(|f| f.approximate)
     }
 
     /// The applied origin survives Stop until the caller has collected the take.

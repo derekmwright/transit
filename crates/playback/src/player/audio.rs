@@ -97,7 +97,7 @@ impl StartFailure {
     /// Plain words for the status line.
     pub fn reason(self) -> &'static str {
         match self {
-            Self::Clock => "the audio device clock was lost during the count-in",
+            Self::Clock => "the audio device clock was not ready in time",
             Self::Timeline => "the transport timeline refused the start position",
             Self::Position => "the start position is out of range",
         }
@@ -147,9 +147,59 @@ struct Transport {
     clock_key: ClockKey,
     clock_map: Option<device_clock::ClockMap>,
     clock_now: Option<u64>,
+    /// A recording start waiting for the output clock to validate, retried each block.
+    waiting: Option<Waiting>,
+    /// How long such a start may wait, in output frames (one second).
+    wait_frames: u64,
+}
+
+/// A recording start that needs the device clock and is waiting for it to validate.
+#[derive(Debug, Clone, Copy)]
+struct Waiting {
+    ticket: start::Ticket,
+    from: Option<Samples>,
+    end: Option<Samples>,
+    looped: Option<Range>,
+    /// The output frame after which the start falls back or fails.
+    deadline: u64,
+}
+
+/// What the latch publishes besides the output frame and the session position.
+#[derive(Debug, Clone, Copy)]
+struct Basis {
+    /// Host time of the output frame; 0 when the output clock has no validated map.
+    host_ns: u64,
+    /// The input frame chosen from the duplex stream's own position, when there is one.
+    input_frame: Option<u64>,
+    approximate: bool,
 }
 
 impl Transport {
+    /// What a start at `output_frame` can publish. The latch itself needs only the output frame
+    /// and the session position, which is all a MIDI-only pass uses. An audio pass also has to
+    /// align the input stream with the output: by the validated clock maps when there are some,
+    /// else, on a duplex device whose two streams belong to one driver, by the input stream's own
+    /// position (approximate by up to one block). With neither it is an error.
+    fn start_basis(&self, output_frame: u64, audio: bool) -> Result<Basis, device_clock::Unavailable> {
+        let mapped = match (self.clock_map, self.clock_now) {
+            (Some(map), Some(now)) => map.frame_to_host(self.clock_key, output_frame, now),
+            (None, _) => Err(device_clock::Unavailable::WarmingUp),
+            (Some(_), None) => Err(device_clock::Unavailable::Stale),
+        };
+        let input_frame = if audio { self.record_start.duplex_input_frame() } else { None };
+        match mapped {
+            Ok(host_ns) => Ok(Basis { host_ns, input_frame, approximate: false }),
+            Err(_) if !audio => Ok(Basis { host_ns: 0, input_frame: None, approximate: false }),
+            Err(_) if input_frame.is_some() => Ok(Basis { host_ns: 0, input_frame, approximate: true }),
+            Err(reason) => Err(reason),
+        }
+    }
+
+    /// A clock that may yet validate: wait for it rather than refuse.
+    fn clock_may_validate(reason: device_clock::Unavailable) -> bool {
+        matches!(reason, device_clock::Unavailable::WarmingUp | device_clock::Unavailable::Stale)
+    }
+
     fn record(
         &mut self,
         ticket: start::Ticket,
@@ -158,6 +208,29 @@ impl Transport {
         looped: Option<Range>,
         live: &mut plan_bridge::Processing<'_>,
     ) -> ActionResult {
+        self.record_within(ticket, from, end, looped, live, None)
+    }
+
+    /// Retry a start that was waiting for the clock. Fails once `deadline` has passed.
+    fn retry_waiting(&mut self, live: &mut plan_bridge::Processing<'_>) -> Option<ActionResult> {
+        let waiting = self.waiting.take()?;
+        let now = self.timeline.next_output();
+        let patience = if now <= waiting.deadline { waiting.deadline } else { 0 };
+        Some(self.record_within(waiting.ticket, waiting.from, waiting.end, waiting.looped, live, Some(patience)))
+    }
+
+    /// `patience`: `None` on a fresh request (wait for the clock if it may validate), the deadline
+    /// of a start already waiting (`Some(0)` once it has passed: no more waiting).
+    fn record_within(
+        &mut self,
+        ticket: start::Ticket,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        live: &mut plan_bridge::Processing<'_>,
+        patience: Option<u64>,
+    ) -> ActionResult {
+        let audio = self.record_start.audio_pass();
         let prepared = (|| {
             let mut timeline = self.timeline;
             let mut epoch = self.epoch;
@@ -172,16 +245,25 @@ impl Transport {
             } else if !self.playing {
                 return Err(ActionResult::RecordingNotPlaying);
             }
-            let map = self.clock_map.ok_or(ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp))?;
-            let now = self.clock_now.ok_or(ActionResult::RecordingClock(device_clock::Unavailable::Stale))?;
             let output_frame = timeline.next_output();
-            let host_ns = map.frame_to_host(self.clock_key, output_frame, now).map_err(ActionResult::RecordingClock)?;
+            let basis = self.start_basis(output_frame, audio).map_err(ActionResult::RecordingClock)?;
             let position = timeline.position().map_err(ActionResult::Timeline)?;
-            Ok((timeline, epoch, start::Point { host_ns, output_frame, position }))
+            Ok((timeline, epoch, start::Point { host_ns: basis.host_ns, output_frame, position }, basis))
         })();
-        let (timeline, epoch, point) = match prepared {
+        let (timeline, epoch, point, basis) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                if let ActionResult::RecordingClock(reason) = error
+                    && Self::clock_may_validate(reason)
+                    && patience != Some(0)
+                {
+                    // The clock is warming up and this pass cannot be placed without it: keep the
+                    // start pending (the ticket stays armed) for up to a second, then fail.
+                    let now = self.timeline.next_output();
+                    let deadline = patience.unwrap_or_else(|| now.saturating_add(self.wait_frames));
+                    self.waiting = Some(Waiting { ticket, from, end, looped, deadline });
+                    return ActionResult::Applied;
+                }
                 self.record_start.cancel(ticket);
                 return error;
             }
@@ -189,7 +271,7 @@ impl Transport {
         // All fallible preparation precedes publication. If Main cancelled or
         // rearmed, neither Play nor recording changes. After success the local
         // assignments are infallible and precede rendering this output frame.
-        if !self.record_start.start(ticket, point) {
+        if !self.record_start.start_placed(ticket, point, basis.input_frame, basis.approximate) {
             return ActionResult::RecordingCancelled;
         }
         if let Some(from) = from {
@@ -229,10 +311,14 @@ impl Transport {
             self.record_start.cancel(ticket);
             return ActionResult::InvalidPosition;
         }
-        // Same preconditions as the start itself, so a missing clock fails now, not after the bars.
-        if self.clock_map.is_none() || self.clock_now.is_none() {
+        // Same preconditions as the start itself, so a clock that cannot come good fails now, not
+        // after the bars. A clock still warming up is waited for when the bars end.
+        let audio = self.record_start.audio_pass();
+        if let Err(reason) = self.start_basis(self.timeline.next_output(), audio)
+            && !Self::clock_may_validate(reason)
+        {
             self.record_start.cancel(ticket);
-            return ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp);
+            return ActionResult::RecordingClock(reason);
         }
         self.end_count_in();
         if let Err(error) = self.change(Some(from), false, None) {
@@ -253,6 +339,9 @@ impl Transport {
 
     /// Drop a count-in under way, withdrawing its recording start.
     fn end_count_in(&mut self) {
+        if let Some(waiting) = self.waiting.take() {
+            self.record_start.cancel(waiting.ticket);
+        }
         if let Some(counting) = self.count_in.take() {
             self.record_start.cancel(counting.ticket);
         }
@@ -522,6 +611,8 @@ impl Audio {
                     clock_key: key,
                     clock_map: None,
                     clock_now: None,
+                    waiting: None,
+                    wait_frames: u64::from(device_rate),
                 },
             },
             record_control,
@@ -656,6 +747,16 @@ impl Audio {
     }
 
     fn render_next(&mut self, quantum: usize, actions: &mut action_lane::Budget) -> Result<(), timeline_map::MapError> {
+        if self.transport.waiting.is_some() {
+            // The clock was warming up when Record arrived: try again at this block boundary.
+            let mut live = self.plans.processing();
+            if let Some(result) = self.transport.retry_waiting(&mut live) {
+                if let Some(failure) = StartFailure::of(result) {
+                    self.shared.metro.start_failure.store(failure as u8, Ordering::Relaxed);
+                }
+                self.transport.discard_pending = false;
+            }
+        }
         if let Some(counting) = self.transport.count_in.filter(|c| c.left <= 0) {
             // The count-in ended exactly at the previous block's last sample: start Play and the
             // recording latch now, for the block about to render. Nothing is pending, so the reset

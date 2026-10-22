@@ -144,6 +144,10 @@ impl ClockService {
         self.ui.lock().unwrap_or_else(PoisonError::into_inner).poll()
     }
 
+    pub(crate) fn key(&self) -> super::ClockKey {
+        self.key
+    }
+
     pub(crate) fn prepare_recording(&mut self, start: start::Reader) -> Result<mapping::InputStart, &'static str> {
         if self.is_finished() || self.key.direction != super::Direction::Input {
             return Err("recording input clock is unavailable");

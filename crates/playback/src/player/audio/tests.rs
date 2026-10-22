@@ -104,10 +104,11 @@ fn recording_waits_for_its_plan_and_publishes_the_actual_consumed_output_boundar
 #[test]
 fn cancelled_or_unclocked_recording_cannot_apply_play_or_start_a_newer_take() {
     for unavailable in [false, true] {
-        let (mut control, mut audio, _) = fixture(48_000);
+        let (mut control, mut audio, shared) = fixture(48_000);
         let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
         audio.transport.record_start = publisher;
         let reader = start.prepare().unwrap();
+        reader.mark_audio();
         let newer = if unavailable {
             None
         } else {
@@ -120,14 +121,21 @@ fn cancelled_or_unclocked_recording_cannot_apply_play_or_start_a_newer_take() {
         let ((), heap) = measure(|| fill(&mut audio, &mut [0.0; 8]));
         assert!(heap.is_zero());
         assert!(!audio.transport.playing && !audio.transport.recording);
+        if unavailable {
+            // A clock that has not validated is waited for, up to a second, then the start fails.
+            assert_eq!(reader.status(), start::Status::Pending);
+            for _ in 0..13_000 {
+                fill(&mut audio, &mut [0.0; 8]);
+            }
+            assert_eq!(shared.metro.start_failure.load(Ordering::Relaxed), StartFailure::Clock as u8);
+        }
         assert_eq!(reader.status(), start::Status::Cancelled);
         if let Some(newer) = newer {
             assert_eq!(newer.status(), start::Status::Pending);
         }
         let mut notices = [None; 16];
         let n = control.poll_notices(&mut notices);
-        let expected =
-            if unavailable { ActionResult::RecordingClock(device_clock::Unavailable::WarmingUp) } else { ActionResult::RecordingCancelled };
+        let expected = if unavailable { ActionResult::Applied } else { ActionResult::RecordingCancelled };
         assert!(
             notices[..n]
                 .iter()
@@ -1243,6 +1251,7 @@ fn counting(from: Samples, bars: i64) -> (Control<Command, ActionResult>, Audio,
     audio.transport.record_start = publisher;
     recording_clock(&mut audio, 48_000);
     let reader = start.prepare().unwrap();
+    reader.mark_audio();
     let count_in = CountIn { frames: bars * 4 * 24_000, beat: 24_000, per_bar: 4 };
     let command = Command::Record { ticket: reader.ticket(), from: Some(from), end: None, looped: None, count_in: Some(count_in) };
     control.send_action(command, true).unwrap();
@@ -1429,4 +1438,93 @@ fn metronome_gain_scales_the_click_and_changing_it_allocates_nothing() {
     };
     let (full, quarter) = (peak_of_beat_two(1.0), peak_of_beat_two(0.25));
     assert!(full > 0.0 && (quarter / full - 0.25).abs() < 0.02, "{full} {quarter}");
+}
+
+fn record_rig(from: Option<Samples>) -> (Control<Command, ActionResult>, Audio, Arc<Shared>, start::Control, start::Reader) {
+    let (mut control, mut audio, shared) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 8]);
+    control.service(&mut make);
+    let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    audio.transport.record_start = publisher;
+    let reader = start.prepare().unwrap();
+    control.send_action(Command::Record { ticket: reader.ticket(), from, end: None, looped: None, count_in: None }, true).unwrap();
+    (control, audio, shared, start, reader)
+}
+
+#[test]
+fn a_midi_only_pass_starts_without_a_clock_map_at_the_output_frame_and_position() {
+    let (control, mut audio, _, _start, reader) = record_rig(Some(700));
+    assert!(audio.transport.clock_map.is_none() && audio.transport.clock_now.is_none());
+    let first = audio.transport.timeline.next_output();
+    fill(&mut audio, &mut [0.0; 8]);
+    let start::Status::Started(point) = reader.status() else { panic!("a MIDI-only pass needs no clock map") };
+    assert_eq!(point.output_frame, first);
+    assert_eq!(point.host_ns, 0);
+    assert_eq!(point.position, timeline_map::Position { sample: 700, fraction: 0, denominator: 1 });
+    assert!(audio.transport.playing && audio.transport.recording);
+    assert_eq!(reader.fallback(), Some(start::Fallback { input_frame: None, approximate: false }));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn an_audio_pass_on_a_duplex_device_without_a_clock_aligns_the_input_by_frame_ordinal_and_is_approximate() {
+    let (mut control, mut audio, _) = fixture(48_000);
+    fill(&mut audio, &mut [0.0; 8]);
+    control.service(&mut make);
+    let (mut start, publisher) = start::pair(soundcraft_mix::EngineEpoch(1));
+    audio.transport.record_start = publisher;
+    let reader = start.prepare().unwrap();
+    reader.mark_audio();
+    let input = start.input_progress();
+    input.publish(1_000, 64);
+    let (mapping, input_start) = start::mapping::pair(reader.clone(), ClockKey { generation: 9, domain: 9, direction: Direction::Input });
+    let mut mapping = mapping;
+    control.send_action(Command::Record { ticket: reader.ticket(), from: Some(300), end: None, looped: None, count_in: None }, true).unwrap();
+    fill(&mut audio, &mut [0.0; 8]);
+    let start::Status::Started(point) = reader.status() else { panic!("a duplex audio pass must not wait for the clock") };
+    assert_eq!(point.host_ns, 0);
+    // One block earlier than the newest input block's end: never a clipped start.
+    assert_eq!(reader.fallback(), Some(start::Fallback { input_frame: Some(936), approximate: true }));
+    assert!(mapping.service(None, None));
+    assert_eq!(input_start.frame(), Ok(Some(936)));
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_clock_that_validates_within_the_wait_starts_the_audio_pass_without_refusal() {
+    let (mut control, mut audio, _, _start, reader) = record_rig(Some(500));
+    reader.mark_audio();
+    for _ in 0..2_400 {
+        fill(&mut audio, &mut [0.0; 8]); // 200 ms of 4-frame callbacks
+    }
+    assert_eq!(reader.status(), start::Status::Pending);
+    assert!(!audio.transport.playing);
+    recording_clock(&mut audio, 48_000);
+    fill(&mut audio, &mut [0.0; 8]);
+    let start::Status::Started(point) = reader.status() else { panic!("the start did not follow the clock") };
+    assert_ne!(point.host_ns, 0);
+    assert_eq!(reader.fallback(), Some(start::Fallback { input_frame: None, approximate: false }));
+    assert!(audio.transport.playing && audio.transport.recording);
+    let mut notices = [None; 16];
+    let n = control.poll_notices(&mut notices);
+    assert!(
+        !notices[..n]
+            .iter()
+            .flatten()
+            .any(|n| matches!(n, super::super::Notice::Action(r) if matches!(r.handler_result, Some(ActionResult::RecordingClock(_)))))
+    );
+    control.retire(audio.plans, audio.actions);
+}
+
+#[test]
+fn a_non_duplex_audio_pass_without_any_clock_still_fails_with_the_clock_reason() {
+    let (control, mut audio, shared, _start, reader) = record_rig(Some(500));
+    reader.mark_audio();
+    for _ in 0..13_000 {
+        fill(&mut audio, &mut [0.0; 8]);
+    }
+    assert_eq!(reader.status(), start::Status::Cancelled);
+    assert_eq!(shared.metro.start_failure.load(Ordering::Relaxed), StartFailure::Clock as u8);
+    assert!(!audio.transport.playing && !audio.transport.recording);
+    control.retire(audio.plans, audio.actions);
 }

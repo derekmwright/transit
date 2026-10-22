@@ -28,7 +28,8 @@ fn pending_play_does_not_claim_applied_transport_and_refusal_is_visible() {
     assert!(requests.notice(refused, &mut app.status, &mut app.engine.transport.recording));
     assert!(requests.play.is_none());
     assert!(!app.is_playing());
-    assert!(app.status.contains("InvalidPosition"));
+    assert!(app.status.contains("position is out of range"), "{}", app.status);
+    assert!(!app.status.contains("InvalidPosition"));
 }
 
 #[test]
@@ -112,7 +113,7 @@ fn session_and_untracked_action_failures_reach_status() {
         &mut status,
         &mut false,
     );
-    assert!(status.contains("PlanRejected"));
+    assert!(status.contains("rejected that change"), "{status}");
 }
 
 #[test]
@@ -167,7 +168,7 @@ fn atomic_record_start_receipt_updates_transport_and_clock_refusal_collects_the_
                 position: Position { sample: 500, fraction: 0, denominator: 1 },
             })
         } else {
-            ActionResult::RecordingClock(soundcraft_playback::device_clock::Unavailable::Stale)
+            ActionResult::RecordingClock(soundcraft_playback::device_clock::Unavailable::WarmingUp)
         };
         let collect = requests.notice(
             PlayerNotice::Action(Receipt { sequence, payload: command, outcome: Outcome::Applied, handler_result: Some(result) }),
@@ -180,7 +181,8 @@ fn atomic_record_start_receipt_updates_transport_and_clock_refusal_collects_the_
         if success {
             assert_eq!(status, "Recording");
         } else {
-            assert!(status.contains("RecordingClock"));
+            assert_eq!(status, "Recording can't start: the audio clock is still warming up; try again in a moment.");
+            assert!(!status.contains("RecordingClock"));
         }
     }
 }
@@ -286,5 +288,21 @@ mod reopen_state {
         assert_eq!(app.ui.audio, old_config);
         assert!(app.reconnect_audio_using(true, |_, _| panic!("pending document must not tear down the player")).is_err());
         assert!(app.player.as_ref().unwrap().has_requested_session(&confirmed));
+    }
+}
+
+#[test]
+fn refusals_read_as_sentences_and_keep_the_variant_out_of_the_status_line() {
+    use soundcraft_playback::device_clock::Unavailable;
+    let text = |result| crate::host::refusal_text(Outcome::Applied, Some(result));
+    assert_eq!(
+        text(ActionResult::RecordingClock(Unavailable::WarmingUp)),
+        "Recording can't start: the audio clock is still warming up; try again in a moment."
+    );
+    assert_eq!(text(ActionResult::RecordingClock(Unavailable::WrongClock)), "Recording can't start: no audio input is open on this device.");
+    assert_eq!(text(ActionResult::RecordingNotPlaying), "Recording can't start: the transport is not playing.");
+    for result in [ActionResult::RecordingCancelled, ActionResult::InvalidPosition, ActionResult::MidiFull, ActionResult::MidiBuffered] {
+        let message = text(result);
+        assert!(!message.contains("Recording(") && !message.contains("Midi") && !message.contains("Invalid"), "{message}");
     }
 }

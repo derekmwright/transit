@@ -318,7 +318,11 @@ impl Player {
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
             *player.input.get_mut() = if duplex {
-                match record::Recorder::build_on(&*backend, endpoint, rate, request.period) {
+                let progress = player.record_start.get_mut().as_ref().map(record::start::Control::input_progress);
+                let built = progress
+                    .ok_or_else(|| "the record start latch is missing".to_owned())
+                    .and_then(|progress| record::Recorder::build_on(&*backend, endpoint, rate, request.period, progress));
+                match built {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
                     Err(error) => HeldInput::Failed(format!("the audio input did not open with the output ({error})")),
                 }
