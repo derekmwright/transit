@@ -89,11 +89,46 @@ impl Period {
     }
 }
 
-/// How the device is shared. Only the shared (system mixer or driver) mode exists so far.
+/// How the device is shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Mode {
+    /// Through the system mixer (or the driver's own sharing): other apps keep playing.
     Shared,
+    /// The device is held by this process: other apps are silenced while the stream is open. Any
+    /// format the device accepts in this mode ([`Backend::probe_exclusive`]); the period is the
+    /// driver's (its minimum unless one is requested).
+    Exclusive,
+}
+
+/// The standard sample rates, in the order exclusive formats are probed after the wished rate.
+pub const STANDARD_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
+/// The exclusive-mode formats to probe, in preference order: for each rate (`rate_first`, then
+/// [`STANDARD_RATES`], none twice), for each channel count in `channels` (none twice), the sample
+/// formats F32, I32 with 24 valid bits, I32, packed I24, I16. A stereo format leaves the channel
+/// mask to the backend (`None`, the front pair); any other count asks for direct output (`Some(0)`).
+pub fn exclusive_candidates(rate_first: u32, channels: &[u16]) -> Vec<Format> {
+    let mut rates = vec![rate_first];
+    rates.extend(STANDARD_RATES.iter().copied().filter(|r| *r != rate_first));
+    let mut counts: Vec<u16> = Vec::with_capacity(channels.len());
+    for &c in channels {
+        if !counts.contains(&c) {
+            counts.push(c);
+        }
+    }
+    let samples: [(SampleFormat, Option<u8>); 5] =
+        [(SampleFormat::F32, None), (SampleFormat::I32, Some(24)), (SampleFormat::I32, None), (SampleFormat::I24, None), (SampleFormat::I16, None)];
+    let mut out = Vec::with_capacity(rates.len() * counts.len() * samples.len());
+    for &rate in &rates {
+        for &channels in &counts {
+            let channel_mask = if channels == 2 { None } else { Some(0) };
+            for (sample, valid_bits) in samples {
+                out.push(Format { rate, channels, sample, valid_bits, channel_mask });
+            }
+        }
+    }
+    out
 }
 
 /// A request to open one stream. `origin` is the process origin that stamps are relative to.
@@ -207,13 +242,18 @@ pub enum OpenError {
     DeviceNotAvailable(String),
     /// Another client holds the device exclusively (`AUDCLNT_E_DEVICE_IN_USE`).
     InUse(String),
+    /// The endpoint's settings forbid exclusive use (`AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`: the
+    /// "Allow applications to take exclusive control" box in its Advanced properties is cleared).
+    ExclusiveDisallowed(String),
     Other(String),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::DeviceNotAvailable(text) | OpenError::InUse(text) | OpenError::Other(text) => f.write_str(text),
+            OpenError::DeviceNotAvailable(text) | OpenError::InUse(text) | OpenError::ExclusiveDisallowed(text) | OpenError::Other(text) => {
+                f.write_str(text)
+            }
         }
     }
 }
@@ -369,9 +409,55 @@ pub trait Backend {
     fn on_device_change(&self, _handler: Box<dyn FnMut(DeviceEvent) + Send>) -> bool {
         false
     }
+    /// The `candidates` (see [`exclusive_candidates`]) that `endpoint` accepts in [`Mode::Exclusive`],
+    /// in their order. A control-thread call that may take a moment and fails while another app
+    /// holds the device ([`OpenError::InUse`]) or the endpoint forbids exclusive use
+    /// ([`OpenError::ExclusiveDisallowed`]). A backend without exclusive mode accepts none.
+    fn probe_exclusive(&self, _endpoint: &Endpoint, _candidates: &[Format]) -> Result<Vec<Format>, OpenError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Creates the backend of the audio system a configuration names (else the default one).
 pub trait BackendFactory {
     fn backend(&self, system: Option<&str>) -> Option<Box<dyn Backend>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclusive_candidates_go_rate_then_channels_then_sample_in_preference_order() {
+        let got = exclusive_candidates(48_000, &[2, 8]);
+        assert_eq!(got.len(), 6 * 2 * 5);
+        let samples: Vec<(SampleFormat, Option<u8>)> = got[..5].iter().map(|f| (f.sample, f.valid_bits)).collect();
+        assert_eq!(
+            samples,
+            [
+                (SampleFormat::F32, None),
+                (SampleFormat::I32, Some(24)),
+                (SampleFormat::I32, None),
+                (SampleFormat::I24, None),
+                (SampleFormat::I16, None)
+            ]
+        );
+        assert!(got[..5].iter().all(|f| f.rate == 48_000 && f.channels == 2 && f.channel_mask.is_none()), "stereo leaves the mask to the backend");
+        assert!(got[5..10].iter().all(|f| f.rate == 48_000 && f.channels == 8 && f.channel_mask == Some(0)), "other counts are direct out");
+        let rates: Vec<u32> = got.iter().step_by(10).map(|f| f.rate).collect();
+        assert_eq!(rates, [48_000, 44_100, 88_200, 96_000, 176_400, 192_000], "the wished rate first, then the standard ones once each");
+    }
+
+    #[test]
+    fn exclusive_candidates_have_no_duplicates() {
+        for (rate, channels) in [(48_000, vec![2]), (22_050, vec![1, 2, 2, 1]), (192_000, vec![6, 2])] {
+            let got = exclusive_candidates(rate, &channels);
+            for (i, a) in got.iter().enumerate() {
+                assert!(!got[i + 1..].contains(a), "{a:?} is listed twice for {rate} {channels:?}");
+            }
+            assert_eq!(got[0].rate, rate);
+        }
+        assert_eq!(exclusive_candidates(22_050, &[1, 2, 2, 1]).len(), 7 * 2 * 5, "an odd rate is tried first, then all six standard ones");
+        assert!(exclusive_candidates(48_000, &[]).is_empty());
+    }
 }

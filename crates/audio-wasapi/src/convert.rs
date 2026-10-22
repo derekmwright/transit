@@ -5,9 +5,13 @@
 
 use transit_audio_backend::{CaptureSource, RenderSink};
 
-/// The sample formats a shared-mode endpoint mixes in: 32-bit float, and PCM of 16, 24 (packed
-/// in three bytes) and 32 (container) bits. 24 valid bits in a 32-bit container is `I32`: the
-/// sample is left-justified, so the low byte carries only rounding noise the device ignores.
+/// The sample formats of a device buffer, shared or exclusive: 32-bit float, and PCM of 16, 24
+/// (packed in three bytes) and 32 (container) bits. 24 valid bits in a 32-bit container is `I32`
+/// as well: the sample is left-justified, so writing scales by 2^31 (truncating toward zero) and
+/// the top 24 bits carry the audio while the low byte carries only sub-LSB residue the device
+/// ignores; reading scales the whole container by 2^31, which is the top 24 bits at their weight
+/// because such a device delivers a zero low byte. Valid bits would only change a dither policy,
+/// and there is none yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wire {
     F32,
@@ -214,6 +218,107 @@ mod tests {
             let got = read_through(wire, &bytes_of(wire, &x), 2, 5);
             assert!(got.iter().zip(&x).all(|(a, b)| (a - b).abs() <= lsb.max(f32::EPSILON)), "{wire:?}");
         }
+    }
+
+    /// The little-endian integer of each `width`-byte sample (sign-extended).
+    fn ints(bytes: &[u8], width: usize) -> Vec<i32> {
+        words(bytes, width)
+            .map(|b| match width {
+                2 => i32::from(i16::from_le_bytes([b[0], b[1]])),
+                3 => i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8,
+                _ => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn int_formats_write_and_read_known_values_exactly() {
+        let x = [0.5, -0.5, 0.25, -1.0, 0.0];
+        let cases: [(Wire, [i32; 5]); 3] = [
+            (Wire::I16, [16_384, -16_384, 8_192, -32_768, 0]),
+            (Wire::I24, [4_194_304, -4_194_304, 2_097_152, -8_388_608, 0]),
+            (Wire::I32, [1 << 30, -(1 << 30), 1 << 29, i32::MIN, 0]),
+        ];
+        for (wire, want) in cases {
+            let bytes = bytes_of(wire, &x);
+            assert_eq!(ints(&bytes, wire.bytes()), want, "{wire:?} write");
+            assert_eq!(read_through(wire, &bytes, 1, 2), x, "{wire:?} read back");
+        }
+    }
+
+    #[test]
+    fn float_to_int_truncates_toward_zero() {
+        // 0.1 is 3276.8 LSB of 16 bits and 838_860.8 of 24.
+        assert_eq!(ints(&bytes_of(Wire::I16, &[0.1, -0.1]), 2), [3_276, -3_276]);
+        assert_eq!(ints(&bytes_of(Wire::I24, &[0.1, -0.1]), 3), [838_860, -838_860]);
+    }
+
+    #[test]
+    fn i32_with_24_valid_bits_carries_the_audio_in_the_top_24_bits() {
+        // Values on the 24-bit grid: the low byte written is zero and the top 24 bits are the
+        // 24-bit sample; a 24-in-32 device sample (v << 8) reads back as v / 2^23.
+        let x = [0.5, -0.5, 1.0 / 8_388_608.0, -3.0 / 8_388_608.0, -1.0];
+        let bytes = bytes_of(Wire::I32, &x);
+        let got = ints(&bytes, 4);
+        assert!(got.iter().all(|v| v & 0xff == 0), "the low byte is zero on the 24-bit grid: {got:x?}");
+        assert_eq!(got.iter().map(|v| v >> 8).collect::<Vec<_>>(), [4_194_304, -4_194_304, 1, -3, -8_388_608]);
+        let device: Vec<u8> = [4_194_304i32, -1, 8_388_607].iter().flat_map(|v| (v << 8).to_le_bytes()).collect();
+        assert_eq!(read_through(Wire::I32, &device, 1, 4), [0.5, -1.0 / 8_388_608.0, 8_388_607.0 / 8_388_608.0]);
+        // Off the grid the top 24 bits are the sample to within one 24-bit LSB.
+        let fine = bytes_of(Wire::I32, &[0.123_456_79]);
+        assert!((f64::from(ints(&fine, 4)[0] >> 8) / 8_388_608.0 - 0.123_456_79).abs() <= 1.0 / 8_388_608.0);
+    }
+
+    #[test]
+    fn int_formats_clamp_at_full_scale() {
+        let x = [1.0, 1.5, -1.0, -1.5, f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(ints(&bytes_of(Wire::I16, &x), 2), [32_767, 32_767, -32_768, -32_768, 32_767, -32_768]);
+        assert_eq!(ints(&bytes_of(Wire::I24, &x), 3), [8_388_607, 8_388_607, -8_388_608, -8_388_608, 8_388_607, -8_388_608]);
+        assert_eq!(ints(&bytes_of(Wire::I32, &x), 4), [i32::MAX, i32::MAX, i32::MIN, i32::MIN, i32::MAX, i32::MIN]);
+    }
+
+    #[test]
+    fn silence_is_zero_bytes_both_ways() {
+        for wire in [Wire::F32, Wire::I16, Wire::I24, Wire::I32] {
+            let bytes = bytes_of(wire, &[0.0; 9]);
+            assert!(bytes.iter().all(|b| *b == 0), "{wire:?}");
+            assert!(read_through(wire, &vec![0u8; 9 * wire.bytes()], 3, 2).iter().all(|v| *v == 0.0), "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn odd_frame_counts_convert_every_frame_through_a_chunked_scratch() {
+        // 7 stereo frames through a 7-sample scratch (render) and a 2-frame scratch (capture): the
+        // last chunk is partial both ways.
+        for wire in [Wire::I16, Wire::I24, Wire::I32] {
+            let x: Vec<f32> = (0..14).map(|i| (i as f32 - 7.0) / 8.0).collect();
+            let bytes = bytes_of(wire, &x);
+            assert_eq!(bytes.len(), 14 * wire.bytes());
+            assert_eq!(read_through(wire, &bytes, 2, 2), x, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn int_conversion_allocates_nothing() {
+        use transit_rt::testing::measure;
+        let x: Vec<f32> = (0..2 * 129).map(|i| (i as f32 / 129.0) - 1.0).collect();
+        let mut scratch = vec![0.0f32; 64];
+        let mut bytes = vec![0u8; x.len() * 4];
+        let mut seen = 0usize;
+        for wire in [Wire::I16, Wire::I24, Wire::I32] {
+            let len = x.len() * wire.bytes();
+            let ((), stats) = measure(|| {
+                let mut at = 0;
+                ConvertSink { scratch: &mut scratch, bytes: &mut bytes[..len], wire }.render(&mut |s| {
+                    s.copy_from_slice(&x[at..at + s.len()]);
+                    at += s.len();
+                });
+                ConvertSource { scratch: &mut scratch, channels: 2, frames: 129, bytes: Some(&bytes[..len]), wire }
+                    .chunks(&mut |_, s| seen += s.len());
+            });
+            assert!(stats.is_zero(), "{wire:?} allocated: {stats:?}");
+        }
+        assert_eq!(seen, 3 * x.len());
     }
 
     #[test]

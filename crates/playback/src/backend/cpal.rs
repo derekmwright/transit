@@ -96,6 +96,11 @@ fn stream_error(error: &cpal::StreamError) -> ab::StreamError {
     if matches!(error, cpal::StreamError::DeviceNotAvailable) { ab::StreamError::DeviceNotAvailable } else { ab::StreamError::Other }
 }
 
+/// cpal opens shared streams only: exclusive mode is the native WASAPI backend's.
+fn shared_only(request: &ab::OpenRequest) -> Result<(), ab::OpenError> {
+    if request.mode == ab::Mode::Shared { Ok(()) } else { Err(ab::OpenError::Other("exclusive mode needs the native backend".into())) }
+}
+
 fn open_error(error: cpal::BuildStreamError) -> ab::OpenError {
     match error {
         cpal::BuildStreamError::DeviceNotAvailable => ab::OpenError::DeviceNotAvailable(error.to_string()),
@@ -330,6 +335,7 @@ impl ab::Backend for CpalBackend {
         error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
         use ab::SampleFormat as S;
+        shared_only(request)?;
         let device = device_of(endpoint)?;
         let config = stream_config(request);
         let built = match request.format.sample {
@@ -359,6 +365,7 @@ impl ab::Backend for CpalBackend {
         error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
         use ab::SampleFormat as S;
+        shared_only(request)?;
         let device = device_of(endpoint)?;
         let config = stream_config(request);
         let built = match request.format.sample {
