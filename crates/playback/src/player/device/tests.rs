@@ -545,7 +545,7 @@ fn a_refused_period_retries_exclusive_at_the_device_period_and_says_so() {
         default_frames: Some(480),
         message: "Initialize(exclusive): the period is outside the range the device accepts".into(),
     });
-    let cfg = AudioConfig { buffer_size: Some(128), ..Default::default() };
+    let cfg = AudioConfig { buffer_size: Some(128), share_device: false, ..Default::default() };
     let fallback = fake_factory(false);
     let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &native, &fallback).unwrap();
     assert_eq!(
@@ -566,7 +566,9 @@ fn a_period_error_at_the_device_period_has_no_step_left_and_falls_back_to_cpal()
         message: "Initialize(exclusive): the period is outside the range the device accepts".into(),
     });
     let fallback = fake_factory(false);
-    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).unwrap();
+    let player =
+        Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig { share_device: false, ..Default::default() }, &native, &fallback)
+            .unwrap();
     assert!(!player.native_backend);
     assert!(player.backend_note.as_deref().is_some_and(|n| n.starts_with("Native WASAPI failed: ") && n.ends_with("; using the cpal backend")));
 }
@@ -581,7 +583,7 @@ fn a_device_held_by_another_app_or_closed_to_exclusive_use_opens_shared_and_says
     ] {
         let native = fake_at_128();
         native.fail_next_open(error);
-        let cfg = AudioConfig { buffer_size: Some(128), ..Default::default() };
+        let cfg = AudioConfig { buffer_size: Some(128), share_device: false, ..Default::default() };
         let fallback = fake_factory(false);
         let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &native, &fallback).unwrap();
         assert_eq!(
@@ -619,7 +621,13 @@ fn any_other_exclusive_error_and_any_shared_error_fall_back_to_cpal() {
 fn a_duplex_input_that_cannot_open_exclusive_reopens_both_streams_in_the_fallback_mode() {
     let native = fake_factory(false).with_capture(2, true);
     native.fail_next_open(ab::OpenError::InUse("in use".into()));
-    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fake_factory(false)).unwrap();
+    let player = Player::open_native_or_cpal(
+        Arc::new(Session::default()),
+        &AudioConfig { share_device: false, ..Default::default() },
+        &native,
+        &fake_factory(false),
+    )
+    .unwrap();
     assert_eq!(
         modes(&native),
         [
@@ -636,7 +644,7 @@ fn a_duplex_input_that_cannot_open_exclusive_reopens_both_streams_in_the_fallbac
 
 #[test]
 fn a_duplex_input_failure_the_ladder_does_not_answer_keeps_the_output_exclusive() {
-    let cfg = AudioConfig::default();
+    let cfg = AudioConfig { share_device: false, ..Default::default() };
     let held = fake_factory(false).with_capture(2, true);
     held.fail_next_open(ab::OpenError::Other("not an exclusive-mode error".into()));
     let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &held, &fake_factory(false)).unwrap();
@@ -749,7 +757,7 @@ fn fake_calibration(rate: u32) -> crate::LoopbackCalibration {
 fn a_matching_calibration_reaches_both_streams_and_a_mismatched_one_does_not() {
     for (calibration_rate, expected) in [(48_000, Some(ab::Calibration { round_trip_ns: 10_000_000, uncertainty_ns: 520_833 })), (44_100, None)] {
         let fake = fake_factory(false).with_capture(2, true);
-        let cfg = AudioConfig { calibrations: vec![fake_calibration(calibration_rate)], ..Default::default() };
+        let cfg = AudioConfig { calibrations: vec![fake_calibration(calibration_rate)], share_device: false, ..Default::default() };
         let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
         assert!(player.native_backend && !player.silent);
         let opens = fake.opens();

@@ -442,15 +442,16 @@ fn settings_path(app: &StudioApp) -> String {
         .map_or_else(|| r"%APPDATA%\transit\ui.json".to_string(), |dir| dir.join("ui.json").display().to_string())
 }
 
-/// The checkbox under the Backend selector (native WASAPI): unchecked is exclusive, the default.
-pub const SHARE_LABEL: &str = "Share the device with other apps";
+/// The checkbox under the Backend selector (native WASAPI): unchecked is shared, the default;
+/// checked is exclusive (`share_device` false).
+pub const SHARE_LABEL: &str = "Take exclusive control of the device";
 
 /// The one-line hint under the checkbox, for the state it is in.
 pub fn share_hint(shared: bool) -> &'static str {
     if shared {
-        "Shared: Windows mixes other apps in with transit; higher latency."
+        "Shared: Windows mixes other apps in with transit; the most dependable choice."
     } else {
-        "Exclusive: the lowest latency the driver allows; other apps are silenced while transit runs."
+        "Exclusive: other apps are silenced while transit runs, and latency is only as good as the driver; some drivers open silent."
     }
 }
 
@@ -614,7 +615,9 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     ui.end_row();
                     if draft.backend == Backend::NativeWasapi {
                         ui.label("");
-                        let b = ui.add_enabled(audio_on, egui::Checkbox::new(&mut draft.share_device, SHARE_LABEL));
+                        let mut exclusive = !draft.share_device;
+                        let b = ui.add_enabled(audio_on, egui::Checkbox::new(&mut exclusive, SHARE_LABEL));
+                        draft.share_device = !exclusive;
                         controls.push((SHARE_LABEL.into(), "share_device", b.rect));
                         ui.end_row();
                         ui.label("");

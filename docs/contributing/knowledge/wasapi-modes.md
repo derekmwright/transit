@@ -29,7 +29,7 @@ silenced while it is open. What changes:
 - **Calibration.** A loopback calibration is keyed by mode (`"shared"` or `"exclusive"`); measure each.
 
 On the Scarlett 2i2 exclusive mode at 480 frames still measures about 223 ms round trip: that latency is
-in the Focusrite WDM driver, and ASIO is the low-latency path there. The cpal adapter opens shared
+in the Focusrite WDM driver, and ASIO is the low-latency path there. The app opens shared by default; exclusive is available via the "Take exclusive control of the device" checkbox (ADR 0016, amendment 2), because on a Model 12 it measures about 276 ms with silence on about half the opens. The cpal adapter opens shared
 streams only; it refuses `Mode::Exclusive`.
 
 ## Instrumentation

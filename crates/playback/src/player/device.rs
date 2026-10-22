@@ -296,7 +296,7 @@ impl Player {
         native: &dyn ab::BackendFactory,
         fallback: &dyn ab::BackendFactory,
     ) -> Result<Self, String> {
-        // Exclusive unless the user asked to share the device; each step down the ladder
+        // Shared unless the user asked for exclusive control of the device; each step down the ladder
         // (`exclusive_fallback`) reopens the whole device, before any stream has started.
         let mut step = OpenStep { mode: Some(if cfg.share_device { ab::Mode::Shared } else { ab::Mode::Exclusive }), default_period: false };
         let mut notes: Vec<String> = Vec::new();

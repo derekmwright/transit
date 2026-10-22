@@ -105,6 +105,10 @@ Measured the same day on a Focusrite Scarlett 2i2: round trip shared 248 ms, exc
 
 A duplex open keeps both streams in one mode: if the exclusive input fails with an error the ladder answers, the whole open is redone at the next step, so an exclusive output never sits beside a shared input. When the user already asked to share the device there is no ladder; an error goes straight to step 4.
 
+### Amendment 2 2026-10-22: shared is the default again; exclusive is the opt-in
+
+The project owner reversed the amendment above after measuring both interfaces: when the native backend is selected, shared mode is the default and exclusive is the opt-in. `AudioConfig.share_device` now defaults to true, so a saved `ui.json` without the field loads shared, and the checkbox reads "Take exclusive control of the device" (checked sets `share_device` false). On the Focusrite Scarlett 2i2 at 48 kHz the round trip is 248 ms shared and 223 ms exclusive, stable only at the driver's 10 ms default period (K24, K25); on the TASCAM Model 12 at 44.1 kHz it is 61 to 71 ms shared and about 276 ms exclusive, with silence on about half the opens. Exclusive is therefore no faster where it works and unreliable where it does not, ASIO is the tracking path on both, and exclusive stays available through the checkbox; the fallback ladder is unchanged and applies only to an exclusive open.
+
 ## Consequences
 
 - One more `unsafe`-bearing crate and a `windows` dependency; the review burden is bounded by the quoted-unsafe pass and by the crate being small and Windows-only.
@@ -118,7 +122,7 @@ A duplex open keeps both streams in one mode: if the exclusive input fails with 
 - **Keep patching CPAL upstream.** Rejected: slow, shared-only by design, and the minimal-diff rule forbids the redesign this needs.
 - **The `wasapi-rs` crate.** Rejected as the foundation: its `unsafe` and COM lifetime handling would sit outside the quoted-unsafe review, and `IAudioClient3` and device-position access are thin. It stays a reference for reviewers.
 - **ASIO only on Windows.** Rejected: needs Steinberg's SDK and agreement (pending), one driver per process, no coexistence, nothing for interfaces without ASIO.
-- **Exclusive mode as the default.** Rejected: it silences every other app and fails when the device is busy; it is a per-device opt-in. Reversed by the 2026-10-22 amendment above: the owner chose exclusive as the default with a share checkbox and a fallback ladder.
+- **Exclusive mode as the default.** Rejected: it silences every other app and fails when the device is busy; it is a per-device opt-in. Reversed by the first 2026-10-22 amendment (exclusive as the default with a share checkbox and a fallback ladder) and reversed back by amendment 2: shared is the default and exclusive is the opt-in.
 - **Build the backend before the harness.** Rejected by the project owner's requirement: without a baseline, "better than CPAL" is an opinion.
 
 ## Related

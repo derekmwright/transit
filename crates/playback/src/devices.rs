@@ -29,7 +29,7 @@ pub enum Backend {
     #[default]
     Auto,
     Cpal,
-    /// The native WASAPI backend (shared mode, `IAudioClient3`). Used only on the WASAPI system
+    /// The native WASAPI backend (shared mode by default, exclusive on request; ADR 0016). Used only on the WASAPI system
     /// of a build with the `native-wasapi` feature; otherwise, or if it fails to open, cpal.
     NativeWasapi,
 }
@@ -61,7 +61,7 @@ pub fn native_wasapi_offered(system: Option<&str>) -> bool {
 }
 
 /// The user's audio device choice. Every field is optional: `None` means "the system default".
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
     /// Which backend opens the device on the WASAPI system (`Auto` is cpal in this slice).
@@ -81,10 +81,26 @@ pub struct AudioConfig {
     /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`). Only the
     /// native WASAPI backend applies one, and only on an exact key match.
     pub calibrations: Vec<LoopbackCalibration>,
-    /// The native WASAPI backend opens the device shared (through the Windows mixer) instead of
-    /// exclusive, which is its default (ADR 0016, amendment of 2026-10-22). Missing in a saved
-    /// config reads as alse: exclusive.
+    /// The native WASAPI backend opens the device shared (through the Windows mixer), which is its
+    /// default; false asks for exclusive mode (ADR 0016, amendment 2 of 2026-10-22). Missing in a
+    /// saved config reads as true: shared.
     pub share_device: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            backend: Backend::default(),
+            system: None,
+            output: None,
+            input: None,
+            input_pairing: None,
+            sample_rate: None,
+            buffer_size: None,
+            calibrations: Vec::new(),
+            share_device: true,
+        }
+    }
 }
 
 /// The `mode` key of a shared-mode calibration.
@@ -477,15 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn the_share_checkbox_defaults_to_exclusive_and_round_trips() {
-        assert!(!AudioConfig::default().share_device, "exclusive is the default");
-        assert!(
-            !serde_json::from_str::<AudioConfig>(r#"{"output":"X"}"#).unwrap().share_device,
-            "a config saved before the field exists is exclusive"
-        );
-        let shared = AudioConfig { share_device: true, ..Default::default() };
-        let text = serde_json::to_string(&shared).unwrap();
-        assert!(serde_json::from_str::<AudioConfig>(&text).unwrap().share_device);
+    fn the_share_checkbox_defaults_to_shared_and_round_trips() {
+        assert!(AudioConfig::default().share_device, "shared is the default");
+        assert!(serde_json::from_str::<AudioConfig>(r#"{"output":"X"}"#).unwrap().share_device, "a config saved before the field exists is shared");
+        let exclusive = AudioConfig { share_device: false, ..Default::default() };
+        let text = serde_json::to_string(&exclusive).unwrap();
+        assert!(!serde_json::from_str::<AudioConfig>(&text).unwrap().share_device);
     }
 
     #[test]

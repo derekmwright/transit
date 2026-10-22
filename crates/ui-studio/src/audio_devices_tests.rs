@@ -2,7 +2,7 @@
 //! input queue, one frame at a time, over stand-in devices (`audio.fake_devices`). No player, no
 //! audio device is listed or opened.
 
-use crate::audio_devices::{Opened, PAIRED_AUTOMATIC, REFUSED_RECORDING, fallback_notes};
+use crate::audio_devices::{Opened, PAIRED_AUTOMATIC, REFUSED_RECORDING, SHARE_LABEL, fallback_notes};
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
 use soundcraft_playback::{AudioConfig, Backend};
@@ -326,7 +326,7 @@ fn audio_patch_merges_fields_and_rejects_zero_atomically() {
             input_pairing: None,
             backend: Backend::Auto,
             calibrations: Vec::new(),
-            share_device: false,
+            share_device: true,
         }
     );
     let before = t.app.ui.audio.clone();
@@ -680,19 +680,20 @@ fn the_share_checkbox_follows_the_native_backend_and_applies_with_the_devices() 
     }
     t.pick("backend", Backend::NativeWasapi.label());
     assert!(has_control(&t, "share_device"), "the native backend offers it");
-    assert!(!t.app.audio_devices.draft.share_device, "unchecked: exclusive is the default");
-    assert!(t.layout()["calibration"].as_str().unwrap().contains("exclusive"), "the Calibration line names the mode");
+    assert_eq!(SHARE_LABEL, "Take exclusive control of the device");
+    assert!(t.app.audio_devices.draft.share_device, "unchecked: shared is the default");
+    assert!(t.layout()["calibration"].as_str().unwrap().contains("shared"), "the Calibration line names the mode");
     t.click(mid(t.control_rect("share_device")));
-    assert!(t.app.audio_devices.draft.share_device, "checking it asks for a shared device");
-    assert!(t.layout()["calibration"].as_str().unwrap().contains("shared"));
-    assert!(!t.app.ui.audio.share_device, "nothing is applied until Apply");
+    assert!(!t.app.audio_devices.draft.share_device, "checking it asks for exclusive control");
+    assert!(t.layout()["calibration"].as_str().unwrap().contains("exclusive"));
+    assert!(t.app.ui.audio.share_device, "nothing is applied until Apply");
     t.click(mid(t.control_rect("apply")));
-    assert_eq!(t.reopened().last().map(|c| c.share_device), Some(true), "Apply reopens the devices shared");
-    assert!(t.app.ui.audio.share_device);
+    assert_eq!(t.reopened().last().map(|c| c.share_device), Some(false), "Apply reopens the devices exclusive");
+    assert!(!t.app.ui.audio.share_device);
     t.click(mid(t.control_rect("share_device")));
-    assert!(!t.app.audio_devices.draft.share_device);
+    assert!(t.app.audio_devices.draft.share_device);
     t.click(mid(t.control_rect("apply")));
-    assert_eq!(t.reopened().last().map(|c| c.share_device), Some(false));
+    assert_eq!(t.reopened().last().map(|c| c.share_device), Some(true));
     t.pick("backend", Backend::Auto.label());
     assert!(!has_control(&t, "share_device"), "back to the default backend");
 }
