@@ -75,6 +75,15 @@ pub struct ClipRect {
     pub end: Samples,
 }
 
+/// A MIDI clip being recorded on a track's lane.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RecordingLane {
+    pub track: u64,
+    pub rect: R4,
+    /// The notes played so far, as rectangles in the lane.
+    pub notes: Vec<R4>,
+}
+
 /// Last frame's arrangement geometry.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Layout {
@@ -89,6 +98,8 @@ pub struct Layout {
     pub scroll: Samples,
     pub tracks: Vec<TrackRow>,
     pub clips: Vec<ClipRect>,
+    /// MIDI passes being recorded: the growing clip outline per track with its provisional notes.
+    pub recording: Vec<RecordingLane>,
     pub add_audio: R4,
     pub add_instrument: R4,
     /// Transport bar buttons (`play`, `stop`, `record`, `rtz`, `cycle`).
@@ -317,7 +328,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     crate::loopbar::strip(app, ui, &s, map, strip);
     layout.loop_strip = r4(strip);
     ruler_input(app, ui, map, Rect::from_min_max(pos2(ruler.min.x, strip.max.y), ruler.max));
-    overlays(app, ui, &s, map, ruler, tl, &rows, &geo);
+    overlays(app, ui, &s, map, ruler, tl, &rows, &geo, &mut layout);
     scroll_and_zoom(app, ui, map, full, tl, content_h);
     follow_playhead(app, map, tl);
     app.arrange.layout = layout;
@@ -1006,7 +1017,7 @@ fn ruler_input(app: &mut StudioApp, ui: &mut Ui, map: Map, ruler: Rect) {
 
 /// Cycle range, recording takes, cursor and playhead.
 #[allow(clippy::too_many_arguments)]
-fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Rect, rows: &[&Track], geo: &RowGeo) {
+fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Rect, rows: &[&Track], geo: &RowGeo, layout: &mut Layout) {
     let p = ui.painter();
     let sel = s.edit.cycle_range();
     if s.edit.loop_playback && !sel.is_empty() {
@@ -1023,7 +1034,7 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
     if let Some(Some((_, span))) = span {
         let rp = p.with_clip_rect(tl);
         for (i, t) in rows.iter().enumerate() {
-            if t.mixer.record_arm {
+            if t.mixer.record_arm && !app.midi_live.as_ref().is_some_and(|live| live.tracks.contains(&t.id)) {
                 let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
                 let r = Rect::from_min_max(pos2(map.x(span.start), y0 + 1.0), pos2(map.x(span.end).max(map.x(span.start) + 2.0), y0 + geo.rh - 1.0));
                 rp.rect_filled(r, crate::theme::RADIUS, TOKENS.record.gamma_multiply(0.45));
@@ -1040,6 +1051,7 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
             }
         }
     }
+    midi_recording(app, ui, s, map, tl, rows, geo, layout);
     let full = Rect::from_min_max(ruler.min, tl.max);
     let lp = p.with_clip_rect(full);
     let cx = map.x(app.cursor());
@@ -1049,6 +1061,52 @@ fn overlays(app: &StudioApp, ui: &Ui, s: &Session, map: Map, ruler: Rect, tl: Re
     if app.is_playing() {
         let px = map.x(app.engine.transport.position);
         lp.line_segment([pos2(px, ruler.min.y), pos2(px, tl.max.y)], Stroke::new(1.5, TOKENS.accent));
+    }
+}
+
+/// The MIDI take being recorded grows on each armed instrument lane from the latch to the playhead,
+/// with the notes played so far drawn inside it.
+#[allow(clippy::too_many_arguments)]
+fn midi_recording(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Track], geo: &RowGeo, layout: &mut Layout) {
+    let Some(live) = &app.midi_live else { return };
+    let rp = ui.painter().with_clip_rect(tl);
+    for (i, t) in rows.iter().enumerate() {
+        if !live.tracks.contains(&t.id) {
+            continue;
+        }
+        let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
+        let (x0, x1) = (map.x(live.start), map.x(live.end).max(map.x(live.start) + 2.0));
+        let r = Rect::from_min_max(pos2(x0, y0 + 1.0), pos2(x1, y0 + geo.rh - 1.0));
+        rp.rect_filled(r, crate::theme::RADIUS, TOKENS.record.gamma_multiply(0.45));
+        let strip = Rect::from_min_max(r.min, pos2(r.max.x, (r.min.y + CLIP_NAME_H).min(r.max.y)));
+        rp.rect_filled(strip, crate::theme::top_corners(), TOKENS.record);
+        rp.with_clip_rect(strip.intersect(tl)).text(
+            pos2(strip.min.x + 4.0, strip.center().y),
+            Align2::LEFT_CENTER,
+            "Recording",
+            FontId::proportional(11.0),
+            theme::text_on(TOKENS.record),
+        );
+        // Provisional notes: pitch maps onto the lane under the name strip.
+        let mine: Vec<_> = live.built.iter().filter(|b| b.track == t.id).collect();
+        let (lo, hi) = mine.iter().flat_map(|b| b.sequence.notes.iter().map(|n| n.pitch)).fold((127u8, 0u8), |(lo, hi), p| (lo.min(p), hi.max(p)));
+        let body = Rect::from_min_max(pos2(r.min.x, strip.max.y + 2.0), pos2(r.max.x, r.max.y - 2.0));
+        let span = f32::from(hi.saturating_sub(lo).max(11)) + 1.0;
+        let mut notes = Vec::new();
+        for b in mine {
+            let base = s.tempo.samples_to_ticks(b.range.start, s.sample_rate);
+            for n in &b.sequence.notes {
+                let (a, e) = (s.tempo.tick_to_samples(base + n.start, s.sample_rate), s.tempo.tick_to_samples(base + n.end(), s.sample_rate));
+                let h = (body.height() / span).clamp(1.5, 6.0);
+                let y = body.max.y - (f32::from(n.pitch.saturating_sub(lo)) + 1.0) * body.height() / span;
+                let nr = Rect::from_min_max(pos2(map.x(a), y), pos2(map.x(e).max(map.x(a) + 1.5), y + h)).intersect(body);
+                if nr.is_positive() {
+                    rp.rect_filled(nr, crate::theme::RADIUS_SM, theme::text_on(TOKENS.record));
+                }
+                notes.push(r4(nr));
+            }
+        }
+        layout.recording.push(RecordingLane { track: t.id.0, rect: r4(r), notes });
     }
 }
 

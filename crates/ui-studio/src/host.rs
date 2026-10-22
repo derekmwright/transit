@@ -529,6 +529,33 @@ impl StudioApp {
         }
     }
 
+    /// Rebuild the provisional MIDI clip and notes of a pass under way from what the audio thread
+    /// has captured so far. Control side only; with a long event list it runs every other frame.
+    pub(crate) fn update_midi_live(&mut self) {
+        let take = self.player.as_ref().and_then(Player::midi_recording_snapshot);
+        #[cfg(test)]
+        let take = take.or_else(|| self.finished_test_midi.clone());
+        let (Some(take), Some(plan)) = (take, self.take_plan.as_ref()) else {
+            self.midi_live = None;
+            return;
+        };
+        self.midi_live_tick = self.midi_live_tick.wrapping_add(1);
+        if take.events.len() > 2_000 && self.midi_live_tick % 2 == 1 && self.midi_live.is_some() {
+            return;
+        }
+        let Some(latch) = take.start else {
+            self.midi_live = None;
+            return;
+        };
+        let events: Vec<_> = take.timed(self.engine.session().sample_rate.hz()).iter().filter_map(|(offset, e)| rec_event(*offset, e)).collect();
+        let start = latch.position.sample;
+        let now = self.position().max(start);
+        let cut = soundcraft_engine::midi_take::Cut { start, pass: plan.pass, punch: plan.punch, stop: now - start };
+        let s = self.engine.session();
+        let built = soundcraft_engine::midi_take::build(&s.tempo, s.sample_rate, &events, &cut);
+        self.midi_live = Some(MidiLive { tracks: take.tracks.clone(), start, end: now, built });
+    }
+
     /// Take the input once (for recording and input monitoring) from the player and feed the
     /// player: on ASIO the one it opened with the output, elsewhere a newly opened device.
     pub(crate) fn ensure_input(&mut self) {
@@ -662,6 +689,7 @@ impl StudioApp {
     }
 
     fn finish_recording(&mut self) {
+        self.midi_live = None;
         if self.player.is_none() {
             self.engine.transport.recording = false;
         }
@@ -1230,6 +1258,16 @@ impl PlayerRequests {
 #[cfg(test)]
 #[path = "player_tests.rs"]
 mod player_tests;
+
+/// A MIDI pass under way, for drawing: the armed tracks, where it started and the playhead, and
+/// the notes played so far (open notes closed at the playhead).
+#[derive(Debug, Clone)]
+pub(crate) struct MidiLive {
+    pub tracks: Vec<TrackId>,
+    pub start: Samples,
+    pub end: Samples,
+    pub built: Vec<soundcraft_engine::midi_take::Built>,
+}
 
 /// A captured live message as the engine's recorder takes it; controllers it cannot keep (14-bit
 /// pairs, which ingress does not produce) are left out.

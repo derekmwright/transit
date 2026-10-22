@@ -237,6 +237,9 @@ pub struct StudioApp {
     #[cfg(test)]
     finished_test_midi: Option<soundcraft_playback::MidiTake>,
     record_start: Samples,
+    /// The MIDI pass under way as drawn: provisional notes, rebuilt each frame (or every other).
+    pub(crate) midi_live: Option<host::MidiLive>,
+    midi_live_tick: u32,
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
     recorder_failed: bool,
@@ -333,6 +336,8 @@ impl StudioApp {
             #[cfg(test)]
             finished_test_midi: None,
             record_start: 0,
+            midi_live: None,
+            midi_live_tick: 0,
             punch: None,
             recorder_failed: false,
             lost_shown: 0,
@@ -695,6 +700,7 @@ impl StudioApp {
         // E7: plug-in editors only work while `Player::idle` runs every frame.
         self.apply_editor_edits();
         self.poll_player();
+        self.update_midi_live();
         self.step_poll();
         self.drive_editors();
         theme::probe_fonts(ctx);

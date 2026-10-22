@@ -192,3 +192,45 @@ fn a_midi_only_pass_runs_the_real_player_plumbing_and_clears_it_at_stop() {
     assert!(app.take_plan.is_none());
     assert!(app.engine.session().track(t).unwrap().clips().is_empty(), "the latch never started, so nothing is placed");
 }
+
+#[test]
+fn the_lane_shows_a_growing_recording_clip_with_the_notes_played_so_far_until_stop_replaces_it() {
+    let (mut app, t) = app();
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    let mut frames = |app: &mut StudioApp, n: usize| {
+        for _ in 0..n {
+            time += 1.0 / 60.0;
+            let mut raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 800.0))),
+                time: Some(time),
+                ..Default::default()
+            };
+            app.raw_input_hook(&mut raw);
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            });
+            out.textures_delta.clear();
+        }
+    };
+    frames(&mut app, 3);
+    assert!(app.arrange.layout.recording.is_empty());
+    let events = vec![on(LATCH, t, 60), off(LATCH + BEAT as u64, t, 60), on(LATCH + 2 * BEAT as u64, t, 64)];
+    app.record_start = 0;
+    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new() });
+    app.engine.transport.recording = true;
+    app.start_play(4 * BEAT, None, None);
+    app.finished_test_midi = Some(pass(t, Some(0), events));
+    frames(&mut app, 3);
+    let lane = &app.arrange.layout.recording;
+    assert_eq!(lane.len(), 1, "one recording clip on the armed lane");
+    assert_eq!(lane[0].track, t.0);
+    assert_eq!(lane[0].notes.len(), 2, "two provisional notes, the held one closed at the playhead");
+    assert!(lane[0].rect[2] > lane[0].rect[0]);
+    assert!(app.engine.session().track(t).unwrap().clips().is_empty(), "nothing is placed until Stop");
+    app.stop_play();
+    frames(&mut app, 3);
+    assert!(app.arrange.layout.recording.is_empty());
+    assert_eq!(app.engine.session().track(t).unwrap().clips().len(), 1, "the real clip replaces it");
+}

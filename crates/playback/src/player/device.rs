@@ -552,6 +552,18 @@ impl Player {
         MidiTake { tracks: pass.tracks.clone(), start: Some(point), events: capture.events().to_vec(), dropped: 0, device_rate: self.device_rate }
             .timed(session_rate)
     }
+    /// The pass so far as a take (latch if applied, events captured to now), for drawing the
+    /// recording while it runs. Drains the queue into the take list; nothing is consumed.
+    pub fn midi_recording_snapshot(&self) -> Option<MidiTake> {
+        let (mut capture, pass) = (self.capture.try_borrow_mut().ok()?, self.midi_pass.try_borrow().ok()?);
+        let (capture, pass) = (capture.as_mut()?, pass.as_ref()?);
+        capture.poll();
+        let start = match pass.reader.status() {
+            Status::Started(point) => Some(point),
+            _ => None,
+        };
+        Some(MidiTake { tracks: pass.tracks.clone(), start, events: capture.events().to_vec(), dropped: 0, device_rate: self.device_rate })
+    }
     /// End the MIDI pass: everything captured, the latch and the loss count. None when no pass
     /// was prepared.
     pub fn finish_midi_recording(&self) -> Option<MidiTake> {
