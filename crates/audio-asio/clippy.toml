@@ -1,0 +1,7 @@
+# The audio callback must not allocate (ADR 0016, section 4). The callback modules deny these
+# lints; the control-thread modules allow them.
+disallowed-macros = [{ path = "std::format", reason = "allocates; never on the audio thread" }]
+disallowed-methods = [
+    { path = "std::string::ToString::to_string", reason = "allocates; never on the audio thread" },
+    { path = "std::string::String::from_utf8_lossy", reason = "allocates; never on the audio thread" },
+]

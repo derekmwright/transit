@@ -17,6 +17,7 @@ transit-rt = { path = "crates/rt" }
 soundcraft-audio-io = { path = "crates/audio-io" }
 transit-audio-backend = { path = "crates/audio-backend" }
 transit-audio-wasapi = { path = "crates/audio-wasapi" }
+transit-audio-asio = { path = "crates/audio-asio" }
 transit-midi-io = { path = "crates/midi-io" }
 soundcraft-midi = { path = "crates/midi" }
 soundcraft-video = { path = "crates/video" }

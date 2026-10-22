@@ -23,6 +23,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("audio-io", 0),
     ("audio-backend", 0),
     ("audio-wasapi", 0),
+    ("audio-asio", 0),
     ("midi-io", 0),
     ("midi", 0),
     ("video", 0),
@@ -44,10 +45,10 @@ const STANDALONE: &[&str] = &["time", "audio-io", "midi-io", "midi", "video", "d
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask", "audio-bench"];
 /// The only crates whose manifest may opt out of the workspace `unsafe_code = "forbid"` (ADR 0013
-/// and its amendments): `rt` and `audio-wasapi` set `allow`; the SDK and FFI crates set `deny`
+/// and its amendments): `rt`, `audio-wasapi` and `audio-asio` set `allow`; the SDK and FFI crates set `deny`
 /// and allow `unsafe` only on their FFI module. `au-host` and `asio-panel` are the two isolated
 /// FFI helpers that predate the amendments and follow the same `deny` pattern.
-const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi", "clap-host", "vst3-host", "au-host", "asio-panel"];
+const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi", "audio-asio", "clap-host", "vst3-host", "au-host", "asio-panel"];
 
 /// True when the manifest sets `unsafe_code` to anything but `forbid` (any spacing or quoting).
 fn opts_out_of_forbid(manifest: &str) -> bool {
