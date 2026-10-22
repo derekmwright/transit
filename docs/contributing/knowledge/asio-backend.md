@@ -31,7 +31,11 @@ One dedicated thread, `transit-asio-host`, owns the driver object and makes ever
   passes an uninitialized `sysRef`; we never do.
 - **Requests.** Callers queue a closure over `HostState` (list, load and init, query, set rate, panel,
   unload) and set an auto-reset event. Between requests the thread dispatches its window messages and
-  sleeps in `MsgWaitForMultipleObjects` on that event and its queue.
+  sleeps in `MsgWaitForMultipleObjects` on that event and its queue: without a timeout while no driver
+  runs, and for at most a quarter of the watchdog's limit while one does ([Watchdog](#the-watchdog-slice-d1)).
+- **Priority.** The thread raises itself to `THREAD_PRIORITY_ABOVE_NORMAL` at its start: it serves the
+  driver's messages, the watchdog and the stream requests, and never runs audio, so it stays below
+  the time-critical and MMCSS threads (a refusal is logged; it then runs at normal priority).
 - **Timeouts.** A caller waits at most 10 s (`HOST_TIMEOUT`; 600 s for `controlPanel`, which may be
   modal). A driver that blocks (in `init`, say) makes the request fail with an error, not a hang; later
   requests fail at once while the thread is blocked; a load whose caller gave up is undone when the
@@ -144,15 +148,16 @@ process makes that sufficient; a second install fails). The callbacks:
 - run the user callbacks under `catch_unwind`: a panic is reported once as `StreamError::Other`, the
   callback is not called again and its outputs play silence.
 
-The callback runs at the driver's thread priority (`WorkerPriority::Unobserved`); no MMCSS promotion
-is attempted (the amendment defers that to slice d).
+The callback thread joins MMCSS "Pro Audio" at its first buffer switch after each start; see
+[MMCSS](#mmcss-slice-d1).
 
 ### Driver messages
 
 `asioMessage`: `kAsioSelectorSupported` (1 for the selectors below), `kAsioEngineVersion` 2,
 `kAsioSupportsTimeInfo` 1 (so drivers call `bufferSwitchTimeInfo`), `kAsioSupportsTimeCode` 0,
 `kAsioBufferSizeChange` 0 (the SDK: "not yet supported ... use kAsioResetRequest instead"),
-`kAsioResetRequest` (counted in `resets`; each open stream gets `StreamError::ResetRequested` once),
+`kAsioResetRequest` (counted in `resets`; each open stream gets `StreamError::ResetRequested` once, and
+the app reopens the device, [Reset handling](#reset-handling-slice-d1)),
 `kAsioResyncRequest` (counted in `resets`; the stamps re-anchor at the next callback),
 `kAsioLatenciesChanged` (the host thread refetches `getLatencies` for the stamps), `kAsioOverload`
 (counted in `overloads`). `sampleRateDidChange` to a rate other than the session's is a reset
@@ -196,9 +201,11 @@ crate-private and works on interleaved bytes. MSB and DSD types stay unsupported
 
 `Stream::stats()` per direction: `wakes` (buffer switches served), `wake_late_us` (arrival minus the
 previous arrival plus one buffer), `service_us` (entry to the end of the work, `outputReady`
-included), `faults` (panicked callbacks), and the driver-wide `overloads`, `position_jumps` and
-`resets`. `timeouts`, `skipped_wakes`, `min_padding_frames` and `max_packets_per_wake` stay 0: ASIO
-has no wait and no padding. A driver that stops calling is not detected yet (no watchdog).
+included), `faults` (panicked callbacks), and the driver-wide `overloads`, `busy_skips` (switches
+that found the engine still busy, from the previous switch or an error being delivered, and did
+nothing), `position_jumps`, `resets` and `timeouts` (the watchdog's stalls). `skipped_wakes`,
+`min_padding_frames` and `max_packets_per_wake` stay 0: ASIO has no wait and no padding. The
+driver-event tail reads "; overloads N, busy skips N, position jumps N, resets N".
 
 ### Measuring it
 
@@ -206,7 +213,7 @@ has no wait and no padding. A driver that stops calling is not detected yet (no 
 no SDK and no LLVM) measures the native backend through the trait, with `--period` as the buffer size
 asked of `createBuffers` and the usual `--loopback --out-ch --in-ch`. The cpal path (`--backend cpal
 --system ASIO`, `--features asio`) stays for comparison. The backend lines of an ASIO run always end
-with `overloads, position jumps, resets`.
+with `overloads, busy skips, position jumps, resets`.
 
 Hardware (2026-10-22, `hardware_scarlett_duplex_streams_two_seconds` and
 `hardware_model12_duplex_streams_two_seconds`, capture then render, every channel, two seconds of
@@ -263,15 +270,16 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   stamp-time calibration finds no pair), so the Calibration line says the driver's figures are used.
 - **Input on demand.** An input that does not open with the output (`HeldInput::No`, native WASAPI
   without a pairing) opens through the native backend that serves the output, cpal only if that fails.
-- **Reset.** `StreamError::ResetRequested` stops the output like a lost device and is said as
-  "ASIO driver asked for a reset; reopen the device" (`OutputTrouble::ResetRequested`; the input's
-  trouble says the same). The device is reopened by the user (Reconnect), not automatically.
+- **Reset.** `StreamError::ResetRequested` stops the output like a lost device
+  (`OutputTrouble::ResetRequested`), and the app reopens the device by itself:
+  [Reset handling](#reset-handling-slice-d1).
 - **Driver settings.** The button opens the running driver's panel through `Loaded::control_panel`
   on the host thread (the running session's driver is shared with the handle), called from a thread
   of its own so a modal panel does not hold the UI; the status line says when it closed. While the
   panel is open the host thread is busy, so Reconnect, Apply and Rescan Devices wait for it to
   close (they are disabled, and a listing keeps the last list), and an open refused by that blocked
-  host does not fall back to cpal, which would load the same driver twice.
+  host does not fall back to cpal, which would load the same driver twice. A reset the driver asks
+  for while its panel is open is reopened when the panel closes.
 
 Hardware (2026-10-22, `cargo test -p soundcraft-playback --features native-asio --lib -- --ignored
 hardware_player_opens_native_asio --nocapture --test-threads 1`): the whole Player path opens the
@@ -284,16 +292,94 @@ backend error. The ADR 0015 hardware-insert click train through the Player
 output 2 to input 1, every click found; without clearing the input ring after the open the Model 12
 read 1239 frames, one buffer more. On drivers whose loop phase changes between starts, such as the Model 12 (974 or 1239 frames, one buffer apart), remeasure hardware inserts after a reconnect.
 
-## Next (slice d)
+## Reset handling (slice d1)
 
-- **Reset handling:** reopen both streams on a reset or rate change (today the user reconnects), with
-  the "close both, reopen both" rule a running session needs; `busy_skips` (switches skipped while an
-  error was being delivered) into `StreamStats`.
+Code: `crates/playback/src/reopen.rs` (`Reopener`), `Player::reopen_cause` and `Player::host_blocked`
+(`crates/playback/src/player/device.rs`), `StudioApp::step_reopen` and `stop_for_reopen`
+(`crates/ui-studio/src/host.rs`). Issue #19.
+
+- **Close both, reopen both.** A reset request (or a rate change under the streams) delivers
+  `StreamError::ResetRequested` to both directions; the Player silences the output and reports
+  `reopen_cause() == DriverReset` for as long as it lives (unlike `trouble()`, which is said once).
+  The app then replaces the Player through its one reopen path, `reconnect_audio_using`, as
+  Reconnect does: the old streams are stopped and dropped (disposeBuffers, the driver released), the
+  new Player opens with the same `AudioConfig` (same driver, rate, channels and requested buffer
+  size), the input first and then the output (the open-order rule), and `createBuffers` negotiates
+  against the driver's `getBufferSize` as it is now, so a buffer size changed in the driver's panel
+  is picked up. Monitoring and armed tracks take the reopened input again (`ensure_input`). The
+  plug-ins keep their live state (`capture_states_for_reopen`), but they are re-created and their
+  editors close and reopen, as on Reconnect (known issue K32).
+- **Never a splice.** On the reset the transport stops for good (`stop_for_reopen`): a take in
+  progress ends there and is kept ("Recording ended: driver reset. The take is kept up to there.
+  Reopening the device."), and since the faulted runtime acknowledges nothing, the transport is
+  stopped on the UI side; the runtime gets no more session, I/O or transport work until it is
+  replaced. Recording resumes only when the user records again.
+- **When.** `Reopener` waits 0.25 s for the driver to settle, then makes at most three attempts
+  (waits 0.25, 1 and 3 s); an attempt succeeds when the new Player runs (not silent, no reopen
+  cause). A reopened device must run 10 s before the count starts afresh, so a driver that keeps
+  asking runs out of attempts instead of looping. After the third failure the status says to use
+  Audio › Reconnect Device, as before slice d1. A manual Reconnect or Apply starts the count afresh.
+- **The settings panel.** While the driver's settings panel is open (the window's panel flag, or the
+  backend's `host_blocked`), nothing is attempted and no attempt is used: the panel holds the host
+  thread, and a reopen then would be refused. The panel's close message says the device reopens.
+- **What it says.** The status line says what happened and what happens next; Audio Devices shows a
+  "Recovery:" line with the state and the counts ("resets 1, stalls 0, reopened 1"). The streams'
+  own `resets` counter starts from zero with each reopen.
+- **Tests:** `crates/playback/src/reopen.rs` (the policy on a fake clock),
+  `a_driver_reset_*` and `a_device_that_does_not_reopen_*` in `crates/ui-studio/src/audio_devices_tests.rs`
+  (the whole app over the scripted native ASIO driver).
+
+## The watchdog (slice d1)
+
+Code: `crates/audio-asio/src/watchdog.rs`, `Session::tend`/`watch`, `CallbackState::stalled`.
+
+- The callback stores the QPC of each buffer switch's entry (one relaxed store); the host thread
+  compares it with the clock between requests, waking at least every quarter of the limit while the
+  driver runs. Nothing waits or spins on the driver's thread.
+- The limit is eight buffers, at least 250 ms (`STALL_PERIODS`, `STALL_FLOOR`); until the first
+  switch after a start the driver gets at least a second (`FIRST_CALL_GRACE`). It is checked only
+  while a stream of the driver is started and fires once per driver start.
+- A stall is counted in `timeouts` (driver-wide, apart from `resets`) and each open stream gets
+  `StreamError::Stalled` once, delivered under the `busy` flag like a reset. The Player treats it
+  like a reset (`OutputTrouble::Stalled`, `reopen_cause() == DriverStalled`), so the app reopens the
+  device through the same path; the "Recovery:" line counts stalls apart.
+- It does not run while a driver call holds the host thread (the settings panel, a stuck request);
+  see known issue K34.
+- **Tests:** the limit, grace and once-per-start rule on a fake clock (`watchdog.rs`); through the
+  real host thread on the fake driver, `a_driver_that_stops_calling_back_is_reported_stalled_once_by_the_watchdog`
+  and `the_watchdog_leaves_a_driver_that_calls_back_and_a_stopped_one_alone` (`stream_tests.rs`).
+  The stream tests that play the driver by hand use a watchdog floor of an hour.
+
+## MMCSS (slice d1)
+
+Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` bound by hand through
+`raw-dylib`: `AvSetMmThreadCharacteristicsW`, `AvRevertMmThreadCharacteristics`; no new crate).
+
+- The driver calls back on a thread it owns, so it cannot be promoted at its start the way the
+  WASAPI worker is. Each driver start arms the session's registration; the first buffer switch
+  registers its own thread with the MMCSS task "Pro Audio" (one OS call per start, not per buffer;
+  the callback otherwise makes one atomic load). A driver that calls back on the host thread is
+  left as it is.
+- Before the driver's `stop`, the host asks the registered thread to revert at its next switch and
+  waits up to three buffers (20 to 200 ms); a driver that does not call again by then is reverted
+  from the host thread, and that is logged (known issue K33).
+- `Stream::thread_priority` reports it: `Pending` before the first switch, `MmcssProAudio` while it
+  runs, `PromotionFailed` when MMCSS refused (logged at the stop with the OS error; playback goes
+  on), `Released`/`ReleaseFailed` after the stop, `Unobserved` on the host thread. The ignored
+  hardware stream tests print it and expect `MmcssProAudio` while running and `Released` after.
+- **Tests** use counting hooks (no test thread is really registered): `mmcss.rs` and
+  `the_buffer_switch_thread_joins_mmcss_*`, `a_driver_that_does_not_call_at_the_stop_*` in
+  `stream_tests.rs`; `the_host_thread_runs_above_normal_priority` in `host.rs`.
+
+## Next (slice d2 and later)
+
+- **Listing:** probe only the selected driver, and list off the UI thread.
+- **Stop from inside the callback.**
 - **Calibration:** the stamp-time loopback calibration cannot pair clicks while the drivers'
   `getLatencies` figures over-report the loop (known issue K31: the Focusrite driver always, the
   Model 12 in the phase that measures 22 ms); the frame-time formulas need the measured offset before
   `audio-bench --settings` can write an `asio` calibration and stamps reach `Measured` in the app.
-- **Watchdog** for a driver that stops calling (`timeouts` stays 0 today), and the MMCSS decision.
+- A stream-only reopen inside the Player (known issue K32).
 - Slice (e): retiring cpal's ASIO path and `crates/asio-panel` (the cpal path's "Driver Control Panel").
 
 Open: the WOW6432Node (32-bit) drivers are not listed; whether a message-only `sysRef` suits every
