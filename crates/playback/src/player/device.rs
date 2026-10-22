@@ -279,7 +279,7 @@ impl Player {
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {
-                midi.enable(soundcraft_midi_io::MidiIo::new("transitDAW"));
+                midi.enable(soundcraft_midi_io::MidiIo::new("transit"));
             }
             return Ok(player);
         }

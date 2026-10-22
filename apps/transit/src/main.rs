@@ -1,4 +1,4 @@
-//! transitDAW desktop app (working name): the studio UI over the SoundCraft engine.
+//! transit desktop app: the studio UI over the SoundCraft engine.
 //!
 //! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.scraft]`
 //!
@@ -120,7 +120,7 @@ impl eframe::App for App {
             }
         }
         let dirty = if self.0.engine.is_dirty() { " *" } else { "" };
-        set_title(ctx, format!("{}{dirty} — transitDAW", self.0.engine.session().name));
+        set_title(ctx, format!("{}{dirty} — transit", self.0.engine.session().name));
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.0.raw_input_hook(raw);
@@ -268,6 +268,9 @@ fn main() -> eframe::Result {
         .map(|(_, a)| a.clone())
         .collect();
     log::info!("transit {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
+    if prefs_enabled() {
+        config::migrate_legacy_config();
+    }
     if let Some(logger) = logger {
         match config::config_dir() {
             _ if !prefs_enabled() => logger.no_file(),
@@ -291,18 +294,18 @@ fn main() -> eframe::Result {
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("transitDAW")
+            .with_title("transit")
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("transitdaw"),
+            .with_app_id("transit"),
         ..Default::default()
     };
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
     graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
     eframe::run_native(
-        "transitDAW",
+        "transit",
         options,
         Box::new(move |cc| {
             let player =

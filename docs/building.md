@@ -20,9 +20,9 @@ The binary is `target/release/transit` (`transit.exe` on Windows).
 
 transit keeps `ui.json`, `Autosave/` and `logs/` in its own settings folder:
 
-- Windows: `%APPDATA%\transitDAW`
-- macOS: `~/Library/Application Support/transitDAW`
-- Linux: `~/.config/transitdaw` (or `$XDG_CONFIG_HOME/transitdaw`)
+- Windows: `%APPDATA%\transit`
+- macOS: `~/Library/Application Support/transit`
+- Linux: `~/.config/transit` (or `$XDG_CONFIG_HOME/transit`)
 
 Set `TRANSIT_CONFIG_DIR` to use a different folder, for example to keep a test build away from your
 real settings. The plug-in scan cache is shared with SoundCraft (`SOUNDCRAFT_CONFIG_DIR` overrides).

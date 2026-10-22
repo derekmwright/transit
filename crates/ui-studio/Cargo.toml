@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-ui-studio"
-description = "transitDAW's studio UI (egui): arrangement, transport and the host loop over the SoundCraft engine"
+description = "transit's studio UI (egui): arrangement, transport and the host loop over the SoundCraft engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

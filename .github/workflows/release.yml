@@ -57,7 +57,7 @@ jobs:
 
           - Audio is WASAPI only; this build has no ASIO support.
           - The program is unsigned. If SmartScreen blocks it, click "More info", then "Run anyway".
-          - Settings and logs: %APPDATA%\transitDAW (set TRANSIT_CONFIG_DIR to change).
+          - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
           - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
           Compress-Archive -Path $d -DestinationPath "$d.zip"

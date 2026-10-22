@@ -101,9 +101,9 @@ cargo run -p transit --release -- --demo  # built-in demo song
 transit --version
 ```
 
-Settings, autosaves and logs live in a per-user folder: `%APPDATA%\transitDAW` on Windows,
-`~/Library/Application Support/transitDAW` on macOS, `$XDG_CONFIG_HOME/transitdaw` (or
-`~/.config/transitdaw`) elsewhere. Set `TRANSIT_CONFIG_DIR` to use another folder. An empty value
+Settings, autosaves and logs live in a per-user folder: `%APPDATA%\transit` on Windows,
+`~/Library/Application Support/transit` on macOS, `$XDG_CONFIG_HOME/transit` (or
+`~/.config/transit`) elsewhere. Set `TRANSIT_CONFIG_DIR` to use another folder. An empty value
 disables saving settings.
 
 ## Status and known issues

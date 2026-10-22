@@ -25,7 +25,7 @@ The project owner decided (2026-10-18) to take the engine and continue to refine
 
 ## Decision
 
-1. The fork `derekmwright/soundcraft` becomes our product repo. The product name is to be chosen later. `transitDAW` is the working name.
+1. The fork `derekmwright/soundcraft` becomes our product repo. The product name was to be chosen later; `transitDAW` was the working name (now **transit**).
 2. Keep the engine layers: time, audio-io, dsp, model, mix, engine, playback, clap-host, vst3-host, and au-host. Keep refining them under the stabilization playbook.
 3. Replace the UI crate with our own. Build it Logic-style first: arrangement, mixer, and piano roll. Track stacks and cycle region come early. Ableton ideas come later, and only where the model allows them.
 4. Drop the Pro Tools parity catalog and its floor test from the fork. The authorities for product behavior become the project owner's acceptance scenarios, with the three incumbents (Logic, Ableton, FL Studio) as reference.

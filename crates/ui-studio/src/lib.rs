@@ -1,4 +1,4 @@
-//! transitDAW's studio UI: an arrangement window and a transport over the SoundCraft engine.
+//! transit's studio UI: an arrangement window and a transport over the SoundCraft engine.
 //!
 //! "Cubase bones, Ableton manners" (ADR 0008). The UI draws engine state and acts by executing
 //! engine commands; audio goes through [`soundcraft_playback::Player`] and the host loop in
