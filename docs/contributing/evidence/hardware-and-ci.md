@@ -26,9 +26,9 @@ Not gated: FreeBSD, `cargo xtask rt-targets` and the device-free `audio-bench` r
 advisories (no `deny.toml`), and every hardware test. Hardware tests are `#[ignore]`d and never CI
 gates: they need a real device and a person (see below).
 
-The Windows release job builds twice: `windows-x86_64-asio` (`transit/asio` and
-`transit/native-wasapi`, LLVM from the runner for bindgen, optional `ASIO_SDK_URL` secret for the SDK
-zip) and the WASAPI-only `windows-x86_64`.
+The Windows release job builds one target, `windows-x86_64` (`transit/native-wasapi` and
+`transit/native-asio`, no SDK). The cpal ASIO host is build-only and is exercised by the
+`windows-asio` job in `ci.yml` (allowed to fail, never published).
 
 ## Hardware evidence
 

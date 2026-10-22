@@ -12,9 +12,8 @@ Releases are tag-driven. `.github/workflows/release.yml` does the building.
    ```
 
 3. `release.yml` builds four archives and attaches them to a GitHub pre-release for the tag:
-   - Windows x86_64 (two builds, each a `.msi` installer and a portable `.zip`): `windows-x86_64-asio`
-     (native WASAPI, native ASIO and cpal ASIO; see below) and `windows-x86_64` (native WASAPI and native
-     ASIO, no cpal ASIO; the fallback). Unsigned unless the
+   - Windows x86_64 (one download, a `.msi` installer and a portable `.zip`): `windows-x86_64`
+     (native WASAPI and native ASIO; no cpal ASIO, see below). Unsigned unless the
      Windows signing secrets below are set. SmartScreen may ask for "More info", then "Run anyway".
    - macOS arm64: `transit-<version>-macos-aarch64.dmg` (`transit.app` with a drag-to-Applications
      window, built by `packaging/macos/package.sh`) and a `macos-arm64` tarball with the bare binary
@@ -54,8 +53,8 @@ An MSI version is numeric `major.minor.build`, so the tag `v0.2.0` becomes `0.2.
 tag such as `v0.1.0-alpha.1` becomes `0.1.0` (the suffix is dropped; the workflow fails if the result
 is not three numeric fields). The full version is kept in the installer's comments (Apps and
 features) and in `HKLM\Software\transit\Version`. Same-version upgrades are allowed, so successive
-pre-releases of one `X.Y.Z` replace each other. The two Windows MSIs share one product, so
-installing one replaces the other.
+pre-releases of one `X.Y.Z` replace each other. Successive Windows MSIs share one product,
+so installing a newer one replaces the older.
 
 With both repository secrets set, `packaging/windows/sign.ps1` signs `transit.exe`, `audio-bench.exe`
 and the MSI with `signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256` (the files in
@@ -74,13 +73,8 @@ Say in the release notes when the build was signed; the notes say unsigned other
 
 ## ASIO
 
-The `windows-x86_64-asio` zip is built with the cpal ASIO feature (`--features transit/asio`), so the
-job needs the Steinberg ASIO SDK. By default `asio-sys` downloads it from steinberg.net during the
-build, using the LLVM preinstalled on `windows-latest`. To use an SDK zip the owner hosts instead, set
-the optional repository secret `ASIO_SDK_URL` to its URL; the workflow unpacks it and sets
-`CPAL_ASIO_DIR`. The native ASIO backend (`transit/native-asio`) needs none of this and is in both Windows zips; it will
-replace the cpal path.
-
-Distributing an ASIO-enabled binary is subject to Steinberg's ASIO SDK license, which the owner
-handles. The zip carries the required notice in `README-WINDOWS.txt`: "ASIO is a trademark of Steinberg Media
-Technologies GmbH, registered in Europe and other countries."
+The release has one Windows download (zip and MSI). It carries the native ASIO backend
+(`transit/native-asio`), which is SDK-free and needs no Steinberg agreement. The cpal ASIO host
+(`--features transit/asio`) compiles against the Steinberg ASIO SDK, so it is build-only: it is not
+released, and `release.yml` does not build it. To build it yourself you need the SDK and LLVM; see
+docs/building.md. Distributing a binary built with it requires Steinberg's ASIO SDK license.

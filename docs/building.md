@@ -85,9 +85,8 @@ The `transit/asio` feature enables `cpal`'s `asio` feature through `asio-sys`, w
 Steinberg's ASIO SDK and generates bindings with bindgen. Use it until the app moves to the native
 backend. In CI, the `windows-asio` job (allowed to fail) builds this feature, and its first run
 succeeded, which shows the SDK download works unattended on `windows-latest` with its preinstalled
-LLVM. `release.yml` builds the `windows-x86_64-asio` artifact the same way, with an optional
-`ASIO_SDK_URL` secret for an owner-hosted SDK zip; distributing that build is subject to Steinberg's
-license (see Licensing below).
+LLVM. `release.yml` does not build it: the release ships one Windows download (zip and MSI) with the native
+ASIO backend, and the cpal ASIO host is build-only (see Licensing below).
 
 The one-command build used for the owner's test builds (app, bench, native WASAPI and both ASIO
 paths), in a PowerShell session with the environment from the Build step below:
@@ -163,7 +162,6 @@ If only WASAPI appears, the binary was built without the feature. To measure it,
 Building the ASIO SDK into a binary for your own use is allowed by the SDK license. If you want to
 redistribute an ASIO-enabled binary, you must first sign Steinberg's ASIO SDK Licensing Agreement
 (free; signed and emailed to Steinberg) and show this notice: "ASIO is a trademark of Steinberg
-Media Technologies GmbH, registered in Europe and other countries." Distributing the ASIO-enabled
-release build is subject to Steinberg's ASIO SDK license, which the project owner handles; the
-release workflow also publishes a fallback build without cpal ASIO (it still carries native WASAPI and native
-ASIO).
+Media Technologies GmbH, registered in Europe and other countries." The published
+release does not include the cpal ASIO host; its one Windows download (zip and MSI) carries native
+WASAPI and native ASIO, which need no SDK.

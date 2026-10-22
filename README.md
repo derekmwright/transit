@@ -118,7 +118,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 
 ### Audio devices
 
-- Audio Devices window to pick the driver (WASAPI, or ASIO in the ASIO release build or builds you make yourself), device and buffer size.
+- Audio Devices window to pick the driver (WASAPI, or ASIO (native ASIO in the release; the cpal ASIO host only in builds you make yourself)), device and buffer size.
 - Named input and output paths, saved per machine.
 - Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. It opens the device shared by default; a "Take exclusive control of the device" checkbox opens it exclusive instead (other apps are silenced while transit runs), and an exclusive open that fails steps down to shared, with a message, rather than failing silently. `audio-bench --backend wasapi` measures it. Verified on a Scarlett 2i2 in shared and exclusive mode (a Model 12 run is pending). On Windows, native WASAPI gives any interface a dependable, calibrated stereo path with no SDK and no extra driver install. How many channels it sees is decided by the vendor's WDM driver: the TASCAM Model 12 registers one stereo playback and one stereo recording endpoint, so WASAPI shows 2 in and 2 out on it in every mode, and individual channels cannot be recorded over WASAPI. Multichannel and tracking-grade latency on Windows are the ASIO path (a native ASIO backend is in progress).
 - Experimental native ASIO backend (build with the `native-asio` feature; no Steinberg SDK and no LLVM): choose Audio system ASIO, then Backend > Native ASIO. It lists every installed driver and says which failed to load, opens every channel of the interface (all 12 inputs and 10 outputs of the TASCAM Model 12, named as the driver names them), plays, records and runs hardware inserts duplex, shows the buffer, sample format and latency the driver reports, and opens the driver's own settings (Driver settings). About 6 ms round trip on the Scarlett 2i2 at 64 samples. A driver reset request stops playback with a message to reconnect.
@@ -144,7 +144,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 
 ## Status
 
-Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). Windows releases include an ASIO build (ASIO and native WASAPI, `transit-<version>-windows-x86_64-asio.zip`) and a WASAPI-only build; you can also build ASIO yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
+Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). The Windows release is one download (zip and MSI) with native WASAPI and native ASIO; the cpal ASIO host is build-only (`--features asio`, needs the Steinberg SDK and LLVM) and you can build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
 Expect rough edges and breaking changes to the session format. Back up anything you care about.
 
 ## Build
@@ -168,9 +168,9 @@ The native ASIO backend (`crates/audio-asio`, used by `audio-bench --backend asi
 beyond the Windows prerequisites: no SDK, LLVM or environment variables. The app's ASIO path is still
 cpal's, behind the `transit/asio` feature (`cargo build -p transit --release --features transit/asio`),
 which needs the Visual Studio 2019+ Build Tools, LLVM and the Steinberg ASIO SDK (`asio-sys` downloads
-it on the first build unless `CPAL_ASIO_DIR` points at a copy). Releases ship an ASIO build; Steinberg's
-licensing terms apply to anyone who redistributes ASIO-enabled binaries, and the project owner handles
-that for the published one.
+it on the first build unless `CPAL_ASIO_DIR` points at a copy). Releases do not include it; the one Windows download
+carries the native ASIO backend. Steinberg's licensing terms apply to anyone who redistributes
+binaries built with the cpal ASIO feature.
 
 Full steps, the MinGW/libclang pitfall, and the hardware tests: [docs/building.md](docs/building.md#building-with-asio-windows); scripted build of the cpal feature: `tools/build-asio.ps1`.
 
@@ -194,7 +194,7 @@ disables saving settings.
 - Pre-alpha; the session format and UI change freely.
 - A heavy plug-in can still block the UI for the duration of its single create call.
 - Approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
-- The Windows release includes an ASIO build (with native WASAPI) and a WASAPI-only fallback. Both are unsigned: SmartScreen shows "More info", then "Run anyway".
+- The Windows release is one download (zip and MSI) with native WASAPI and native ASIO. It is unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft
 

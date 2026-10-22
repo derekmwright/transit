@@ -2,10 +2,9 @@
 # the tag. Linux is unsigned; Windows is unsigned unless the optional signing secrets are set
 # (docs/releasing.md). macOS ships transit.app on a DMG (packaging/macos/package.sh),
 # ad-hoc signed unless the optional signing secrets are set (docs/releasing.md), plus a tarball with
-# the bare binary and the bench harness. Windows ships two zips and two MSIs (packaging/windows/transit.wxs):
-# transit-<ver>-windows-x86_64-asio (native WASAPI, native ASIO and cpal ASIO) and
-# transit-<ver>-windows-x86_64 (native WASAPI and native ASIO, no cpal ASIO; the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
-# the project owner handles; see docs/building.md. Every archive also carries the audio-bench
+# the bare binary and the bench harness. Windows ships one zip and one MSI (packaging/windows/transit.wxs):
+# transit-<ver>-windows-x86_64 (native WASAPI and native ASIO). The cpal ASIO host needs the Steinberg
+# ASIO SDK and is build-only, never released (docs/building.md). Every archive also carries the audio-bench
 # harness and BENCH-README.txt so testers can measure their interfaces without building.
 name: Release
 
@@ -33,8 +32,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x86_64-asio, os: windows-latest, asio: true, features: "--features transit/asio,transit/native-wasapi,transit/native-asio,audio-bench/asio,audio-bench/native-wasapi,audio-bench/native-asio" }
-          - { name: windows-x86_64, os: windows-latest, asio: false, features: "--features transit/native-wasapi,transit/native-asio,audio-bench/native-wasapi,audio-bench/native-asio" }
+          - { name: windows-x86_64, os: windows-latest, features: "--features transit/native-wasapi,transit/native-asio,audio-bench/native-wasapi,audio-bench/native-asio" }
           - { name: macos-arm64, os: macos-14 }
           - { name: linux-x86_64, os: ubuntu-22.04 }
     steps:
@@ -48,17 +46,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.name }}
-      # asio-sys needs libclang for bindgen. windows-latest has LLVM in C:\Program Files\LLVM. Pin the
-      # MSVC ABI as docs/building.md describes (otherwise a MinGW libclang yields E0080 layout errors).
-      - name: ASIO build environment
-        if: matrix.asio
-        shell: pwsh
-        env:
-          # Optional repository secret: a URL of the ASIO SDK zip the owner hosts. Leave it unset to
-          # let asio-sys download the SDK itself (https://www.steinberg.net/asiosdk).
-          ASIO_SDK_URL: ${{ secrets.ASIO_SDK_URL }}
-        run: |
-          ./tools/build-asio.ps1 -SetupOnly -GitHubEnvironment
       # One invocation builds the app and the audio-bench harness (shipped in every archive) so the
       # shared crates compile once with one feature set.
       - name: Build
@@ -114,20 +101,6 @@ jobs:
           $d = "${{ steps.ver.outputs.name }}"
           New-Item -ItemType Directory $d | Out-Null
           Copy-Item target/release/transit.exe, target/release/audio-bench.exe, LICENSE-MIT, LICENSE-APACHE, NOTICE $d
-          $audio = if ("${{ matrix.asio }}" -eq "true") {
-            "- Audio: native WASAPI, native ASIO (experimental) and ASIO through the cpal host are included, plus the standard WASAPI host."
-          } else {
-            "- Audio: native WASAPI and native ASIO (experimental) are included, plus the standard WASAPI host. This build has no ASIO through the cpal host (a build with it is published beside this one)."
-          }
-          $notice = if ("${{ matrix.asio }}" -eq "true") {
-            "`n" + 'ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.'
-          } else { "" }
-          $asioBench = if ("${{ matrix.asio }}" -eq "true") {
-            @'
-          ASIO (the interface's ASIO driver; use the device name --list-devices prints):
-            .\audio-bench.exe --backend cpal --system ASIO --device "<ASIO driver>" --period 64 --seconds 60 --loopback --out-ch 1 --in-ch 1
-          '@
-          } else { "" }
           $bench = @"
           audio-bench: measure your interface (round trip, jitter, xruns)
 
@@ -139,7 +112,6 @@ jobs:
                .\audio-bench.exe --backend cpal --system WASAPI --device "<output>" --in-device "<input>" --period 64 --seconds 60 --loopback --out-ch 1 --in-ch 1
              Native WASAPI:
                .\audio-bench.exe --backend wasapi --loopback --seconds 60 --out-device "<output>" --in-device "<input>"
-          $asioBench
           Do not pass --settings unless you are calibrating transit on this machine.
           "No click detected" means a wrong cable, channel or level.
           Send the table row and the backend lines via the measurement issue template:
@@ -149,13 +121,12 @@ jobs:
           @"
           transit for Windows (pre-alpha)
 
-          $audio
+          - Audio: native WASAPI and native ASIO (experimental) are included, plus the standard WASAPI host.
           - Install: run the .msi (the installer, with the Start Menu shortcut and .transit/.transitz file associations). This zip is the portable form: unzip and run transit.exe.
           - The program and the installer are unsigned. If SmartScreen blocks them, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
           - audio-bench.exe and BENCH-README.txt measure your interface; see that file.
           - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
-          $notice
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
           Compress-Archive -Path $d -DestinationPath "$d.zip"
       # Optional: with all five secrets set, import the Developer ID certificate into a temporary
@@ -265,8 +236,7 @@ jobs:
             Windows: the `.msi` installs transit and `audio-bench.exe` to Program Files (per-machine, needs administrator approval), with a Start Menu shortcut and the `.transit` and `.transitz` file associations; the `.zip` is the portable form. Both are unsigned unless these notes say signed: SmartScreen will warn, so click "More info", then "Run anyway".
 
             Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
-            - windows-x86_64-asio: transit with native WASAPI, native ASIO (experimental) and cpal ASIO; `audio-bench.exe` with the same three plus cpal WASAPI.
-            - windows-x86_64: transit with native WASAPI and native ASIO (experimental), no cpal ASIO; `audio-bench.exe` with native WASAPI, native ASIO and cpal WASAPI.
+            - windows-x86_64: transit with native WASAPI and native ASIO (experimental); `audio-bench.exe` with native WASAPI, native ASIO and cpal WASAPI.
             - macos-arm64: `audio-bench` (cpal, Core Audio), in the tarball only, not in the DMG.
             - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false
