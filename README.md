@@ -112,7 +112,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
-- MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass; each loop pass becomes a take; the lane shows the growing clip while you play.
+- MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass. With a loop on, each lap is committed as a stacked take and recording continues; stopping mid-lap keeps the partial lap, and the status line reports the take count. Held notes are cut at the loop end; resuming them in the next lap is planned.
 - A MIDI take journal is written during the pass and kept until an autosave that holds the recording lands; after a crash, the next launch recovers it as a `<Track>_recovered` clip. Record works without a validated device clock: alignment is approximate, a take recorded that way says so, and when recording cannot start you get a plain-English reason.
 - A hosted plug-in that re-sends an unchanged parameter value no longer registers an automation touch; only a real change does.
 
@@ -132,7 +132,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 - Bounce in Place turns a track's clips into audio.
 - Full undo history; every edit is a command.
 - Autosave, and sessions saved as versioned, human-readable JSON in `.transit` files.
-- A launch splash that reports the audio device opening first, then plug-in scan progress, and Help > About with version info.
+- A launch splash that reports the audio device opening first, then plug-in scan progress, and Help > About with version info and a link to the transit repository.
 - Import audio and MIDI files; export MIDI. File > Open Recent lists your last ten sessions (Ctrl+Shift+O).
 
 ### Under the hood
