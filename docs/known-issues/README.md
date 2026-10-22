@@ -21,6 +21,8 @@ A new issue is a new row; give it its own file only if the row cannot hold what 
 | K13 | Closed: the MIDI take journal was deleted at Stop, before the autosave held the clip. | Closed | The journal is kept until an autosave without the recording lands; recovery discards one whose clips the autosave has. |
 | K14 | Approximate record alignment on devices whose clock never validates: audio vs MIDI from one pass may differ by up to one input block. | Open | Surface `start_approximate` in the UI; native capture (ADR 0016 slice d). |
 | K15 | Closed: a hosted plug-in re-emitting an unchanged parameter value registered an automation touch every frame. | Closed | `apply_edits` touches a parameter only when the delivered value differs from the session's. |
+| K16 | Native WASAPI capture does not fill lost packets: a take recorded across a DATA_DISCONTINUITY is shorter than wall time by the gap and later material is early (cpal capture has no discontinuity handling at all). | Open, rare | Insert zero frames sized from the device-position jump and surface the count. |
+| K17 | Native WASAPI stamps are clamped non-decreasing (Held): a forward read spike holds stamps flat until time catches up; a real clock step still fails the fit slope/residual checks. | Open, cosmetic | Watch the fit telemetry on hardware; none expected. |
 | Note | The MIDI capture ring is shared by all tracks: a heavily played unarmed instrument could crowd out armed events (reported as events lost). | Note | Revisit if reports appear; a per-armed-track filter would remove it. |
 
 ## Release-note caveats
