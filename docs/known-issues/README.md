@@ -18,9 +18,9 @@ A new issue is a new row; give it its own file only if the row cannot hold what 
 | K10 | A heavy plug-in's single create call still blocks the UI thread for its duration (SDK main-thread rule). | Open, unchanged | A dedicated plug-in-host thread (needs an ADR). |
 | K11 | Closed: a MIDI take journal (`<Audio Files>/<session>_<stamp>.midijournal`) is appended during a pass and recovered at launch as `<Track>_recovered`. | Closed | Done. |
 | K12 | Freeze uses a fixed 2 s tail (`TAIL_SECS` in `crates/engine/src/cmd/freeze.rs`); longer reverb tails are truncated. | Open | Measure or ask the plug-in for its tail. |
-| K13 | The journal is deleted at Stop before the next autosave lands: a crash in that window loses the pass. | Open | Delete the journal after the autosave confirms. |
+| K13 | Closed: the MIDI take journal was deleted at Stop, before the autosave held the clip. | Closed | The journal is kept until an autosave without the recording lands; recovery discards one whose clips the autosave has. |
 | K14 | Approximate record alignment on devices whose clock never validates: audio vs MIDI from one pass may differ by up to one input block. | Open | Surface `start_approximate` in the UI; native capture (ADR 0016 slice d). |
-| K15 | Hosted plug-ins that re-emit a parameter value every block register automation touches (Touch/Latch write points) until a changed-value check lands. | Open | Touch only on a changed value. |
+| K15 | Closed: a hosted plug-in re-emitting an unchanged parameter value registered an automation touch every frame. | Closed | `apply_edits` touches a parameter only when the delivered value differs from the session's. |
 | Note | The MIDI capture ring is shared by all tracks: a heavily played unarmed instrument could crowd out armed events (reported as events lost). | Note | Revisit if reports appear; a per-armed-track filter would remove it. |
 
 ## Release-note caveats

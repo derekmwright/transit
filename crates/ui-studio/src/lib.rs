@@ -250,6 +250,11 @@ pub struct StudioApp {
     midi_live_tick: u32,
     /// The MIDI take journal of the pass under way (crash recovery, K11).
     pub(crate) midi_journal: Option<soundcraft_engine::midi_journal::Writer>,
+    /// The journal of a finished pass, until the autosave holds its clips (K13).
+    pub(crate) placed_journal: Option<host::PlacedJournal>,
+    /// Makes the next Stop see an approximate start, standing in for the recorder's latch.
+    #[cfg(test)]
+    test_approximate_start: bool,
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
     recorder_failed: bool,
@@ -353,6 +358,9 @@ impl StudioApp {
             midi_live: None,
             midi_live_tick: 0,
             midi_journal: None,
+            placed_journal: None,
+            #[cfg(test)]
+            test_approximate_start: false,
             punch: None,
             recorder_failed: false,
             lost_shown: 0,

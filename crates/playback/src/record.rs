@@ -1041,6 +1041,25 @@ mod tests {
     }
 
     #[test]
+    fn a_recorder_reports_whether_its_pass_started_without_a_validated_clock() {
+        use crate::record::start::{Point, pair};
+        use crate::timeline_map::Position;
+        let point = Point { host_ns: 0, output_frame: 100, position: Position { sample: 0, fraction: 0, denominator: 1 } };
+        for approximate in [false, true] {
+            let mut r = recorder(&Arc::new(Shared::new(CaptureRing::new(8))));
+            assert!(!r.start_approximate(), "no pass");
+            let (mut control, mut publisher) = pair(soundcraft_mix::EngineEpoch(1));
+            let reader = control.prepare().unwrap();
+            r.record_start = Some(reader.clone());
+            assert!(!r.start_approximate(), "not started yet");
+            assert!(publisher.start_placed(reader.ticket(), point, Some(64), approximate));
+            assert_eq!(r.start_approximate(), approximate);
+            r.finish();
+            assert_eq!(r.start_approximate(), approximate, "still known after Stop collected the take");
+        }
+    }
+
+    #[test]
     fn stop_waits_for_an_admitted_push_before_the_final_drain() {
         use std::sync::mpsc::channel;
         let shared = Arc::new(Shared::new(CaptureRing::new(8)));

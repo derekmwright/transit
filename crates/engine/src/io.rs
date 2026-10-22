@@ -1522,6 +1522,10 @@ pub struct Recording {
     /// clip from it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midi_journal: Option<PathBuf>,
+    /// The pass's MIDI clips are already in the session this plan was saved with, so recovery
+    /// discards the journal instead of rebuilding them (set once Stop has placed the clips).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub midi_placed: bool,
 }
 
 /// One track's take file.
@@ -1742,7 +1746,7 @@ mod record_tests {
     fn new_take_recording_over_a_clip_is_one_record_step() {
         let (mut e, vox, _, second) = over_a_clip("one");
         let before = e.undo_history();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
         let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
         assert_eq!(ids.len(), 1);
         let h = e.undo_history();
@@ -1759,7 +1763,15 @@ mod record_tests {
     fn new_take_with_punch_folds_the_trim_into_the_record_step() {
         let (mut e, vox, _, second) = over_a_clip("punch");
         let n = e.undo_history().len();
-        let plan = Recording { start: 1_000, pass: None, punch: Some(Range::new(2_000, 3_000)), rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording {
+            start: 1_000,
+            pass: None,
+            punch: Some(Range::new(2_000, 3_000)),
+            rate: 48_000,
+            takes: Vec::new(),
+            midi_journal: None,
+            midi_placed: false,
+        };
         let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
         let h = e.undo_history();
         assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
@@ -1774,7 +1786,7 @@ mod record_tests {
         let (mut e, vox, _, second) = over_a_clip("full");
         e.history_limit = e.undo_history().len();
         let last = e.undo_history().pop();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
         place_recording_take(&mut e, &plan, vec![(vox, second)], true);
         let h = e.undo_history();
         // One new entry on top of the previous newest; the duplicate step is folded, not left behind.
@@ -1791,7 +1803,7 @@ mod record_tests {
         let gtr = armed(&mut e, "Gtr", "mono", "In 2");
         add_recording(&mut e, 1_000, vec![(gtr, second.clone())], None);
         let n = e.undo_history().len();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
         place_recording_take(&mut e, &plan, vec![(vox, second.clone()), (gtr, second)], true);
         let h = e.undo_history();
         assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
@@ -1804,7 +1816,7 @@ mod record_tests {
     fn new_take_into_empty_space_does_not_duplicate_and_is_one_step() {
         let (mut e, vox, _, second) = over_a_clip("empty");
         let n = e.undo_history().len();
-        let plan = Recording { start: 20_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording { start: 20_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
         place_recording_take(&mut e, &plan, vec![(vox, second)], true);
         let h = e.undo_history();
         assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
@@ -1815,7 +1827,15 @@ mod record_tests {
     fn recording_without_new_take_keeps_the_old_steps() {
         let (mut e, vox, _, second) = over_a_clip("old");
         let n = e.undo_history().len();
-        let plan = Recording { start: 1_000, pass: None, punch: Some(Range::new(2_000, 3_000)), rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = Recording {
+            start: 1_000,
+            pass: None,
+            punch: Some(Range::new(2_000, 3_000)),
+            rate: 48_000,
+            takes: Vec::new(),
+            midi_journal: None,
+            midi_placed: false,
+        };
         place_recording(&mut e, &plan, vec![(vox, second)]);
         assert_eq!(e.undo_history().len(), n + 2);
     }

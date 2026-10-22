@@ -63,6 +63,8 @@ pub struct TelemetryState {
     pub injected_host: Option<String>,
     /// Peak resets requested (the details window button).
     pub peak_resets: u64,
+    /// Audio takes recorded without a validated device clock (aligned approximately) this run.
+    pub approximate_takes: u64,
     pub layout: TelemetryLayout,
 }
 

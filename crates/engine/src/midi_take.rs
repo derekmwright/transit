@@ -408,7 +408,7 @@ mod tests {
         (e, t)
     }
     fn plan(start: Samples, pass: Option<Samples>) -> Recording {
-        Recording { start, pass, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None }
+        Recording { start, pass, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false }
     }
     fn two_notes(t: TrackId) -> Vec<RecEvent> {
         let mut v = vec![on(0, 60), off(24_000, 60), on(24_000, 64), off(48_000, 64)];

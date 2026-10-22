@@ -8,6 +8,7 @@ use soundcraft_model::{Session, SourceAudio, SourceId};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -26,10 +27,18 @@ pub struct Autosaver {
     jobs: Option<Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
     failure: Arc<Mutex<Option<String>>>,
+    /// Writes handed over so far.
+    queued: AtomicU64,
+    /// The newest write that reached the disk.
+    landed: Arc<AtomicU64>,
 }
 
+/// A write handed to the autosaver, to ask [`Autosaver::landed`] about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket(u64);
+
 enum Job {
-    Write(Arc<Session>, Option<String>, Option<Recording>),
+    Write(Arc<Session>, Option<String>, Option<Recording>, u64),
     /// Done with the session's folder: keep it for the next launch, or delete it.
     Close(bool),
     Flush(Sender<std::result::Result<(), String>>),
@@ -40,18 +49,28 @@ impl Autosaver {
     pub fn new(root: PathBuf) -> Autosaver {
         let (tx, rx) = channel();
         let failure = Arc::new(Mutex::new(None));
-        let writer = Writer { root, failure: Arc::clone(&failure), folder: None, pending: None, last: None, written: Ok(()) };
+        let landed = Arc::new(AtomicU64::new(0));
+        let writer =
+            Writer { root, failure: Arc::clone(&failure), landed: Arc::clone(&landed), folder: None, pending: None, last: None, written: Ok(()) };
         let thread = std::thread::Builder::new().name("soundcraft-autosave".into()).spawn(move || writer.run(&rx));
         if let Err(e) = &thread {
             report(&failure, format!("{STOPPED}: {e}"));
         }
-        Autosaver { jobs: Some(tx), thread: thread.ok(), failure }
+        Autosaver { jobs: Some(tx), thread: thread.ok(), failure, queued: AtomicU64::new(0), landed }
     }
 
     /// Autosave `session`, opened from the session file `origin`, soon, with the plan of the
-    /// recording running in it.
-    pub fn write(&self, session: Arc<Session>, origin: Option<String>, recording: Option<Recording>) {
-        self.send(Job::Write(session, origin, recording));
+    /// recording running in it. The ticket says when it is on disk (see [`Autosaver::landed`]).
+    pub fn write(&self, session: Arc<Session>, origin: Option<String>, recording: Option<Recording>) -> Ticket {
+        let n = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(Job::Write(session, origin, recording, n));
+        Ticket(n)
+    }
+
+    /// Has the write of `ticket`, or a newer one, reached the disk? Writes handed over while an
+    /// older one waits replace it, so a newer write landing covers the older ticket too.
+    pub fn landed(&self, ticket: Ticket) -> bool {
+        self.landed.load(Ordering::Acquire) >= ticket.0
     }
 
     /// Done with the open session's folder: keep it for the next launch, or delete it.
@@ -97,10 +116,11 @@ impl Drop for Autosaver {
 struct Writer {
     root: PathBuf,
     failure: Arc<Mutex<Option<String>>>,
+    landed: Arc<AtomicU64>,
     /// The open session's folder.
     folder: Option<Autosave>,
     /// The newest session not written yet.
-    pending: Option<(Arc<Session>, Option<String>, Option<Recording>)>,
+    pending: Option<(Arc<Session>, Option<String>, Option<Recording>, u64)>,
     last: Option<Instant>,
     /// How the newest write into the open folder went, for `Flush`.
     written: std::result::Result<(), String>,
@@ -114,7 +134,7 @@ impl Writer {
                 (Some(_), last) => last.map_or(Duration::ZERO, |t| INTERVAL.saturating_sub(t.elapsed())),
             };
             match jobs.recv_timeout(wait) {
-                Ok(Job::Write(session, origin, recording)) => self.pending = Some((session, origin, recording)),
+                Ok(Job::Write(session, origin, recording, n)) => self.pending = Some((session, origin, recording, n)),
                 Ok(Job::Flush(reply)) => {
                     self.write_pending();
                     let _ = reply.send(self.written.clone());
@@ -141,7 +161,7 @@ impl Writer {
     }
 
     fn write_pending(&mut self) {
-        let Some((session, origin, recording)) = self.pending.take() else { return };
+        let Some((session, origin, recording, ticket)) = self.pending.take() else { return };
         self.last = Some(Instant::now());
         let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             if self.folder.is_none() {
@@ -153,8 +173,9 @@ impl Writer {
             Ok(written) => written.map_err(|e| e.to_string()),
             Err(_) => Err("internal error (see the log)".into()),
         };
-        if let Err(e) = &self.written {
-            report(&self.failure, e.clone());
+        match &self.written {
+            Ok(()) => self.landed.store(ticket, Ordering::Release),
+            Err(e) => report(&self.failure, e.clone()),
         }
     }
 }
@@ -256,6 +277,8 @@ pub struct Leftover {
     pub recording: bool,
     /// The MIDI take journal of that recording, if it left one.
     pub midi_journal: Option<PathBuf>,
+    /// Stop had already placed that recording's MIDI clips in the autosaved session.
+    pub midi_placed: bool,
 }
 
 /// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
@@ -277,8 +300,10 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
                 let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
-                let midi_journal = recording.then(|| journal_of(&dir)).flatten();
-                out.push(Leftover { dir, name, origin, saved, recording, midi_journal });
+                let plan = recording.then(|| plan_of(&dir)).flatten();
+                let midi_placed = plan.as_ref().is_some_and(|p| p.midi_placed);
+                let midi_journal = plan.and_then(|p| p.midi_journal).filter(|j| j.is_file());
+                out.push(Leftover { dir, name, origin, saved, recording, midi_journal, midi_placed });
             }
             _ => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -393,22 +418,64 @@ fn is_take_header(head: &[u8], expected: &[u8]) -> bool {
     magic && same_fmt && data
 }
 
-/// The MIDI journal the recording plan in `dir` names, if the file is still there.
-fn journal_of(dir: &Path) -> Option<PathBuf> {
-    let plan: Recording = serde_json::from_str(&std::fs::read_to_string(dir.join(RECORDING)).ok()?).ok()?;
-    plan.midi_journal.filter(|j| j.is_file())
+/// The recording plan in `dir`.
+fn plan_of(dir: &Path) -> Option<Recording> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(RECORDING)).ok()?).ok()
+}
+
+/// `path`, which `left`'s plan names as its MIDI journal, is one SoundCraft wrote: a regular file
+/// with the journal extension in a folder it records into (as [`repair_take`] checks a take).
+/// The plan is only a file in a folder, so nothing it names is trusted further than that.
+fn trusted_journal(left: &Leftover, path: &Path) -> std::io::Result<()> {
+    let refuse = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+    if path.extension().and_then(|e| e.to_str()) != Some(crate::midi_journal::EXTENSION) {
+        return Err(refuse("not a MIDI journal file name"));
+    }
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(refuse("not a regular file"));
+    }
+    let folder = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
+    if !folder.is_some_and(|d| take_folders(left).contains(&d)) {
+        return Err(refuse("not in a folder SoundCraft records into"));
+    }
+    Ok(())
+}
+
+/// Is `left`'s MIDI journal still there and one [`recover_midi`] may use? After a failed
+/// recovery this says the failure may pass (a locked file) and the leftover is worth keeping.
+pub fn midi_journal_usable(left: &Leftover) -> bool {
+    left.midi_journal.as_deref().is_some_and(|j| trusted_journal(left, j).is_ok())
 }
 
 /// Rebuild the MIDI clips of the recording `left` was running, from its journal, into `e` (call
-/// after [`recover`]). Returns the clips made; none when it left no journal or nothing was played.
+/// after [`recover`]). Returns the clips made; none when it left no journal, nothing was played,
+/// or the autosave already holds the clips (the journal is then deleted). A journal that cannot
+/// be read is an error and is deleted with it, so recovery doesn't offer it again; one that isn't
+/// a journal in a recording folder is an error and left alone.
 pub fn recover_midi(e: &mut Engine, left: &Leftover) -> Result<Vec<soundcraft_model::ClipId>> {
-    left.midi_journal.as_deref().map_or_else(|| Ok(Vec::new()), |journal| crate::midi_journal::recover(e, journal))
+    let Some(journal) = left.midi_journal.as_deref() else { return Ok(Vec::new()) };
+    trusted_journal(left, journal).map_err(|err| EngineError::Io(format!("the MIDI journal was not used: {err}")))?;
+    if left.midi_placed {
+        let _ = std::fs::remove_file(journal);
+        return Ok(Vec::new());
+    }
+    std::fs::File::open(journal).map_err(|err| io_error(journal, err))?;
+    crate::midi_journal::recover(e, journal)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(journal);
+        })
+        .map_err(|err| EngineError::Io(format!("{err} (the journal was discarded)")))
 }
 
-/// Delete a leftover autosave, and the MIDI journal it names.
+/// Delete a leftover autosave, and the MIDI journal it names if it is one SoundCraft wrote.
 pub fn discard(left: &Leftover) {
     if let Some(journal) = &left.midi_journal {
-        let _ = std::fs::remove_file(journal);
+        match trusted_journal(left, journal) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(journal);
+            }
+            Err(err) => log::warn!("autosave: left the MIDI journal alone: {err}"),
+        }
     }
     let _ = std::fs::remove_dir_all(&left.dir);
 }
@@ -548,6 +615,7 @@ mod tests {
             rate: 48_000,
             takes: vec![Take { track, path: take, channels: 1 }],
             midi_journal: None,
+            midi_placed: false,
         };
         let clips = |e: &Engine| e.session().track(track).unwrap().clips().iter().map(|c| (c.start, c.length)).collect::<Vec<_>>();
         let w = Autosaver::new(root.clone());
@@ -602,6 +670,7 @@ mod tests {
             rate: 48_000,
             takes: paths.iter().map(|p| Take { track, path: p.clone(), channels: 1 }).collect(),
             midi_journal: None,
+            midi_placed: false,
         };
         let w = Autosaver::new(root.clone());
         w.write(e.session_arc(), None, Some(plan));
@@ -613,6 +682,112 @@ mod tests {
         for (path, bytes) in &files {
             assert_eq!(&std::fs::read(path).unwrap(), bytes, "{} untouched", path.display());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A leftover whose plan names `journal`, for an unsaved session under `root`.
+    fn left_with_journal(root: &Path, journal: &Path, placed: bool) -> Leftover {
+        let e = Engine::default();
+        let plan = Recording {
+            start: 0,
+            pass: None,
+            punch: None,
+            rate: 48_000,
+            takes: Vec::new(),
+            midi_journal: Some(journal.to_path_buf()),
+            midi_placed: placed,
+        };
+        let w = Autosaver::new(root.to_path_buf());
+        w.write(e.session_arc(), None, Some(plan));
+        drop(w);
+        let mut left = leftovers(root);
+        assert_eq!(left.len(), 1);
+        left.remove(0)
+    }
+
+    fn takes_folder(root: &Path) -> PathBuf {
+        let dir = root.join(sanitize_name(&Engine::default().session().name)).join("Audio Files");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn journal_with_a_note(path: &Path, track: soundcraft_model::TrackId) {
+        use crate::midi_journal::{Header, Latch, Record, Writer};
+        let plan = Recording { start: 0, pass: None, punch: None, rate: 0, takes: Vec::new(), midi_journal: None, midi_placed: false };
+        let latch = Latch { output_frame: 0, position: 0, device_rate: 48_000, session_rate: 48_000 };
+        let mut w = Writer::new(path.to_path_buf());
+        let on = Record { frame: 100, track, channel: 0, approximate: false, msg: crate::midi_take::Msg::NoteOn { pitch: 60, velocity: 90 } };
+        let off = Record { frame: 4_900, msg: crate::midi_take::Msg::NoteOff { pitch: 60, velocity: 0 }, ..on };
+        w.append(&Header::new(latch, &plan, None, vec![track]), &[on, off], 2).unwrap();
+        w.flush().unwrap();
+    }
+
+    #[test]
+    fn a_journal_the_autosave_already_has_the_clips_of_is_discarded_without_rebuilding() {
+        let dir = folder("autosave-journal-placed");
+        let root = dir.join("Autosave");
+        let journal = takes_folder(&root).join("Song_1.midijournal");
+        journal_with_a_note(&journal, soundcraft_model::TrackId(1));
+        let left = left_with_journal(&root, &journal, true);
+        assert!(left.midi_placed && left.midi_journal.as_deref() == Some(journal.as_path()));
+        let mut e = Engine::default();
+        e.execute("track.new", &json!({"kind": "midi"})).unwrap();
+        assert_eq!(recover_midi(&mut e, &left).unwrap(), Vec::new());
+        assert!(e.session().tracks[0].clips().is_empty(), "nothing rebuilt");
+        assert!(!journal.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_for_a_clip_the_autosave_lacks_is_rebuilt() {
+        let dir = folder("autosave-journal-unplaced");
+        let root = dir.join("Autosave");
+        let journal = takes_folder(&root).join("Song_1.midijournal");
+        let mut e = Engine::default();
+        let track = soundcraft_model::TrackId(e.execute("track.new", &json!({"kind": "midi"})).unwrap()["tracks"][0].as_u64().unwrap());
+        journal_with_a_note(&journal, track);
+        let left = left_with_journal(&root, &journal, false);
+        assert_eq!(recover_midi(&mut e, &left).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plan_can_only_name_a_journal_in_a_recording_folder() {
+        let dir = folder("autosave-journal-trust");
+        let root = dir.join("Autosave");
+        let inside = takes_folder(&root);
+        let victims = [
+            dir.join("Elsewhere/Song_1.midijournal"),
+            inside.join("notes.txt"),
+            inside.join("../Song_2.midijournal"),
+            inside.join("sub/Song_3.midijournal"),
+        ];
+        for v in &victims {
+            std::fs::create_dir_all(v.parent().unwrap()).unwrap();
+            std::fs::write(v, b"precious").unwrap();
+        }
+        for v in &victims {
+            let left = left_with_journal(&root, v, false);
+            let mut e = Engine::default();
+            let err = recover_midi(&mut e, &left).unwrap_err().to_string();
+            assert!(err.contains("not used"), "{}: {err}", v.display());
+            discard(&left);
+            assert_eq!(std::fs::read(v).unwrap(), b"precious", "{} untouched", v.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_with_a_damaged_header_is_reported_and_discarded_instead_of_offered_again() {
+        let dir = folder("autosave-journal-corrupt");
+        let root = dir.join("Autosave");
+        let journal = takes_folder(&root).join("Song_1.midijournal");
+        std::fs::write(&journal, b"{\"version\":1,\"output_fr").unwrap();
+        let left = left_with_journal(&root, &journal, false);
+        let mut e = Engine::default();
+        let err = recover_midi(&mut e, &left).unwrap_err().to_string();
+        assert!(err.contains("not a MIDI journal") && err.contains("discarded"), "{err}");
+        assert!(!journal.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

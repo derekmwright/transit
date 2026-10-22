@@ -226,7 +226,7 @@ pub fn recover(e: &mut Engine, path: &Path) -> Result<Vec<ClipId>> {
     let h = &journal.header;
     // Held notes end a little after the last event (the journal doesn't record when Stop came).
     let stop = events.iter().map(|ev| ev.offset).max().unwrap_or(0).saturating_add(i64::from(h.session_rate) / 4);
-    let plan = Recording { start: h.plan_start, pass: h.pass, punch: h.punch, rate: 0, takes: Vec::new(), midi_journal: None };
+    let plan = Recording { start: h.plan_start, pass: h.pass, punch: h.punch, rate: 0, takes: Vec::new(), midi_journal: None, midi_placed: false };
     let before = e.session_arc();
     let ids = crate::midi_take::place_midi_recording(e, &plan, &events, stop);
     let mut named: Vec<(TrackId, usize)> = Vec::new();
@@ -266,7 +266,7 @@ mod tests {
         d
     }
     fn header(tracks: Vec<TrackId>) -> Header {
-        let plan = Recording { start: 48_000, pass: None, punch: None, rate: 0, takes: Vec::new(), midi_journal: None };
+        let plan = Recording { start: 48_000, pass: None, punch: None, rate: 0, takes: Vec::new(), midi_journal: None, midi_placed: false };
         let latch = Latch { output_frame: 10_000, position: 48_000, device_rate: 48_000, session_rate: 48_000 };
         Header::new(latch, &plan, None, tracks)
     }

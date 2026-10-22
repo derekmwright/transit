@@ -171,7 +171,15 @@ impl T {
         let path = dir.0.join(format!("take{n}.wav"));
         let frames = (secs * 48_000.0) as u32;
         write_wav(&path, frames);
-        let plan = soundcraft_engine::io::Recording { start, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
+        let plan = soundcraft_engine::io::Recording {
+            start,
+            pass: None,
+            punch: None,
+            rate: 48_000,
+            takes: Vec::new(),
+            midi_journal: None,
+            midi_placed: false,
+        };
         self.app.place_takes(&plan, vec![(t, path)], start + i64::from(frames), 1);
         self.frames(3);
         self.app.status.clone()
@@ -589,7 +597,15 @@ fn a_failed_start_after_the_count_in_releases_the_take_and_says_why() {
     let engine = soundcraft_engine::Engine::default();
     let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
     let mut app = StudioApp::new(engine, Some(player), crate::Services::default());
-    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
+    app.take_plan = Some(soundcraft_engine::io::Recording {
+        start: 0,
+        pass: None,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: None,
+        midi_placed: false,
+    });
     app.status = "Recording".into();
     assert!(app.recording_active());
     app.player.as_ref().unwrap().report_start_failure(soundcraft_playback::StartFailure::Clock);

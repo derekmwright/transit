@@ -242,6 +242,31 @@ fn hosted_edits_within_the_hold_window_are_one_gesture() {
 }
 
 #[test]
+fn a_hosted_value_repeated_every_frame_writes_no_points_but_a_changing_one_does() {
+    let mut t = T::new();
+    let tr = t.eq(AutomationMode::Touch);
+    t.play();
+    t.frames(6);
+    t.app.apply_edits(vec![(tr, 0, GAIN.to_string(), 3.0)]);
+    t.frames(30);
+    assert!(t.app.auto.touches.is_empty(), "the first value is held, then let go");
+    let before = t.lane(tr, 0, GAIN).len();
+    // The same value delivered every frame for two seconds (120 frames).
+    for _ in 0..120 {
+        t.app.apply_edits(vec![(tr, 0, GAIN.to_string(), 3.0)]);
+        t.frames(1);
+    }
+    assert_eq!(t.lane(tr, 0, GAIN).len(), before, "a repeated value is not a gesture");
+    assert!(t.app.auto.touches.is_empty());
+    for i in 0..12 {
+        t.app.apply_edits(vec![(tr, 0, GAIN.to_string(), 4.0 + i as f32)]);
+        t.frames(1);
+    }
+    assert!(t.lane(tr, 0, GAIN).len() >= before + 4, "a changing value still records");
+    t.play();
+}
+
+#[test]
 fn the_picker_offers_the_lane_and_a_recorded_lane_opens_when_automation_shows() {
     let mut t = T::new();
     let tr = t.eq(AutomationMode::Latch);

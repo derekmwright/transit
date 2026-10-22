@@ -171,6 +171,7 @@ impl StudioApp {
             rate,
             takes,
             midi_journal: self.midi_journal.as_ref().map(|j| j.path().to_path_buf()),
+            midi_placed: false,
         });
         if !self.sync_player_session() {
             self.finish_recording();
@@ -402,7 +403,14 @@ impl StudioApp {
             if slot == soundcraft_mix::INSTRUMENT_SLOT {
                 continue;
             }
-            self.touch_param(t, slot, &param, true);
+            // A hosted plug-in re-reports a value it already has (a keep-alive, a rounded echo):
+            // only a changed value is a touch, or the held lane would fill with identical points.
+            let unchanged = crate::automation::Lane::of_param(t, slot, &param).is_some_and(|(track, lane)| {
+                self.engine.session().track(track).is_some_and(|tr| (lane.static_value(tr) - value).abs() <= 1e-6 * value.abs().max(1.0))
+            });
+            if !unchanged {
+                self.touch_param(t, slot, &param, true);
+            }
             let key = format!("param:{}:{slot}:{param}", t.0);
             let _ = self.engine.execute_merged("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": param, "value": value}), &key);
         }
@@ -425,6 +433,7 @@ impl StudioApp {
     /// Autosave a modified session within a second of every change, also while recording. The
     /// plugins' own state reaches the session every two minutes (`autosave`).
     pub(crate) fn autosave_changes(&mut self) {
+        self.poll_journal();
         if let Some(e) = self.autosaver.as_ref().and_then(soundcraft_engine::autosave::Autosaver::failure) {
             self.status = format!("Autosave failed: {e}");
         }
@@ -447,8 +456,63 @@ impl StudioApp {
             self.record_start = plan.start;
         }
         self.autosaved_rev = self.engine.revision;
+        let placed = self.placed_journal.as_ref().filter(|p| !matches!(p.step, JournalStep::Release | JournalStep::Cleared(_)));
+        let plan = self.take_plan.clone().or_else(|| placed.map(|p| p.plan.clone()));
+        let carries = plan.as_ref().is_some_and(|p| p.midi_placed);
         let w = self.autosaver.get_or_insert_with(|| soundcraft_engine::autosave::Autosaver::new(root));
-        w.write(self.engine.session_arc(), self.engine.path.clone(), self.take_plan.clone());
+        let ticket = w.write(self.engine.session_arc(), self.engine.path.clone(), plan);
+        if let Some(p) = &mut self.placed_journal {
+            p.step = match p.step {
+                JournalStep::Queue | JournalStep::Placed(_) if carries => JournalStep::Placed(ticket),
+                JournalStep::Queue | JournalStep::Placed(_) | JournalStep::Release => JournalStep::Cleared(ticket),
+                JournalStep::Cleared(t) => JournalStep::Cleared(t),
+            };
+        }
+    }
+
+    /// Stop placed the pass's MIDI clips in memory. The journal is the only copy of those notes
+    /// that a crash leaves, so it stays until the autosaver has written them: first a write whose
+    /// plan says the clips are placed (a crash then discards the journal on recovery), then one
+    /// whose plan no longer carries the recording, and only then is the journal deleted. Without
+    /// an autosave folder there is no plan to pair it with, and it goes at once.
+    fn hold_journal(&mut self, journal: soundcraft_engine::midi_journal::Writer, plan: &soundcraft_engine::io::Recording) {
+        if self.autosave_dir.is_none() {
+            journal.discard();
+            return;
+        }
+        let plan = soundcraft_engine::io::Recording { midi_journal: Some(journal.path().to_path_buf()), midi_placed: true, ..plan.clone() };
+        if let Some(old) = self.placed_journal.replace(PlacedJournal { journal, plan, step: JournalStep::Queue }) {
+            old.journal.discard();
+        }
+    }
+
+    /// Move a held journal along (see [`StudioApp::hold_journal`]); every frame.
+    pub(crate) fn poll_journal(&mut self) {
+        let Some(root) = self.autosave_dir.clone() else { return };
+        let Some(step) = self.placed_journal.as_ref().map(|p| p.step) else { return };
+        let landed = |app: &StudioApp, t| app.autosaver.as_ref().is_some_and(|w| w.landed(t));
+        if !self.engine.is_dirty() {
+            // Saved (or undone): the session file holds the clips, or nothing wants them.
+            if let Some(p) = self.placed_journal.take() {
+                p.journal.discard();
+            }
+            return;
+        }
+        match step {
+            JournalStep::Queue => self.queue_autosave(root),
+            JournalStep::Placed(t) if landed(self, t) => {
+                if let Some(p) = &mut self.placed_journal {
+                    p.step = JournalStep::Release;
+                }
+                self.queue_autosave(root);
+            }
+            JournalStep::Cleared(t) if landed(self, t) => {
+                if let Some(p) = self.placed_journal.take() {
+                    p.journal.discard();
+                }
+            }
+            JournalStep::Placed(_) | JournalStep::Cleared(_) | JournalStep::Release => {}
+        }
     }
 
     fn autosave_to(&mut self, root: &std::path::Path) -> bool {
@@ -479,6 +543,15 @@ impl StudioApp {
             self.stop_play();
         }
         let keep = self.engine.is_dirty() && (recording || !self.quit_requested);
+        // A journal still held stays on disk with the autosave that names it, or goes with it.
+        if let Some(mut held) = self.placed_journal.take() {
+            if keep {
+                held.step = JournalStep::Queue;
+                self.placed_journal = Some(held);
+            } else {
+                held.journal.discard();
+            }
+        }
         if keep && self.capture_plugin_states().is_ok() {
             self.write_autosave();
         }
@@ -486,6 +559,7 @@ impl StudioApp {
         if let Some(w) = &self.autosaver {
             let _ = w.flush();
         }
+        self.placed_journal = None;
     }
 
     /// Run part of a frame. If it panics, the session is autosaved (once per change) and the app
@@ -513,7 +587,10 @@ impl StudioApp {
         match soundcraft_engine::autosave::recover(&mut self.engine, left) {
             Ok(missing) => {
                 let midi = soundcraft_engine::autosave::recover_midi(&mut self.engine, left);
-                if midi.is_ok() && self.write_autosave() {
+                // A journal that can't be used (damaged, not ours) was deleted or is left alone: either
+                // way it would only be offered again. One that may open next time keeps the leftover.
+                let retry = midi.is_err() && soundcraft_engine::autosave::midi_journal_usable(left);
+                if !retry && self.write_autosave() {
                     soundcraft_engine::autosave::discard(left);
                 }
                 self.status = match missing.len() {
@@ -525,7 +602,7 @@ impl StudioApp {
                         self.status = format!("{} {} recovered MIDI clip(s) from the interrupted recording.", self.status, clips.len());
                     }
                     Ok(_) => {}
-                    Err(e) => self.status = format!("{} The MIDI journal couldn't be read: {e}", self.status),
+                    Err(e) => self.status = format!("{} The MIDI take couldn't be recovered: {e}", self.status),
                 }
             }
             Err(e) => self.status = format!("Couldn't recover “{}”: {e}", left.name),
@@ -762,6 +839,7 @@ impl StudioApp {
             self.player_requests.recording = Some(sequence);
         }
         let plan = self.take_plan.take();
+        let approximate = self.pass_approximate();
         let finished = self.recorder.as_mut().filter(|r| r.has_pending_take()).map(soundcraft_playback::record::Recorder::finish);
         // Tests substitute only the device's finished files; placement and stop ordering stay real.
         #[cfg(test)]
@@ -776,6 +854,7 @@ impl StudioApp {
             }
             return;
         }
+        let audio = finished.is_some();
         let mut plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
             pass: None,
@@ -783,6 +862,7 @@ impl StudioApp {
             rate: 0,
             takes: Vec::new(),
             midi_journal: None,
+            midi_placed: false,
         });
         // The audio take and the MIDI pass share one latch; either's applied start is the real one.
         let latch = finished
@@ -815,7 +895,7 @@ impl StudioApp {
             let journal = self.midi_journal.take();
             self.place_midi_take(&plan, &midi, end);
             if let Some(journal) = journal {
-                journal.discard();
+                self.hold_journal(journal, &plan);
             }
         } else if let Some(journal) = journal {
             journal.discard();
@@ -826,6 +906,21 @@ impl StudioApp {
         {
             let _ = self.engine.squash_undo(added, "Record");
         }
+        if audio && approximate {
+            self.telemetry.approximate_takes += 1;
+            log::warn!("recording: the take was aligned without a validated audio device clock");
+            self.status = format!("{}. {APPROXIMATE_TAKE}", self.status.trim_end_matches('.'));
+        }
+    }
+
+    /// Did this pass start without a validated audio device clock (see
+    /// `Recorder::start_approximate`)?
+    fn pass_approximate(&self) -> bool {
+        #[cfg(test)]
+        if self.test_approximate_start {
+            return true;
+        }
+        self.recorder.as_ref().is_some_and(soundcraft_playback::record::Recorder::start_approximate)
     }
 
     /// Place a finished MIDI pass: one clip per armed track (per pass when loop recording), merged
@@ -1230,6 +1325,30 @@ pub(crate) fn refusal_text(outcome: soundcraft_playback::action_lane::Outcome, r
 
 /// Admission is separate from callback application. Storage is reused every frame,
 /// including idle frames, so terminal results always return admission credits.
+/// Said once at Stop when the audio take started without a validated device clock.
+const APPROXIMATE_TAKE: &str = "Recorded with approximate alignment: the audio device clock did not validate";
+
+/// A finished pass's MIDI journal, kept until the autosaver has the clips.
+pub(crate) struct PlacedJournal {
+    journal: soundcraft_engine::midi_journal::Writer,
+    /// The recording plan the autosave carries meanwhile: the clips are already placed.
+    plan: soundcraft_engine::io::Recording,
+    step: JournalStep,
+}
+
+/// Where a held journal is on its way to deletion.
+#[derive(Clone, Copy)]
+pub(crate) enum JournalStep {
+    /// No autosave carrying the placed plan has been handed over yet.
+    Queue,
+    /// That autosave is handed over (landed once the autosaver says so).
+    Placed(soundcraft_engine::autosave::Ticket),
+    /// It landed: hand over one that no longer carries the recording.
+    Release,
+    /// That one is handed over; once it lands the journal goes.
+    Cleared(soundcraft_engine::autosave::Ticket),
+}
+
 pub(crate) struct PlayerRequests {
     notices: [Option<soundcraft_playback::PlayerNotice>; 64],
     pub(crate) play: Option<soundcraft_playback::action_lane::Sequence>,

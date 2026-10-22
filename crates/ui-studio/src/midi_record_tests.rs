@@ -43,8 +43,15 @@ fn pass(track: TrackId, sample: Option<i64>, events: Vec<CapturedEvent>) -> Midi
 /// then Stop through the host.
 fn record(app: &mut StudioApp, start: i64, pass_len: Option<i64>, stop: i64, take: MidiTake) {
     app.record_start = start;
-    app.take_plan =
-        Some(soundcraft_engine::io::Recording { start, pass: pass_len, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
+    app.take_plan = Some(soundcraft_engine::io::Recording {
+        start,
+        pass: pass_len,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: None,
+        midi_placed: false,
+    });
     app.engine.transport.recording = true;
     app.start_play(stop, None, None);
     app.finished_test_midi = Some(take);
@@ -219,7 +226,15 @@ fn the_lane_shows_a_growing_recording_clip_with_the_notes_played_so_far_until_st
     assert!(app.arrange.layout.recording.is_empty());
     let events = vec![on(LATCH, t, 60), off(LATCH + BEAT as u64, t, 60), on(LATCH + 2 * BEAT as u64, t, 64)];
     app.record_start = 0;
-    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
+    app.take_plan = Some(soundcraft_engine::io::Recording {
+        start: 0,
+        pass: None,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: None,
+        midi_placed: false,
+    });
     app.engine.transport.recording = true;
     app.start_play(4 * BEAT, None, None);
     app.finished_test_midi = Some(pass(t, Some(0), events));
@@ -260,6 +275,7 @@ fn journaled_pass(app: &mut StudioApp, t: TrackId, journal: &std::path::Path) {
         rate: 48_000,
         takes: Vec::new(),
         midi_journal: Some(journal.to_path_buf()),
+        midi_placed: false,
     });
     app.engine.transport.recording = true;
     app.start_play(4 * BEAT, None, None);
@@ -292,12 +308,101 @@ fn a_pass_is_journaled_each_frame_with_its_latch_and_the_clean_stop_deletes_the_
 fn crash(root: &std::path::Path) -> (std::path::PathBuf, TrackId) {
     let (mut app, t) = app();
     app.autosave_dir = Some(root.join("Autosave"));
-    let path = midi_journal::journal_path(&root.join("Audio Files"), "Song");
+    let path = midi_journal::journal_path(&takes_of(&app, root), "Song");
     journaled_pass(&mut app, t, &path);
     assert!(app.write_autosave());
     drop(app);
     assert!(path.is_file());
     (path, t)
+}
+
+/// The folder an unsaved session records its takes (and journals) into.
+fn takes_of(app: &StudioApp, root: &std::path::Path) -> std::path::PathBuf {
+    root.join("Autosave").join(soundcraft_engine::io::sanitize_name(&app.engine.session().name)).join("Audio Files")
+}
+
+/// A pass that has been autosaved once, as the plan alone, and then stopped: the clip is placed
+/// in memory and its journal is held.
+fn stopped(root: &std::path::Path) -> (StudioApp, TrackId, std::path::PathBuf) {
+    let (mut app, t) = app();
+    app.autosave_dir = Some(root.join("Autosave"));
+    let path = midi_journal::journal_path(&takes_of(&app, root), "Song");
+    journaled_pass(&mut app, t, &path);
+    assert!(app.write_autosave());
+    app.stop_play();
+    assert_eq!(app.engine.session().track(t).unwrap().clips().len(), 1);
+    (app, t, path)
+}
+
+fn flush(app: &StudioApp) {
+    app.autosaver.as_ref().unwrap().flush().unwrap();
+}
+
+fn recovered(root: &std::path::Path) -> (StudioApp, soundcraft_engine::autosave::Leftover) {
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    assert_eq!(left.len(), 1);
+    let mut next = StudioApp::new(Engine::default(), None, Services::default());
+    next.autosave_dir = Some(root.join("Autosave"));
+    next.recover(&left[0]);
+    (next, left.into_iter().next().unwrap())
+}
+
+#[test]
+fn a_crash_after_the_clip_is_placed_but_before_the_autosave_rebuilds_it_once() {
+    let root = folder("placed-unsaved");
+    let (app, t, path) = stopped(&root);
+    assert!(path.is_file(), "the journal outlives Stop until the autosave has the clip");
+    drop(app);
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    assert!(left[0].recording && !left[0].midi_placed, "the leftover autosave still shows a pass under way");
+    let (next, left) = recovered(&root);
+    let clips = next.engine.session().track(t).unwrap().clips().to_vec();
+    assert_eq!(clips.len(), 1, "rebuilt once");
+    assert_eq!(clip_notes(&next, clips[0].id), vec![(60, TICKS * 3 / 2, TICKS, 100), (64, TICKS * 3, TICKS / 2, 100)]);
+    assert!(!path.exists() && !left.dir.exists());
+}
+
+#[test]
+fn a_crash_after_the_autosave_landed_discards_the_journal_without_a_duplicate_clip() {
+    let root = folder("placed-saved");
+    let (mut app, t, path) = stopped(&root);
+    app.poll_journal();
+    flush(&app);
+    assert!(path.is_file(), "the plan still names it until a write without the recording lands");
+    drop(app);
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    assert!(left[0].midi_placed && left[0].midi_journal.as_deref() == Some(path.as_path()));
+    let (next, left) = recovered(&root);
+    assert_eq!(next.engine.session().track(t).unwrap().clips().len(), 1, "the clip from the autosave, not a second one");
+    assert!(!next.status.contains("recovered MIDI clip"), "{}", next.status);
+    assert!(!path.exists() && !left.dir.exists());
+}
+
+#[test]
+fn a_clean_stop_deletes_the_journal_once_the_autosave_without_the_recording_landed() {
+    let root = folder("placed-clean");
+    let (mut app, _, path) = stopped(&root);
+    app.poll_journal();
+    flush(&app);
+    app.poll_journal();
+    flush(&app);
+    assert!(path.is_file(), "not yet: the second write has only just landed");
+    app.poll_journal();
+    assert!(!path.exists() && app.placed_journal.is_none());
+    app.close_autosave();
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    assert_eq!(left.len(), 1);
+    assert!(!left[0].recording && left[0].midi_journal.is_none());
+}
+
+#[test]
+fn saving_the_session_releases_a_held_journal() {
+    let root = folder("placed-saved-file");
+    let (mut app, _, path) = stopped(&root);
+    let file = root.join("Song.scraft").to_string_lossy().into_owned();
+    app.run("session.save", json!({"path": file})).unwrap();
+    app.poll_journal();
+    assert!(!path.exists() && app.placed_journal.is_none());
 }
 
 #[test]
