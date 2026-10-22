@@ -13,6 +13,8 @@ pub struct Request {
     pub rate: u32,
     pub period: Option<u32>,
     pub loopback: bool,
+    /// Shared, or exclusive (`--mode exclusive`): every open asks for it.
+    pub mode: ab::Mode,
     /// 1-based channels of the cable.
     pub out_ch: u16,
     pub in_ch: u16,
@@ -24,6 +26,8 @@ pub struct Opened {
     pub device: String,
     pub render_rate: u32,
     pub capture_rate: Option<u32>,
+    /// What the render stream opened with (format, period, latency).
+    pub render: ab::Achieved,
 }
 
 fn open_first<T>(attempts: &[ab::OpenRequest], mut open: impl FnMut(&ab::OpenRequest) -> Result<T, ab::OpenError>) -> Result<T, String> {
@@ -35,6 +39,14 @@ fn open_first<T>(attempts: &[ab::OpenRequest], mut open: impl FnMut(&ab::OpenReq
         }
     }
     Err(last)
+}
+
+/// `plan` with every attempt in `mode`.
+fn in_mode(mut plan: ab::Plan, mode: ab::Mode) -> ab::Plan {
+    for attempt in &mut plan.attempts {
+        attempt.mode = mode;
+    }
+    plan
 }
 
 /// Open render (and capture with `loopback`), start them, call `drive` for the run, stop them.
@@ -57,6 +69,7 @@ pub fn run(
             period: request.period,
         })
         .map_err(|e| format!("output: {e}"))?;
+    let render_plan = in_mode(render_plan, request.mode);
     let capture_plan = request
         .loopback
         .then(|| {
@@ -67,6 +80,7 @@ pub fn run(
                     period: request.period,
                 })
                 .map_err(|e| format!("input: {e}"))
+                .map(|plan| in_mode(plan, request.mode))
         })
         .transpose()?;
     let error_callback = |shared: &Arc<Shared>, render: bool| -> ab::ErrorCallback {
@@ -126,5 +140,6 @@ pub fn run(
         device: render_plan.endpoint.name.clone(),
         render_rate: achieved.format.rate,
         capture_rate: capture.as_ref().map(|(_, a)| a.format.rate),
+        render: achieved,
     })
 }

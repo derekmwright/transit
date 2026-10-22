@@ -103,6 +103,17 @@ detects too few clicks prints the peak level of every input channel (`-inf dBFS`
 channel); the clicks play at -6 dBFS and a detection needs about -20 dBFS on the input channel
 (`--in-ch`), so a quieter or silent channel points to the cable, the channel or the input gain.
 
+## Exclusive mode
+
+`--mode exclusive` (with `--backend wasapi`) opens both streams in WASAPI exclusive mode, which skips
+the Windows audio engine and runs at the driver's period: for example
+`cargo run -p audio-bench --features native-wasapi --release -- --backend wasapi --mode exclusive --period 128 --loopback --out-device "<Scarlett out>" --in-device "<Scarlett in>"`.
+While it runs it holds the device and every other app on it is silenced; a device another app holds
+exclusively fails with "in use", and one whose Advanced settings forbid exclusive control says so. The
+Notes column gives the format and period the driver granted ("exclusive, i32/24 valid, 128 fr"), and
+with `--settings` the calibration is stored under the mode `exclusive`, apart from the shared one
+(see `../contributing/knowledge/wasapi-modes.md`). The fake backend accepts the flag as if shared.
+
 The hardware tests open the owner's default endpoints and stay `#[ignore]`d; run them by hand:
 
 ```

@@ -464,6 +464,20 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_packets_of_one_period_per_wake_are_served_unchanged() {
+        // Exclusive event-driven capture: each wake has exactly one packet, the whole one-period
+        // buffer. The loop delivers each as one block, contiguous, with valid stamps one period apart.
+        let mut device = Fake::wakes(32);
+        let run = drive(&mut device, &config(None));
+        assert_eq!((run.exit, run.seen.len(), run.errors.len()), (Exit::Stopped, 32, 0));
+        assert!(run.seen.iter().all(|s| s.frames == PERIOD as usize && s.stamp.quality == Quality::BackendEstimate));
+        let positions: Vec<u64> = run.seen.iter().map(|s| s.position.unwrap()).collect();
+        assert_eq!(positions, (0..32).map(|k| k * u64::from(PERIOD)).collect::<Vec<_>>());
+        assert_eq!(run.stats, CaptureStats { packets: 32, frames: 32 * u64::from(PERIOD), ..Default::default() });
+        assert_eq!((device.gets, device.releases.get()), (32, 32));
+    }
+
+    #[test]
     fn a_silent_packet_is_delivered_as_zeros_whatever_its_bytes() {
         let silent = ScriptedPacket { silent: true, ..normal() };
         let mut device = Fake::new([Step::Wake(vec![normal(), silent, normal()])]);

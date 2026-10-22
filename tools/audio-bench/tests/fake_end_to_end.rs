@@ -8,7 +8,16 @@ fn config(period: u32, seconds: f64, loopback: bool, script: Script) -> Config {
     Config {
         kind: Kind::Fake,
         system: None,
-        request: Request { device: None, in_device: None, rate: 48_000, period: Some(period), loopback, out_ch: 1, in_ch: 1 },
+        request: Request {
+            device: None,
+            in_device: None,
+            rate: 48_000,
+            period: Some(period),
+            loopback,
+            mode: transit_audio_backend::Mode::Shared,
+            out_ch: 1,
+            in_ch: 1,
+        },
         seconds,
         fake: script,
         out: None,
@@ -145,5 +154,26 @@ fn settings_receive_the_measured_calibration_and_keep_what_was_there() {
     let [cal] = audio.calibrations.as_slice() else { panic!("one entry after two runs: {:?}", audio.calibrations) };
     assert_eq!((cal.device.as_str(), cal.input.as_deref(), cal.mode.as_str()), ("Fake device", Some("Fake input"), "shared"));
     assert_eq!((cal.rate, cal.period, cal.round_trip_frames, cal.spread_frames), (48_000, 64, 240, 1));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn an_exclusive_run_notes_its_mode_and_calibrates_under_the_exclusive_key() {
+    let dir = std::env::temp_dir().join(format!("audio-bench-e2e-exclusive-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ui.json");
+    let mut c = config(128, 3.0, true, script(0, None, 240));
+    c.request.mode = transit_audio_backend::Mode::Exclusive;
+    c.settings = Some(path.clone());
+    let row = run(&c).expect("the fake accepts exclusive as if shared");
+    assert_eq!(row.mode.as_deref(), Some("exclusive, f32, 128 fr"));
+    assert!(row.markdown().ends_with("| exclusive, f32, 128 fr |"), "{}", row.markdown());
+    // A shared run of the same pair is another key: both entries stay.
+    c.request.mode = transit_audio_backend::Mode::Shared;
+    assert_eq!(run(&c).expect("the shared run").mode, None);
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let audio: soundcraft_playback::AudioConfig = serde_json::from_value(doc["audio"].clone()).unwrap();
+    let modes: Vec<&str> = audio.calibrations.iter().map(|c| c.mode.as_str()).collect();
+    assert_eq!(modes, [soundcraft_playback::devices::MODE_EXCLUSIVE, soundcraft_playback::devices::MODE_SHARED]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

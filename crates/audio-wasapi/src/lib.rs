@@ -5,8 +5,9 @@
 //! This is the one crate besides `transit-rt` that contains `unsafe` (ADR 0013, second
 //! amendment), for COM and WASAPI through the `windows` crate only. Each stream is owned by one
 //! MTA thread; see [`com`] for the threading rules and [`render_loop`] for the audio-thread loop.
-//! Capture and the pairing of capture with render endpoints are slice (d); exclusive mode is
-//! slice (e).
+//! Capture and the pairing of capture with render endpoints are slice (d). Exclusive mode (slice e)
+//! opens an event-driven exclusive client at a probed format and the driver's period (see
+//! [`exclusive`]); enumeration stays shared-mode only and never probes.
 #![cfg(windows)]
 // The callback modules (`render_loop`, `convert`) deny these lints; control-thread code may
 // allocate and format.
@@ -15,6 +16,7 @@
 mod capture_loop;
 mod com;
 mod convert;
+mod exclusive;
 mod lifecycle;
 mod pairing;
 mod render_loop;
@@ -99,6 +101,13 @@ fn attempts(info: &EndpointInfo, wished: Vec<u32>, period: Option<u32>) -> Vec<a
 }
 
 impl WasapiBackend {
+    /// The exclusive-mode formats `endpoint` accepts among [`ab::exclusive_candidates`] for
+    /// `rate_first` and `channels`, for the device report. It probes the device (a control-thread
+    /// call that fails while another app holds it); enumeration never calls it.
+    pub fn exclusive_formats(&self, endpoint: &ab::Endpoint, rate_first: u32, channels: &[u16]) -> Result<Vec<ab::Format>, ab::OpenError> {
+        ab::Backend::probe_exclusive(self, endpoint, &ab::exclusive_candidates(rate_first, channels))
+    }
+
     /// The capture endpoint to use for `endpoint`: itself when it is a capture endpoint, else the
     /// one paired with the render endpoint.
     fn paired_input(&self, endpoint: &ab::Endpoint) -> Result<EndpointInfo, ab::OpenError> {
@@ -187,6 +196,12 @@ impl ab::Backend for WasapiBackend {
         let id = if device.output { self.paired_input(endpoint)?.id } else { device.id.clone() };
         let (stream, achieved) = NativeStream::open_capture(OpenParams { id, request: *request }, capture, error)?;
         Ok((Box::new(stream), achieved))
+    }
+
+    /// Probes the endpoint itself (a render endpoint's render side, a capture endpoint's capture side).
+    fn probe_exclusive(&self, endpoint: &ab::Endpoint, candidates: &[ab::Format]) -> Result<Vec<ab::Format>, ab::OpenError> {
+        let device = endpoint.handle::<WasapiEndpoint>().ok_or_else(|| ab::OpenError::Other("the endpoint is not a WASAPI device".into()))?;
+        com::probe_exclusive(&device.id, candidates)
     }
 
     fn on_device_change(&self, handler: Box<dyn FnMut(ab::DeviceEvent) + Send>) -> bool {
@@ -378,6 +393,151 @@ mod hardware {
         let (render_offset, capture_offset) = (median(&mut render.offsets.lock().unwrap()), median(&mut capture.offsets.lock().unwrap()));
         println!("host - backend offset: render {render_offset} ns, capture {capture_offset} ns");
         assert!((render_offset - capture_offset).abs() < 5_000_000, "the two streams' stamps are not comparable in one host origin");
+    }
+
+    /// `result`, or a test failure whose message starts "in use" when another app holds the device.
+    fn or_in_use<T>(result: Result<T, ab::OpenError>, what: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(ab::OpenError::InUse(text)) => {
+                println!("in use: {what}: {text}");
+                panic!("in use: {what}: {text}");
+            }
+            Err(e) => panic!("{what}: {e:?}"),
+        }
+    }
+
+    /// An exclusive request at the first probed format of `endpoint` (its shared rate and channels
+    /// first), at the driver's minimum period, stamped against `origin`.
+    fn exclusive_request(backend: &WasapiBackend, endpoint: &ab::Endpoint, like: ab::Format, origin: ab::HostOrigin) -> ab::OpenRequest {
+        let formats = or_in_use(backend.exclusive_formats(endpoint, like.rate, &[like.channels]), "probe");
+        println!("{} accepts in exclusive mode: {formats:?}", endpoint.name);
+        let format = *formats.first().unwrap_or_else(|| panic!("{} accepts no exclusive format at {} channels", endpoint.name, like.channels));
+        ab::OpenRequest { format, period: ab::Period::Default, mode: ab::Mode::Exclusive, origin, calibration: None }
+    }
+
+    fn print_achieved(what: &str, achieved: &ab::Achieved) {
+        let f = achieved.format;
+        let ms = achieved.period.frames().map(|n| f64::from(n) * 1000.0 / f64::from(f.rate));
+        println!(
+            "{what}: {:?} {} valid bits, {} ch, mask {:?}, {} Hz; period {:?} ({ms:.2?} ms); latency {:?}",
+            f.sample,
+            f.valid_bits.map_or("all".to_string(), |b| b.to_string()),
+            f.channels,
+            f.channel_mask,
+            f.rate,
+            achieved.period,
+            achieved.latency
+        );
+    }
+
+    #[test]
+    #[ignore = "opens the default audio endpoint exclusively (other apps are silenced)"]
+    fn hardware_exclusive_render_default_endpoint_two_seconds() {
+        let backend = WasapiBackend::default();
+        let plan = backend.plan_render(&ab::OutputWish { channels: 2, ..Default::default() }).expect("a default endpoint");
+        let request = exclusive_request(&backend, &plan.endpoint, plan.attempts[0].format, ab::HostOrigin::default());
+        let tally = Arc::new(Tally::default());
+        let (stream, achieved) =
+            or_in_use(backend.open_render(&plan.endpoint, &request, render_callback(&tally), fault_callback(&tally)), "open exclusive render");
+        print_achieved("exclusive render", &achieved);
+        or_in_use(stream.start(), "start exclusive render");
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(2));
+        let (blocks, frames) = (tally.blocks.load(Ordering::Relaxed), tally.frames.load(Ordering::Relaxed));
+        drop(stream);
+        let period = achieved.period.frames().expect("the real period");
+        let expected = started.elapsed().as_secs_f64() * f64::from(achieved.format.rate) / f64::from(period);
+        println!("{blocks} blocks, {frames} frames in 2 s; expected about {expected:.0} blocks of {period} frames");
+        assert!(blocks > 0, "no callbacks");
+        assert_eq!(tally.faults.load(Ordering::Relaxed), 0, "stream faults");
+        assert_eq!(frames, blocks * u64::from(period), "every exclusive wake fills the whole buffer");
+        assert!(blocks as f64 > expected * 0.5, "far fewer callbacks than the period implies");
+        assert_eq!(tally.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+    }
+
+    #[test]
+    #[ignore = "opens the default audio capture endpoint exclusively"]
+    fn hardware_exclusive_capture_default_endpoint_two_seconds() {
+        let backend = WasapiBackend::default();
+        let plan = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint");
+        let request = exclusive_request(&backend, &plan.endpoint, plan.attempts[0].format, ab::HostOrigin::default());
+        let tally = Arc::new(Tally::default());
+        let (stream, achieved) =
+            or_in_use(backend.open_capture(&plan.endpoint, &request, capture_callback(&tally), fault_callback(&tally)), "open exclusive capture");
+        print_achieved("exclusive capture", &achieved);
+        or_in_use(stream.start(), "start exclusive capture");
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(2));
+        let (blocks, frames) = (tally.blocks.load(Ordering::Relaxed), tally.frames.load(Ordering::Relaxed));
+        drop(stream);
+        let expected = started.elapsed().as_secs_f64() * f64::from(achieved.format.rate);
+        println!("{blocks} blocks, {frames} frames in 2 s; expected about {expected:.0} frames");
+        assert!(blocks > 0, "no callbacks");
+        assert_eq!(tally.faults.load(Ordering::Relaxed), 0, "stream faults");
+        assert!((frames as f64 - expected).abs() < expected * 0.1, "captured frames are not the elapsed time at the rate");
+        assert_eq!(tally.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+    }
+
+    #[test]
+    #[ignore = "opens the default audio render and capture endpoints exclusively"]
+    fn hardware_exclusive_duplex_scarlett_pair_by_container() {
+        let backend = WasapiBackend::default();
+        let render_plan = backend.plan_render(&ab::OutputWish { channels: 2, ..Default::default() }).expect("a default render endpoint");
+        let paired = backend.capture_with_render(&render_plan.endpoint);
+        println!("default render {} pairs with a capture endpoint by container: {paired}", render_plan.endpoint.name);
+        let capture_plan = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint");
+        let origin = ab::HostOrigin::default();
+        let (render, capture) = (Arc::new(Tally::default()), Arc::new(Tally::default()));
+        // The capture side is probed on its own endpoint: the paired one, else the default one.
+        let capture_endpoint = if paired {
+            let id = backend.paired_input(&render_plan.endpoint).expect("the paired input").id;
+            backend.endpoints(ab::Direction::Input).expect("inputs").into_iter().find(|e| e.id == id).expect("the paired input endpoint")
+        } else {
+            capture_plan.endpoint.clone()
+        };
+        let like = if paired { backend.capture_format(&render_plan.endpoint, None).expect("format") } else { capture_plan.attempts[0].format };
+        let capture_request = exclusive_request(&backend, &capture_endpoint, like, origin);
+        let (capture_stream, capture_achieved) = or_in_use(
+            backend.open_capture(&capture_endpoint, &capture_request, capture_callback(&capture), fault_callback(&capture)),
+            "open exclusive capture",
+        );
+        let render_request = exclusive_request(&backend, &render_plan.endpoint, render_plan.attempts[0].format, origin);
+        let (render_stream, render_achieved) = or_in_use(
+            backend.open_render(&render_plan.endpoint, &render_request, render_callback(&render), fault_callback(&render)),
+            "open exclusive render",
+        );
+        print_achieved("exclusive capture", &capture_achieved);
+        print_achieved("exclusive render", &render_achieved);
+        or_in_use(capture_stream.start(), "start exclusive capture");
+        or_in_use(render_stream.start(), "start exclusive render");
+        std::thread::sleep(Duration::from_secs(2));
+        drop((render_stream, capture_stream));
+        let (rb, cb) = (render.blocks.load(Ordering::Relaxed), capture.blocks.load(Ordering::Relaxed));
+        assert!(rb > 0 && cb > 0, "both streams ran ({rb} render, {cb} capture blocks)");
+        assert_eq!(render.faults.load(Ordering::Relaxed) + capture.faults.load(Ordering::Relaxed), 0);
+        assert_eq!(render.invalid.load(Ordering::Relaxed) + capture.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+        let (render_offset, capture_offset) = (median(&mut render.offsets.lock().unwrap()), median(&mut capture.offsets.lock().unwrap()));
+        println!("host - backend offset: render {render_offset} ns, capture {capture_offset} ns");
+        assert!((render_offset - capture_offset).abs() < 5_000_000, "the two streams' stamps are not comparable in one host origin");
+    }
+
+    #[test]
+    #[ignore = "probes the default audio endpoints in exclusive mode"]
+    fn hardware_exclusive_probe_lists_formats() {
+        let backend = WasapiBackend::default();
+        let render = backend.plan_render(&ab::OutputWish { channels: 2, ..Default::default() }).expect("a default render endpoint").endpoint;
+        let capture = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint").endpoint;
+        for endpoint in [render, capture] {
+            let own = endpoint.outputs.max(endpoint.inputs);
+            for channels in [2, own] {
+                let formats = or_in_use(backend.exclusive_formats(&endpoint, 48_000, &[channels]), "probe");
+                println!("{} [{}] at 48 kHz first, {channels} ch: {} formats", endpoint.name, endpoint.id, formats.len());
+                for f in &formats {
+                    println!("  {} Hz {:?} valid {:?} mask {:?}", f.rate, f.sample, f.valid_bits, f.channel_mask);
+                }
+            }
+        }
     }
 
     #[test]

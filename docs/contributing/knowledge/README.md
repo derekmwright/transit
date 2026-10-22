@@ -8,6 +8,7 @@ the ADRs. A new topic gets a new file and a row here.
 | [`layering.md`](layering.md) | Any crate or dependency. Always read. |
 | [`audio-thread.md`](audio-thread.md) | Anything the audio callback runs. Always read. |
 | [`clocks.md`](clocks.md) | Device timing, timestamps, MIDI timing, latency. |
+| [`wasapi-modes.md`](wasapi-modes.md) | The native WASAPI backend's shared and exclusive opens. |
 | [`plan-renderer.md`](plan-renderer.md) | `crates/mix`: compile, render, PDC, sinks. |
 | [`routing.md`](routing.md) | Outputs, inputs, device channel maps, the route graph. |
 | [`sidechain.md`](sidechain.md) | Insert keys and key taps. |

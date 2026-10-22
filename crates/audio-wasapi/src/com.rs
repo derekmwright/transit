@@ -7,9 +7,10 @@
 
 use crate::capture_loop::{self, CaptureConfig, CaptureDevice, CaptureStamper, CaptureStats, Packet};
 use crate::convert::Wire;
+use crate::exclusive::{self, ApiError, E_UNSUPPORTED_FORMAT, ExclusiveApi};
 use crate::lifecycle::Lifecycle;
 use crate::pairing::{self, Candidate};
-use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
+use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, Fill, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -20,10 +21,11 @@ use transit_audio_backend as ab;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-    AUDCLNT_STREAMOPTIONS_RAW, AudioCategory_Media, AudioClientProperties, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioCaptureClient,
-    IAudioClient, IAudioClient2, IAudioClient3, IAudioClock, IAudioClock2, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-    IMMNotificationClient_Impl, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
+    AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDCLNT_STREAMOPTIONS_RAW, AudioCategory_Media, AudioClientProperties, DEVICE_STATE,
+    DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioCaptureClient, IAudioClient, IAudioClient2, IAudioClient3, IAudioClock, IAudioClock2,
+    IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, STGM_READ};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -286,10 +288,21 @@ fn enumerator() -> Result<IMMDeviceEnumerator, ab::OpenError> {
     unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(|e| open_error("IMMDeviceEnumerator", &e))
 }
 
-fn activate(device: &IMMDevice) -> Result<IAudioClient, ab::OpenError> {
+fn activate_client(device: &IMMDevice) -> windows::core::Result<IAudioClient> {
     // SAFETY: `Activate` creates an interface of the requested type from a live `IMMDevice`;
     // no activation parameters are needed for `IAudioClient`.
-    unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }.map_err(|e| open_error("Activate(IAudioClient)", &e))
+    unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
+}
+
+fn activate(device: &IMMDevice) -> Result<IAudioClient, ab::OpenError> {
+    activate_client(device).map_err(|e| open_error("Activate(IAudioClient)", &e))
+}
+
+/// The endpoint with this id, resolved on the calling (MTA) thread.
+fn device_by_id(id: &str) -> Result<IMMDevice, ab::OpenError> {
+    let wide = wide(id);
+    // SAFETY: `GetDevice` reads the NUL-terminated UTF-16 id in `wide`, valid for the call.
+    unsafe { enumerator()?.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(|e| open_error("GetDevice", &e))
 }
 
 fn friendly_name(device: &IMMDevice) -> String {
@@ -358,12 +371,12 @@ pub(crate) struct OpenParams {
 /// offered, `IAudioClient3` at the requested (else the minimum) period, else the plain
 /// `IAudioClient` at its default period, with the engine converting a differing session rate.
 /// Returns the client, its period in frames and the format of the buffer.
+/// An exclusive request goes to [`open_exclusive`] instead (no raw mode, no engine, no conversion).
 fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt), ab::OpenError> {
-    let device = {
-        let wide = wide(&params.id);
-        // SAFETY: `GetDevice` reads the NUL-terminated UTF-16 id in `wide`, valid for the call.
-        unsafe { enumerator()?.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(|e| open_error("GetDevice", &e))?
-    };
+    let device = device_by_id(&params.id)?;
+    if params.request.mode == ab::Mode::Exclusive {
+        return open_exclusive(device, &params.request);
+    }
     // Raw mode (APOs bypassed) where the endpoint supports it; a failure degrades to non-raw.
     let want_raw = raw_supported(&device);
     let client = activate(&device)?;
@@ -436,6 +449,132 @@ fn initialize_plain(client: &IAudioClient, raw: &WAVEFORMATEXTENSIBLE, fmt: &Fmt
     Ok((default_hns.unsigned_abs() * u64::from(fmt.rate) / 10_000_000) as u32)
 }
 
+/// `KSAUDIO_SPEAKER_STEREO`: front left and front right.
+const STEREO_MASK: u32 = 0x3;
+
+/// The `WAVEFORMATEXTENSIBLE` of an exclusive-mode `format` (valid bits, PCM or float subtype,
+/// the format's channel mask, else the front pair for stereo and direct output otherwise), with
+/// the parsed form the stream runs on. `None` for a format with no device layout here.
+pub(crate) fn exclusive_format(format: &ab::Format) -> Option<(WAVEFORMATEXTENSIBLE, Fmt)> {
+    let (float, bits, wire) = match format.sample {
+        ab::SampleFormat::F32 => (true, 32u16, Wire::F32),
+        ab::SampleFormat::I32 => (false, 32, Wire::I32),
+        ab::SampleFormat::I24 => (false, 24, Wire::I24),
+        ab::SampleFormat::I16 => (false, 16, Wire::I16),
+        _ => return None,
+    };
+    let valid = format.valid_bits.map_or(bits, u16::from);
+    if format.channels == 0 || format.channels > MAX_CHANNELS || format.rate == 0 || valid == 0 || valid > bits || (float && valid != 32) {
+        return None;
+    }
+    let mask = format.channel_mask.unwrap_or(if format.channels == 2 { STEREO_MASK } else { 0 });
+    let block = format.channels * (bits / 8);
+    let mut raw = WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+            nChannels: format.channels,
+            nSamplesPerSec: format.rate,
+            nAvgBytesPerSec: format.rate * u32::from(block),
+            nBlockAlign: block,
+            wBitsPerSample: bits,
+            cbSize: 22,
+        },
+        dwChannelMask: mask,
+        SubFormat: if float { SUBTYPE_FLOAT } else { SUBTYPE_PCM },
+        ..Default::default()
+    };
+    raw.Samples.wValidBitsPerSample = valid;
+    Some((raw, Fmt { rate: format.rate, channels: format.channels, sample: format.sample, wire, valid_bits: valid, mask }))
+}
+
+fn api_error(error: &windows::core::Error) -> ApiError {
+    ApiError { code: error.code().0, text: error.to_string() }
+}
+
+/// The exclusive-mode client calls on one endpoint (see [`exclusive::open`]).
+struct ComExclusive {
+    device: IMMDevice,
+}
+
+impl ExclusiveApi for ComExclusive {
+    type Client = IAudioClient;
+
+    fn activate(&mut self) -> Result<IAudioClient, ApiError> {
+        activate_client(&self.device).map_err(|e| api_error(&e))
+    }
+
+    fn device_period(&mut self, client: &IAudioClient) -> Result<(i64, i64), ApiError> {
+        let (mut default, mut minimum) = (0i64, 0i64);
+        // SAFETY: `GetDevicePeriod` on a live client (initialized or not) writes the default and
+        // the minimum period, in 100 ns units, through two live `i64` out-pointers.
+        unsafe { client.GetDevicePeriod(Some(&mut default), Some(&mut minimum)) }.map_err(|e| api_error(&e))?;
+        Ok((default, minimum))
+    }
+
+    fn supports(&mut self, client: &IAudioClient, format: &ab::Format) -> Result<bool, ApiError> {
+        let Some((raw, _)) = exclusive_format(format) else { return Ok(false) };
+        // SAFETY: `raw` is a complete `WAVEFORMATEXTENSIBLE` (`cbSize` 22) that lives across the
+        // call, read through its leading `WAVEFORMATEX`; in exclusive mode the closest-match
+        // out-pointer must be null (`None`), so nothing is allocated for us to free. The call is
+        // a query on an uninitialized client and changes no state.
+        let hr = unsafe { client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (&raw const raw).cast::<WAVEFORMATEX>(), None) };
+        match hr.0 {
+            0 => Ok(true),
+            1 | E_UNSUPPORTED_FORMAT => Ok(false),
+            code => Err(ApiError { code, text: hr.message() }),
+        }
+    }
+
+    fn initialize(&mut self, client: &IAudioClient, format: &ab::Format, duration_100ns: i64) -> Result<(), ApiError> {
+        let Some((raw, _)) = exclusive_format(format) else {
+            return Err(ApiError { code: E_UNSUPPORTED_FORMAT, text: format!("{format:?} has no WASAPI layout") });
+        };
+        // SAFETY: `raw` is a complete `WAVEFORMATEXTENSIBLE` live across the call, read through its
+        // leading `WAVEFORMATEX`. `Initialize` is called at most once per client: a client whose
+        // `Initialize` failed is never initialized again (a failed `Initialize` cannot be retried
+        // on the same client; `exclusive::open` activates a new one for the aligned retry).
+        // Exclusive event-driven mode requires `hnsPeriodicity == hnsBufferDuration`, both
+        // `duration_100ns`, and no session GUID (`None`, the default session).
+        unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                duration_100ns,
+                duration_100ns,
+                (&raw const raw).cast::<WAVEFORMATEX>(),
+                None,
+            )
+        }
+        .map_err(|e| api_error(&e))
+    }
+
+    fn buffer_size(&mut self, client: &IAudioClient) -> Result<u32, ApiError> {
+        // SAFETY: `GetBufferSize` on a client that was initialized, or whose `Initialize` failed
+        // with `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` (documented to report the next aligned size
+        // then); it writes one `u32` and changes no state.
+        unsafe { client.GetBufferSize() }.map_err(|e| api_error(&e))
+    }
+}
+
+/// Initialize an event-driven exclusive client on `device` (see [`exclusive::open`]). The period is
+/// the buffer, so both are `GetBufferSize`.
+fn open_exclusive(device: IMMDevice, request: &ab::OpenRequest) -> Result<(IAudioClient, u32, Fmt), ab::OpenError> {
+    let mut api = ComExclusive { device };
+    let opened = exclusive::open(&mut api, &request.format, request.period)?;
+    let (_, fmt) = exclusive_format(&opened.format).ok_or_else(|| ab::OpenError::Other("the exclusive format has no WASAPI layout".into()))?;
+    log::info!("WASAPI exclusive: {:?} at {} frames", opened.format, opened.buffer_frames);
+    Ok((opened.client, opened.buffer_frames, fmt))
+}
+
+/// The `candidates` the endpoint `id` accepts in exclusive mode, in order (on a control thread).
+pub(crate) fn probe_exclusive(id: &str, candidates: &[ab::Format]) -> Result<Vec<ab::Format>, ab::OpenError> {
+    on_mta(|| {
+        let mut api = ComExclusive { device: device_by_id(id)? };
+        let client = api.activate().map_err(|e| exclusive::open_error("Activate(IAudioClient)", &e))?;
+        exclusive::probe(&mut api, &client, candidates)
+    })
+}
+
 /// The opened, not yet started, stream: owned by the stream thread.
 struct Live {
     client: IAudioClient,
@@ -449,12 +588,15 @@ struct Live {
     period_frames: u32,
     latency_100ns: i64,
     calibration: Option<ab::Calibration>,
+    /// How much of the buffer each wake fills: the whole buffer in exclusive mode.
+    fill: Fill,
 }
 
 impl Live {
     fn open(params: &OpenParams, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
         let (client, frames, fmt) = open_client(params)?;
-        Self::finish(client, frames, fmt, stop, params.request.calibration)
+        let fill = if params.request.mode == ab::Mode::Exclusive { Fill::Whole } else { Fill::Free };
+        Self::finish(client, frames, fmt, stop, params.request.calibration, fill)
     }
 
     fn finish(
@@ -463,6 +605,7 @@ impl Live {
         fmt: Fmt,
         stop: Arc<Event>,
         calibration: Option<ab::Calibration>,
+        fill: Fill,
     ) -> Result<Self, ab::OpenError> {
         let event = Event::new(false)?;
         // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
@@ -483,7 +626,7 @@ impl Live {
             render.GetBuffer(buffer_frames).map_err(|e| open_error("GetBuffer", &e))?;
             render.ReleaseBuffer(buffer_frames, BUFFER_SILENT).map_err(|e| open_error("ReleaseBuffer", &e))?;
         }
-        Ok(Self { client, render, clock, clock_frequency, event, stop, fmt, buffer_frames, period_frames, latency_100ns: latency, calibration })
+        Ok(Self { client, render, clock, clock_frequency, event, stop, fmt, buffer_frames, period_frames, latency_100ns: latency, calibration, fill })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
@@ -951,6 +1094,7 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
             Ok(stamper) => {
                 let _ = reply.send(Ok(()));
                 let config = LoopConfig {
+                    fill: live.fill,
                     buffer_frames: live.buffer_frames,
                     format: live.fmt.format(),
                     wire: live.fmt.wire,
@@ -1204,6 +1348,55 @@ mod tests {
         assert!(rejected(&extensible(2, 32, 4, true)), "block align smaller than channels x bytes");
         assert!(rejected(&extensible(2, 32, 16, true)), "block align larger than channels x bytes");
         assert!(rejected(&extensible(2, 24, 8, false)), "24-bit in a 4-byte block is not packed 24");
+    }
+
+    #[test]
+    fn the_exclusive_hresults_are_the_systems() {
+        use windows::Win32::Media::Audio as a;
+        assert_eq!(exclusive::E_UNSUPPORTED_FORMAT, a::AUDCLNT_E_UNSUPPORTED_FORMAT.0);
+        assert_eq!(exclusive::E_EXCLUSIVE_MODE_NOT_ALLOWED, a::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED.0);
+        assert_eq!(exclusive::E_ENDPOINT_CREATE_FAILED, a::AUDCLNT_E_ENDPOINT_CREATE_FAILED.0);
+        assert_eq!(exclusive::E_BUFFER_SIZE_ERROR, a::AUDCLNT_E_BUFFER_SIZE_ERROR.0);
+        assert_eq!(exclusive::E_BUFFER_SIZE_NOT_ALIGNED, a::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED.0);
+        assert_eq!(E_DEVICE_IN_USE, a::AUDCLNT_E_DEVICE_IN_USE.0);
+        assert_eq!(exclusive::E_NOTFOUND, windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NOT_FOUND.0).0);
+    }
+
+    /// The parsed `(container bits, valid bits, block align, mask)` of a format we built.
+    fn layout(raw: &WAVEFORMATEXTENSIBLE) -> (u16, u16, u16, u32) {
+        let valid = parse_format(raw).map(|f| f.valid_bits).unwrap_or(0);
+        (raw.Format.wBitsPerSample, valid, raw.Format.nBlockAlign, raw.dwChannelMask)
+    }
+
+    #[test]
+    fn exclusive_formats_build_the_extensible_layout_and_parse_back() {
+        let i32_24 = ab::Format { valid_bits: Some(24), ..ab::Format::new(48_000, 2, ab::SampleFormat::I32) };
+        let (raw, fmt) = exclusive_format(&i32_24).expect("24 in 32");
+        assert_eq!(layout(&raw), (32, 24, 8, STEREO_MASK));
+        assert_eq!((raw.SubFormat, raw.Format.nAvgBytesPerSec, fmt.wire), (SUBTYPE_PCM, 384_000, Wire::I32));
+        assert_eq!(fmt.format(), ab::Format { channel_mask: Some(STEREO_MASK), ..i32_24 }, "the achieved format reports the mask");
+        assert_eq!(parse_format(&raw).ok().map(|f| f.format()), Some(fmt.format()));
+        for (format, bits, block, sub, wire) in [
+            (ab::Format::new(44_100, 2, ab::SampleFormat::F32), 32, 8, SUBTYPE_FLOAT, Wire::F32),
+            (ab::Format::new(48_000, 2, ab::SampleFormat::I32), 32, 8, SUBTYPE_PCM, Wire::I32),
+            (ab::Format::new(96_000, 2, ab::SampleFormat::I24), 24, 6, SUBTYPE_PCM, Wire::I24),
+            (ab::Format::new(48_000, 2, ab::SampleFormat::I16), 16, 4, SUBTYPE_PCM, Wire::I16),
+        ] {
+            let (raw, fmt) = exclusive_format(&format).expect("a device layout");
+            assert_eq!(layout(&raw), (bits, bits, block, STEREO_MASK), "{format:?}");
+            assert_eq!((raw.SubFormat, fmt.wire, fmt.format().valid_bits), (sub, wire, None), "{format:?}");
+            assert_eq!(parse_format(&raw).ok().map(|f| f.format()), Some(fmt.format()));
+        }
+        // Direct out for a multichannel candidate and for mono without a mask.
+        let eight = ab::Format { channel_mask: Some(0), ..ab::Format::new(48_000, 8, ab::SampleFormat::I32) };
+        assert_eq!(exclusive_format(&eight).map(|(raw, _)| layout(&raw)), Some((32, 32, 32, 0)));
+        let mono = ab::Format::new(48_000, 1, ab::SampleFormat::I16);
+        assert_eq!(exclusive_format(&mono).map(|(raw, _)| raw.dwChannelMask), Some(0));
+        // Formats with no layout are never offered to the device.
+        assert!(exclusive_format(&ab::Format::new(48_000, 2, ab::SampleFormat::F64)).is_none());
+        assert!(exclusive_format(&ab::Format { valid_bits: Some(24), ..ab::Format::new(48_000, 2, ab::SampleFormat::F32) }).is_none());
+        assert!(exclusive_format(&ab::Format { valid_bits: Some(24), ..ab::Format::new(48_000, 2, ab::SampleFormat::I16) }).is_none());
+        assert!(exclusive_format(&ab::Format::new(48_000, 0, ab::SampleFormat::I16)).is_none());
     }
 
     #[test]

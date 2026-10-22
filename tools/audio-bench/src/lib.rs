@@ -21,7 +21,8 @@ use transit_audio_backend as ab;
 pub enum Kind {
     /// The cpal adapter (WASAPI shared or ASIO, chosen with `--system`).
     Cpal,
-    /// The native WASAPI backend (shared mode, `IAudioClient3`); needs the `native-wasapi` feature.
+    /// The native WASAPI backend (shared mode through `IAudioClient3`, or exclusive with
+    /// `--mode exclusive`); needs the `native-wasapi` feature.
     Wasapi,
     /// The scripted [`ab::fake::FakeBackend`] in virtual time.
     Fake,
@@ -94,7 +95,14 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         .map(|trip| calibration::figures(&trip, opened.render_rate, &measurements.input_peaks));
     if let Some(path) = &config.settings {
         let figures = calibration.clone().ok_or("--settings needs a native loopback run (--backend wasapi --loopback) at one rate")??;
-        let record = calibration::record(&figures, &opened.device, config.request.in_device.as_deref(), config.request.period.unwrap_or(0), &date);
+        let record = calibration::record(
+            &figures,
+            &opened.device,
+            config.request.in_device.as_deref(),
+            config.request.mode,
+            config.request.period.unwrap_or(0),
+            &date,
+        );
         calibration::merge_settings(path, &record)?;
     }
     Ok(report::Row {
@@ -102,6 +110,7 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         system,
         device: opened.device,
         requested: config.request.period,
+        mode: (config.request.mode == ab::Mode::Exclusive).then(|| report::exclusive_note(&opened.render)),
         measurements,
         calibration,
         machine: report::machine(),

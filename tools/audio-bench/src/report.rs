@@ -3,6 +3,7 @@
 use crate::analysis::Measurements;
 use std::path::Path;
 use std::process::Command;
+use transit_audio_backend as ab;
 
 pub const HEADER: &str = "| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |";
 const RULE: &str = "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|";
@@ -19,6 +20,9 @@ pub struct Row {
     pub system: String,
     pub device: String,
     pub requested: Option<u32>,
+    /// The mode note of an exclusive run ([`exclusive_note`]), first in the Notes column; `None`
+    /// for shared mode.
+    pub mode: Option<String>,
     pub measurements: Measurements,
     /// The loopback calibration of a native run (`--loopback` on `--backend wasapi`), when it was measurable.
     pub calibration: Option<Result<crate::calibration::Figures, String>>,
@@ -47,7 +51,7 @@ impl Row {
                 format!("{:.0} / {:.0} / {:.0}", t.min_frames, t.median_frames, t.p95_frames),
             ),
         };
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = self.mode.iter().cloned().collect();
         if m.backend_errors > 0 {
             notes.push(format!("backend errors {}", m.backend_errors));
         }
@@ -78,6 +82,19 @@ impl Row {
         ];
         format!("| {} |", cells.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | "))
     }
+}
+
+/// "exclusive, i32/24 valid, 128 fr": the mode, the device sample format and the period an
+/// exclusive stream achieved.
+pub fn exclusive_note(achieved: &ab::Achieved) -> String {
+    let f = achieved.format;
+    let sample = format!("{:?}", f.sample).to_lowercase();
+    let sample = match f.valid_bits {
+        Some(bits) => format!("{sample}/{bits} valid"),
+        None => sample,
+    };
+    let period = achieved.period.frames().map_or_else(|| "default period".to_string(), |n| format!("{n} fr"));
+    format!("exclusive, {sample}, {period}")
 }
 
 /// The table for `rows`.
@@ -193,6 +210,7 @@ mod tests {
             system: "Fake".into(),
             device: "Fake device".into(),
             requested: Some(64),
+            mode: None,
             measurements: Measurements {
                 rate: 48_000,
                 callbacks: 3000,
@@ -227,6 +245,19 @@ mod tests {
         );
         assert_eq!(table(&[row(true), row(false)]), expected);
         assert_eq!(HEADER.matches('|').count(), RULE.matches('|').count());
+    }
+
+    #[test]
+    fn an_exclusive_run_names_its_format_and_period_first_in_the_notes() {
+        let format = ab::Format { valid_bits: Some(24), ..ab::Format::new(48_000, 2, ab::SampleFormat::I32) };
+        let achieved = ab::Achieved::requested(format, ab::Period::Frames(128));
+        assert_eq!(exclusive_note(&achieved), "exclusive, i32/24 valid, 128 fr");
+        let float = ab::Achieved::requested(ab::Format::new(48_000, 2, ab::SampleFormat::F32), ab::Period::Default);
+        assert_eq!(exclusive_note(&float), "exclusive, f32, default period");
+        let mut r = row(false);
+        r.mode = Some(exclusive_note(&achieved));
+        r.measurements.invalid_stamps = 2;
+        assert!(r.markdown().ends_with("| exclusive, i32/24 valid, 128 fr; invalid stamps 2 |"), "{}", r.markdown());
     }
 
     #[test]

@@ -6,8 +6,9 @@
 use crate::analysis::FrameTrip;
 use crate::probe::{CLICK_LEVEL, MIN_ENERGY_RATIO};
 use soundcraft_playback::LoopbackCalibration;
-use soundcraft_playback::devices::MODE_SHARED;
+use soundcraft_playback::devices::{MODE_EXCLUSIVE, MODE_SHARED};
 use std::path::Path;
+use transit_audio_backend::Mode;
 
 /// Fewest clicks that must pair for a calibration to be trusted.
 pub const MIN_PAIRED: usize = 3;
@@ -87,14 +88,19 @@ pub fn figures(trip: &FrameTrip, rate: u32, peaks: &[f32]) -> Result<Figures, St
     Ok(Figures { rate, round_trip_frames: median.round() as u32, spread_frames: spread as u32, paired: trip.paired, clicks: trip.clicks })
 }
 
+/// The `mode` key the Player's settings use for `mode`.
+pub fn mode_key(mode: Mode) -> &'static str {
+    if mode == Mode::Exclusive { MODE_EXCLUSIVE } else { MODE_SHARED }
+}
+
 /// The record for `ui.json`: keyed by the output `device`, the paired `input` as named on the
-/// command line (the app's `input_pairing`), the requested `period` (0 for the driver's default)
-/// and the rate measured.
-pub fn record(figures: &Figures, device: &str, input: Option<&str>, period: u32, measured_at: &str) -> LoopbackCalibration {
+/// command line (the app's `input_pairing`), the `mode` the streams opened in, the requested
+/// `period` (0 for the driver's default) and the rate measured.
+pub fn record(figures: &Figures, device: &str, input: Option<&str>, mode: Mode, period: u32, measured_at: &str) -> LoopbackCalibration {
     LoopbackCalibration {
         device: device.to_owned(),
         input: input.map(str::to_owned),
-        mode: MODE_SHARED.to_owned(),
+        mode: mode_key(mode).to_owned(),
         rate: figures.rate,
         period,
         round_trip_frames: figures.round_trip_frames,
@@ -192,7 +198,10 @@ mod tests {
     #[test]
     fn merging_replaces_the_same_key_and_keeps_everything_else() {
         let f = Figures { rate: 48_000, round_trip_frames: 480, spread_frames: 3, paired: 8, clicks: 8 };
-        let a = record(&f, "Speakers", Some("Line"), 128, "2026-10-21");
+        let a = record(&f, "Speakers", Some("Line"), Mode::Shared, 128, "2026-10-21");
+        let exclusive = record(&f, "Speakers", Some("Line"), Mode::Exclusive, 128, "2026-10-21");
+        assert_eq!((a.mode.as_str(), exclusive.mode.as_str()), ("shared", "exclusive"));
+        assert!(!a.same_key(&exclusive), "a shared and an exclusive calibration are different keys");
         let other = LoopbackCalibration { period: 64, ..a.clone() };
         let mut doc = serde_json::json!({
             "theme": "dark",
@@ -218,7 +227,7 @@ mod tests {
         let path = dir.join("ui.json");
         std::fs::write(&path, r#"{"theme":"dark","audio":{"output":"Speakers","buffer_size":128},"zoom":[1,2]}"#).unwrap();
         let f = Figures { rate: 48_000, round_trip_frames: 480, spread_frames: 3, paired: 8, clicks: 8 };
-        let cal = record(&f, "Speakers", None, 128, "2026-10-21");
+        let cal = record(&f, "Speakers", None, Mode::Shared, 128, "2026-10-21");
         merge_settings(&path, &cal).unwrap();
         merge_settings(&path, &cal).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

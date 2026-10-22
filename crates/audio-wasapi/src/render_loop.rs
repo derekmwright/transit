@@ -187,8 +187,22 @@ impl Stamper {
     }
 }
 
+/// How much of the buffer each wake fills, fixed by the mode at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fill {
+    /// Shared mode: the frames the engine has consumed, `buffer_frames - GetCurrentPadding`.
+    Free,
+    /// Exclusive event-driven mode: the buffer is one period and the driver ping-pongs two of
+    /// them, so every wake fills the whole buffer, whatever `GetCurrentPadding` says (drivers
+    /// report it inconsistently in this mode, and a full-looking buffer would starve the device).
+    /// The written frames are presented after the period the device is playing now, so the stamp
+    /// counts one buffer as queued.
+    Whole,
+}
+
 /// Everything the loop needs that is fixed before `Start`.
 pub(crate) struct LoopConfig {
+    pub(crate) fill: Fill,
     pub(crate) buffer_frames: u32,
     pub(crate) format: Format,
     pub(crate) wire: Wire,
@@ -227,11 +241,13 @@ pub(crate) fn run(
             }
             Wake::Failed(fault) => return fail(error, fault),
         }
-        let padding = match device.padding() {
-            Ok(padding) => padding,
-            Err(fault) => return fail(error, fault),
+        let (padding, frames) = match config.fill {
+            Fill::Free => match device.padding() {
+                Ok(padding) => (padding, config.buffer_frames.saturating_sub(padding)),
+                Err(fault) => return fail(error, fault),
+            },
+            Fill::Whole => (config.buffer_frames, config.buffer_frames),
         };
-        let frames = config.buffer_frames.saturating_sub(padding);
         if frames == 0 {
             continue;
         }
@@ -316,6 +332,7 @@ mod tests {
         releases: std::cell::Cell<u32>,
         /// A second `GetBuffer` while one is outstanding.
         double_get: bool,
+        padding_reads: u32,
     }
 
     impl Fake {
@@ -333,6 +350,7 @@ mod tests {
                 gets: 0,
                 releases: std::cell::Cell::new(0),
                 double_get: false,
+                padding_reads: 0,
             }
         }
     }
@@ -342,6 +360,7 @@ mod tests {
             self.wakes.pop_front().unwrap_or(Wake::Stop)
         }
         fn padding(&mut self) -> Result<u32, Fault> {
+            self.padding_reads += 1;
             Ok(self.padding)
         }
         fn position(&mut self) -> Result<Position, Fault> {
@@ -377,6 +396,7 @@ mod tests {
 
     fn config(origin_ns: i64, latency_100ns: i64) -> LoopConfig {
         LoopConfig {
+            fill: Fill::Free,
             buffer_frames: 2 * PERIOD,
             format: Format::new(RATE, 2, SampleFormat::F32),
             wire: Wire::F32,
@@ -489,6 +509,53 @@ mod tests {
         device.padding = 2 * PERIOD;
         let (_, seen, _) = drive(&mut device, &config(0, 0));
         assert!(seen.is_empty() && device.writes == 0);
+    }
+
+    /// An exclusive stream: the buffer is one period, filled whole on every wake.
+    fn exclusive(latency_100ns: i64) -> LoopConfig {
+        LoopConfig { fill: Fill::Whole, buffer_frames: PERIOD, ..config(0, latency_100ns) }
+    }
+
+    #[test]
+    fn exclusive_fills_the_whole_buffer_every_wake_whatever_the_padding_says() {
+        // A driver that reports an empty buffer, one that reports a full one, and one in between.
+        for padding in [0, PERIOD, PERIOD / 2] {
+            let mut device = Fake::new([Wake::Event; 6]);
+            device.padding = padding;
+            let (exit, seen, errors) = drive(&mut device, &exclusive(0));
+            assert_eq!((exit, seen.len(), errors.len(), device.writes), (Exit::Stopped, 6, 0, 6), "padding {padding}");
+            assert!(seen.iter().all(|s| s.frames == PERIOD as usize), "every wake writes buffer_frames (padding {padding})");
+            assert_eq!(device.padding_reads, 0, "exclusive mode does not ask for the padding");
+            assert_eq!((device.gets, device.releases.get()), (6, 6));
+        }
+    }
+
+    #[test]
+    fn exclusive_presents_after_the_period_being_played_plus_the_stream_latency() {
+        let mut device = Fake::new([Wake::Event; 2]);
+        let (_, seen, _) = drive(&mut device, &exclusive(10_000));
+        let want = 1_000_000 + i64::from(PERIOD) * 1_000_000_000 / i64::from(RATE);
+        assert!(seen.iter().all(|s| s.stamp.backend_frame_ns - s.stamp.backend_callback_ns == want));
+    }
+
+    #[test]
+    fn shared_mode_still_reads_the_padding_once_per_wake() {
+        let mut device = Fake::new([Wake::Event; 4]);
+        let (_, seen, _) = drive(&mut device, &config(0, 0));
+        assert_eq!((device.padding_reads, seen.len()), (4, 4));
+    }
+
+    #[test]
+    fn the_exclusive_loop_body_allocates_nothing() {
+        let mut device = Fake::new([Wake::Event; 200]);
+        let config = exclusive(10_000);
+        let mut render: RenderCallback = Box::new(|block| block.render(&mut |chunk| chunk.fill(0.1)));
+        let mut error: ErrorCallback = Box::new(|_| {});
+        let mut scratch = vec![0.0f32; 64];
+        let (exit, stats) = measure(|| run(&mut device, &config, &mut scratch, &mut render, &mut error));
+        assert_eq!(exit, Exit::Stopped);
+        assert!(stats.is_zero(), "the loop allocated: {stats:?}");
+        assert_eq!(device.writes, 200);
     }
 
     #[test]

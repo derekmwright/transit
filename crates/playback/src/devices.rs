@@ -85,6 +85,8 @@ pub struct AudioConfig {
 
 /// The `mode` key of a shared-mode calibration.
 pub const MODE_SHARED: &str = "shared";
+/// The `mode` key of an exclusive-mode calibration (`audio-bench --mode exclusive`).
+pub const MODE_EXCLUSIVE: &str = "exclusive";
 
 /// One measured loopback of an output/input pair. The key is `(device, input, mode, rate,
 /// period)`; a calibration applies to a stream pair only when every part of the key is equal,
@@ -95,7 +97,7 @@ pub struct LoopbackCalibration {
     pub device: String,
     /// The paired input as the user named it (`input_pairing`); `None` pairs by container id.
     pub input: Option<String>,
-    /// How the device was opened (`"shared"`).
+    /// How the device was opened ([`MODE_SHARED`] or [`MODE_EXCLUSIVE`]).
     pub mode: String,
     pub rate: u32,
     /// The requested period in frames; 0 is the driver's default.

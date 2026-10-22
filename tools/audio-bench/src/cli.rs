@@ -2,6 +2,7 @@
 
 use crate::{Config, Kind, fake, session};
 use std::path::PathBuf;
+use transit_audio_backend as ab;
 
 pub const USAGE: &str = "\
 usage: audio-bench [options]
@@ -9,6 +10,7 @@ usage: audio-bench [options]
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
   --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device)
   --in-device <name>     input device when it differs from --device
+  --mode shared|exclusive  device sharing of --backend wasapi (default shared); exclusive holds the device and silences other apps
   --period <frames>      requested period: 32, 64, 128, ... (default: the driver's)
   --rate <Hz>            sample rate (default 48000)
   --seconds <N>          measurement time (default 20)
@@ -41,7 +43,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     let mut args = args.into_iter();
     let mut kind = Kind::Cpal;
     let mut system = None;
-    let mut request = session::Request { device: None, in_device: None, rate: 48_000, period: None, loopback: false, out_ch: 1, in_ch: 1 };
+    let mut request =
+        session::Request { device: None, in_device: None, rate: 48_000, period: None, loopback: false, mode: ab::Mode::Shared, out_ch: 1, in_ch: 1 };
     let (mut seconds, mut out, mut settings) = (20.0f64, None, None);
     let (mut delay, mut jitter, mut gap) = (None, None, None::<Option<f64>>);
     let mut list = false;
@@ -59,6 +62,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--system" => system = Some(value().ok_or("--system needs a value")?),
             "--device" | "--out-device" => request.device = Some(value().ok_or("--device needs a value")?),
             "--in-device" => request.in_device = Some(value().ok_or("--in-device needs a value")?),
+            "--mode" => {
+                request.mode = match value().as_deref() {
+                    Some("shared") => ab::Mode::Shared,
+                    Some("exclusive") => ab::Mode::Exclusive,
+                    other => return Err(format!("--mode: expected shared or exclusive, got {other:?}")),
+                }
+            }
             "--period" => request.period = Some(number(&flag, value())?),
             "--rate" => request.rate = number(&flag, value())?,
             "--seconds" => seconds = number(&flag, value())?,
@@ -91,6 +101,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     }
     if kind == Kind::Wasapi && system.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("WASAPI")) {
         return Err("--backend wasapi is the native WASAPI system; --system applies to the cpal backend".into());
+    }
+    if request.mode == ab::Mode::Exclusive && kind == Kind::Cpal {
+        return Err("--mode exclusive needs --backend wasapi (or fake): cpal opens shared streams only".into());
     }
     if settings.is_some() && !request.loopback {
         return Err("--settings needs --loopback: a calibration is a measured round trip".into());
@@ -151,5 +164,17 @@ mod tests {
         assert!(matches!(parse_str("--list-devices --system WASAPI"), Ok(Command::List(Some(_)))));
         let Ok(Command::Run(c)) = parse_str("--backend fake --fake-gap-at none") else { panic!("did not parse") };
         assert_eq!(c.fake.gap_at_s, None);
+    }
+
+    #[test]
+    fn the_mode_defaults_to_shared_and_exclusive_needs_a_native_or_fake_backend() {
+        let Ok(Command::Run(c)) = parse_str("--backend wasapi") else { panic!("did not parse") };
+        assert_eq!(c.request.mode, ab::Mode::Shared);
+        let Ok(Command::Run(c)) = parse_str("--backend wasapi --mode exclusive --period 128") else { panic!("did not parse") };
+        assert_eq!((c.request.mode, c.request.period), (ab::Mode::Exclusive, Some(128)));
+        let Ok(Command::Run(c)) = parse_str("--backend fake --loopback --mode exclusive") else { panic!("did not parse") };
+        assert_eq!(c.request.mode, ab::Mode::Exclusive);
+        assert!(parse_str("--backend cpal --mode exclusive").unwrap_err().contains("--backend wasapi"));
+        assert!(parse_str("--backend wasapi --mode raw").unwrap_err().contains("--mode"));
     }
 }
