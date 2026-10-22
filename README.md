@@ -13,7 +13,8 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 > transit is alpha software under active development. The current priority is core engine
 > correctness, stability and performance, measured on real hardware, ahead of new features.
 > Expect rough edges in the UI and some missing features; the audio engine, recording alignment
-> and device handling get fixed first. Releases are frequent, and each lists its
+> and device handling get fixed first, following [the engineering principles](docs/principles.md).
+> Releases are frequent, and each lists its
 > [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
 > help right now: see [How to help](#how-to-help).
 
