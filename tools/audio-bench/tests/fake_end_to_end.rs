@@ -111,6 +111,17 @@ fn without_loopback_there_is_no_round_trip_and_the_table_says_so() {
 }
 
 #[test]
+fn a_silent_input_prints_the_peaks_without_a_calibration() {
+    // A loopback delayed past the end of the run: nothing is detected and the input stays silent.
+    let row = run(&config(64, 3.0, true, script(0, None, 1_000_000))).expect("the fake run");
+    assert_eq!(row.measurements.round_trip.map(|t| t.paired), Some(0));
+    assert_eq!(row.failed_detection_peaks().as_deref(), Some("input peaks: ch1 -inf dBFS, ch2 -inf dBFS"));
+    // A run that detected its clicks has no such line.
+    let ok = run(&config(64, 3.0, true, script(0, None, 144))).expect("the fake run");
+    assert_eq!(ok.failed_detection_peaks(), None);
+}
+
+#[test]
 fn the_default_period_and_bad_channels() {
     let mut c = config(64, 1.0, false, script(0, None, 0));
     c.request.period = None;
@@ -182,8 +193,8 @@ fn an_exclusive_run_notes_its_mode_and_calibrates_under_the_exclusive_key() {
     c.request.mode = transit_audio_backend::Mode::Exclusive;
     c.settings = Some(path.clone());
     let row = run(&c).expect("the fake accepts exclusive as if shared");
-    assert_eq!(row.mode.as_deref(), Some("exclusive, f32, 128 fr"));
-    assert!(row.markdown().ends_with("| exclusive, f32, 128 fr |"), "{}", row.markdown());
+    assert_eq!(row.mode.as_deref(), Some("exclusive, f32, 128 fr, buffer 128 fr"));
+    assert!(row.markdown().ends_with("| exclusive, f32, 128 fr, buffer 128 fr |"), "{}", row.markdown());
     // A shared run of the same pair is another key: both entries stay.
     c.request.mode = transit_audio_backend::Mode::Shared;
     assert_eq!(run(&c).expect("the shared run").mode, None);

@@ -811,6 +811,8 @@ struct LiveCapture {
     calibration: Option<ab::Calibration>,
     /// The device minimum period in frames (exclusive mode), for `Achieved::min_period`.
     min_period: Option<u32>,
+    /// `GetBufferSize` after `Initialize`, for `Achieved::buffer_frames`.
+    buffer_frames: u32,
 }
 
 impl LiveCapture {
@@ -820,12 +822,24 @@ impl LiveCapture {
         // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
         // handle that outlives the client (`event` is a field of `LiveCapture`); `GetService` asks
         // the initialized client for its services.
-        let (capture, latency) = unsafe {
+        let (capture, latency, buffer_frames) = unsafe {
             client.SetEventHandle(event.0).map_err(|e| open_error("SetEventHandle", &e))?;
             let capture = client.GetService::<IAudioCaptureClient>().map_err(|e| open_error("IAudioCaptureClient", &e))?;
-            (capture, client.GetStreamLatency().unwrap_or(0))
+            let buffer_frames = client.GetBufferSize().map_err(|e| open_error("GetBufferSize", &e))?;
+            (capture, client.GetStreamLatency().unwrap_or(0), buffer_frames)
         };
-        Ok(Self { client, capture, event, stop, fmt, period_frames, latency_100ns: latency, calibration: params.request.calibration, min_period })
+        Ok(Self {
+            client,
+            capture,
+            event,
+            stop,
+            fmt,
+            period_frames,
+            latency_100ns: latency,
+            calibration: params.request.calibration,
+            min_period,
+            buffer_frames,
+        })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
@@ -1139,6 +1153,7 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
         latency: Some(Duration::from_nanos(live.latency_100ns.unsigned_abs().saturating_mul(100))),
         device_position: Some(0),
         min_period: live.min_period,
+        buffer_frames: Some(live.buffer_frames),
     };
     let _ = ready.send(Ok(Opened { achieved }));
     // Wait for `start`; a dropped control side ends the thread.
@@ -1205,6 +1220,7 @@ fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback
         latency: Some(Duration::from_nanos(live.latency_100ns.unsigned_abs().saturating_mul(100))),
         device_position: Some(0),
         min_period: live.min_period,
+        buffer_frames: Some(live.buffer_frames),
     };
     let _ = ready.send(Ok(Opened { achieved }));
     if let Ok(Command::Start(reply)) = commands.recv() {
@@ -1418,6 +1434,7 @@ mod tests {
         assert_eq!(exclusive::E_EXCLUSIVE_MODE_NOT_ALLOWED, a::AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED.0);
         assert_eq!(exclusive::E_ENDPOINT_CREATE_FAILED, a::AUDCLNT_E_ENDPOINT_CREATE_FAILED.0);
         assert_eq!(exclusive::E_BUFFER_SIZE_ERROR, a::AUDCLNT_E_BUFFER_SIZE_ERROR.0);
+        assert_eq!(exclusive::E_INVALID_DEVICE_PERIOD, a::AUDCLNT_E_INVALID_DEVICE_PERIOD.0);
         assert_eq!(exclusive::E_BUFFER_SIZE_NOT_ALIGNED, a::AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED.0);
         assert_eq!(E_DEVICE_IN_USE, a::AUDCLNT_E_DEVICE_IN_USE.0);
         assert_eq!(render_loop::E_BUFFER_TOO_LARGE, a::AUDCLNT_E_BUFFER_TOO_LARGE.0);

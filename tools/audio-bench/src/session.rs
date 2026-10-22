@@ -28,6 +28,8 @@ pub struct Opened {
     pub capture_rate: Option<u32>,
     /// What the render stream opened with (format, period, latency).
     pub render: ab::Achieved,
+    /// What the capture stream opened with, on a loopback run.
+    pub capture: Option<ab::Achieved>,
     /// The device-loop counters of each stream at the end of the run, where the backend keeps them.
     pub render_stats: Option<ab::StreamStats>,
     pub capture_stats: Option<ab::StreamStats>,
@@ -147,6 +149,7 @@ pub fn run(
         render_rate: achieved.format.rate,
         capture_rate: capture.as_ref().map(|(_, a)| a.format.rate),
         render: achieved,
+        capture: capture.as_ref().map(|(_, a)| *a),
         render_stats,
         capture_stats,
     })

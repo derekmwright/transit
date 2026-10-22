@@ -156,12 +156,15 @@ pub struct Achieved {
     /// The smallest period the device reports for this mode, in frames, where it says (WASAPI
     /// exclusive: `GetDevicePeriod`'s minimum). A driver may not sustain it; it is offered, not used.
     pub min_period: Option<u32>,
+    /// The frames the driver allocated for the stream's buffer, where the system says (WASAPI:
+    /// `GetBufferSize` after `Initialize`); it may exceed the requested period.
+    pub buffer_frames: Option<u32>,
 }
 
 impl Achieved {
     /// The request honored as asked, with nothing more reported.
     pub const fn requested(format: Format, period: Period) -> Self {
-        Self { format, period, latency: None, device_position: None, min_period: None }
+        Self { format, period, latency: None, device_position: None, min_period: None, buffer_frames: None }
     }
 }
 

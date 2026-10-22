@@ -29,6 +29,9 @@ pub struct Row {
     /// The device-loop counters of the render and capture streams, when the backend keeps them.
     pub render_stats: Option<ab::StreamStats>,
     pub capture_stats: Option<ab::StreamStats>,
+    /// What each stream opened with, for the buffer and latency the backend lines report.
+    pub render_achieved: Option<ab::Achieved>,
+    pub capture_achieved: Option<ab::Achieved>,
     pub machine: Machine,
     pub date: String,
 }
@@ -40,8 +43,20 @@ fn cell(text: &str) -> String {
 impl Row {
     /// One line per stream that kept device-loop counters (`--backend wasapi` and the fake one).
     pub fn stats_lines(&self) -> Vec<String> {
-        let line = |name: &str, stats: &Option<ab::StreamStats>, capture: bool| stats.map(|s| format!("{name} backend: {}", s.line(capture)));
-        [line("render", &self.render_stats, false), line("capture", &self.capture_stats, true)].into_iter().flatten().collect()
+        let line = |name: &str, stats: &Option<ab::StreamStats>, achieved: &Option<ab::Achieved>, capture: bool| {
+            stats.map(|s| format!("{name} backend: {}{}", s.line(capture), opened_figures(achieved.as_ref())))
+        };
+        [line("render", &self.render_stats, &self.render_achieved, false), line("capture", &self.capture_stats, &self.capture_achieved, true)]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The per-channel input peaks, when a loopback run detected no click at all: printed whether or
+    /// not a stamp-time calibration exists, so a silent or too-quiet input is never invisible.
+    pub fn failed_detection_peaks(&self) -> Option<String> {
+        let none = self.measurements.round_trip.is_some_and(|t| t.paired == 0);
+        none.then(|| crate::calibration::input_peaks_line(&self.measurements.input_peaks))
     }
 
     pub fn markdown(&self) -> String {
@@ -93,8 +108,17 @@ impl Row {
     }
 }
 
-/// "exclusive, i32/24 valid, 128 fr": the mode, the device sample format and the period an
-/// exclusive stream achieved.
+/// "; buffer 441 fr; latency 12.5 ms": what the driver allocated and reported at open, each only
+/// where the backend says.
+fn opened_figures(achieved: Option<&ab::Achieved>) -> String {
+    let Some(a) = achieved else { return String::new() };
+    let buffer = a.buffer_frames.map(|n| format!("; buffer {n} fr"));
+    let latency = a.latency.map(|d| format!("; latency {:.1} ms", d.as_secs_f64() * 1000.0));
+    buffer.into_iter().chain(latency).collect()
+}
+
+/// "exclusive, i32/24 valid, 128 fr, buffer 128 fr": the mode, the device sample format, the period
+/// an exclusive stream achieved and the buffer the driver allocated.
 pub fn exclusive_note(achieved: &ab::Achieved) -> String {
     let f = achieved.format;
     let sample = format!("{:?}", f.sample).to_lowercase();
@@ -103,7 +127,8 @@ pub fn exclusive_note(achieved: &ab::Achieved) -> String {
         None => sample,
     };
     let period = achieved.period.frames().map_or_else(|| "default period".to_string(), |n| format!("{n} fr"));
-    format!("exclusive, {sample}, {period}")
+    let buffer = achieved.buffer_frames.map(|n| format!(", buffer {n} fr")).unwrap_or_default();
+    format!("exclusive, {sample}, {period}{buffer}")
 }
 
 /// The table for `rows`.
@@ -242,9 +267,23 @@ mod tests {
             calibration: None,
             render_stats: None,
             capture_stats: None,
+            render_achieved: None,
+            capture_achieved: None,
             machine: Machine { cpu: "Test CPU | 8 cores".into(), os: "Test OS 1.0".into() },
             date: "2026-10-21".into(),
         }
+    }
+
+    #[test]
+    fn the_backend_lines_carry_the_buffer_and_latency_where_known() {
+        let mut r = row(true);
+        r.render_stats = Some(ab::StreamStats::default());
+        let mut a = ab::Achieved::requested(ab::Format::new(48_000, 2, ab::SampleFormat::F32), ab::Period::Frames(64));
+        a.buffer_frames = Some(128);
+        a.latency = Some(std::time::Duration::from_micros(12_500));
+        r.render_achieved = Some(a);
+        let line = &r.stats_lines()[0];
+        assert!(line.starts_with("render backend: wakes 0") && line.ends_with("; buffer 128 fr; latency 12.5 ms"), "{line}");
     }
 
     #[test]

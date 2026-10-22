@@ -36,7 +36,9 @@ streams only; it refuses `Mode::Exclusive`.
 
 Each native stream keeps a `LoopStats` block of relaxed atomics (created at open, written by the loop,
 read by `Stream::stats()` as an `ab::StreamStats` snapshot). The Audio Devices panel shows it under the
-"Output open" and "Input open" lines, and `audio-bench --backend wasapi` prints it after the table.
+"Output open" and "Input open" lines, and `audio-bench --backend wasapi` prints it after the table. The "render backend:" and "capture backend:" lines also carry `buffer N fr`
+(`GetBufferSize`, the frames the driver allocated, which may exceed the requested period) and
+`latency N ms` (`GetStreamLatency`), and an exclusive run's Notes cell repeats the buffer.
 
 - **wakes / timeouts / faults.** Events served; waits that timed out (the stream ends); faults that ended it.
 - **skipped.** Exclusive events whose buffer was not free yet (`AUDCLNT_E_BUFFER_TOO_LARGE`), skipped.

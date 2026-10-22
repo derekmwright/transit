@@ -112,7 +112,10 @@ impl FakeBackend {
         if let Some(error) = state.fail_open.take() {
             return Err(error);
         }
-        Ok((Box::new(FakeStream { state: Arc::clone(&self.state), direction }), Achieved::requested(request.format, request.period)))
+        Ok((
+            Box::new(FakeStream { state: Arc::clone(&self.state), direction }),
+            Achieved { buffer_frames: request.period.frames(), ..Achieved::requested(request.format, request.period) },
+        ))
     }
 }
 

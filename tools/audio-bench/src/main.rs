@@ -24,6 +24,9 @@ fn main() -> ExitCode {
                 Some(Err(why)) => println!("calibration: none ({why})"),
                 None => {}
             }
+            if let Some(line) = rows[0].failed_detection_peaks() {
+                println!("{line}");
+            }
             if let Some(path) = &config.settings {
                 eprintln!("calibration merged into {}", path.display());
             }

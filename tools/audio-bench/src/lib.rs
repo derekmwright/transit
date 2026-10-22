@@ -115,6 +115,8 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         calibration,
         render_stats: opened.render_stats,
         capture_stats: opened.capture_stats,
+        render_achieved: Some(opened.render),
+        capture_achieved: opened.capture,
         machine: report::machine(),
         date,
     })

@@ -13,6 +13,9 @@ pub(crate) const E_EXCLUSIVE_MODE_NOT_ALLOWED: i32 = 0x8889_000E_u32 as i32;
 pub(crate) const E_ENDPOINT_CREATE_FAILED: i32 = 0x8889_000F_u32 as i32;
 /// `AUDCLNT_E_BUFFER_SIZE_ERROR`: the requested period is outside the range the device accepts.
 pub(crate) const E_BUFFER_SIZE_ERROR: i32 = 0x8889_0016_u32 as i32;
+/// `AUDCLNT_E_INVALID_DEVICE_PERIOD`: the period is outside what the device allows (some drivers
+/// answer a period below their minimum with this instead of `AUDCLNT_E_BUFFER_SIZE_ERROR`).
+pub(crate) const E_INVALID_DEVICE_PERIOD: i32 = 0x8889_0020_u32 as i32;
 /// `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`: the period is not a multiple of the driver's alignment.
 pub(crate) const E_BUFFER_SIZE_NOT_ALIGNED: i32 = 0x8889_0019_u32 as i32;
 /// `E_NOTFOUND` (`HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`): no such endpoint.
@@ -151,6 +154,17 @@ fn period_text(duration_100ns: i64, rate: u32) -> String {
 fn initialize_error(error: &ApiError, rate: u32, requested_100ns: i64, default_100ns: i64, min_100ns: i64) -> ab::OpenError {
     let requested = period_text(requested_100ns, rate);
     match error.code {
+        E_INVALID_DEVICE_PERIOD => ab::OpenError::PeriodRefused {
+            requested_frames: frames_of_100ns(requested_100ns, rate),
+            min_frames: Some(frames_of_100ns(min_100ns, rate)),
+            default_frames: Some(frames_of_100ns(default_100ns, rate)),
+            message: format!(
+                "Initialize(exclusive): the period of {} frames is below what the device allows (minimum {}, default {} at {rate} Hz)",
+                frames_of_100ns(requested_100ns, rate),
+                frames_of_100ns(min_100ns, rate),
+                frames_of_100ns(default_100ns, rate)
+            ),
+        },
         E_BUFFER_SIZE_ERROR => ab::OpenError::PeriodRefused {
             requested_frames: frames_of_100ns(requested_100ns, rate),
             min_frames: Some(frames_of_100ns(min_100ns, rate)),
@@ -333,6 +347,16 @@ mod tests {
         assert_eq!((requested_frames, min_frames, default_frames), (16, Some(144), Some(480)));
         assert!(text.contains("the period of 16 frames (0.33 ms) is outside"), "{text}");
         assert!(text.contains("at least 144 frames (3.00 ms) at 48000 Hz, default 480 frames (10.00 ms)"), "{text}");
+    }
+
+    #[test]
+    fn an_invalid_device_period_is_a_refused_period_with_the_range() {
+        let mut fake = scarlett();
+        fake.inits.push_back(Err(E_INVALID_DEVICE_PERIOD));
+        let error = open(&mut fake, &i32_24(48_000), ab::Period::Frames(128)).err().unwrap();
+        let ab::OpenError::PeriodRefused { requested_frames, min_frames, default_frames, message: text } = error else { panic!("{error:?}") };
+        assert_eq!((requested_frames, min_frames, default_frames), (128, Some(144), Some(480)));
+        assert_eq!(text, "Initialize(exclusive): the period of 128 frames is below what the device allows (minimum 144, default 480 at 48000 Hz)");
     }
 
     #[test]

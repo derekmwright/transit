@@ -57,14 +57,20 @@ pub fn input_peak_line(peaks: &[f32], in_ch: u16) -> String {
     format!("input peak on ch{in_ch}: {}", dbfs(peak))
 }
 
+/// "input peaks: ch1 -inf dBFS, ch2 -42.1 dBFS": every input channel's peak, on its own line of a
+/// failed detection.
+pub fn input_peaks_line(peaks: &[f32]) -> String {
+    let list = peaks.iter().enumerate().map(|(i, p)| format!("ch{} {}", i + 1, dbfs(*p))).collect::<Vec<_>>().join(", ");
+    let list = if list.is_empty() { "no input channels".to_string() } else { list };
+    format!("input peaks: {list}")
+}
+
 /// "input peaks: ch1 -inf dBFS, ch2 -42.1 dBFS; clicks play at -6 dBFS and a detection needs about
 /// -20 dBFS" (the figures follow the click level and the detector's energy threshold).
 fn peaks_note(peaks: &[f32]) -> String {
-    let list = peaks.iter().enumerate().map(|(i, p)| format!("ch{} {}", i + 1, dbfs(*p))).collect::<Vec<_>>().join(", ");
     let play = 20.0 * CLICK_LEVEL.log10();
     let need = play + 10.0 * MIN_ENERGY_RATIO.log10();
-    let list = if list.is_empty() { "no input channels".to_string() } else { list };
-    format!("input peaks: {list}; clicks play at {play:.0} dBFS and a detection needs about {need:.0} dBFS")
+    format!("{}; clicks play at {play:.0} dBFS and a detection needs about {need:.0} dBFS", input_peaks_line(peaks))
 }
 
 /// The calibration of `trip` at `rate` Hz: the median of the per-click round trips, and the spread
