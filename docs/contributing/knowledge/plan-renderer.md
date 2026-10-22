@@ -37,7 +37,7 @@ that would create one fail (`would_create_cycle_all`), and a loop in a loaded fi
 ## Parity and goldens
 
 `crates/mix/tests/plan_parity.rs` renders sessions and compares with
-`crates/mix/tests/golden/plan_parity`; `offline_plan_parity.rs` checks offline equals realtime.
+`crates/mix/tests/golden/plan_parity`; offline against realtime is covered only in part: `output_sinks.rs` (`only_main_falls_back_and_a_path_table_without_routes_adds_nothing`) compares the plan's main mix bit for bit with `render_range` on a session with a send, a bus and a latent insert, and `path_pdc.rs` (`a_two_aux_lookahead_cascade_lines_up_with_the_dry_path`) checks the offline arrival within one sample. A general offline-equals-realtime parity test is planned, not written.
 Update a golden only with a stated audible reason (`../evidence/tests-as-evidence.md`).
 
 Design: [ADR 0015](../../adr/0015-io-routing-abstraction.md) sections 6 and 7.
