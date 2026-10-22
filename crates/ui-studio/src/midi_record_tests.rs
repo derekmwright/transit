@@ -433,3 +433,77 @@ fn declining_recovery_deletes_the_journal() {
     assert!(!path.exists() && !left[0].dir.exists());
     assert!(soundcraft_engine::autosave::leftovers(&root.join("Autosave")).is_empty());
 }
+
+/// Cycle `4..6` beats with the playhead at `at`, recording from there with no loop pass.
+fn cycling(app: &mut StudioApp, at: i64) {
+    let edit = &mut app.engine.session_mut().edit;
+    edit.loop_playback = true;
+    edit.loop_range = soundcraft_time::Range::new(4 * BEAT, 6 * BEAT);
+    app.record_start = at;
+    app.take_plan = Some(soundcraft_engine::io::Recording {
+        start: at,
+        pass: None,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: None,
+        midi_placed: false,
+    });
+    app.engine.transport.recording = true;
+    app.start_play(at, None, None);
+}
+
+/// The fake clock: the transport reaches `at`, and a frame of the UI sees it.
+fn tick(app: &mut StudioApp, at: i64) {
+    app.engine.transport.position = at;
+    app.update_midi_live();
+}
+
+#[test]
+fn a_wrapped_recording_stops_where_the_capture_got_to_not_where_the_cycle_wrapped_back_to() {
+    let (mut app, t) = app();
+    cycling(&mut app, 5 * BEAT);
+    let beats = |b: f64| (b * BEAT as f64) as u64;
+    // A note a beat in (the loop end), a second one half a beat into the second lap, held at Stop.
+    let events = vec![on(LATCH, t, 60), off(LATCH + beats(0.5), t, 60), on(LATCH + beats(1.5), t, 64)];
+    app.finished_test_midi = Some(pass(t, Some(5 * BEAT), events));
+    tick(&mut app, 5 * BEAT + BEAT / 2);
+    tick(&mut app, 4 * BEAT + BEAT / 5);
+    let live = app.midi_live.as_ref().expect("the pass is drawn");
+    assert_eq!(live.end, 6 * BEAT + BEAT / 5, "the lap is counted: the playhead wrapped to 4.2 beats but 1.2 beats have been recorded");
+    tick(&mut app, 4 * BEAT + BEAT * 7 / 10);
+    app.stop_play();
+    let tr = app.engine.session().track(t).unwrap().clone();
+    assert_eq!(tr.playlists.len(), 2, "one take per lap");
+    assert_eq!(app.status, "Recorded 2 takes (2 notes) on MIDI 1", "{}", app.status);
+    assert!(app.take_plan.is_none() && app.record_clock.is_none());
+}
+
+#[test]
+fn recording_within_one_lap_keeps_the_single_take_status() {
+    let (mut app, t) = app();
+    cycling(&mut app, 4 * BEAT);
+    let events = vec![on(LATCH, t, 60), off(LATCH + BEAT as u64 / 2, t, 60)];
+    app.finished_test_midi = Some(pass(t, Some(4 * BEAT), events));
+    tick(&mut app, 4 * BEAT + BEAT / 2);
+    tick(&mut app, 4 * BEAT + BEAT);
+    app.stop_play();
+    assert!(app.status.starts_with("Recorded 1 MIDI clip (1 notes) on"), "{}", app.status);
+}
+
+#[test]
+fn record_pressed_while_cycling_from_the_loop_start_loop_records_in_passes() {
+    let (mut app, t) = app();
+    let _ = t;
+    let edit = &mut app.engine.session_mut().edit;
+    edit.loop_playback = true;
+    edit.loop_range = soundcraft_time::Range::new(4 * BEAT, 6 * BEAT);
+    app.engine.transport.playing = true;
+    app.engine.transport.position = 4 * BEAT;
+    app.begin_pass(Vec::new());
+    assert_eq!(app.take_plan.as_ref().and_then(|p| p.pass), Some(2 * BEAT));
+    app.take_plan = None;
+    app.engine.transport.position = 5 * BEAT;
+    app.begin_pass(Vec::new());
+    assert_eq!(app.take_plan.as_ref().and_then(|p| p.pass), None, "mid-lap the wrapped path cuts the laps from the latch");
+}

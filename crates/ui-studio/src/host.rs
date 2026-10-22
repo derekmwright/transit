@@ -114,9 +114,16 @@ impl StudioApp {
         let already_playing = self.is_playing();
         if already_playing {
             // Punch in on the fly at the current playhead.
-            self.record_start = self.position();
+            let at = self.position();
+            self.record_start = at;
             self.punch = None;
-            self.plan_recording(takes, None, None, None);
+            // Cycling already: the pass is the loop, as with Loop Record, so every lap is a take.
+            // (The per-pass path cuts from the latch in whole laps, so it needs the latch at the
+            // loop start; from inside the loop the wrapped-recording path cuts the laps instead.)
+            let e = &self.engine.session().edit;
+            let sel = e.cycle_range();
+            let pass = (e.loop_playback && !sel.is_empty() && at == sel.start).then(|| sel.len());
+            self.plan_recording(takes, pass, None, None);
             return;
         }
         let e = self.engine.session().edit.clone();
@@ -164,6 +171,7 @@ impl StudioApp {
         count_in: Option<CountIn>,
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
+        self.record_clock = None;
         self.take_plan = Some(soundcraft_engine::io::Recording {
             start: self.record_start,
             pass,
@@ -671,6 +679,7 @@ impl StudioApp {
     /// Rebuild the provisional MIDI clip and notes of a pass under way from what the audio thread
     /// has captured so far. Control side only; with a long event list it runs every other frame.
     pub(crate) fn update_midi_live(&mut self) {
+        self.observe_recording();
         let take = self.player.as_ref().and_then(Player::midi_recording_snapshot);
         #[cfg(test)]
         let take = take.or_else(|| self.finished_test_midi.clone());
@@ -689,7 +698,7 @@ impl StudioApp {
         };
         let events: Vec<_> = take.timed(self.engine.session().sample_rate.hz()).iter().filter_map(|(offset, e)| rec_event(*offset, e)).collect();
         let start = latch.position.sample;
-        let now = self.position().max(start);
+        let now = start + self.recording_elapsed(start);
         let cut = soundcraft_engine::midi_take::Cut { start, pass: plan.pass, punch: plan.punch, stop: now - start };
         let s = self.engine.session();
         let built = soundcraft_engine::midi_take::build(&s.tempo, s.sample_rate, &events, &cut);
@@ -833,7 +842,30 @@ impl StudioApp {
         Ok(captured)
     }
 
+    /// Follow the transport while a pass runs, counting each wrap of the cycle as a lap.
+    pub(crate) fn observe_recording(&mut self) {
+        if self.take_plan.is_none() || !self.is_playing() {
+            return;
+        }
+        let at = self.position();
+        let edit = &self.engine.session().edit;
+        let cycle = edit.cycle_range();
+        let looping = edit.loop_playback && !cycle.is_empty();
+        let clock = self.record_clock.get_or_insert(RecordClock { last: at, laps: 0 });
+        if looping && at < clock.last {
+            clock.laps += cycle.len();
+        }
+        clock.last = at;
+    }
+
+    /// Samples from the latch `start` to where the pass has got to, laps included. Never the
+    /// position at Stop: that wrapped back into the loop, or is the edit cursor once stopped.
+    fn recording_elapsed(&self, start: Samples) -> Samples {
+        self.record_clock.map_or(0, |c| (c.last + c.laps - start).max(0))
+    }
+
     fn finish_recording(&mut self) {
+        self.observe_recording();
         self.midi_live = None;
         if self.player.is_none() {
             self.engine.transport.recording = false;
@@ -881,7 +913,8 @@ impl StudioApp {
         }
         self.punch = None;
         self.autosaved_rev = 0;
-        let end = self.engine.transport.position;
+        let tracked = self.record_clock.take();
+        let end = tracked.map_or(self.engine.transport.position, |c| c.last + c.laps);
         let pushes = self.engine.undo_pushes();
         if let Some((takes, problem)) = finished {
             let tracks = takes.len().max(1);
@@ -892,7 +925,7 @@ impl StudioApp {
             }
         }
         if let Some(midi) = midi {
-            let end = self.position().max(plan.start);
+            let end = tracked.map_or_else(|| self.position().max(plan.start), |c| (c.last + c.laps).max(plan.start));
             // Whatever the last frame hadn't journaled reaches the file before the clip is built,
             // which then deletes it: a crash while placing still leaves the whole pass.
             self.midi_journal = journal;
@@ -943,21 +976,31 @@ impl StudioApp {
             return;
         }
         let s = self.engine.session_arc();
+        // A take of an earlier lap lives on a playlist that is no longer the active one.
+        let placed: Vec<(TrackId, &soundcraft_model::Clip)> = ids
+            .iter()
+            .filter_map(|id| s.tracks.iter().find_map(|t| t.playlists.iter().flat_map(|p| p.clips.iter()).find(|c| c.id == *id).map(|c| (t.id, c))))
+            .collect();
         let mut names: Vec<String> = Vec::new();
-        for id in &ids {
-            if let Some((t, _)) = s.find_clip(*id)
-                && let Some(tr) = s.track(t)
-                && !names.contains(&tr.name)
-            {
-                names.push(tr.name.clone());
+        let mut lanes: Vec<TrackId> = Vec::new();
+        for (t, _) in &placed {
+            if !lanes.contains(t) {
+                lanes.push(*t);
+                if let Some(tr) = s.track(*t) {
+                    names.push(tr.name.clone());
+                }
             }
         }
-        let notes: usize = ids
+        let notes: usize = placed
             .iter()
-            .filter_map(|id| s.find_clip(*id))
             .map(|(_, c)| if let soundcraft_model::ClipContent::Midi { sequence } = &c.content { sequence.notes.len() } else { 0 })
             .sum();
-        let status = format!("Recorded {} MIDI clip{} ({notes} notes) on {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, names.join(", "));
+        let passes = ids.len() / lanes.len().max(1);
+        let status = if passes > 1 {
+            format!("Recorded {passes} takes ({notes} notes) on {}", names.join(", "))
+        } else {
+            format!("Recorded {} MIDI clip{} ({notes} notes) on {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, names.join(", "))
+        };
         self.status = if midi.dropped > 0 { format!("{status}; {} events lost", midi.dropped) } else { status };
         let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
         let _ = self.run("edit.select", json!({"clips": clips}));
@@ -990,7 +1033,8 @@ impl StudioApp {
         }
         let ids = soundcraft_engine::io::place_recording_take(&mut self.engine, plan, takes, true);
         if plan.pass.is_some() {
-            self.status = format!("Loop-recorded {} take(s)", ids.len() / tracks.max(1));
+            let passes = ids.len() / tracks.max(1);
+            self.status = if passes > 1 { format!("Recorded {passes} takes") } else { format!("Loop-recorded {passes} take(s)") };
             return;
         }
         let s = self.engine.session_arc();
@@ -1492,6 +1536,14 @@ impl PlayerRequests {
 #[cfg(test)]
 #[path = "player_tests.rs"]
 mod player_tests;
+
+/// How far a recording pass has run on the transport: the last position seen and the cycle laps
+/// it has wrapped over since, so `last + laps` only ever grows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordClock {
+    pub(crate) last: Samples,
+    pub(crate) laps: Samples,
+}
 
 /// A MIDI pass under way, for drawing: the armed tracks, where it started and the playhead, and
 /// the notes played so far (open notes closed at the playhead).
