@@ -458,6 +458,10 @@ impl ab::Backend for AsioBackend {
         Ok(e.drivers.iter().filter(|(_, info)| info.channels(direction) > 0).map(|(entry, info)| Self::endpoint(entry, info, direction)).collect())
     }
 
+    fn host_blocked(&self) -> bool {
+        self.host.is_stuck()
+    }
+
     fn plan_render(&self, wish: &ab::OutputWish) -> Result<ab::Plan, String> {
         let endpoint = self.find(ab::Direction::Output, wish.device.as_deref())?;
         let attempts = attempts(&endpoint, ab::Direction::Output, &wish.rates, wish.period)?;

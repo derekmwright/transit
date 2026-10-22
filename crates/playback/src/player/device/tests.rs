@@ -490,6 +490,17 @@ fn a_native_backend_that_fails_to_open_falls_back_and_says_why() {
     assert_eq!(fallback.opens().len(), 1);
 }
 
+/// The fake's `set_host_blocked` is the hook for a stuck ASIO host thread (a driver settings panel
+/// that is still open): the open fails and the same driver must not be loaded again through cpal.
+#[test]
+fn a_native_open_refused_by_a_stuck_host_does_not_fall_back_to_cpal() {
+    let (native, fallback) = (fake_factory(true), fake_factory(false));
+    native.set_host_blocked(true);
+    let error = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).err();
+    assert_eq!(error.as_deref(), Some("the ASIO driver's settings panel is open; close it and reconnect"));
+    assert!(fallback.opens().is_empty(), "cpal was not asked to open the driver again");
+}
+
 #[test]
 fn both_backends_failing_reports_the_fallbacks_error() {
     let (native, fallback) = (fake_factory(true), fake_factory(true));

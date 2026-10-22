@@ -19,6 +19,7 @@ struct State {
     capture_error: Option<ErrorCallback>,
     fail_open: Option<OpenError>,
     fail_start: Option<OpenError>,
+    host_blocked: bool,
     opens: Vec<(Direction, OpenRequest)>,
     started: [bool; 2],
     /// The snapshot each direction's stream reports (output, input): a pump counts a wake; a test
@@ -84,6 +85,11 @@ impl FakeBackend {
     /// The next open of either direction fails with `error`.
     pub fn fail_next_open(&self, error: OpenError) {
         self.lock().fail_open = Some(error);
+    }
+    /// The backend reports its host thread blocked ([`Backend::host_blocked`]), as an ASIO driver's
+    /// open settings panel leaves it.
+    pub fn set_host_blocked(&self, blocked: bool) {
+        self.lock().host_blocked = blocked;
     }
     /// The next stream start fails with `error`.
     pub fn fail_next_start(&self, error: OpenError) {
@@ -157,6 +163,9 @@ impl Backend for FakeBackend {
     }
     fn endpoints(&self, direction: Direction) -> Result<Vec<Endpoint>, OpenError> {
         Ok(vec![self.endpoint(direction)])
+    }
+    fn host_blocked(&self) -> bool {
+        self.lock().host_blocked
     }
     fn plan_render(&self, _wish: &OutputWish) -> Result<Plan, String> {
         Ok(Plan { endpoint: self.endpoint(Direction::Output), attempts: self.attempts.clone() })

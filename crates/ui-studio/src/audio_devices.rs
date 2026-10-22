@@ -23,6 +23,9 @@ use soundcraft_playback::{AudioConfig, Backend};
 /// Said when Apply (or `ui.set {audio}`) is asked while recording.
 pub const REFUSED_RECORDING: &str = "Stop recording before changing the audio devices.";
 /// The label of every "no choice" entry.
+/// Why Reconnect, Apply and Rescan wait while a native ASIO driver's settings panel is open: the
+/// panel holds the driver's host thread, which each of them would wait on.
+pub const PANEL_OPEN_FIRST: &str = "Close the driver settings panel first";
 pub const SYSTEM_DEFAULT: &str = "System default";
 const CHOOSE_ANOTHER: &str = "Choose another in Audio › Audio Devices.";
 
@@ -91,7 +94,7 @@ pub struct AudioDevicesState {
     pub draft: AudioConfig,
     /// The `ui.audio` the draft was taken from: when it changes elsewhere (`ui.set`), the draft follows.
     base: Option<AudioConfig>,
-    systems: Option<Vec<AudioSystem>>,
+    pub(crate) systems: Option<Vec<AudioSystem>>,
     pub fake: Option<FakeDevices>,
     /// Fallbacks found at the last reopen (or at startup).
     pub notes: Vec<String>,
@@ -114,7 +117,7 @@ pub struct AudioDevicesState {
     /// The wake counters sampled at the last panel refreshes (output, input), for the rates.
     wake_rates: (WakeRate, WakeRate),
     /// A native ASIO driver's settings panel that is open; its result arrives when it closes.
-    panel: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    pub(crate) panel: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// The driver whose settings the window's "Driver settings" opened with fake devices (tests).
     pub(crate) panel_opened: Option<String>,
     /// Channel names standing in for the open device's (tests without a player).
@@ -163,6 +166,11 @@ impl AudioDevicesState {
     }
     /// List the devices again on the next frame the window is drawn (Rescan, a new fake).
     pub fn forget_listing(&mut self) {
+        // A listing probes the drivers on the host thread, which the open settings panel holds:
+        // keep showing the last list until the panel closes.
+        if self.panel.is_some() {
+            return;
+        }
         self.systems = None;
     }
 }
@@ -351,7 +359,7 @@ impl StudioApp {
         s.open = true;
         s.draft = self.ui.audio.clone();
         s.base = Some(self.ui.audio.clone());
-        s.systems = None;
+        s.forget_listing();
     }
 
     /// The window's Apply: keep `cfg` as `ui.audio` and reopen the devices with it. Playback stops
@@ -412,6 +420,10 @@ impl StudioApp {
     pub fn reconnect_audio_devices(&mut self) {
         if self.recording_active() {
             self.status = REFUSED_RECORDING.into();
+            return;
+        }
+        if self.audio_devices.panel.is_some() {
+            self.status = PANEL_OPEN_FIRST.into();
             return;
         }
         let _ = self.reopen_audio();
@@ -579,7 +591,7 @@ pub fn calibration_line(cfg: &AudioConfig, device: &str, paired_input: Option<&s
 /// The Calibration line under the native ASIO backend: a saved loopback of this driver (its
 /// registry name), rate and buffer under the mode key `asio`, else the driver's own figures. The
 /// bench writes no ASIO calibration yet: the Focusrite driver's `getLatencies` over-reports (known
-/// issue K30), so the stamps carry the driver's figures and a placement can be off by it.
+/// issue K31), so the stamps carry the driver's figures and a placement can be off by it.
 pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, rate: u32) -> String {
     let period = cfg.buffer_size.unwrap_or(0);
     let mode = devices::MODE_ASIO;
@@ -587,7 +599,7 @@ pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, rate: u32) -> Stri
         return format!("measured {} frames \u{b1}{} ({}) \u{b7} {mode}", c.round_trip_frames, c.spread_frames, c.measured_at);
     }
     format!(
-        "not calibrated \u{b7} {mode}: the driver's own latency figures are used (no loopback calibration over native ASIO yet, see known issue K30)"
+        "not calibrated \u{b7} {mode}: the driver's own latency figures are used (no loopback calibration over native ASIO yet, see known issue K31)"
     )
 }
 
@@ -678,13 +690,14 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         app.audio_devices.draft = app.ui.audio.clone();
         app.audio_devices.base = Some(app.ui.audio.clone());
     }
-    if app.audio_devices.systems.is_none() {
+    if app.audio_devices.systems.is_none() && app.audio_devices.panel.is_none() {
         app.audio_devices.systems = Some(app.listing());
     }
     let systems = app.audio_devices.systems.clone().unwrap_or_default();
     let mut draft = app.audio_devices.draft.clone();
     let mut lay = AudioDevicesLayout { open: true, systems: systems.iter().map(|s| s.name.clone()).collect(), ..Default::default() };
     let recording = app.recording_active();
+    let panel_open = app.audio_devices.panel.is_some();
     let audio_on = app.player.is_some() || app.audio_devices.fake.is_some();
     let (mut apply, mut reconnect, mut rescan, mut panel) = (false, false, false, false);
     let mut native_panel: Option<String> = None;
@@ -888,19 +901,28 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
             (hw_action, hw_layout) = crate::audio_devices_io::hardware_section(ui, &io, rate, blocker, progress, &mut editor, &mut io_items);
             ui.add_space(SPACE);
             ui.horizontal(|ui| {
-                let b = ui.add_enabled(!recording, egui::Button::new("Apply"));
+                let b = ui.add_enabled(!recording && !panel_open, egui::Button::new("Apply"));
                 controls.push(("Apply".into(), "apply", b.rect));
-                apply = b.on_hover_text("Reopen the devices with these choices. Playback stops first.").clicked();
-                let b = ui.add_enabled(!recording && audio_on, egui::Button::new("Reconnect"));
+                apply = b
+                    .on_hover_text("Reopen the devices with these choices. Playback stops first.")
+                    .on_disabled_hover_text(if panel_open { PANEL_OPEN_FIRST } else { REFUSED_RECORDING })
+                    .clicked();
+                let b = ui.add_enabled(!recording && audio_on && !panel_open, egui::Button::new("Reconnect"));
                 controls.push(("Reconnect".into(), "reconnect", b.rect));
-                reconnect = b.on_hover_text("Reopen the saved devices (after plugging one back in).").clicked();
-                let b = ui.add_enabled(audio_on, egui::Button::new("Rescan Devices"));
+                reconnect = b
+                    .on_hover_text("Reopen the saved devices (after plugging one back in).")
+                    .on_disabled_hover_text(if panel_open { PANEL_OPEN_FIRST } else { REFUSED_RECORDING })
+                    .clicked();
+                let b = ui.add_enabled(audio_on && !panel_open, egui::Button::new("Rescan Devices"));
                 controls.push(("Rescan Devices".into(), "rescan", b.rect));
-                rescan = b.clicked();
+                rescan = b.on_disabled_hover_text(PANEL_OPEN_FIRST).clicked();
                 if let Some(driver) = app.running_native_asio() {
-                    let b = ui.add_enabled(app.audio_devices.panel.is_none(), egui::Button::new(DRIVER_SETTINGS));
+                    let b = ui.add_enabled(!panel_open, egui::Button::new(DRIVER_SETTINGS));
                     controls.push((DRIVER_SETTINGS.into(), "panel", b.rect));
-                    if b.on_hover_text("The open ASIO driver's own settings (buffer size, clock). Reconnect afterwards.").clicked() {
+                    if b.on_hover_text("The open ASIO driver's own settings (buffer size, clock). Reconnect afterwards.")
+                        .on_disabled_hover_text(PANEL_OPEN_FIRST)
+                        .clicked()
+                    {
                         native_panel = Some(driver);
                     }
                 } else if app.running_asio() && (devices::ASIO_CONTROL_PANEL || app.audio_devices.fake.is_some()) {

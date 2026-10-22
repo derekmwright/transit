@@ -528,6 +528,12 @@ pub trait Backend {
     fn paired_input_name(&self, _render: &Endpoint) -> Option<String> {
         None
     }
+    /// Whether the system's host thread is blocked in a driver call (an ASIO driver's settings
+    /// panel is open), so every request to it is refused. Opening the same device through
+    /// another backend would load it twice, so a caller does not fall back while this is true.
+    fn host_blocked(&self) -> bool {
+        false
+    }
     /// The names of `endpoint`'s channels in `direction`, in device channel order, where the
     /// system reports them (ASIO: `getChannelInfo`); empty when it does not. For a duplex endpoint
     /// the input names are the capture side's.

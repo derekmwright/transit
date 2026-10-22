@@ -354,6 +354,12 @@ impl Player {
                         step = next;
                         continue;
                     }
+                    // A host thread stuck in a driver call (its settings panel is open) refuses the
+                    // open; the cpal fallback would load the same driver a second time.
+                    if native.backend(cfg.system.as_deref()).is_some_and(|backend| backend.host_blocked()) {
+                        log::warn!("{} did not open ({}); not falling back to cpal", kind.label(), failure.text);
+                        return Err("the ASIO driver's settings panel is open; close it and reconnect".to_owned());
+                    }
                     let reason = failure.text;
                     log::warn!("{} did not open ({reason}); using the cpal backend", kind.label());
                     let mut player = Self::open_with(session, cfg, fallback)?;

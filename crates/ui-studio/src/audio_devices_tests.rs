@@ -301,6 +301,44 @@ fn native_asio_is_chosen_on_the_asio_system_with_its_calibration_line_and_driver
 }
 
 #[test]
+fn while_the_driver_settings_panel_is_open_reconnect_apply_and_rescan_wait_and_nothing_is_listed() {
+    if !soundcraft_playback::devices::NATIVE_ASIO_COMPILED {
+        return;
+    }
+    let mut t = T::new();
+    t.control("audio.fake_devices", asio_devices()).unwrap();
+    t.open_window();
+    t.pick("system", "ASIO");
+    t.click(mid(t.control_rect("backend")));
+    t.click(mid(T::rect(&t.layout()["items"], Some(Backend::NativeAsio.label()), "backend")));
+    t.pick("output", &format!("{MODEL12} · 10 ch"));
+    t.click(mid(t.control_rect("apply")));
+    let panel = T::rect(&t.layout()["controls"], Some(crate::audio_devices::DRIVER_SETTINGS), "panel");
+    // The fake opens no panel of its own: hold one open the way the real panel's receiver is.
+    let (_open, rx) = std::sync::mpsc::channel();
+    t.app.audio_devices.panel = Some(rx);
+    let (reopened, listed) = (t.reopened().len(), t.app.audio_devices.fake.as_ref().unwrap().enumerations);
+    for key in ["apply", "reconnect", "rescan"] {
+        t.click(mid(t.control_rect(key)));
+    }
+    t.click(mid(panel));
+    assert_eq!(t.reopened().len(), reopened, "Apply and Reconnect do not reopen the devices while the panel is open");
+    assert_eq!(t.app.audio_devices.fake.as_ref().unwrap().enumerations, listed, "Rescan lists nothing while the panel is open");
+    assert!(t.app.audio_devices.panel_opened.is_none(), "Driver settings is disabled while it is open");
+    t.app.reconnect_audio_devices();
+    assert_eq!(t.reopened().len(), reopened, "the Audio menu's Reconnect waits as well");
+    assert_eq!(t.app.status, crate::audio_devices::PANEL_OPEN_FIRST);
+    t.app.open_audio_devices();
+    t.frames(2);
+    assert_eq!(t.app.audio_devices.fake.as_ref().unwrap().enumerations, listed, "reopening the window shows the last list");
+    assert!(t.app.audio_devices.systems.is_some(), "the last list is still shown");
+    // Closed, they work again.
+    t.app.audio_devices.panel = None;
+    t.click(mid(t.control_rect("reconnect")));
+    assert_eq!(t.reopened().len(), reopened + 1);
+}
+
+#[test]
 fn the_open_lines_and_the_load_readout_say_what_a_native_stream_reported() {
     use crate::audio_devices::achieved_detail;
     use crate::telemetry::native_host_name;

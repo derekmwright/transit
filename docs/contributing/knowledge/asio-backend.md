@@ -268,7 +268,10 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   trouble says the same). The device is reopened by the user (Reconnect), not automatically.
 - **Driver settings.** The button opens the running driver's panel through `Loaded::control_panel`
   on the host thread (the running session's driver is shared with the handle), called from a thread
-  of its own so a modal panel does not hold the UI; the status line says when it closed.
+  of its own so a modal panel does not hold the UI; the status line says when it closed. While the
+  panel is open the host thread is busy, so Reconnect, Apply and Rescan Devices wait for it to
+  close (they are disabled, and a listing keeps the last list), and an open refused by that blocked
+  host does not fall back to cpal, which would load the same driver twice.
 
 Hardware (2026-10-22, `cargo test -p soundcraft-playback --features native-asio --lib -- --ignored
 hardware_player_opens_native_asio --nocapture --test-threads 1`): the whole Player path opens the
