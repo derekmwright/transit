@@ -2315,7 +2315,7 @@ impl SampleSource for PoolSample {
 
 /// Record insert latency without processing audio, so this block can compensate for it.
 /// The latency in samples a frozen track reports (0 for any other).
-fn frozen_latency(t: &Track) -> usize {
+pub(crate) fn frozen_latency(t: &Track) -> usize {
     t.freeze.as_ref().map_or(0, |f| f.latency as usize)
 }
 
@@ -2945,7 +2945,11 @@ pub fn render_track_pre_fader_timed(s: &Session, track: TrackId, range: Range) -
     // Multichannel tracks render into a main mix of their own format (straight through).
     let fmt = s.track(track).map_or(ChannelFormat::Stereo, |t| if t.channels() > 2 { t.format } else { ChannelFormat::Stereo });
     solo.outputs = vec![soundcraft_model::OutputPath { name: "Out".into(), first_channel: 0, format: fmt }];
-    for t in &mut solo.tracks {
+    // The tracks and busses that feed the track a sidechain key keep running, so a keyed insert
+    // detects as it does live; their audio goes nowhere else (outputs and other sends are cut).
+    let (feeding_tracks, feeding_busses) = key_feeders(s, track);
+    let feeds_bus = |r: &Route| matches!(r, Route::Bus(b) if s.busses.iter().position(|x| x.id == *b).is_some_and(|i| feeding_busses.get(i).copied().unwrap_or(false)));
+    for (i, t) in solo.tracks.iter_mut().enumerate() {
         if t.id == track {
             t.mixer.volume_db = 0.0;
             t.mixer.mute = false;
@@ -2958,6 +2962,16 @@ pub fn render_track_pre_fader_timed(s: &Session, track: TrackId, range: Range) -
             t.automation.retain(|l| matches!(l.param, AutoParam::Plugin { .. }));
             t.mixer.sends.iter_mut().for_each(|x| *x = None);
             t.mixer.surround = None;
+        } else if feeding_tracks.get(i).copied().unwrap_or(false) {
+            t.mixer.solo = false;
+            if !feeds_bus(&t.mixer.output) {
+                t.mixer.output = Route::None;
+            }
+            for send in &mut t.mixer.sends {
+                if send.as_ref().is_some_and(|x| !feeds_bus(&x.target)) {
+                    *send = None;
+                }
+            }
         } else {
             t.inactive = true;
         }
@@ -2971,6 +2985,38 @@ pub fn render_track_pre_fader_timed(s: &Session, track: TrackId, range: Range) -
         out = vec![l.iter().map(|x| x * g).collect()];
     }
     (out, latency)
+}
+
+/// The tracks (by table index) and busses (by index in [`Session::busses`]) that must run for
+/// `track` to hear its sidechain keys as it does live: the sources of its keyed inserts and,
+/// transitively, whatever feeds those (a bus's writers, a keyed source's own keys). `track`
+/// itself is not marked.
+fn key_feeders(s: &Session, track: TrackId) -> (Vec<bool>, Vec<bool>) {
+    use soundcraft_model::{EdgeKind, RouteNode};
+    let graph = s.route_graph();
+    let mut tracks = vec![false; s.tracks.len()];
+    let mut busses = vec![false; s.busses.len()];
+    let Some(start) = s.tracks.iter().position(|t| t.id == track) else { return (tracks, busses) };
+    let mut work = vec![RouteNode::Track(start)];
+    while let Some(n) = work.pop() {
+        for e in graph.edges().iter().filter(|e| e.to == n) {
+            // The frozen track's own chain is rendered live; only its keys reach beyond it.
+            if n == RouteNode::Track(start) && !matches!(e.kind, EdgeKind::Key { .. }) {
+                continue;
+            }
+            let seen = match e.from {
+                RouteNode::Track(i) if i != start => tracks.get_mut(i),
+                RouteNode::Bus(i) => busses.get_mut(i),
+                _ => None,
+            };
+            if let Some(seen) = seen
+                && !std::mem::replace(seen, true)
+            {
+                work.push(e.from);
+            }
+        }
+    }
+    (tracks, busses)
 }
 
 /// A built-in plugin, else a hosted CLAP plugin (`clap:<id>`).
@@ -3149,6 +3195,45 @@ mod tests {
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{Insert, SourceAudio, SourceId};
     use std::sync::Arc;
+
+    /// What a keyed track needs running: its key sources and, through them, what feeds those.
+    #[test]
+    fn key_feeders_follow_keys_through_busses_and_keyed_sources() {
+        use soundcraft_model::{ChannelFormat, KeyFrom, KeySource, Tap, TrackKind};
+        let mut s = Session::default();
+        let add = |s: &mut Session, k, n: &str| s.add_track(k, ChannelFormat::Stereo, Some(n));
+        let a = add(&mut s, TrackKind::Audio, "A");
+        let b = add(&mut s, TrackKind::Audio, "B");
+        let c = add(&mut s, TrackKind::Audio, "C");
+        let unrelated = add(&mut s, TrackKind::Audio, "U");
+        let bus = s.add_bus("Drums", ChannelFormat::Stereo);
+        let target = add(&mut s, TrackKind::Aux, "Target");
+        let key = |from| Some(KeySource { from, tap: Tap::Post });
+        for (t, slot_key) in [(target, key(KeyFrom::Bus(bus))), (c, key(KeyFrom::Track(unrelated)))] {
+            let tr = s.track_mut(t).unwrap();
+            let mut i = Insert::new("compressor");
+            i.key = slot_key;
+            tr.mixer.inserts[0] = Some(i);
+        }
+        s.track_mut(a).unwrap().mixer.output = Route::Bus(bus);
+        s.track_mut(b).unwrap().mixer.sends[0] = Some(soundcraft_model::SendSlot::new(Route::Bus(bus)));
+        let ix: Vec<usize> = [a, b, c, unrelated, target].iter().map(|&id| s.track_index(id).unwrap()).collect();
+        let idx = |id| ix[[a, b, c, unrelated, target].iter().position(|&x| x == id).unwrap()];
+        let (tracks, busses) = key_feeders(&s, target);
+        assert!(tracks[idx(a)] && tracks[idx(b)], "both writers of the key bus run");
+        assert!(!tracks[idx(c)] && !tracks[idx(unrelated)] && !tracks[idx(target)]);
+        assert_eq!(busses, vec![true]);
+        // A key from a track whose own insert is keyed keeps that source too.
+        let tr = s.track_mut(target).unwrap();
+        tr.mixer.inserts[1] = Some({
+            let mut i = Insert::new("compressor");
+            i.key = key(KeyFrom::Track(c));
+            i
+        });
+        let (tracks, _) = key_feeders(&s, target);
+        assert!(tracks[idx(c)] && tracks[idx(unrelated)]);
+        assert!(key_feeders(&s, unrelated).0.iter().all(|x| !x), "no keys: nothing else runs");
+    }
 
     /// A plan engine for tests. A `fake` stands in for the instance of its (track, slot); every
     /// other plug-in is built as playback builds it.

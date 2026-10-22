@@ -169,3 +169,84 @@ fn a_session_with_a_freeze_round_trips_and_older_files_load() {
     let loaded: Session = serde_json::from_value(old).unwrap();
     assert!(loaded.track(t).unwrap().freeze.is_none());
 }
+
+/// A synth track playing one held note.
+fn synth(e: &mut Engine, name: &str, pitch: u32, vel: u32) -> TrackId {
+    let r = e.execute("track.new", &json!({"kind": "instrument", "name": name, "instrument": "subtractive_synth"})).unwrap();
+    let track = r["tracks"][0].as_u64().unwrap();
+    let r = e.execute("midi.new_clip", &json!({"track": track, "start": 12_000, "length": 48_000})).unwrap();
+    let clip = r["clip"].as_u64().unwrap();
+    e.execute("event.midi_note", &json!({"clip": clip, "pitch": pitch, "start_ticks": 0, "length_ticks": 1920, "velocity": vel})).unwrap();
+    TrackId(track)
+}
+
+/// A compressor on slot `slot` of `t` that clamps hard on anything over -50 dB.
+fn clamp(e: &mut Engine, t: TrackId, slot: usize) {
+    e.execute("mix.insert", &json!({"track": t.0, "slot": slot, "plugin": "compressor"})).unwrap();
+    e.execute("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": "threshold", "value": -50.0})).unwrap();
+    e.execute("mix.insert_param", &json!({"track": t.0, "slot": slot, "param": "ratio", "value": 20.0})).unwrap();
+}
+
+fn diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+    a.iter().flatten().zip(b.iter().flatten()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn a_keyed_insert_on_a_frozen_track_keeps_its_ducking() {
+    let mut e = Engine::default();
+    let kick = synth(&mut e, "Kick", 36, 127);
+    let bass = synth(&mut e, "Bass", 48, 100);
+    clamp(&mut e, bass, 0);
+    let unkeyed = mix(&e);
+    e.execute("mix.insert_key", &json!({"track": bass.0, "slot": 0, "from": {"track": kick.0}})).unwrap();
+    let live = mix(&e);
+    assert!(diff(&live, &unkeyed) > 1e-3, "the key changes the sound live");
+    e.execute("track.freeze", &json!({"tracks": [bass.0]})).unwrap();
+    let frozen = mix(&e);
+    assert!(diff(&frozen, &live) <= 1e-4, "frozen {} off live", diff(&frozen, &live));
+    assert!(diff(&frozen, &unkeyed) > 1e-3);
+}
+
+#[test]
+fn a_key_from_a_keyed_source_keeps_that_sources_own_key_running() {
+    let mut e = Engine::default();
+    let drums = synth(&mut e, "Drums", 36, 127);
+    let kick = synth(&mut e, "Kick", 40, 110);
+    let bass = synth(&mut e, "Bass", 48, 100);
+    clamp(&mut e, kick, 0);
+    clamp(&mut e, bass, 0);
+    e.execute("mix.insert_key", &json!({"track": kick.0, "slot": 0, "from": {"track": drums.0}})).unwrap();
+    e.execute("mix.insert_key", &json!({"track": bass.0, "slot": 0, "from": {"track": kick.0}})).unwrap();
+    let live = mix(&e);
+    e.execute("track.freeze", &json!({"tracks": [bass.0]})).unwrap();
+    assert!(diff(&mix(&e), &live) <= 1e-4);
+}
+
+#[test]
+fn a_frozen_track_with_latency_keys_another_track_as_it_did_live() {
+    for tap in ["pre", "post"] {
+        let mut e = Engine::default();
+        let kick = synth(&mut e, "Kick", 36, 127);
+        let pad = synth(&mut e, "Pad", 60, 100);
+        clamp(&mut e, pad, 0);
+        e.execute("mix.insert", &json!({"track": kick.0, "slot": 0, "plugin": "maximizer"})).unwrap();
+        e.execute("mix.insert_key", &json!({"track": pad.0, "slot": 0, "from": {"track": kick.0}, "tap": tap})).unwrap();
+        let live = mix(&e);
+        e.execute("track.freeze", &json!({"tracks": [kick.0]})).unwrap();
+        assert!(e.session().track(kick).unwrap().freeze.as_ref().unwrap().latency > 0);
+        let frozen = mix(&e);
+        assert!(diff(&frozen, &live) <= 1e-4, "{tap} tap: frozen {} off live", diff(&frozen, &live));
+    }
+}
+
+#[test]
+fn a_frozen_track_refuses_a_key_from_another_track() {
+    let mut e = Engine::default();
+    let kick = synth(&mut e, "Kick", 36, 127);
+    let bass = synth(&mut e, "Bass", 48, 100);
+    clamp(&mut e, bass, 0);
+    e.execute("track.freeze", &json!({"tracks": [bass.0]})).unwrap();
+    let r = e.execute("mix.insert_key", &json!({"track": bass.0, "slot": 0, "from": {"track": kick.0}}));
+    assert!(matches!(r, Err(EngineError::TrackFrozen)), "{r:?}");
+    assert!(e.session().track(bass).unwrap().mixer.inserts[0].as_ref().unwrap().key.is_none());
+}

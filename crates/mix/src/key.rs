@@ -165,7 +165,9 @@ impl KeyBank {
         for e in self.entries.iter_mut().filter(|e| usize::from(e.spec.keyed) == at) {
             e.want = 0;
         }
-        let mut own = st.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency());
+        // A frozen track reports the latency of the chain its render replaces (`frozen_latency`): the
+        // forward pass reads `st.latency`, so dropping it here made a frozen key source arrive early.
+        let mut own = frozen_latency(t).saturating_add(st.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency()));
         let mut short = 0usize;
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
             let (Some(ins), Some(Some(slot))) = (ins, st.plugins.get_mut(i)) else { continue };
