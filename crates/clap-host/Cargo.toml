@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-clap-host"
-description = "SoundCraft CLAP plugin host: scans, loads and runs third-party CLAP plugins behind the safe soundcraft-dsp Plugin trait (the only crate with unsafe code)"
+description = "transit CLAP plugin host: scans, loads and runs third-party CLAP plugins behind the safe soundcraft-dsp Plugin trait (the only crate with unsafe code)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

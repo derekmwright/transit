@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-model"
-description = "SoundCraft session document: tracks, playlists, clips, mixer, routing, automation, markers"
+description = "transit session document: tracks, playlists, clips, mixer, routing, automation, markers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

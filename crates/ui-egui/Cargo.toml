@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-ui-egui"
-description = "SoundCraft's egui user interface: Edit and Mix windows, transport, dialogs, control channel"
+description = "transit's egui user interface: Edit and Mix windows, transport, dialogs, control channel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

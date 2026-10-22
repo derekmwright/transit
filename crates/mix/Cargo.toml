@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-mix"
-description = "SoundCraft mix engine: renders a session's tracks, plugins, sends, busses and automation to audio"
+description = "transit mix engine: renders a session's tracks, plugins, sends, busses and automation to audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

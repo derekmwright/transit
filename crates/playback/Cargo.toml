@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-playback"
-description = "SoundCraft audio device I/O: realtime playback and recording through the mix engine"
+description = "transit audio device I/O: realtime playback and recording through the mix engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

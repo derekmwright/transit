@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-engine"
-description = "SoundCraft command engine: commands, undo, editing operations, import/export, bounce, parity catalog"
+description = "transit command engine: commands, undo, editing operations, import/export, bounce, parity catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

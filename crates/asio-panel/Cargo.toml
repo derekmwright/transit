@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-asio-panel"
-description = "SoundCraft: ASIO driver helpers cpal lacks (installed driver names, the loaded driver's control panel); Windows, opt-in `asio` feature; an isolated unsafe helper crate"
+description = "transit: ASIO driver helpers cpal lacks (installed driver names, the loaded driver's control panel); Windows, opt-in `asio` feature; an isolated unsafe helper crate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

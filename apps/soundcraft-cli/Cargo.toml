@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-cli"
-description = "SoundCraft command line: headless editing, conversion, bounce, MCP server, app control"
+description = "transit command line: headless editing, conversion, bounce, MCP server, app control"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

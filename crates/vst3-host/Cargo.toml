@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-vst3-host"
-description = "SoundCraft VST3 plugin host: scans, loads and runs third-party VST3 plugins behind the safe soundcraft-dsp Plugin trait (an isolated unsafe FFI crate)"
+description = "transit VST3 plugin host: scans, loads and runs third-party VST3 plugins behind the safe soundcraft-dsp Plugin trait (an isolated unsafe FFI crate)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-automation"
-description = "SoundCraft agent control: MCP server (stdio JSON-RPC), headless engine backend and control-channel client"
+description = "transit agent control: MCP server (stdio JSON-RPC), headless engine backend and control-channel client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

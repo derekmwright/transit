@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-dsp"
-description = "SoundCraft DSP: realtime plugins (EQ, dynamics, reverb, delay, modulation, instruments), meters, loudness, and offline AudioSuite-style processing"
+description = "transit DSP: realtime plugins (EQ, dynamics, reverb, delay, modulation, instruments), meters, loudness, and offline AudioSuite-style processing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-web"
-description = "SoundCraft in the browser (eframe web runner, WebGPU with WebGL2 fallback, WebAudio playback)"
+description = "transit in the browser (eframe web runner, WebGPU with WebGL2 fallback, WebAudio playback)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

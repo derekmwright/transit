@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-au-host"
-description = "SoundCraft Audio Unit (AUv2, macOS) plugin host: lists, loads and runs system-registered Audio Units behind the safe soundcraft-dsp Plugin trait (an isolated unsafe FFI crate)"
+description = "transit Audio Unit (AUv2, macOS) plugin host: lists, loads and runs system-registered Audio Units behind the safe soundcraft-dsp Plugin trait (an isolated unsafe FFI crate)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
