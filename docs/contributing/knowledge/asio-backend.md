@@ -13,8 +13,10 @@ compiled only under `cfg(all(windows, target_pointer_width = "64"))`, so a plain
 `cargo build --release -p audio-bench --features audio-bench/native-asio`, then
 `audio-bench --backend asio --device "<driver registry name>"`. The hardware tests are ignored by
 default: `cargo test -p transit-audio-asio -- --ignored hardware_ --nocapture --test-threads 1`, or
-one by name (for example `hardware_scarlett_duplex_streams_two_seconds`). The app's own ASIO path is
-still cpal's until it is wired to this crate; its build is in [docs/building.md](../../building.md).
+one by name (for example `hardware_scarlett_duplex_streams_two_seconds`). The app uses it with the
+`transit/native-asio` feature (`soundcraft-playback/native-asio`), as "Native ASIO (experimental)"
+under Audio system ASIO; see [In the app](#in-the-app-slice-c). The legacy cpal ASIO feature and its
+SDK build are in [docs/building.md](../../building.md).
 
 ## The host thread (`src/host.rs`)
 
@@ -103,6 +105,18 @@ Code: `src/session.rs` (host thread), `src/callback.rs` (driver thread, `unsafe`
   stream of it runs, and the last drop disposes the buffers, frees the callback state and unloads the
   driver (unless a `Loaded` handle holds it). Dropping a stream is a host request that can wait up to
   `HOST_TIMEOUT`: drop on a control thread.
+- **No callback after `stop()` returns.** While the other direction keeps the driver running, `stop`
+  and a drop wait (up to 2 s, then a warning) until no buffer switch is inside that direction's
+  callback: the switch marks a direction in flight before it reads whether the direction runs, the
+  control side changes the state before it reads the mark, both `SeqCst`, so one of them sees the
+  other. The last stream's `stop` is the driver's `stop`, which the SDK makes synchronous.
+- **Orphaned sessions.** A stream dropped while the host thread is stuck in a driver call cannot send
+  its detach; its direction is still marked detached, and the host ends a session whose directions
+  are all detached between requests and before every open, so a later open is not refused by a
+  running driver nobody owns.
+- **Tokens.** `createBuffers` hands back a `Buffers` token that only `disposeBuffers` takes (`start`
+  turns it into `Running`, `stop` back); both are `#[must_use]`, and a `Buffers` dropped any other way
+  is logged and panics in debug builds, so a path that forgets to dispose fails its test.
 - **Buffer size.** `Period::Default` is the driver's preferred size; a requested size snaps to the
   nearest one the driver allows (granularity -1: powers of two between min and max; 0: the one fixed
   size; n: steps of n from min; ties go to the larger). A driver that reports no usable size is an
@@ -152,7 +166,9 @@ request. An error that arrives on a driver thread is delivered to the owner's er
   nanoseconds at the nominal rate, anchored once per driver start to the QPC read at the first
   callback with a valid position. Both directions share the anchor, so their frame times are
   comparable (what the loopback calibration subtracts). A position that goes back re-anchors; one that
-  does not advance by exactly one buffer is counted in `position_jumps`.
+  does not advance by exactly one buffer is counted in `position_jumps`. After either, and after a
+  resync request, the next stamp of each running direction is `Quality::Invalid`, so the Player's
+  clock fit restarts there (as after a WASAPI discontinuity) instead of bridging the step.
 - **Host time:** the QPC read at callback entry, in the stream's `HostOrigin` through the
   `(QPC, Instant)` pair the stream captured at its own `start()` (`origin_pair`/`relative_ns`, as in
   `transit-audio-wasapi`).
@@ -207,15 +223,73 @@ switches; `cargo test -p transit-audio-asio -- --ignored hardware_scarlett hardw
 --nocapture --test-threads 1` streams the two interfaces for two seconds. (`hardware_control_panel_*`
 opens a panel window; run it only on purpose.)
 
-## Next
+## In the app (slice c)
 
-Slice (c): wire the Player (`AudioConfig.backend` gains the native ASIO choice; the cpal adapter's ASIO
-order rule, `ASIO_OUTPUT` cache and `capture_with_render` special case are not needed by this backend,
-whose rule is only "open both before starting either"), hardware inserts over the native path. Slice
-(d): the reset and rate-change errors reaching the Fault path in the Player, the panel in the UI, a
-watchdog for a driver that stops calling, the MMCSS decision, the loopback calibration reaching
-`Measured` in the app. Slice (e): retiring cpal's ASIO path and `crates/asio-panel`, which today still
-acts on cpal's loaded driver. Open: the WOW6432Node (32-bit) drivers are not listed; whether a
-message-only `sysRef` suits every driver's control panel is untested; a driver whose `init`,
-`createBuffers` or `controlPanel` waits for a thread that `SendMessage`s to `sysRef` makes the request
-time out (the host pumps only between calls; see the module documentation of `host.rs`).
+Code: `crates/playback/src/backend/native.rs` (which backend serves a configuration, the native
+listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`),
+`crates/playback/src/devices.rs` (`Backend::NativeAsio`, calibration keys),
+`crates/ui-studio/src/audio_devices.rs` (the window).
+
+- **Selection.** `AudioConfig.backend` is `NativeAsio` (saved as `"native_asio"`), offered in Audio
+  Devices as "Native ASIO (experimental)" when Audio system is ASIO, in a 64-bit Windows build with
+  `transit/native-asio`. Each system offers only its own native backend (`Backend::offered`); a native
+  choice that does not serve a newly chosen system goes back to Auto. Without the feature the choice
+  is not offered and a saved `NativeAsio` opens cpal.
+- **Listing.** With the feature, the ASIO system of the Audio Devices lists comes from this crate's
+  `Backend::endpoints` (registry names, probed channel counts, the standard rates and buffer range the
+  formats cover), whichever backend then opens it, not from cpal's ASIO host. Drivers that could not be
+  probed because this process holds another one are still offered by registry name with unknown
+  counts; drivers that failed to load are listed under the Output list as "Not loaded: <driver>:
+  <problem>" (`AsioBackend::diagnostics`, minus the `blocked` ones). While cpal's ASIO host holds a
+  driver nothing is probed (the registry names only), so two drivers are never loaded at once.
+- **Open order in the Player.** `Player::open_native` runs the same `open_stepped` ladder as native
+  WASAPI, with no mode step (ASIO has one mode; `share_device` does not apply). Because
+  `capture_with_render` is true, `open_stepped` builds the input first (`Recorder::build_on`, an
+  `open_capture` on the render endpoint), then opens the output, then starts the input, then the
+  output: both opens before either start, which is this crate's open-order rule. The Player already
+  ran in that order for cpal ASIO, so nothing was restructured. A native open error falls back to the
+  cpal adapter before `start` only ("Native ASIO failed: ...; using the cpal backend").
+- **Multichannel.** The plans open every channel (`format.channels` is the driver's count), so the
+  Model 12 opens 12 in / 10 out; `IoMap::for_device` gives every channel a path ("Out 9-10", "In 12",
+  "In 11-12"), keyed `("ASIO", <registry name>)` as cpal's ASIO tables were. `Backend::channel_names`
+  carries `getChannelInfo`'s names ("IN 1" .. "IN 12", "OUT 1" .. "OUT 10" on the Model 12; "Input 1",
+  "Output 1" on the Scarlett) to the Player and the channel picker. Hardware inserts and stems route to
+  them through the ordinary path table (tests: `a_hardware_insert_is_measured_through_the_model12s_last_channels`,
+  `an_insert_on_the_last_channels_of_a_12_in_10_out_device_sends_and_returns_there`).
+- **What opened.** `Achieved` fills the Output open and Input open lines (buffer, `i24`/`i32`, the
+  direction's `getLatencies` figure) and the load readout says `ASIO*` (cpal's ASIO host stays `ASIO`).
+- **Calibration** is keyed `(driver registry name, input None, mode "asio", rate, period)`. The bench
+  writes none yet (known issue K31: the drivers' `getLatencies` figures over-report the loopback, so a
+  stamp-time calibration finds no pair), so the Calibration line says the driver's figures are used.
+- **Input on demand.** An input that does not open with the output (`HeldInput::No`, native WASAPI
+  without a pairing) opens through the native backend that serves the output, cpal only if that fails.
+- **Reset.** `StreamError::ResetRequested` stops the output like a lost device and is said as
+  "ASIO driver asked for a reset; reopen the device" (`OutputTrouble::ResetRequested`; the input's
+  trouble says the same). The device is reopened by the user (Reconnect), not automatically.
+- **Driver settings.** The button opens the running driver's panel through `Loaded::control_panel`
+  on the host thread (the running session's driver is shared with the handle), called from a thread
+  of its own so a modal panel does not hold the UI; the status line says when it closed.
+
+Hardware (2026-10-22, `cargo test -p soundcraft-playback --features native-asio --lib -- --ignored
+hardware_player_opens_native_asio --nocapture --test-threads 1`): the whole Player path opens the
+Scarlett at 48 kHz, 64 frames (2 in / 2 out, `i32`, 2.9 ms out / 3.9 ms in) and the Model 12 at
+44.1 kHz, 256 frames (12 in / 10 out, `i24`, 15.8 ms out / 6.8 ms in) and runs two seconds with no
+backend error.
+
+## Next (slice d)
+
+- **Reset handling:** reopen both streams on a reset or rate change (today the user reconnects), with
+  the "close both, reopen both" rule a running session needs; `busy_skips` (switches skipped while an
+  error was being delivered) into `StreamStats`.
+- **Calibration:** the stamp-time loopback calibration cannot pair clicks while the drivers'
+  `getLatencies` figures over-report the loop (known issue K31: the Focusrite driver always, the
+  Model 12 in the phase that measures 22 ms); the frame-time formulas need the measured offset before
+  `audio-bench --settings` can write an `asio` calibration and stamps reach `Measured` in the app.
+- **Watchdog** for a driver that stops calling (`timeouts` stays 0 today), and the MMCSS decision.
+- Slice (e): retiring cpal's ASIO path and `crates/asio-panel` (the cpal path's "Driver Control Panel").
+
+Open: the WOW6432Node (32-bit) drivers are not listed; whether a message-only `sysRef` suits every
+driver's control panel is untested; a driver whose `init`, `createBuffers` or `controlPanel` waits for
+a thread that `SendMessage`s to `sysRef` makes the request time out (the host pumps only between calls;
+see the module documentation of `host.rs`), and a modal panel holds the host thread, so other requests
+(a reopen) wait behind it.

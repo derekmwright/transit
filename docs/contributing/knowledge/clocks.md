@@ -40,15 +40,23 @@ see `../evidence/hardware-and-ci.md`. Device backend work: [ADR 0016](../../adr/
 
 ## Which backend serves the device
 
-`AudioConfig.backend` (`Auto | Cpal | NativeWasapi`, saved with the audio settings) picks the
-implementation on the WASAPI system; `Auto` is cpal until ADR 0016 slice (f). `NativeWasapi` takes
-effect only in a build with the `native-wasapi` feature (`transit`, `soundcraft-playback`,
-`audio-bench`); if its open fails before `start()`, the Player opens cpal with the same choices and
-keeps "Native WASAPI failed: <reason>; using the cpal backend" (`Player::backend_note`), shown on the
-status line and in Audio Devices. The load readout's host text is `WASAPI*` while the native
-backend serves the device and `WASAPI` for cpal; the saved I/O map is keyed by the system name
-(`WASAPI`) in both cases. Native stream stamps are `BackendEstimate` (device position plus padding
-plus `GetStreamLatency`); measure them with `audio-bench --backend wasapi` before trusting them.
+`AudioConfig.backend` (`Auto | Cpal | NativeWasapi | NativeAsio`, saved with the audio settings)
+picks the implementation: `NativeWasapi` on the WASAPI system, `NativeAsio` on the ASIO system
+(`Backend::native_on`; `crates/playback/src/backend/native.rs`, `factory_for`); `Auto` is cpal until
+ADR 0016 slice (f). A native choice takes effect only in a build with its feature (`native-wasapi`,
+or `native-asio` on 64-bit Windows; `transit`, `soundcraft-playback`, `audio-bench`); if its open
+fails before `start()`, the Player opens cpal with the same choices and keeps "Native WASAPI failed:
+<reason>; using the cpal backend" (or "Native ASIO failed: ...") in `Player::backend_note`, shown on
+the status line and in Audio Devices. An input opened on demand goes through the backend that serves
+the output. The load readout's host text is `WASAPI* shared`/`WASAPI* exclusive` or `ASIO*` while a
+native backend serves the device and `WASAPI`/`ASIO` for cpal; the saved I/O map is keyed by the
+system name (`WASAPI`, `ASIO`) and the device name (an ASIO driver's registry name) in both cases.
+Native WASAPI stamps are `BackendEstimate` (device position plus padding plus `GetStreamLatency`);
+native ASIO stamps are `BackendEstimate` from the driver's sample position plus its `getLatencies`
+figures, which over-report the measured loop on the reference interfaces (known issue K31), so a
+native ASIO placement is off by that excess until a calibration exists. Measure either with
+`audio-bench --backend wasapi|asio` before trusting them. Calibrations of native ASIO are keyed by
+mode `asio` (`devices::calibration_mode`); details in [asio-backend.md](asio-backend.md).
 
 ## Native capture, duplex and what `Measured` means (ADR 0016 slice d)
 

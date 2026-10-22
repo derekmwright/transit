@@ -39,16 +39,19 @@ The tagged GitHub release (`.github/workflows/release.yml`) is separate: it ship
 ## Building with ASIO (Windows)
 
 ASIO has two implementations in the tree. The native backend needs nothing beyond the Windows
-prerequisites above. The cpal ASIO feature is the legacy path the app still uses today; it needs the
-Steinberg SDK and libclang, and retires when the app moves to the native backend.
+prerequisites above; the app offers it with the `native-asio` feature. The cpal ASIO feature is the
+legacy path (the app's ASIO path without `native-asio`, and the fallback when the native backend does
+not open); it needs the Steinberg SDK and libclang, and retires with ASIO slice (e).
 
 ### Native ASIO backend (no SDK)
 
 `crates/audio-asio` (`transit-audio-asio`) has hand-written bindings, so it needs no Steinberg SDK,
 no C++ compile, no bindgen, no libclang, no `CPAL_ASIO_DIR` and no environment variables. It is
 compiled only on 64-bit Windows (`cfg(all(windows, target_pointer_width = "64"))`; the crate is empty
-elsewhere) and builds with a plain `cargo build`. The app is not wired to it yet, so the transit
-app's ASIO path is still cpal's (below). The benchmark uses it through the `audio-bench/native-asio`
+elsewhere) and builds with a plain `cargo build`. The app uses it with the `native-asio` feature
+(`cargo build --release -p transit --features native-asio`, usually beside `native-wasapi`): choose
+Audio system ASIO, then Backend "Native ASIO (experimental)" in Audio Devices. Without the feature the
+app's ASIO path is cpal's (below). The benchmark uses it through the `audio-bench/native-asio`
 feature:
 
 ```powershell
