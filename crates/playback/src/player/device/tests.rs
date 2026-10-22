@@ -1124,9 +1124,15 @@ fn a_native_asio_driver_opens_every_channel_capture_first_in_its_one_mode() {
     assert!(io.path("Out 9-10").is_some() && io.path("In 12").is_some() && io.path("In 11-12").is_some(), "every channel has a path");
     assert_eq!((player.output_channel_names.len(), player.input_channel_names.len()), (10, 12));
     assert_eq!((player.output_channel_names[9].as_str(), player.input_channel_names[11].as_str()), ("Analog Out 10", "Analog In 12"));
+    assert!(player.holds_input() && player.duplex(), "the input opened with the output is held from the start, before any track arms");
+    let held = player
+        .with_held_input(|r| (r.device_name.clone(), r.sample_rate, r.channels, r.buffer_frames, r.latency))
+        .expect("the held input is readable");
+    assert_eq!((held.0.as_str(), held.1, held.2, held.4), ("Model Mixer ASIO Driver", 48_000, 12, Some(std::time::Duration::from_micros(15_760))));
     let recorder = player.open_input(&cfg).expect("the duplex input is held for the recorder");
     assert_eq!((recorder.channels, recorder.sample_rate, recorder.latency), (12, 48_000, Some(std::time::Duration::from_micros(15_760))));
     assert_eq!(fake.opens().len(), 2, "taking the held input opens nothing");
+    assert!(!player.holds_input() && player.with_held_input(|_| ()).is_none(), "the recorder owns it once taken");
 }
 
 /// The ADR 0015 hardware-insert measurement on the Model 12's last channels: the click leaves on

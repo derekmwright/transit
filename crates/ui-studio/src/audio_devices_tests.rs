@@ -1084,6 +1084,33 @@ mod hardware_inserts {
     }
 }
 
+/// Native ASIO opens its input with the output and the player holds it until a track takes it:
+/// the window reports it open, with its own Backend line, and a hardware insert can be measured.
+#[test]
+fn the_held_native_asio_input_shows_as_open_and_measure_is_enabled_on_it() {
+    use transit_audio_backend as ab;
+    let names = |prefix: &str, n: u16| (1..=n).map(|c| format!("{prefix} {c}")).collect();
+    let driver = ab::fake::FakeBackend::new(ab::Format::new(48_000, 10, ab::SampleFormat::I24))
+        .named("ASIO", "Model Mixer ASIO Driver")
+        .with_capture(12, true)
+        .with_channel_names(names("Analog In", 12), names("Analog Out", 10))
+        .with_latency(std::time::Duration::from_micros(6_800));
+    let cfg = AudioConfig { backend: Backend::NativeAsio, system: Some("ASIO".into()), ..Default::default() };
+    let mut t = T::new();
+    let player = soundcraft_playback::Player::open_fake_native_asio(t.app.engine.session_arc(), &cfg, &driver).unwrap();
+    t.app.engine.set_io_map(player.io_map().as_ref().clone());
+    t.app.player = Some(player);
+    assert!(t.app.recorder.is_none(), "no track is armed: the recorder has not opened");
+    t.open_window();
+    let lines: Vec<String> = t.layout()["opened"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[2], "Input open: Model Mixer ASIO Driver · 48000 Hz · 12 ch · f32 · 6.8 ms in", "{lines:?}");
+    assert!(lines[3].starts_with("Backend: ") && lines[3].ends_with("max packets 0"), "the held input has its own Backend line: {lines:?}");
+    assert_eq!(t.app.measure_blocker(), None, "a held duplex input is a live input");
+    assert_eq!(t.layout()["hardware"]["blocked"], "");
+    T::rect(&t.layout()["controls"], Some("Measure"), "hw_measure");
+}
+
 #[test]
 fn the_window_shows_the_backend_loop_lines_under_the_open_lines_from_a_scripted_snapshot() {
     use soundcraft_playback::telemetry::StreamStats;

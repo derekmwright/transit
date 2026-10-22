@@ -304,6 +304,15 @@ impl Player {
         Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
     }
 
+    /// A native ASIO Player over a scripted duplex driver, for the caller's device-free tests: the
+    /// input opens with the output and the player holds it.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn open_fake_native_asio(session: Arc<Session>, cfg: &AudioConfig, driver: &ab::fake::FakeBackend) -> Result<Self, String> {
+        let fallback = ab::fake::FakeBackend::new(ab::Format::new(48_000, 2, ab::SampleFormat::F32));
+        Self::open_native(session, cfg, Box::new(driver.clone()), &fallback, NativeKind::Asio)
+    }
+
     /// [`Self::open_native`] for native WASAPI with a scripted backend (tests).
     #[cfg(test)]
     fn open_native_or_cpal(
@@ -603,7 +612,22 @@ impl Player {
     /// Whether a live input feeds the plan: the device is duplex and its input is open, so a
     /// hardware insert's return has something to read.
     pub fn duplex(&self) -> bool {
-        !self.silent && self.plan_input.get() && self.io_map().inputs > 0
+        !self.silent && (self.plan_input.get() || self.holds_input()) && self.io_map().inputs > 0
+    }
+
+    /// Whether the player holds the input it opened with the output (native ASIO and native
+    /// WASAPI duplex): it is open and running although the recorder has not taken it yet.
+    pub fn holds_input(&self) -> bool {
+        self.input.try_borrow().is_ok_and(|held| matches!(*held, HeldInput::Held(Some(_))))
+    }
+
+    /// Reads the held input (rate, channels, buffer, latency, stats) while the player has it;
+    /// `None` once the recorder has taken it, or when there is none.
+    pub fn with_held_input<R>(&self, read: impl FnOnce(&record::Recorder) -> R) -> Option<R> {
+        match &*self.input.try_borrow().ok()? {
+            HeldInput::Held(Some(recorder)) => Some(read(recorder)),
+            _ => None,
+        }
     }
 
     /// Start measuring the round trip of a hardware insert: a click train plays on the device
@@ -614,6 +638,12 @@ impl Player {
     pub fn start_hardware_probe(&self, send: &[u16], ret: &[u16]) -> Result<(), String> {
         let probe = self.probe.as_ref().filter(|_| !self.silent).ok_or("there is no audio device to measure through")?;
         let io = self.io_map();
+        if !self.plan_input.get()
+            && let Some(ring) = self.with_held_input(|recorder| Arc::clone(&recorder.monitor))
+        {
+            // The probe reads the live input ring: the held input feeds the plan for it.
+            self.set_input(ring).map_err(|e| format!("the held input could not feed the probe ({e:?})"))?;
+        }
         if !self.plan_input.get() || io.inputs == 0 {
             return Err("this device has no live input open (hardware inserts need a duplex device)".into());
         }

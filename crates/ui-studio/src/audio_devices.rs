@@ -1020,7 +1020,13 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
         None => lines.push("Output open: none".into()),
     }
     let output = app.player.as_ref().and_then(|p| p.backend_stats());
-    let input = app.recorder.as_ref().and_then(|r| r.backend_stats());
+    // The input is the recorder's once a track takes it; until then a native duplex output holds
+    // the one it opened with, and the panel reads that.
+    let held = app.player.as_ref().and_then(|p| p.with_held_input(|r| (input_line(r, native), r.backend_stats())));
+    let input = match &app.recorder {
+        Some(r) => r.backend_stats(),
+        None => held.as_ref().and_then(|(_, stats)| *stats),
+    };
     #[cfg(test)]
     let (output, input) = app.audio_devices.injected_backend.unwrap_or((output, input));
     let (mut out_rate, mut in_rate) = app.audio_devices.wake_rates;
@@ -1029,17 +1035,24 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
     let keep = |present: bool, rate: WakeRate| if present { rate } else { WakeRate::default() };
     app.audio_devices.wake_rates = (keep(output.is_some(), out_rate), keep(input.is_some(), in_rate));
     lines.extend(output.map(|s| crate::telemetry::backend_line(&s, false, output_rate)));
-    lines.push(match &app.recorder {
-        Some(r) if native => {
-            let buffer = r.buffer_frames.map_or(String::new(), |b| format!(" · {b}-sample buffer"));
-            let detail = achieved_detail(r.sample_format, r.latency, "in");
-            format!("Input open: {} · {} Hz · {} ch{buffer}{detail}", r.device_name, r.sample_rate, r.channels)
-        }
-        Some(r) => format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels),
-        None => "Input open: none yet (it opens when a track is armed or monitored)".into(),
+    lines.push(match (&app.recorder, &held) {
+        (Some(r), _) => input_line(r, native),
+        (None, Some((line, _))) => line.clone(),
+        (None, None) => "Input open: none yet (it opens when a track is armed or monitored)".into(),
     });
     lines.extend(input.map(|s| crate::telemetry::backend_line(&s, true, input_rate)));
     lines
+}
+
+/// The "Input open:" line of an input, the recorder's or the player's held one.
+fn input_line(r: &soundcraft_playback::record::Recorder, native: bool) -> String {
+    if native {
+        let buffer = r.buffer_frames.map_or(String::new(), |b| format!(" · {b}-sample buffer"));
+        let detail = achieved_detail(r.sample_format, r.latency, "in");
+        format!("Input open: {} · {} Hz · {} ch{buffer}{detail}", r.device_name, r.sample_rate, r.channels)
+    } else {
+        format!("Input open: {} · {} Hz · {} ch", r.device_name, r.sample_rate, r.channels)
+    }
 }
 
 /// What a native stream reported at open, for its "open" line: " · i24 · 15.8 ms out" (each part
