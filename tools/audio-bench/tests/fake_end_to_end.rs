@@ -15,6 +15,7 @@ fn config(period: u32, seconds: f64, loopback: bool, script: Script) -> Config {
             period: Some(period),
             loopback,
             mode: transit_audio_backend::Mode::Shared,
+            in_mode: None,
             out_ch: 1,
             in_ch: 1,
         },

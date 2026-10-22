@@ -15,6 +15,8 @@ pub struct Request {
     pub loopback: bool,
     /// Shared, or exclusive (`--mode exclusive`): every open asks for it.
     pub mode: ab::Mode,
+    /// The capture stream's own mode (`--in-mode`), when it differs from `mode`.
+    pub in_mode: Option<ab::Mode>,
     /// 1-based channels of the cable.
     pub out_ch: u16,
     pub in_ch: u16,
@@ -85,7 +87,7 @@ pub fn run(
                     period: request.period,
                 })
                 .map_err(|e| format!("input: {e}"))
-                .map(|plan| in_mode(plan, request.mode))
+                .map(|plan| in_mode(plan, request.in_mode.unwrap_or(request.mode)))
         })
         .transpose()?;
     let error_callback = |shared: &Arc<Shared>, render: bool| -> ab::ErrorCallback {

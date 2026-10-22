@@ -114,7 +114,10 @@ fn opened_figures(achieved: Option<&ab::Achieved>) -> String {
     let Some(a) = achieved else { return String::new() };
     let buffer = a.buffer_frames.map(|n| format!("; buffer {n} fr"));
     let latency = a.latency.map(|d| format!("; latency {:.1} ms", d.as_secs_f64() * 1000.0));
-    buffer.into_iter().chain(latency).collect()
+    let sample = format!("{:?}", a.format.sample).to_lowercase();
+    let sample = a.format.valid_bits.map_or(sample.clone(), |bits| format!("{sample}/{bits}"));
+    let format = Some(format!("; fmt {sample} {} Hz", a.format.rate));
+    buffer.into_iter().chain(latency).chain(format).collect()
 }
 
 /// "exclusive, i32/24 valid, 128 fr, buffer 128 fr": the mode, the device sample format, the period
@@ -283,7 +286,7 @@ mod tests {
         a.latency = Some(std::time::Duration::from_micros(12_500));
         r.render_achieved = Some(a);
         let line = &r.stats_lines()[0];
-        assert!(line.starts_with("render backend: wakes 0") && line.ends_with("; buffer 128 fr; latency 12.5 ms"), "{line}");
+        assert!(line.starts_with("render backend: wakes 0") && line.ends_with("; buffer 128 fr; latency 12.5 ms; fmt f32 48000 Hz"), "{line}");
     }
 
     #[test]
