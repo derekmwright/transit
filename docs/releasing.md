@@ -78,3 +78,6 @@ The release has one Windows download (zip and MSI). It carries the native ASIO b
 (`--features transit/asio`) compiles against the Steinberg ASIO SDK, so it is build-only: it is not
 released, and `release.yml` does not build it. To build it yourself you need the SDK and LLVM; see
 docs/building.md. Distributing a binary built with it requires Steinberg's ASIO SDK license.
+
+Because the zip and MSI ship the native ASIO backend, `README-WINDOWS.txt` in the zip carries the
+required notice: "ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries."

@@ -219,3 +219,5 @@ Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Background on past d
 - [docs/adr/](docs/adr/README.md): architecture decisions.
 - [docs/contributing/](docs/contributing/README.md): evidence and knowledge notes.
 - [docs/known-issues/](docs/known-issues/README.md): accepted, tracked limitations.
+
+ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.
