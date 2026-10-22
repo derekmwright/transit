@@ -10,6 +10,8 @@
 //! - **Several clips in the way:** the track's playlist is duplicated first, so the old clips stay
 //!   as the previous take, as audio recording does.
 //! - **Loop record:** each pass is its own clip on its own playlist (a take lane), as audio does.
+//! - **Transport wrap:** a recording that started inside the cycle and ran past its end (Cycle on,
+//!   Loop Record off) is cut at each wrap the same way: a clip per pass, never discarded.
 //! - **Nothing played:** no clip.
 
 use crate::Engine;
@@ -92,6 +94,29 @@ pub struct Built {
 /// dropped, a note released after its pass is closed at the pass end, and a note still held at
 /// Stop ends at the stop sample. Passes (or tracks) with no notes produce nothing.
 pub fn build(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut: &Cut) -> Vec<Built> {
+    build_wrapping(tempo, sr, events, cut, None)
+}
+
+/// One stretch of the pass that becomes one clip: the offsets it takes (`window`), where its clip
+/// lies on the timeline (`range`) and the session sample at the window's first offset (`origin`).
+struct Segment {
+    window: Range,
+    range: Range,
+    origin: Samples,
+}
+
+/// Does a recording that started inside `wrap` (the loop region the transport cycles over) run
+/// past the loop end, so the transport wrapped while recording?
+fn wrapped(cut: &Cut, wrap: Option<Range>, last: Samples) -> Option<Range> {
+    let w = wrap.filter(|w| cut.pass.is_none() && !w.is_empty() && w.contains(cut.start))?;
+    (last >= w.end - cut.start).then_some(w)
+}
+
+/// As [`build`], for a recording the transport may have looped over `wrap` while it ran. Every
+/// pass of the loop is its own clip, as with loop recording; the offsets are device time, which a
+/// wrap does not reset, so the session position at Stop (which is back inside the loop) is never
+/// used to decide what was played.
+pub fn build_wrapping(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut: &Cut, wrap: Option<Range>) -> Vec<Built> {
     let mut tracks: Vec<TrackId> = Vec::new();
     for e in events {
         if !tracks.contains(&e.track) {
@@ -102,27 +127,45 @@ pub fn build(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut: &Cut) -
     for track in tracks {
         let mut mine: Vec<&RecEvent> = events.iter().filter(|e| e.track == track && e.offset >= 0).collect();
         mine.sort_by_key(|e| e.offset);
+        let last = mine.last().map_or(0, |e| e.offset);
         let pass_len = cut.pass.filter(|p| *p > 0);
-        let passes = match pass_len {
-            Some(len) => mine.last().map_or(0, |e| (e.offset / len + 1).min(MAX_PASSES)),
-            None => 1,
+        let segments: Vec<Segment> = if let Some(len) = pass_len {
+            let passes = mine.last().map_or(0, |e| (e.offset / len + 1).min(MAX_PASSES));
+            (0..passes)
+                .map(|k| Segment {
+                    window: Range::new(k * len, (k + 1) * len),
+                    range: Range::new(cut.start, cut.start.saturating_add(len)),
+                    origin: cut.start,
+                })
+                .collect()
+        } else if let Some(w) = wrapped(cut, wrap, last) {
+            // The first stretch runs from the latch to the loop end, every later one is a whole loop.
+            let first = w.end - cut.start;
+            let passes = (1 + (last - first) / w.len() + 1).min(MAX_PASSES);
+            (0..passes)
+                .map(|k| {
+                    if k == 0 {
+                        Segment { window: Range::new(0, first), range: Range::new(cut.start, w.end), origin: cut.start }
+                    } else {
+                        let from = first + (k - 1) * w.len();
+                        Segment { window: Range::new(from, from + w.len()), range: w, origin: w.start }
+                    }
+                })
+                .collect()
+        } else {
+            // Stop never cuts off what was captured: the transport can halt at a punch end or
+            // the end of the session before Stop, leaving the position behind the events.
+            let stop = cut.stop.max(last);
+            let end = cut.start.saturating_add(stop);
+            let range = cut.punch.map_or(Range::new(cut.start, end), |p| Range::new(p.start.max(cut.start), p.end.min(end)));
+            vec![Segment { window: Range::new(0, stop.saturating_add(1)), range, origin: cut.start }]
         };
-        for k in 0..passes {
-            let (window, range) = match pass_len {
-                Some(len) => (Range::new(k * len, (k + 1) * len), Range::new(cut.start, cut.start.saturating_add(len))),
-                None => {
-                    let end = cut.start.saturating_add(cut.stop.max(0));
-                    let range = cut.punch.map_or(Range::new(cut.start, end), |p| Range::new(p.start.max(cut.start), p.end.min(end)));
-                    (Range::new(0, cut.stop.max(0).saturating_add(1)), range)
-                }
-            };
+        for (k, seg) in segments.into_iter().enumerate() {
+            let Segment { window, range, origin } = seg;
             if range.is_empty() {
                 continue;
             }
-            let at = |offset: Samples| match pass_len {
-                Some(_) => cut.start.saturating_add(offset - window.start),
-                None => cut.start.saturating_add(offset),
-            };
+            let at = |offset: Samples| origin.saturating_add(offset - window.start);
             let base = tempo.samples_to_ticks(range.start, sr);
             let tick = |sample: Samples| tempo.samples_to_ticks(sample.clamp(range.start, range.end), sr) - base;
             let mut sequence = Sequence::default();
@@ -187,7 +230,7 @@ pub fn build(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut: &Cut) -
                 continue;
             }
             sequence.sort();
-            out.push(Built { track, pass: usize::try_from(k).unwrap_or(0), range, sequence });
+            out.push(Built { track, pass: k, range, sequence });
         }
     }
     out
@@ -199,7 +242,8 @@ pub fn place_midi_recording(e: &mut Engine, plan: &Recording, events: &[RecEvent
     let cut = Cut { start: plan.start, pass: plan.pass, punch: plan.punch, stop };
     let built = {
         let s = e.session();
-        build(&s.tempo, s.sample_rate, events, &cut)
+        let wrap = s.edit.loop_playback.then_some(s.edit.cycle_range());
+        build_wrapping(&s.tempo, s.sample_rate, events, &cut, wrap)
     };
     if built.is_empty() {
         return Vec::new();
@@ -227,7 +271,7 @@ pub fn place_midi_recording(e: &mut Engine, plan: &Recording, events: &[RecEvent
                 })
                 .unwrap_or_default()
         };
-        let looped = plan.pass.is_some();
+        let looped = plan.pass.is_some() || built.iter().any(|b| b.pass > 0);
         let span = mine.iter().map(|b| b.range).reduce(|a, b| Range::new(a.start.min(b.start), a.end.max(b.end)));
         let Some(span) = span else { continue };
         let covered = overlapping(e, span);
@@ -523,5 +567,76 @@ mod tests {
         assert_eq!(e.undo_history().len(), undo + 1);
         assert_eq!(notes_of(&e, ids[0]), vec![(60, 0, TICKS_PER_QUARTER / 2)]);
         assert_eq!(notes_of(&e, ids[1]), vec![(62, TICKS_PER_QUARTER, TICKS_PER_QUARTER / 2)]);
+    }
+
+    fn on_track(t: TrackId, mut v: Vec<RecEvent>) -> Vec<RecEvent> {
+        for e in &mut v {
+            e.track = t;
+        }
+        v
+    }
+
+    /// Issue #18: Record pressed while the transport cycles. The position at Stop is back inside
+    /// the loop, so the stop sample is behind the events; the notes of every pass must survive.
+    #[test]
+    fn recording_across_a_transport_wrap_commits_each_pass_as_a_take_and_never_discards() {
+        let (mut e, t) = midi_engine();
+        e.session_mut().edit.loop_playback = true;
+        e.session_mut().edit.loop_range = Range::new(96_000, 144_000);
+        // Started at 120,000 (inside the loop): 24,000 samples to the loop end, then whole passes.
+        let events = on_track(
+            t,
+            vec![
+                on(0, 60),
+                off(12_000, 60),
+                on(24_000 + 12_000, 62),
+                off(24_000 + 24_000, 62),
+                on(24_000 + 48_000 + 6_000, 64),
+                off(24_000 + 48_000 + 12_000, 64),
+            ],
+        );
+        // Stop reports a position behind the events (the playhead wrapped), here 0.
+        let ids = place_midi_recording(&mut e, &plan(120_000, None), &events, 0);
+        assert_eq!(ids.len(), 3, "one take per pass, the partial last pass included");
+        let tr = e.session().track(t).unwrap();
+        assert_eq!(tr.playlists.len(), 3);
+        assert_eq!(tr.playlists[0].clips[0].range(), Range::new(120_000, 144_000));
+        assert_eq!(tr.playlists[1].clips[0].range(), Range::new(96_000, 144_000));
+        assert_eq!(tr.playlists[2].clips[0].range(), Range::new(96_000, 144_000));
+        assert_eq!(notes_of(&e, ids[0]), vec![(60, 0, TICKS_PER_QUARTER / 2)]);
+        assert_eq!(notes_of(&e, ids[1]), vec![(62, TICKS_PER_QUARTER / 2, TICKS_PER_QUARTER / 2)]);
+        assert_eq!(notes_of(&e, ids[2]), vec![(64, TICKS_PER_QUARTER / 4, TICKS_PER_QUARTER / 4)]);
+    }
+
+    #[test]
+    fn stopping_mid_pass_of_a_wrapped_recording_commits_the_partial_pass() {
+        let (mut e, t) = midi_engine();
+        e.session_mut().edit.loop_playback = true;
+        e.session_mut().edit.loop_range = Range::new(0, 48_000);
+        let events = on_track(t, vec![on(1_000, 60), off(2_000, 60), on(48_000 + 1_000, 62)]);
+        let ids = place_midi_recording(&mut e, &plan(0, None), &events, 5_000);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(notes_of(&e, ids[0]).len(), 1);
+        assert_eq!(notes_of(&e, ids[1]).len(), 1, "the note held at Stop is closed, not dropped");
+    }
+
+    /// The transport halts at a punch end before Stop is pressed, leaving the position behind
+    /// the captured events; the notes are still the user's.
+    #[test]
+    fn a_stop_position_behind_the_captured_events_never_discards_them() {
+        let (mut e, t) = midi_engine();
+        let ids = place_midi_recording(&mut e, &plan(10_000, None), &two_notes(t), 0);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(notes_of(&e, ids[0]).len(), 2);
+    }
+
+    #[test]
+    fn without_a_wrap_the_loop_region_changes_nothing() {
+        let (mut e, t) = midi_engine();
+        e.session_mut().edit.loop_playback = true;
+        e.session_mut().edit.loop_range = Range::new(0, 480_000);
+        let ids = place_midi_recording(&mut e, &plan(0, None), &two_notes(t), 48_000);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(e.session().track(t).unwrap().playlists.len(), 1);
     }
 }
