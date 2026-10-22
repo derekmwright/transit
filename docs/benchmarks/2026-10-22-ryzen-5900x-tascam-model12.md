@@ -1,4 +1,4 @@
-# 2026-10-22, Ryzen 9 5900X, TASCAM Model 12 (WASAPI shared and exclusive)
+# 2026-10-22, Ryzen 9 5900X, TASCAM Model 12 (WASAPI shared and exclusive, native ASIO)
 
 Windows 11 (build 10.0.26200.9711), AMD Ryzen 9 5900X, TASCAM Model 12 over USB with TASCAM's Model Mixer
 driver, 44.1 kHz, `--out-ch 2 --in-ch 1`, 8 s runs. The unit's loaded SD song pins it to 44.1 kHz: it
@@ -50,7 +50,33 @@ the round trips were unchanged.
 No row yet. "Model Mixer ASIO" loads and initializes (12 inputs, 10 outputs, ASIOSTInt24LSB), but cpal's
 ASIO host has no packed 24-bit sample format and skips the driver, so the cpal ASIO backend cannot open it.
 `audio-bench --list-devices --system ASIO` now prints a line for a driver that fails to load, with its
-error. A native ASIO backend would carry Int24 directly.
+error. The native ASIO backend carries Int24 directly; see Native ASIO below.
+
+## Native ASIO
+
+The native ASIO backend (`transit-audio-asio`, ASIO slice b of the draft ADR 0016 amendment) opens the
+driver that cpal skips, at its fixed 256-frame buffer with packed 24-bit samples both ways, all 12
+inputs and 10 outputs: `audio-bench --backend asio --device "Model Mixer ASIO Driver" --rate 44100
+--loopback --out-ch 2 --in-ch 1 --seconds 10` (built with `--features native-asio,native-wasapi`), same
+cabling as above, transit closed. The rate stayed at 44.1 kHz (the backend sets a rate only when the
+driver runs at another one).
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| asio | ASIO | Model Mixer ASIO Driver | default | 256 fr / 5.805 ms | 44100 | 0.196 / 0.807 / 1.042 | 0/0 | 0.00 | 12.8 / 22.8 | 27.892 / 28.085 / 28.834 (19 of 19) | 1230 / 1239 / 1272 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+
+Backend lines:
+
+- "render backend: wakes 1675, late p95 256 µs, max 528 µs; service p95 64 µs, max 180 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 15.8 ms; fmt i24 44100 Hz"
+- "capture backend: wakes 1675, late p95 256 µs, max 528 µs; service p95 64 µs, max 180 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 6.8 ms; fmt i24 44100 Hz"
+- "calibration: round trip 245 frames (5.556 ms) +-1 frames (0.023 ms), 19 of 19 clicks paired"; "input peak on ch1: -12.8 dBFS"
+
+Reading: 28.1 ms round trip (1239 frames), every click paired, 0/0 xruns, no overload, position jump
+or reset, against 60 to 73 ms for WASAPI shared (native) and 100 ms (cpal), and 271 to 277 ms for
+WASAPI exclusive: ASIO is the tracking path on this interface. The driver reports 300 input plus 695
+output frames (995 frames, 22.6 ms); the loopback measures 244 frames (5.5 ms) more, almost exactly one
+256-frame buffer, and the stamp-time calibration agrees (245 frames, +-1). The callback time (12.8 us
+median, 22.8 us p95) is the conversion of 22 channels of packed 24-bit samples.
 
 ## Reading
 

@@ -77,3 +77,46 @@ Backend lines of the shared-mode run: "render backend: wakes 999, late p95 1024 
 calibration: round trip 10057 frames (209.521 ms) +-1517 frames (31.604 ms), 19 of 20 clicks paired
 
 Reading: the ASIO rows at 64 and 32 frames now report 0/0 where the gap heuristic reported 1666/1617 and 3784/3653, with the round trips unchanged within 0.15 ms. That confirms the old counts were burst delivery, not lost frames. The shared-mode run reports 0 input xruns where the heuristic reported 63 and 25, so the unexplained input counts of known issue K24 were the heuristic. Its 3 render xruns are real: one wake came 11.1 ms late with the padding at zero, and the engine then handed a 1056-frame block. The run was measured while another interface's driver was being installed, so that is a machine load event, not a steady fault. The shared round trip measured 236 ms in this run against 248 ms in the morning runs; the difference is not explained (the Windows audio engine had restarted for the new device).
+
+## Native ASIO
+
+The same cable (output 2 to input 2) at 48 kHz with Focusrite Safe Mode off, through the native ASIO
+backend (`transit-audio-asio`, ASIO slice b of the draft ADR 0016 amendment), with the drift detector:
+`audio-bench --backend asio --device "Focusrite USB ASIO" --loopback --out-ch 2 --in-ch 2 --seconds 10
+--period N` (built with `--features native-asio,native-wasapi`; no ASIO SDK, no LLVM), run one after
+the other with transit closed.
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| asio | ASIO | Focusrite USB ASIO | 256 | 256 fr / 5.333 ms | 48000 | 0.666 / 5.316 / 5.320 | 0/0 | 0.00 | 2.1 / 3.7 | 21.344 / 22.139 / 28.129 (20 of 20) | 1025 / 1063 / 1350 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+| asio | ASIO | Focusrite USB ASIO | 128 | 128 fr / 2.667 ms | 48000 | 0.333 / 2.657 / 2.659 | 0/0 | 0.00 | 1.2 / 1.9 | 12.047 / 12.138 / 15.137 (20 of 20) | 578 / 583 / 727 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.669 / 1.328 / 1.328 | 0/0 | 0.00 | 0.8 / 1.1 | 6.101 / 6.125 / 6.136 (20 of 20) | 293 / 294 / 295 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+| asio | ASIO | Focusrite USB ASIO | 32 | 32 fr / 0.667 ms | 48000 | 0.337 / 0.663 / 0.703 | 0/0 | 0.00 | 0.5 / 0.8 | 4.429 / 4.452 / 4.459 (20 of 20) | 213 / 214 / 214 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | - |
+
+Backend lines (render, then capture, for 256, 128, 64 and 32 frames):
+
+- "render backend: wakes 1873, late p95 992 µs, max 992 µs; service p95 32 µs, max 66 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 12.9 ms; fmt i32 48000 Hz"
+- "capture backend: wakes 1873, late p95 992 µs, max 992 µs; service p95 32 µs, max 66 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 11.9 ms; fmt i32 48000 Hz"
+- "render backend: wakes 3746, late p95 512 µs, max 662 µs; service p95 16 µs, max 50 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 128 fr; latency 7.2 ms; fmt i32 48000 Hz"
+- "capture backend: wakes 3746, late p95 512 µs, max 662 µs; service p95 16 µs, max 50 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 128 fr; latency 6.2 ms; fmt i32 48000 Hz"
+- "render backend: wakes 7492, late p95 1024 µs, max 1262 µs; service p95 16 µs, max 51 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 64 fr; latency 2.9 ms; fmt i32 48000 Hz"
+- "capture backend: wakes 7492, late p95 1024 µs, max 1262 µs; service p95 16 µs, max 51 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 64 fr; latency 3.9 ms; fmt i32 48000 Hz"
+- "render backend: wakes 14985, late p95 512 µs, max 702 µs; service p95 16 µs, max 64 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 32 fr; latency 2.2 ms; fmt i32 48000 Hz"
+- "capture backend: wakes 14985, late p95 512 µs, max 702 µs; service p95 16 µs, max 64 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 32 fr; latency 2.2 ms; fmt i32 48000 Hz"
+
+Every run printed "calibration: none (only 0 of 20 clicks were detected on the loopback ...)" with the
+input peak on ch2 at -14.9 dBFS: the clicks were detected and paired by host time (20 of 20 above), but
+the stamp-time pairing found no click whose capture frame time came after its render frame time.
+
+Reading: the native backend matches cpal's ASIO host to within 0.2 ms at every buffer size: 22.14 ms
+against 22.13 at 256, 12.14 against 12.25 at 128, 6.13 against 6.12 and 6.24 at 64, 4.45 against 4.46
+at 32 (the 1 ms gate of ASIO slice b is met), with every click paired, 0/0 xruns on the drift detector,
+and the driver reporting 0 overloads, position jumps and resets. Callback time is 0.5 to 2.1 us at the
+median against cpal's 0.2 to 1.0 (the bench measures inside the callback, so the difference is ours:
+conversion of planar Int32 plus the stamp). Lateness p95 near one buffer at 256 and 64 frames is the
+driver's burst delivery (K26), not lost frames: the sample position never jumped. The stamps are the
+open item: the Focusrite driver's `getLatencies` figures (input plus output: 24.8 ms at 256, 13.4 at 128,
+6.8 at 64, 4.4 at 32 frames) exceed the measured round trip at 256, 128 and 64 frames, so the stamp
+frame times put the captured click before the played one and no loopback calibration can be formed
+(the calibration's round trip is unsigned). Either the driver counts a buffer it should not, or the
+stamp model's "latency includes the buffer" reading is wrong for this driver; ASIO slice d decides.
