@@ -411,6 +411,11 @@ impl Recorder {
         }
     }
 
+    /// The latch of the take prepared for this pass, for a MIDI pass that must start with it.
+    pub fn start_reader(&self) -> Option<start::Reader> {
+        self.record_start.clone()
+    }
+
     /// The applied origin survives Stop until the caller has collected the take.
     pub(crate) fn prepared_start(&self) -> Option<start::Ticket> {
         self.record_start.as_ref().map(start::Reader::ticket)

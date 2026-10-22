@@ -2,6 +2,7 @@
 //! belong to this creating-thread owner; the device borrows its anchored audio state.
 use super::audio::{ActionResult, Audio, Command, CountIn};
 use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId, sources};
+use crate::record::start::Status;
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
 use soundcraft_audio_backend as ab;
@@ -16,6 +17,45 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 type Owner = RuntimeControl<Command, ActionResult>;
 pub type PlayerNotice = Notice<Command, ActionResult>;
 
+/// A prepared MIDI recording pass.
+struct MidiPass {
+    reader: record::start::Reader,
+    tracks: Vec<TrackId>,
+}
+
+/// What a MIDI recording pass captured.
+#[derive(Debug, Clone)]
+pub struct MidiTake {
+    /// The armed instrument tracks the pass recorded.
+    pub tracks: Vec<TrackId>,
+    /// The record-start latch the audio thread applied; None if it never started.
+    pub start: Option<record::start::Point>,
+    pub events: Vec<crate::midi_capture::CapturedEvent>,
+    /// Events lost to a full queue.
+    pub dropped: u64,
+    pub device_rate: u32,
+}
+
+impl MidiTake {
+    /// The events of the pass's tracks at or after the latch, each with the session samples
+    /// since the latch: the device frames since the latch frame, converted at the session rate
+    /// (the same latch the audio take is placed from). Events before the latch are not part of
+    /// the take.
+    pub fn timed(&self, session_rate: u32) -> Vec<(i64, crate::midi_capture::CapturedEvent)> {
+        let Some(point) = self.start else { return Vec::new() };
+        let rate = u128::from(self.device_rate.max(1));
+        self.events
+            .iter()
+            .filter(|e| self.tracks.contains(&e.track))
+            .filter_map(|e| {
+                let frames = e.frame.checked_sub(point.output_frame)?;
+                let samples = (u128::from(frames) * u128::from(session_rate) + rate / 2) / rate;
+                Some((i64::try_from(samples).ok()?, *e))
+            })
+            .collect()
+    }
+}
+
 /// Main-thread facade. RuntimeControl deliberately makes this type !Send/!Sync.
 /// The remaining native lifecycle migration moves stream/writer joins off main;
 /// it does not move this owner or its plug-ins to that worker.
@@ -29,6 +69,9 @@ pub struct Player {
     #[cfg(not(target_arch = "wasm32"))]
     midi_error: Option<String>,
     record_start: RefCell<Option<record::start::Control>>,
+    /// MIDI recording capture (control side) and the pass it is collecting.
+    capture: RefCell<Option<crate::midi_capture::Capture>>,
+    midi_pass: RefCell<Option<MidiPass>>,
     state: Option<Anchor<Audio>>,
     #[cfg(feature = "test-hooks")]
     test_output: RefCell<Option<DeviceOutput>>,
@@ -119,6 +162,8 @@ impl Player {
             #[cfg(not(target_arch = "wasm32"))]
             midi_error: None,
             record_start: RefCell::new(None),
+            capture: RefCell::new(None),
+            midi_pass: RefCell::new(None),
             state: None,
             #[cfg(feature = "test-hooks")]
             test_output: RefCell::new(None),
@@ -201,6 +246,9 @@ impl Player {
             Err(error) => player.midi_error = Some(error.to_string()),
         }
         *player.record_start.get_mut() = Some(record_start);
+        let (capture, sink) = crate::midi_capture::pair(crate::midi_capture::CAPACITY);
+        audio.set_midi_capture(sink);
+        *player.capture.get_mut() = Some(capture);
         let (anchor, access) = Anchor::new(audio);
         player.state = Some(anchor);
         player.failure_signal = Some(owner.failure_signal());
@@ -443,11 +491,88 @@ impl Player {
         count_in: Option<CountIn>,
     ) -> Result<action_lane::Sequence, PlayerError> {
         let ticket = recorder.prepared_start().ok_or(PlayerError::NoPreparedRecording)?;
+        self.start_recording(ticket, from, end, looped, count_in)
+    }
+    /// As [`Player::record_with_count_in`] for a pass that records MIDI only (no audio input).
+    pub fn record_midi_with_count_in(
+        &self,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        count_in: Option<CountIn>,
+    ) -> Result<action_lane::Sequence, PlayerError> {
+        let ticket = self.midi_pass.try_borrow().map_err(|_| PlayerError::Busy)?.as_ref().map(|pass| pass.reader.ticket());
+        self.start_recording(ticket.ok_or(PlayerError::NoPreparedRecording)?, from, end, looped, count_in)
+    }
+    fn start_recording(
+        &self,
+        ticket: record::start::Ticket,
+        from: Option<Samples>,
+        end: Option<Samples>,
+        looped: Option<Range>,
+        count_in: Option<CountIn>,
+    ) -> Result<action_lane::Sequence, PlayerError> {
         let result = self.owner()?.send_action(Command::Record { ticket, from, end, looped, count_in }, true);
         if result.is_err() {
             self.cancel_record_start()?;
         }
         result
+    }
+    /// Prepare a MIDI recording pass of `tracks` (armed instrument tracks): clear the capture and
+    /// share the record-start latch of the audio take prepared for the same pass (`audio`), else
+    /// issue a latch of its own. The latch is applied by the audio thread with Play, so the pass
+    /// starts at the same sample as any audio take.
+    pub fn prepare_midi_recording(&self, tracks: Vec<TrackId>, audio: Option<record::start::Reader>) -> Result<(), String> {
+        self.owner().map_err(|error| error.to_string())?;
+        let reader = match audio {
+            Some(reader) => reader,
+            None => {
+                let mut control = self.record_start.try_borrow_mut().map_err(|_| PlayerError::Busy.to_string())?;
+                let control = control.as_mut().ok_or_else(|| PlayerError::Faulted.to_string())?;
+                control.prepare().ok_or_else(|| PlayerError::SequenceExhausted.to_string())?
+            }
+        };
+        let mut capture = self.capture.try_borrow_mut().map_err(|_| PlayerError::Busy.to_string())?;
+        capture.as_mut().ok_or_else(|| PlayerError::Faulted.to_string())?.clear();
+        *self.midi_pass.try_borrow_mut().map_err(|_| PlayerError::Busy.to_string())? = Some(MidiPass { reader, tracks });
+        Ok(())
+    }
+    /// Is a MIDI pass prepared and not yet finished?
+    pub fn midi_recording_prepared(&self) -> bool {
+        self.midi_pass.try_borrow().is_ok_and(|pass| pass.is_some())
+    }
+    /// The events captured for the pass so far that belong to it (after the latch, on its tracks),
+    /// as `(samples since the latch, event)` at `session_rate`. Drains the queue into the take
+    /// list without consuming it, so Stop still finds every event.
+    pub fn midi_recording_progress(&self, session_rate: u32) -> Vec<(i64, crate::midi_capture::CapturedEvent)> {
+        let (Ok(mut capture), Ok(pass)) = (self.capture.try_borrow_mut(), self.midi_pass.try_borrow()) else { return Vec::new() };
+        let (Some(capture), Some(pass)) = (capture.as_mut(), pass.as_ref()) else { return Vec::new() };
+        capture.poll();
+        let Status::Started(point) = pass.reader.status() else { return Vec::new() };
+        MidiTake { tracks: pass.tracks.clone(), start: Some(point), events: capture.events().to_vec(), dropped: 0, device_rate: self.device_rate }
+            .timed(session_rate)
+    }
+    /// End the MIDI pass: everything captured, the latch and the loss count. None when no pass
+    /// was prepared.
+    pub fn finish_midi_recording(&self) -> Option<MidiTake> {
+        let pass = self.midi_pass.try_borrow_mut().ok()?.take()?;
+        let mut capture = self.capture.try_borrow_mut().ok()?;
+        let (events, dropped) = capture.as_mut()?.finish();
+        let start = match pass.reader.status() {
+            Status::Started(point) => Some(point),
+            _ => None,
+        };
+        Some(MidiTake { tracks: pass.tracks, start, events, dropped, device_rate: self.device_rate })
+    }
+    /// Stand in for the audio thread: add an event to the capture, as a device-free test.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn inject_midi_capture(&self, event: crate::midi_capture::CapturedEvent) {
+        if let Ok(mut capture) = self.capture.try_borrow_mut()
+            && let Some(capture) = capture.as_mut()
+        {
+            capture.inject(event);
+        }
     }
     fn cancel_record_start(&self) -> Result<(), PlayerError> {
         if let Some(control) = self.record_start.try_borrow().map_err(|_| PlayerError::Busy)?.as_ref() {

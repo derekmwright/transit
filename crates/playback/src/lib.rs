@@ -20,6 +20,7 @@ pub mod action_lane;
 pub mod backend;
 pub mod device_clock;
 pub mod devices;
+pub mod midi_capture;
 pub mod plan_bridge;
 pub mod player;
 pub mod publication;
@@ -31,7 +32,7 @@ pub mod timeline_map;
 #[cfg(test)]
 pub(crate) use backend::cpal::OutputCallback;
 pub use devices::AudioConfig;
-pub use player::{ActionResult, CountIn, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice, StartFailure};
+pub use player::{ActionResult, CountIn, MidiTake, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice, StartFailure};
 
 use soundcraft_mix::{MAX_CHANNELS, StripMeter, itu_stereo_fold};
 use soundcraft_model::{Session, TrackId};

@@ -5,6 +5,7 @@ use super::super::{
 };
 use super::*;
 use crate::player::Control;
+use crate::record::start;
 use soundcraft_mix::{EngineEpoch, Message, NoteId, SlotBinding, Source};
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
 use soundcraft_rt::testing::measure;
@@ -17,6 +18,7 @@ struct Rig {
     audio: Audio,
     token: sources::Token,
     target: SlotBinding,
+    capture: crate::midi_capture::Capture,
 }
 
 impl Rig {
@@ -35,7 +37,9 @@ impl Rig {
         let target = control.sessions.active_bindings()[0];
         recording_clock(&mut audio, device);
         audio.plans.install_event_tap_for_test(512);
-        Self { control, registry, lane, audio, token, target }
+        let (capture, sink) = crate::midi_capture::pair(crate::midi_capture::CAPACITY);
+        audio.set_midi_capture(sink);
+        Self { control, registry, lane, audio, token, target, capture }
     }
     fn packet(&self, output: u64, sequence: u64, release: bool) -> Packet {
         let audio = &self.audio;
@@ -260,4 +264,97 @@ fn deferred_capacity_reserves_releases_and_unknown_releases_do_not_revoke_other_
     rig.render(64);
     assert!(rig.registry.admits(rig.token));
     assert_eq!(rig.audio.plans.engine().event_tap()[0].outcome, soundcraft_mix::EventOutcome::Unmatched);
+}
+
+fn recording(rig: &mut Rig) {
+    rig.audio.transport.playing = true;
+    rig.audio.transport.recording = true;
+}
+
+#[test]
+fn a_recording_pass_captures_admitted_events_at_the_frames_the_instrument_gets_them_without_allocating() {
+    for device in [44_100, 48_000] {
+        let mut rig = Rig::new(device);
+        recording(&mut rig);
+        rig.send(100, 0, false);
+        rig.send(300, 1, true);
+        let mut pedal = rig.packet(320, 2, false);
+        pedal.message = Message::Control { cc: 64, value: 127 };
+        pedal.raw.bytes = [0xb0, 64, 127];
+        rig.lane.send_note(pedal, action_lane::NoteKind::On).unwrap();
+        rig.render(512);
+        rig.capture.poll();
+        let got: Vec<_> = rig.capture.events().iter().map(|e| (e.frame, e.track, e.channel, e.approximate)).collect();
+        assert_eq!(got, vec![(100, rig.target.0, 0, false), (300, rig.target.0, 0, false), (320, rig.target.0, 0, false)]);
+        assert!(matches!(rig.capture.events()[0].message, Message::NoteOn { key: 60, velocity: 100, .. }));
+        assert!(matches!(rig.capture.events()[1].message, Message::NoteOff { key: 60, .. }));
+        assert!(matches!(rig.capture.events()[2].message, Message::Control { cc: 64, value: 127 }));
+        assert_eq!(rig.capture.dropped(), 0);
+        // The instrument got the same events.
+        assert_eq!(rig.audio.plans.engine().event_tap().len(), 3);
+    }
+}
+
+#[test]
+fn an_unclocked_event_is_captured_at_its_approximate_placement_and_flagged() {
+    let mut rig = Rig::new(48_000);
+    recording(&mut rig);
+    let mut packet = rig.packet(100, 0, false);
+    packet.lookahead = 37;
+    rig.audio.transport.clock_map = None;
+    let first = rig.audio.transport.timeline.next_output();
+    rig.lane.send_note(packet, action_lane::NoteKind::On).unwrap();
+    rig.render(128);
+    rig.capture.poll();
+    assert_eq!(rig.capture.events().len(), 1);
+    assert_eq!((rig.capture.events()[0].frame, rig.capture.events()[0].approximate), (first + 37, true));
+}
+
+#[test]
+fn nothing_is_captured_before_recording_starts_or_during_the_count_in() {
+    let mut rig = Rig::new(48_000);
+    rig.send(100, 0, false);
+    rig.render(256);
+    rig.audio.transport.playing = true;
+    rig.send(400, 1, false);
+    rig.render(256);
+    rig.capture.poll();
+    assert!(rig.capture.events().is_empty(), "playing is not recording");
+    // A count-in under way: recording is off then, and a stray flag must not capture either.
+    let (mut start, _publisher) = start::pair(EngineEpoch(1));
+    let ticket = start.prepare().unwrap().ticket();
+    rig.audio.transport.count_in = Some(super::super::Counting {
+        ticket,
+        from: 0,
+        end: None,
+        looped: None,
+        plan: super::super::CountIn { frames: 96_000, beat: 24_000, per_bar: 4 },
+        left: 96_000,
+    });
+    rig.audio.transport.recording = true;
+    rig.send(700, 2, false);
+    rig.render(512);
+    rig.capture.poll();
+    assert!(rig.capture.events().is_empty(), "the count-in captures nothing");
+    assert_eq!(rig.audio.plans.engine().event_tap().len(), 3, "the instrument still sounds them");
+}
+
+#[test]
+fn a_full_capture_queue_drops_and_counts_and_playing_goes_on() {
+    let mut rig = Rig::new(48_000);
+    let (capture, sink) = crate::midi_capture::pair(8);
+    rig.audio.set_midi_capture(sink);
+    rig.capture = capture;
+    recording(&mut rig);
+    for sequence in 0..6 {
+        rig.send(50 + sequence * 10, sequence, false);
+    }
+    rig.send(200, 6, true);
+    rig.render(512);
+    rig.capture.poll();
+    // Half of a queue this small is kept for releases: four ons fit, two are dropped, the off fits.
+    assert_eq!(rig.capture.events().len(), 5);
+    assert_eq!(rig.capture.dropped(), 2);
+    assert!(matches!(rig.capture.events()[4].message, Message::NoteOff { .. }));
+    assert_eq!(rig.audio.plans.engine().event_tap().len(), 7, "the instrument gets every event");
 }

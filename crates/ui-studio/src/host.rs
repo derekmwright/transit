@@ -93,7 +93,9 @@ impl StudioApp {
             self.record_hint = Some((self.last_frame.unwrap_or_default(), why));
             return;
         }
-        self.ensure_input();
+        if self.audio_armed() {
+            self.ensure_input();
+        }
         let takes = match self.arm_recorder() {
             Ok(takes) => takes,
             Err(err) => {
@@ -168,13 +170,18 @@ impl StudioApp {
             return;
         }
         if let Some(p) = &self.player {
-            let Some(recorder) = self.recorder.as_ref() else {
+            let (from, end, looped) = play.map_or((None, None, None), |(from, end, looped)| (Some(from), end, looped));
+            let _ = p.take_start_failure();
+            let started = if self.take_plan.as_ref().is_some_and(|plan| plan.takes.is_empty()) && p.midi_recording_prepared() {
+                // MIDI only: the latch is the capture pass's own.
+                p.record_midi_with_count_in(from, end, looped, count_in)
+            } else if let Some(recorder) = self.recorder.as_ref() {
+                p.record_with_count_in(recorder, from, end, looped, count_in)
+            } else {
                 self.finish_recording();
                 return;
             };
-            let (from, end, looped) = play.map_or((None, None, None), |(from, end, looped)| (Some(from), end, looped));
-            let _ = p.take_start_failure();
-            let Some(sequence) = self.player_requests.result(&mut self.status, p.record_with_count_in(recorder, from, end, looped, count_in)) else {
+            let Some(sequence) = self.player_requests.result(&mut self.status, started) else {
                 self.finish_recording();
                 return;
             };
@@ -200,9 +207,40 @@ impl StudioApp {
         }
     }
 
+    /// Is an audio track record-enabled (so the input device must be opened and armed)?
+    fn audio_armed(&self) -> bool {
+        self.engine.session().tracks.iter().any(|t| t.mixer.record_arm && t.kind == soundcraft_model::TrackKind::Audio && !t.inactive)
+    }
+
+    /// The record-enabled MIDI and instrument tracks: their live input is recorded as clips.
+    fn midi_armed(&self) -> Vec<TrackId> {
+        self.engine.session().tracks.iter().filter(|t| t.mixer.record_arm && t.kind.is_midi() && !t.inactive).map(|t| t.id).collect()
+    }
+
     /// Arm the input for the record-enabled tracks; a session never saved records into its
-    /// autosave folder. Returns the takes it records.
+    /// autosave folder. Returns the audio takes it records; armed MIDI tracks start a capture
+    /// pass that shares the audio take's record-start latch.
     fn arm_recorder(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
+        let midi = self.midi_armed();
+        let mut takes = Vec::new();
+        let audio = self.audio_armed();
+        if audio || midi.is_empty() {
+            takes = self.arm_audio_takes()?;
+        }
+        if !midi.is_empty() {
+            match &self.player {
+                Some(player) => {
+                    let latch = if audio { self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::start_reader) } else { None };
+                    player.prepare_midi_recording(midi, latch)?;
+                }
+                None if !audio => return Err("no audio device is open to record MIDI".into()),
+                None => {}
+            }
+        }
+        Ok(takes)
+    }
+
+    fn arm_audio_takes(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
         if self.recorder_failed {
             return Err(self.status.clone());
         }
@@ -349,7 +387,7 @@ impl StudioApp {
 
     fn queue_autosave(&mut self, root: std::path::PathBuf) {
         if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start)
-            && let Some(plan) = &mut self.take_plan
+            && let Some(plan) = self.take_plan.as_mut().filter(|plan| !plan.takes.is_empty())
         {
             plan.start = point.position.sample;
             self.record_start = plan.start;
@@ -479,7 +517,7 @@ impl StudioApp {
             self.finish_recording();
         }
         if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start)
-            && self.take_plan.as_ref().is_some_and(|plan| plan.start != point.position.sample)
+            && self.take_plan.as_ref().is_some_and(|plan| !plan.takes.is_empty() && plan.start != point.position.sample)
         {
             self.record_start = point.position.sample;
             if let Some(plan) = &mut self.take_plan {
@@ -637,8 +675,12 @@ impl StudioApp {
         // Tests substitute only the device's finished files; placement and stop ordering stay real.
         #[cfg(test)]
         let finished = finished.or_else(|| self.finished_test_takes.take());
-        let Some((takes, problem)) = finished else { return };
-        let tracks = takes.len().max(1);
+        let midi = self.player.as_ref().and_then(Player::finish_midi_recording);
+        #[cfg(test)]
+        let midi = midi.or_else(|| self.finished_test_midi.take());
+        if finished.is_none() && midi.is_none() {
+            return;
+        }
         let mut plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
             start: self.record_start,
             pass: None,
@@ -646,17 +688,75 @@ impl StudioApp {
             rate: 0,
             takes: Vec::new(),
         });
-        if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start) {
+        // The audio take and the MIDI pass share one latch; either's applied start is the real one.
+        let latch = finished
+            .is_some()
+            .then(|| self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start))
+            .flatten()
+            .or_else(|| midi.as_ref().and_then(|m| m.start));
+        if let Some(point) = latch {
             plan.start = point.position.sample;
             self.record_start = plan.start;
         }
         self.punch = None;
         self.autosaved_rev = 0;
         let end = self.engine.transport.position;
-        self.place_takes(&plan, takes, end, tracks);
-        if let Some(p) = problem {
-            log::warn!("recording: {p}");
-            self.status = format!("{} ({p})", self.status);
+        let pushes = self.engine.undo_pushes();
+        if let Some((takes, problem)) = finished {
+            let tracks = takes.len().max(1);
+            self.place_takes(&plan, takes, end, tracks);
+            if let Some(p) = problem {
+                log::warn!("recording: {p}");
+                self.status = format!("{} ({p})", self.status);
+            }
+        }
+        if let Some(midi) = midi {
+            let end = self.position().max(plan.start);
+            self.place_midi_take(&plan, &midi, end);
+        }
+        // An audio take and a MIDI take of the same pass are one undo step.
+        if let Ok(added) = usize::try_from(self.engine.undo_pushes() - pushes)
+            && added > 1
+        {
+            let _ = self.engine.squash_undo(added, "Record");
+        }
+    }
+
+    /// Place a finished MIDI pass: one clip per armed track (per pass when loop recording), merged
+    /// into a clip already under the take. Nothing played, nothing placed.
+    fn place_midi_take(&mut self, plan: &soundcraft_engine::io::Recording, midi: &soundcraft_playback::MidiTake, end: Samples) {
+        let events: Vec<_> = midi.timed(self.engine.session().sample_rate.hz()).iter().filter_map(|(offset, e)| rec_event(*offset, e)).collect();
+        let ids = soundcraft_engine::midi_take::place_midi_recording(&mut self.engine, plan, &events, end - plan.start);
+        if midi.dropped > 0 {
+            self.status = format!("{} MIDI events were lost: the capture queue was full", midi.dropped);
+        }
+        if ids.is_empty() {
+            if midi.dropped == 0 && midi.start.is_some() && !midi.tracks.is_empty() {
+                self.status = "Recorded no MIDI notes".into();
+            }
+            return;
+        }
+        let s = self.engine.session_arc();
+        let mut names: Vec<String> = Vec::new();
+        for id in &ids {
+            if let Some((t, _)) = s.find_clip(*id)
+                && let Some(tr) = s.track(t)
+                && !names.contains(&tr.name)
+            {
+                names.push(tr.name.clone());
+            }
+        }
+        let notes: usize = ids
+            .iter()
+            .filter_map(|id| s.find_clip(*id))
+            .map(|(_, c)| if let soundcraft_model::ClipContent::Midi { sequence } = &c.content { sequence.notes.len() } else { 0 })
+            .sum();
+        let status = format!("Recorded {} MIDI clip{} ({notes} notes) on {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, names.join(", "));
+        self.status = if midi.dropped > 0 { format!("{status}; {} events lost", midi.dropped) } else { status };
+        let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
+        let _ = self.run("edit.select", json!({"clips": clips}));
+        if let Some((t, _)) = ids.first().and_then(|id| s.find_clip(*id)) {
+            self.ui.focus_track = Some(t);
         }
     }
 
@@ -1130,3 +1230,21 @@ impl PlayerRequests {
 #[cfg(test)]
 #[path = "player_tests.rs"]
 mod player_tests;
+
+/// A captured live message as the engine's recorder takes it; controllers it cannot keep (14-bit
+/// pairs, which ingress does not produce) are left out.
+fn rec_event(offset: Samples, e: &soundcraft_playback::midi_capture::CapturedEvent) -> Option<soundcraft_engine::midi_take::RecEvent> {
+    use soundcraft_engine::midi_take::Msg;
+    use soundcraft_mix::Message;
+    let msg = match e.message {
+        Message::NoteOn { key, velocity, .. } => Msg::NoteOn { pitch: key, velocity },
+        Message::NoteOff { key, velocity, .. } => Msg::NoteOff { pitch: key, velocity },
+        Message::Control { cc, value } => Msg::Cc { cc, value },
+        Message::PitchBend { value } => Msg::PitchBend { value },
+        Message::ChannelPressure { value } => Msg::ChannelPressure { value },
+        Message::PolyPressure { key, value, .. } => Msg::PolyPressure { pitch: key, value },
+        Message::Program { program } => Msg::Program { program },
+        Message::Control14 { .. } => return None,
+    };
+    Some(soundcraft_engine::midi_take::RecEvent { track: e.track, channel: e.channel, offset, msg })
+}

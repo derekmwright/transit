@@ -388,6 +388,8 @@ pub(super) struct Audio {
     midi: Option<action_lane::Audio<super::ingress::Packet, ActionResult>>,
     #[cfg(not(target_arch = "wasm32"))]
     midi_inbox: midi::Inbox,
+    /// Live MIDI copied out for a MIDI recording (preallocated by Main).
+    capture: Option<crate::midi_capture::Sink>,
     transport: Transport,
     shared: Arc<Shared>,
     pending: usize,
@@ -489,6 +491,7 @@ impl Audio {
                 midi: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 midi_inbox: midi::Inbox::new(),
+                capture: None,
                 shared,
                 pending: 0,
                 read,
@@ -534,6 +537,10 @@ impl Audio {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn set_midi(&mut self, midi: action_lane::Audio<super::ingress::Packet, ActionResult>) {
         self.midi = Some(midi);
+    }
+
+    pub(super) fn set_midi_capture(&mut self, capture: crate::midi_capture::Sink) {
+        self.capture = Some(capture);
     }
 
     /// Main only, after callback quiescence. Retained panic payloads are dropped
@@ -604,6 +611,7 @@ impl Audio {
         let sources = &self.sources;
         let state = &self.transport;
         let inbox = &mut self.midi_inbox;
+        let capture = &mut self.capture;
         let report = midi.service(budget, &mut self.plans, &mut |event, live| {
             let action_lane::Event::Action { payload: packet, .. } = event else {
                 live.all_notes_off();
@@ -625,7 +633,24 @@ impl Audio {
             let Some(output) = output.checked_add(u64::from(packet.lookahead)) else {
                 return ActionResult::MidiTimeline(timeline_map::MapError::Arithmetic);
             };
-            inbox.admit(packet, output, mapped.is_none(), sources)
+            let result = inbox.admit(packet, output, mapped.is_none(), sources);
+            // A MIDI recording keeps what the instrument is given, at the frame it is given it:
+            // only while the transport records (not during the count-in), and never blocking.
+            if matches!(result, ActionResult::MidiBuffered | ActionResult::MidiBufferedApproximate)
+                && state.recording
+                && state.playing
+                && state.count_in.is_none()
+                && let Some(capture) = capture
+            {
+                capture.push(crate::midi_capture::CapturedEvent {
+                    frame: output,
+                    track: packet.target.0,
+                    channel: packet.source.channel,
+                    message: packet.message,
+                    approximate: result == ActionResult::MidiBufferedApproximate,
+                });
+            }
+            result
         });
         self.faulted |= report.faulted;
     }

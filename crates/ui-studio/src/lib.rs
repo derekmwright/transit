@@ -233,6 +233,9 @@ pub struct StudioApp {
     /// Synthetic recorder output for tests that must not open an input device.
     #[cfg(test)]
     finished_test_takes: Option<soundcraft_playback::record::Takes>,
+    /// Synthetic MIDI capture for tests that must not run the audio thread.
+    #[cfg(test)]
+    finished_test_midi: Option<soundcraft_playback::MidiTake>,
     record_start: Samples,
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
@@ -327,6 +330,8 @@ impl StudioApp {
             recorder: None,
             #[cfg(test)]
             finished_test_takes: None,
+            #[cfg(test)]
+            finished_test_midi: None,
             record_start: 0,
             punch: None,
             recorder_failed: false,
@@ -907,6 +912,8 @@ mod builtin_editor_tests;
 mod groups_tests;
 #[cfg(test)]
 mod keys_tests;
+#[cfg(test)]
+mod midi_record_tests;
 #[cfg(test)]
 mod recent_tests;
 #[cfg(test)]
