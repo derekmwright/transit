@@ -33,6 +33,10 @@ unwind. Windows and Linux do none of these, so a test can pass there and fail on
 lock once at construction on the control thread (see `InputRing::new`), use `const`-initialized
 thread-locals of types without `Drop`, and keep destructor thread-locals off the audio path.
 
+The VST3 host pre-locks both of its process-path mutexes this way: `EventList::new` and
+`HostContext.edits` (plug-ins call `performEdit` from the audio thread despite the spec) in
+`crates/vst3-host/src/ffi.rs`.
+
 ## Worker threads
 
 Pool workers are promoted at thread start (MMCSS, SCHED_FIFO or rtkit, time-constraint policy) by

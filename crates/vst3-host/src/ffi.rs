@@ -632,6 +632,10 @@ pub(crate) struct HostContext {
 
 impl Default for HostContext {
     fn default() -> Self {
+        let edits = Mutex::new(Vec::with_capacity(EDIT_CAP));
+        // Plug-ins are known to call `performEdit` from the audio thread despite the spec, and on
+        // macOS the first lock boxes the pthread mutex (an allocation). Take it once here.
+        drop(edits.lock());
         HostContext {
             latency_changed: AtomicBool::new(false),
             restart_requested: AtomicBool::new(false),
@@ -641,7 +645,7 @@ impl Default for HostContext {
             io_changed: AtomicBool::new(false),
             reload_requested: AtomicBool::new(false),
             other_flags: AtomicU32::new(0),
-            edits: Mutex::new(Vec::with_capacity(EDIT_CAP)),
+            edits,
         }
     }
 }
