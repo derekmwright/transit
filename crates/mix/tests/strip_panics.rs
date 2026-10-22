@@ -22,7 +22,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
-use transit_rt::testing::{AllocStats, CountingAlloc, measure};
+use transit_rt::testing::{CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -201,24 +201,30 @@ fn serial_panicking_instruments_keep_their_payloads_and_allocate_nothing_more() 
     let mut mix = plan_engine(&shared);
     MixEngine::force_serial(true);
     let here = std::thread::current().id();
-    // What the panics themselves cost on this thread: one strip's panic caught, and a re-raise.
-    let calibrate = || {
-        let (p, raise) = measure(|| std::panic::catch_unwind(|| std::panic::panic_any(Payload(Arc::clone(&shared)))).unwrap_err());
-        let (p, reraise) = measure(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| std::panic::resume_unwind(p))).unwrap_err());
-        drop(p);
-        (raise, reraise)
+    // What the panics themselves cost on this thread, measured the way the render performs them:
+    // TRACKS panics caught and kept, then one re-raise caught. The baseline is measured on this
+    // platform in the same shape, not derived from per-panic figures: macOS's panic machinery
+    // allocates once more (64 bytes) in the sequence than the sum of its parts, so a hand-derived
+    // sum is off by that on macOS. The first run warms the panic path; the second is the figure.
+    let calibrate = |mut kept: Vec<Box<dyn Any + Send>>| {
+        measure(|| {
+            for _ in 0..TRACKS {
+                kept.push(std::panic::catch_unwind(|| std::panic::panic_any(Payload(Arc::clone(&shared)))).unwrap_err());
+            }
+            let first = kept.swap_remove(0);
+            let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| std::panic::resume_unwind(first))).unwrap_err();
+            (kept, again)
+        })
     };
-    let _ = calibrate();
-    let (raise, reraise) = calibrate();
+    let _ = calibrate(Vec::with_capacity(TRACKS));
+    let ((kept, again), expected) = calibrate(Vec::with_capacity(TRACKS));
+    drop((kept, again));
     shared.payload_drops.lock().unwrap().clear();
-    let n = TRACKS as u64;
-    let expected =
-        AllocStats { allocs: raise.allocs * n + reraise.allocs, frees: raise.frees * n + reraise.frees, bytes: raise.bytes * n + reraise.bytes };
     shared.armed.store(true, Ordering::Relaxed);
     mark_audio_thread();
     let mut out = vec![vec![0.0; BLOCK]; 2];
     let (panic, stats) = measure(|| render_active_panic(&mut mix, 4 * BLOCK as i64, &mut out));
-    println!("one panic {raise:?}, re-raise {reraise:?}; the render {stats:?}");
+    println!("the panics alone {expected:?}; the render {stats:?}");
     assert_eq!(stats, expected, "the render adds no heap operation to the panics' own");
     assert!(shared.raised.lock().unwrap().iter().all(|t| *t == here), "serial: every strip rendered on this thread");
     assert_all_dropped_here("serial", &shared, panic, mix);

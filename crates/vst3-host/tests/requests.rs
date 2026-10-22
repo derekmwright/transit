@@ -171,6 +171,7 @@ fn io_changes_reactivate_and_a_reload_request_is_refused_clearly() {
 
 /// A state for the gain fixture whose controller part also carries a "preset" gain (normalized)
 /// that the plug-in returns to at each `getState` (see `tests/fixture`).
+#[cfg(not(target_os = "macos"))]
 fn gain_state_with_preset(preset: f64) -> Vec<u8> {
     let comp = 0.25f64.to_le_bytes();
     let ctrl: Vec<u8> = [0.5f64.to_le_bytes(), preset.to_le_bytes()].concat();
