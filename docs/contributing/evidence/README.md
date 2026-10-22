@@ -11,7 +11,7 @@ a new gate only fixes one instance.
 | [`refutation-review.md`](refutation-review.md) | A second reviewer tries to break the change; verdict shape; the merge bar. |
 | [`escape-record.md`](escape-record.md) | Recording an escaped defect and the gate it produced. |
 | [`tests-as-evidence.md`](tests-as-evidence.md) | Writing a test that proves something. |
-| [`hardware-and-ci.md`](hardware-and-ci.md) | What counts as hardware evidence; CI runs only on tags. |
+| [`hardware-and-ci.md`](hardware-and-ci.md) | What counts as hardware evidence; CI gates every pull request and push to `main`. |
 
 Reading order for a pull request: `gates.md`, then `tests-as-evidence.md`, then
 `refutation-review.md`.

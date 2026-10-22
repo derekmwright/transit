@@ -662,7 +662,7 @@ fn the_paired_input_and_calibration_line_exist_only_under_the_native_backend() {
     assert!(has_control(&t, "paired_input") && calibration_shown(&t), "the native backend pairs an input");
     let line = t.layout()["calibration"].as_str().unwrap().to_string();
     assert!(
-        line.starts_with("not calibrated \u{b7} exclusive: run audio-bench --backend wasapi --loopback --out-device \"Speakers (Realtek)\""),
+        line.starts_with("not calibrated \u{b7} shared: run audio-bench --backend wasapi --loopback --out-device \"Speakers (Realtek)\""),
         "{line}"
     );
     t.pick("paired_input", &format!("{SCARLETT_IN} \u{b7} 2 ch"));

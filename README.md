@@ -18,6 +18,9 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 > [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
 > help right now: see [How to help](#how-to-help).
 
+[![CI](https://github.com/derekmwright/transit/actions/workflows/ci.yml/badge.svg)](https://github.com/derekmwright/transit/actions/workflows/ci.yml)
+Every pull request and push to `main` is checked with clippy, tests and the layer rules on Windows, Linux and macOS, plus the web build and the ASIO and native WASAPI features. Hardware tests are never CI gates.
+
 ![Arrangement view](docs/images/transit-arrange.png)
 
 ![Mixer](docs/images/transit-mixer.png)

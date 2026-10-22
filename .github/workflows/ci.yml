@@ -1,41 +1,131 @@
-# Format, lint, test and layer-check on Linux and Windows. rt.yml adds the realtime-crate matrix.
+# The push gate (issue #4): clippy, tests and the layer check on every pull request and every push
+# to main, on Windows (default WASAPI, native WASAPI, ASIO), Linux and macOS, plus the web build.
+# Hardware tests are #[ignore]d and never run here (docs/contributing/evidence/hardware-and-ci.md).
+# release.yml and rt.yml still run on tags; rt.yml also runs on pushes and pull requests that touch
+# the realtime crates.
 name: CI
 
-# Runs only for release tags and on demand: GitHub Actions minutes are limited.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  windows:
+    name: windows (wasapi, native-wasapi)
+    runs-on: windows-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - run: cargo xtask layers
+      - run: cargo xtask assets
+      - run: cargo clippy --locked --workspace --all-targets --features transit/native-wasapi -- -D warnings
+      - run: cargo test --locked --workspace --features transit/native-wasapi
+
+  # ASIO needs Steinberg's SDK, which asio-sys downloads during the build (or ASIO_SDK_URL supplies).
+  # A failed download must not block a merge, so this job reports without gating.
+  windows-asio:
+    name: windows (asio)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-asio
+      # asio-sys needs libclang for bindgen. windows-latest has LLVM in C:\Program Files\LLVM. Pin the
+      # MSVC ABI as docs/building.md describes (otherwise a MinGW libclang yields E0080 layout errors).
+      - name: ASIO build environment
+        shell: pwsh
+        env:
+          # Optional repository secret: a URL of the ASIO SDK zip the owner hosts. Leave it unset to
+          # let asio-sys download the SDK itself (https://www.steinberg.net/asiosdk).
+          ASIO_SDK_URL: ${{ secrets.ASIO_SDK_URL }}
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path "$llvm\clang.exe")) { throw "LLVM not found at $llvm" }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          "CLANG_PATH=$llvm\clang.exe" >> $env:GITHUB_ENV
+          "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-msvc" >> $env:GITHUB_ENV
+          $llvm >> $env:GITHUB_PATH
+          if ($env:ASIO_SDK_URL) {
+            $zip = Join-Path $env:RUNNER_TEMP 'asio_sdk.zip'
+            $dst = Join-Path $env:RUNNER_TEMP 'asio_sdk_unpacked'
+            Invoke-WebRequest -Uri $env:ASIO_SDK_URL -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $dst -Force
+            # The Steinberg zip holds one top-level folder (asiosdk_*); CPAL_ASIO_DIR is that folder.
+            $sdk = Get-ChildItem $dst -Directory | Select-Object -First 1
+            if (-not (Test-Path (Join-Path $sdk.FullName 'common'))) { throw "ASIO SDK layout unexpected in $dst" }
+            "CPAL_ASIO_DIR=$($sdk.FullName)" >> $env:GITHUB_ENV
+          }
+      - run: cargo clippy --locked -p transit -p audio-bench --all-targets --features transit/asio,transit/native-wasapi,audio-bench/asio -- -D warnings
+      - run: cargo test --locked -p soundcraft-playback -p audio-bench --features soundcraft-playback/asio,audio-bench/asio
+
+  linux:
+    name: linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Linux system libraries
-        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo xtask layers
+        with:
+          key: linux
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  # crates/au-host and the objc2 code in crates/vst3-host compile only here.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  wasm:
+    name: wasm
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - run: cargo xtask wasm

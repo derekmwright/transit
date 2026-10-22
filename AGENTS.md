@@ -46,4 +46,4 @@ cargo xtask assets
 - Run a refutation review on behavior changes; only critical findings block, the rest are known issues.
 - Every bundled asset needs a row in `ATTRIBUTION.md`.
 - American English in code, comments, UI strings and docs.
-- Keep diffs small and in the style of the surrounding code. CI runs only on tags: report what you ran.
+- Keep diffs small and in the style of the surrounding code. CI gates pull requests and pushes to `main`; still report what you ran locally.
