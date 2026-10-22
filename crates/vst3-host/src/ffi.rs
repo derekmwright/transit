@@ -1399,7 +1399,11 @@ impl Class for EventList {
 
 impl EventList {
     fn new(cap: usize) -> EventList {
-        EventList { events: Mutex::new(Vec::with_capacity(cap)), cap }
+        let list = EventList { events: Mutex::new(Vec::with_capacity(cap)), cap };
+        // On macOS the first lock boxes the mutex's pthread_mutex_t (64 bytes). Take it once here,
+        // on the control thread, so `process` never allocates (see the audio-thread knowledge note).
+        drop(list.events.lock());
+        list
     }
     fn with<R>(&self, f: impl FnOnce(&mut Vec<sv::Event>) -> R) -> Option<R> {
         match self.events.try_lock() {
