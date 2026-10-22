@@ -399,7 +399,7 @@ fn a_clean_stop_deletes_the_journal_once_the_autosave_without_the_recording_land
 fn saving_the_session_releases_a_held_journal() {
     let root = folder("placed-saved-file");
     let (mut app, _, path) = stopped(&root);
-    let file = root.join("Song.scraft").to_string_lossy().into_owned();
+    let file = root.join("Song.transit").to_string_lossy().into_owned();
     app.run("session.save", json!({"path": file})).unwrap();
     app.poll_journal();
     assert!(!path.exists() && app.placed_journal.is_none());

@@ -133,7 +133,7 @@ fn dropping_audio_without_a_path_reads_its_bytes() {
 #[test]
 fn non_audio_drops_are_left_to_the_shell() {
     let (mut h, keys) = harness();
-    drop_on_window(&mut h, keys, Dropped { path: PathBuf::from("/tmp/song.scraft"), bytes: Vec::new() });
+    drop_on_window(&mut h, keys, Dropped { path: PathBuf::from("/tmp/song.transit"), bytes: Vec::new() });
     assert_eq!(instrument(&h, keys).plugin, "subtractive_synth");
     assert!(h.state_mut().take_sample_reads().is_empty());
 }

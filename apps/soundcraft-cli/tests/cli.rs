@@ -69,8 +69,8 @@ fn mcp_automation_roots_confine_the_server() {
     let calls = [
         ("import_audio", serde_json::json!({"path": work.join("in.wav").to_str().unwrap()})),
         ("import_audio", serde_json::json!({"path": secret})),
-        ("save_session", serde_json::json!({"path": work.join("saved.scraft").to_str().unwrap()})),
-        ("save_session", serde_json::json!({"path": elsewhere.join("saved.scraft").to_str().unwrap()})),
+        ("save_session", serde_json::json!({"path": work.join("saved.transit").to_str().unwrap()})),
+        ("save_session", serde_json::json!({"path": elsewhere.join("saved.transit").to_str().unwrap()})),
         ("bounce_mix", serde_json::json!({"path": elsewhere.join("mix.wav").to_str().unwrap()})),
     ];
     let (success, stderr, replies) = mcp_session(&[&read_flag, "--automation-write-root", work_s], &calls);
@@ -80,12 +80,12 @@ fn mcp_automation_roots_confine_the_server() {
     assert_eq!(replies[1]["result"]["isError"], true);
     assert!(text(&replies[1]).contains("outside the read root"), "{}", text(&replies[1]));
     assert_eq!(replies[2]["result"]["isError"], false, "{}", replies[2]);
-    assert!(work.join("saved.scraft").exists());
+    assert!(work.join("saved.transit").exists());
     assert_eq!(replies[3]["result"]["isError"], true);
     assert!(text(&replies[3]).contains("outside the write root"), "{}", text(&replies[3]));
     assert_eq!(replies[4]["result"]["isError"], true);
     assert!(text(&replies[4]).contains("outside the write root"), "{}", text(&replies[4]));
-    assert!(!elsewhere.join("saved.scraft").exists() && !elsewhere.join("mix.wav").exists());
+    assert!(!elsewhere.join("saved.transit").exists() && !elsewhere.join("mix.wav").exists());
 
     // A root left out grants none of its access.
     let (_, _, replies) = mcp_session(&[&read_flag], &calls[2..3]);

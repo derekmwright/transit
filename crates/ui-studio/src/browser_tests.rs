@@ -612,7 +612,7 @@ fn the_wheel_scrolls_the_tree() {
 fn the_session_audio_files_folder_is_a_location_once_saved() {
     let mut t = T::new();
     assert!(!t.names().iter().any(|n| n.starts_with("Audio Files")));
-    let path = t.dir.0.join("Song.scraft");
+    let path = t.dir.0.join("Song.transit");
     t.app.run("session.save_as", json!({"path": path.to_string_lossy(), "replace": true})).unwrap();
     t.frames(3);
     let row = t.row_named("Audio Files (this session)");

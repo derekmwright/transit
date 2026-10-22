@@ -9,7 +9,7 @@ fn saving_over_another_session_takes_the_replace_button() {
     let dir = std::env::temp_dir().join(format!("soundcraft-ui-replace-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("Song.scraft");
+    let path = dir.join("Song.transit");
     soundcraft_engine::Engine::default().execute("session.save_as", &json!({"path": path})).unwrap();
     let other = std::fs::read(&path).unwrap();
     let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());

@@ -53,7 +53,12 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({"name": {"type": "string"}, "sample_rate": {"type": "integer"}, "template": {"type": "string", "enum": ["blank", "demo"]}}),
             &[],
         ),
-        tool("open_session", "Open a .scraft session file.", json!({"path": {"type": "string"}}), &["path"]),
+        tool(
+            "open_session",
+            "Open a .transit session file (a .scraft file from before the rename also opens).",
+            json!({"path": {"type": "string"}}),
+            &["path"],
+        ),
         tool(
             "save_session",
             "Save the session (path required the first time; replace: true to save over another existing file).",

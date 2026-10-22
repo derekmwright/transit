@@ -86,7 +86,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("soundcraft-insert-state-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("s.scraft");
+        let path = dir.join("s.transit");
         e.execute("session.save", &json!({"path": path.to_string_lossy()})).unwrap();
         let mut f = Engine::default();
         f.execute("session.open", &json!({"path": path.to_string_lossy()})).unwrap();

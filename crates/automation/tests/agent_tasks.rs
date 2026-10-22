@@ -116,7 +116,7 @@ fn agent_builds_and_mixes_a_session() {
     assert_eq!(&bytes[0..4], b"RIFF");
 
     // 9. Save, reopen, and the mix survives.
-    let sp = dir.join("Agent Mix").join("Agent Mix.scraft");
+    let sp = dir.join("Agent Mix").join("Agent Mix.transit");
     std::fs::create_dir_all(sp.parent().unwrap()).unwrap();
     tool(&mut s, "save_session", json!({"path": sp.to_string_lossy()}));
     tool(&mut s, "new_session", json!({}));

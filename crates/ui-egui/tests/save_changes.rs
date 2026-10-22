@@ -70,7 +70,7 @@ fn closing_a_modified_session_asks_first() {
 fn save_in_the_question_saves_before_closing() {
     let dir = std::env::temp_dir().join(format!("soundcraft-save-changes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+    let path = dir.join("Song.transit").to_string_lossy().into_owned();
 
     let mut h = harness();
     mute_kick(&mut h);

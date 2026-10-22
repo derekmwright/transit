@@ -47,11 +47,11 @@ fn fixture(name: &str) -> Fixture {
         run(&mut e, "file.export_midi", json!({"path": s(dir.join("keys.mid")), "tracks": ["Keys"]}));
         run(&mut e, "edit.select", json!({"tracks": ["Bass"]}));
         run(&mut e, "track.save_preset", json!({"path": s(dir.join("bass.json"))}));
-        run(&mut e, "session.save_as", json!({"path": s(dir.join("song.scraft")), "replace": true}));
+        run(&mut e, "session.save_as", json!({"path": s(dir.join("song.transit")), "replace": true}));
         let clips = e.session().track_by_name("Kick").unwrap().clips().iter().map(|c| c.id.0).collect::<Vec<_>>();
         run(&mut e, "file.export_clip_groups", json!({"path": s(dir.join("group.scgrp")), "clips": clips}));
     }
-    for f in ["secret.wav", "secret.mid", "secret.scraft", "secret.json", "secret.scgrp", "secret.mp4"] {
+    for f in ["secret.wav", "secret.mid", "secret.transit", "secret.json", "secret.scgrp", "secret.mp4"] {
         std::fs::write(outside.join(f), SECRET).unwrap();
     }
     Fixture { base, read, write, outside }
@@ -111,13 +111,13 @@ fn inspect(s: &mut Server<Headless>) -> Value {
 fn reads(dir: &Path, name: &dyn Fn(&str) -> String) -> Vec<(&'static str, Value)> {
     let p = |f: &str| s(dir.join(name(f)));
     vec![
-        ("session.open", json!({"path": p("song.scraft")})),
+        ("session.open", json!({"path": p("song.transit")})),
         ("file.import_audio", json!({"path": p("tone.wav")})),
         ("file.import_audio", json!({"paths": [p("tone.wav")]})),
         ("file.import_midi", json!({"path": p("keys.mid")})),
         ("file.import_video", json!({"path": p("movie.mp4")})),
         ("file.import_clip_groups", json!({"path": p("group.scgrp")})),
-        ("file.import_session_data", json!({"path": p("song.scraft")})),
+        ("file.import_session_data", json!({"path": p("song.transit")})),
         ("track.load_preset", json!({"path": p("bass.json"), "tracks": ["Bass"]})),
     ]
 }
@@ -142,17 +142,17 @@ fn reads_outside_the_read_root_are_refused_and_nothing_reaches_the_result() {
     ok(&mut srv, "file.import_audio", json!({"path": s(f.read.join("tone.wav"))}));
     ok(&mut srv, "file.import_midi", json!({"path": s(f.read.join("keys.mid"))}));
     ok(&mut srv, "file.import_clip_groups", json!({"path": s(f.read.join("group.scgrp"))}));
-    ok(&mut srv, "file.import_session_data", json!({"path": s(f.read.join("song.scraft")), "tracks": ["Kick"]}));
+    ok(&mut srv, "file.import_session_data", json!({"path": s(f.read.join("song.transit")), "tracks": ["Kick"]}));
     ok(&mut srv, "track.load_preset", json!({"path": s(f.read.join("bass.json")), "tracks": ["Bass"]}));
     ok(&mut srv, "mix.sampler_load", json!({"track": "Pads", "path": s(f.read.join("tone.wav"))}));
     // A missing movie inside the root is an ordinary error, not a refusal.
     let (failed, text) = run(&mut srv, "file.import_video", json!({"path": s(f.read.join("movie.mp4"))}));
     assert!(failed && !text.contains("read root"), "{text}");
-    ok(&mut srv, "session.open", json!({"path": s(f.read.join("song.scraft"))}));
+    ok(&mut srv, "session.open", json!({"path": s(f.read.join("song.transit"))}));
     // The typed tools take the same path through the same checks.
     let r = srv
         .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "open_session", "arguments": {"path": s(f.outside.join("secret.scraft"))}}}))
+            "params": {"name": "open_session", "arguments": {"path": s(f.outside.join("secret.transit"))}}}))
         .unwrap();
     assert_eq!(r["result"]["isError"], true);
     assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("outside the read root"));
@@ -168,16 +168,16 @@ fn writes(dir: &Path) -> Vec<(&'static str, Value)> {
     let p = |f: &str| s(dir.join(f));
     let clip = kick_clip();
     vec![
-        ("session.save", json!({"path": p("a.scraft")})),
-        ("session.save_as", json!({"path": p("b.scraft")})),
-        ("session.save_copy", json!({"path": p("c.scraft")})),
-        ("session.save_template", json!({"path": p("d.scraft")})),
+        ("session.save", json!({"path": p("a.transit")})),
+        ("session.save_as", json!({"path": p("b.transit")})),
+        ("session.save_copy", json!({"path": p("c.transit")})),
+        ("session.save_template", json!({"path": p("d.transit")})),
         ("file.bounce_mix", json!({"path": p("e.wav"), "start": 0, "end": 4800})),
         ("file.bounce_stems", json!({"dir": p("stems"), "start": 0, "end": 4800})),
         ("file.export_midi", json!({"path": p("f.mid")})),
         ("file.export_session_text", json!({"path": p("g.txt")})),
         ("file.export_clips", json!({"dir": p("clips"), "clips": [clip]})),
-        ("file.export_selected_tracks_as_session", json!({"path": p("h.scraft"), "tracks": ["Kick"]})),
+        ("file.export_selected_tracks_as_session", json!({"path": p("h.transit"), "tracks": ["Kick"]})),
         ("file.export_sibelius", json!({"path": p("i.musicxml")})),
         ("file.send_to_sibelius", json!({"path": p("j.musicxml")})),
         ("file.print_score", json!({"path": p("k.svg")})),
@@ -222,7 +222,7 @@ fn saving_over_an_existing_file_outside_does_not_report_that_it_exists() {
     let f = fixture("exists");
     let mut srv = demo_server(Some(&f.read), Some(&f.write));
     // Without `replace`, an existing target is reported as existing: not for a path outside the root.
-    refused(&mut srv, "session.save_as", json!({"path": s(f.outside.join("song.scraft"))}), "outside the write root");
+    refused(&mut srv, "session.save_as", json!({"path": s(f.outside.join("song.transit"))}), "outside the write root");
 }
 
 #[test]
@@ -231,13 +231,13 @@ fn the_typed_bounce_and_save_tools_are_confined() {
     let mut srv = demo_server(Some(&f.read), Some(&f.write));
     for (tool, args) in [
         ("bounce_mix", json!({"path": s(f.outside.join("x.wav")), "start": 0, "end": 4800})),
-        ("save_session", json!({"path": s(f.outside.join("x.scraft"))})),
+        ("save_session", json!({"path": s(f.outside.join("x.transit"))})),
     ] {
         let r = srv.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}})).unwrap();
         assert_eq!(r["result"]["isError"], true, "{tool}");
         assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("outside the write root"), "{tool}");
     }
-    assert!(!f.outside.join("x.wav").exists() && !f.outside.join("x.scraft").exists());
+    assert!(!f.outside.join("x.wav").exists() && !f.outside.join("x.transit").exists());
     let r = srv
         .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "bounce_mix", "arguments": {"path": s(f.write.join("x.wav")), "start": 0, "end": 4800}}}))
@@ -301,7 +301,7 @@ fn links_out_of_the_roots_are_refused() {
     let before = listing(&f.outside);
     refused(&mut srv, "file.bounce_mix", json!({"path": s(f.write.join("away/x.wav"))}), "outside the write root");
     refused(&mut srv, "file.bounce_stems", json!({"dir": s(f.write.join("away/stems"))}), "outside the write root");
-    refused(&mut srv, "session.save_as", json!({"path": s(f.write.join("away/x.scraft"))}), "outside the write root");
+    refused(&mut srv, "session.save_as", json!({"path": s(f.write.join("away/x.transit"))}), "outside the write root");
     refused(&mut srv, "file.bounce_mix", json!({"path": s(f.write.join("dangling.wav"))}), "a link that leads nowhere");
     assert_eq!(listing(&f.outside), before, "nothing was written through a link");
     assert!(!f.outside.join("not-yet.wav").exists());
@@ -316,7 +316,7 @@ fn links_out_of_the_roots_are_refused() {
 #[test]
 fn media_a_session_names_outside_the_read_root_is_not_loaded() {
     let f = fixture("media");
-    let session = f.read.join("song.scraft");
+    let session = f.read.join("song.transit");
     let text = std::fs::read_to_string(&session).unwrap();
     let outside_wav = s(f.outside.join("tone.wav"));
     let swapped = {

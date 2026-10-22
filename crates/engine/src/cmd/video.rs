@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(e.session().tracks.iter().filter(|t| t.kind == TrackKind::Video).count(), 1);
         e.execute("edit.undo", &json!({})).unwrap();
         // Save, reopen: the clip and the movie reference round-trip; nothing is missing.
-        let sess = dir.join("s.scraft");
+        let sess = dir.join("s.transit");
         e.execute("session.save_as", &json!({"path": sess.to_string_lossy()})).unwrap();
         let mut e2 = Engine::default();
         let missing = crate::io::open_session(&mut e2, &sess.to_string_lossy()).unwrap();

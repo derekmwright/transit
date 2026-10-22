@@ -13,7 +13,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
-const SESSION: &str = "session.scraft";
+const SESSION: &str = "session.transit";
+/// The name autosave folders written before `.transit` use for the session.
+const LEGACY_SESSION: &str = "session.transit";
 const ORIGIN: &str = "origin";
 const LOCK: &str = "lock";
 /// The plan of a recording still running when the folder was written.
@@ -292,12 +294,13 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         }
         let origin = std::fs::read_to_string(dir.join(ORIGIN)).ok().filter(|o| !o.is_empty());
         let origin_saved = origin.as_ref().and_then(|o| std::fs::metadata(o).and_then(|m| m.modified()).ok());
-        let saved = std::fs::metadata(dir.join(SESSION)).and_then(|m| m.modified());
+        let session_file = session_in(&dir);
+        let saved = std::fs::metadata(&session_file).and_then(|m| m.modified());
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
             Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
-                let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
+                let text = std::fs::read_to_string(&session_file).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
                 let plan = recording.then(|| plan_of(&dir)).flatten();
@@ -314,12 +317,19 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
     out
 }
 
+/// The session file of an autosave folder: the `.transit` one, or an older folder's `.transit`.
+fn session_in(dir: &Path) -> PathBuf {
+    let current = dir.join(SESSION);
+    let legacy = dir.join(LEGACY_SESSION);
+    if !current.exists() && legacy.exists() { legacy } else { current }
+}
+
 /// Open `left` as an unsaved version of the session it came from, so Save writes it back there,
 /// with the takes of a recording that never finished placed as Stop would have. Returns the
 /// media that couldn't be loaded.
 pub fn recover(e: &mut Engine, left: &Leftover) -> Result<Vec<String>> {
     let mut r = Engine::default();
-    let session = left.dir.join(SESSION);
+    let session = session_in(&left.dir);
     let links = left.origin.as_deref().map_or(session.as_path(), Path::new);
     let mut missing = open_session_linked(&mut r, &session.to_string_lossy(), links)?;
     let mut s = r.session().clone();
@@ -534,7 +544,7 @@ mod tests {
     #[test]
     fn saved_audio_is_referenced_and_takes_are_copied_once() {
         let dir = folder("autosave-copies");
-        let path = dir.join("Song/Song.scraft");
+        let path = dir.join("Song/Song.transit");
         let mut e = Engine::default();
         record(&mut e, 0.5);
         crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
@@ -794,7 +804,7 @@ mod tests {
     #[test]
     fn unsaved_work_is_offered_once_its_session_closes() {
         let dir = folder("autosave-leftovers");
-        let path = dir.join("Song.scraft").to_string_lossy().into_owned();
+        let path = dir.join("Song.transit").to_string_lossy().into_owned();
         let root = dir.join("Autosave");
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = Engine::default();

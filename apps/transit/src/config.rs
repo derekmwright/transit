@@ -203,9 +203,9 @@ mod tests {
         let (old, new) = (root.join("transitDAW"), root.join("transit"));
         std::fs::create_dir_all(old.join("Autosave")).unwrap();
         std::fs::write(old.join("ui.json"), b"{}").unwrap();
-        std::fs::write(old.join("Autosave/a.scraft"), b"a").unwrap();
+        std::fs::write(old.join("Autosave/a.transit"), b"a").unwrap();
         assert_eq!(migrate_legacy_dir(&new, &old), Migration::Moved);
-        assert!(new.join("ui.json").is_file() && new.join("Autosave/a.scraft").is_file());
+        assert!(new.join("ui.json").is_file() && new.join("Autosave/a.transit").is_file());
         assert!(!old.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -271,8 +271,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("transit-recent-files-{}", std::process::id()));
         let path = dir.join("ui.json");
         let mut ui = transit_ui_studio::UiState::default();
-        ui.remember_recent(Path::new("/music/a.scraft"), 100);
-        ui.remember_recent(Path::new("/music/b.scraft"), 200);
+        ui.remember_recent(Path::new("/music/a.transit"), 100);
+        ui.remember_recent(Path::new("/music/b.transit"), 200);
         save_ui(&path, &ui).unwrap();
         assert_eq!(load_ui(&path).unwrap().unwrap().recent_files, ui.recent_files);
         let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

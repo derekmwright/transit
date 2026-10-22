@@ -124,30 +124,30 @@ mod tests {
     #[test]
     fn newest_first_without_duplicates_and_capped() {
         let mut l = Vec::new();
-        assert!(note(&mut l, "a.scraft"));
-        assert!(note(&mut l, "b.scraft"));
-        assert!(!note(&mut l, "b.scraft"), "already at the front");
-        assert!(note(&mut l, "a.scraft"));
-        assert_eq!(l, ["a.scraft", "b.scraft"]);
+        assert!(note(&mut l, "a.transit"));
+        assert!(note(&mut l, "b.transit"));
+        assert!(!note(&mut l, "b.transit"), "already at the front");
+        assert!(note(&mut l, "a.transit"));
+        assert_eq!(l, ["a.transit", "b.transit"]);
         for i in 0..20 {
-            note(&mut l, &format!("{i}.scraft"));
+            note(&mut l, &format!("{i}.transit"));
         }
         assert_eq!(l.len(), MAX_RECENT);
-        assert_eq!(l.first().map(String::as_str), Some("19.scraft"));
+        assert_eq!(l.first().map(String::as_str), Some("19.transit"));
         assert!(!note(&mut l, ""), "an empty path is never recorded");
     }
 
     #[test]
     fn windows_paths_match_regardless_of_case_and_separator() {
-        let mut l = vec![r"C:\Songs\Mix.scraft".to_string()];
-        note(&mut l, "c:/songs/mix.scraft");
+        let mut l = vec![r"C:\Songs\Mix.transit".to_string()];
+        note(&mut l, "c:/songs/mix.transit");
         assert_eq!(l.len(), if cfg!(windows) { 1 } else { 2 });
     }
 
     #[test]
     fn label_names_the_session_and_its_folder() {
-        assert_eq!(label("/x/on the mob/on the mob.scraft"), "on the mob  —  on the mob");
-        assert_eq!(label("solo.scraft"), "solo");
+        assert_eq!(label("/x/on the mob/on the mob.transit"), "on the mob  —  on the mob");
+        assert_eq!(label("solo.transit"), "solo");
     }
 
     #[test]

@@ -81,7 +81,7 @@ impl T {
     /// Save a new session named `name` in the fixture folder and return its path.
     fn save_new(&mut self, name: &str) -> String {
         self.app.run("session.new", json!({"name": name})).unwrap();
-        let path = self.dir.path(&format!("{name}.scraft"));
+        let path = self.dir.path(&format!("{name}.transit"));
         self.app.run("session.save_as", json!({"path": path, "replace": true})).unwrap();
         path
     }
@@ -124,7 +124,7 @@ fn opened_and_saved_sessions_list_most_recent_first_without_duplicates() {
     t.open(&a);
     assert_eq!(t.recent(), [abs(&a), abs(&b)], "opening one again moves it to the top, no duplicate");
     let items = t.show_menu();
-    assert_eq!(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["Alpha.scraft", "Bravo.scraft"]);
+    assert_eq!(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["Alpha.transit", "Bravo.transit"]);
     assert_eq!(items[0].folder, t.dir.0.file_name().unwrap().to_string_lossy());
     assert!(items.iter().all(|i| !i.missing));
     assert!(!t.app.engine.is_dirty(), "the list is not part of the document");
@@ -138,7 +138,7 @@ fn picking_an_entry_opens_it_through_file_open() {
     t.save_new("Bravo");
     assert_eq!(t.app.engine.session().name, "Bravo");
     let items = t.show_menu();
-    let alpha = items.iter().find(|i| i.name == "Alpha.scraft").unwrap();
+    let alpha = items.iter().find(|i| i.name == "Alpha.transit").unwrap();
     t.click(mid(alpha.rect));
     assert_eq!(t.app.engine.session().name, "Alpha");
     assert_eq!(t.app.engine.path.as_deref(), Some(a.as_str()));
@@ -172,7 +172,7 @@ fn a_missing_file_is_dimmed_and_picking_it_removes_it() {
     let b = t.save_new("Bravo");
     std::fs::remove_file(&a).unwrap();
     let items = t.show_menu();
-    assert_eq!(items.iter().map(|i| (i.name.as_str(), i.missing)).collect::<Vec<_>>(), [("Bravo.scraft", false), ("Alpha.scraft", true)]);
+    assert_eq!(items.iter().map(|i| (i.name.as_str(), i.missing)).collect::<Vec<_>>(), [("Bravo.transit", false), ("Alpha.transit", true)]);
     let gone = items[1].rect;
     t.click(mid(gone));
     assert_eq!(t.app.status, "File not found");
@@ -206,7 +206,7 @@ fn autosave_files_are_never_listed() {
     let auto = t.dir.0.join("Autosave");
     std::fs::create_dir_all(&auto).unwrap();
     t.app.autosave_dir = Some(auto.clone());
-    let p = auto.join("x.scraft").to_string_lossy().into_owned();
+    let p = auto.join("x.transit").to_string_lossy().into_owned();
     t.app.run("session.save_as", json!({"path": p, "replace": true})).unwrap();
     assert!(t.recent().is_empty());
 }
@@ -214,8 +214,8 @@ fn autosave_files_are_never_listed() {
 #[test]
 fn ui_json_round_trips_the_list_and_an_old_file_loads() {
     let mut ui = UiState::default();
-    ui.remember_recent(std::path::Path::new("/music/a.scraft"), 100);
-    ui.remember_recent(std::path::Path::new("/music/b.scraft"), 200);
+    ui.remember_recent(std::path::Path::new("/music/a.transit"), 100);
+    ui.remember_recent(std::path::Path::new("/music/b.transit"), 200);
     let text = serde_json::to_string(&ui).unwrap();
     let back: UiState = serde_json::from_str(&text).unwrap();
     assert_eq!(back.recent_files, ui.recent_files);

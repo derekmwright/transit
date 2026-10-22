@@ -719,7 +719,7 @@ mod tests {
         app.dialogs.open = None;
 
         let dir = std::env::temp_dir().join(format!("soundcraft-save-{}", std::process::id()));
-        let path = dir.join("Song.scraft");
+        let path = dir.join("Song.transit");
         app.run("session.save_as", json!({"path": path.to_string_lossy()})).unwrap();
         app.run("track.new", json!({})).unwrap();
         assert!(!invoke_shortcut_dialog(&mut app, "session.save"));

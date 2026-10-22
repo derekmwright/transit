@@ -298,7 +298,7 @@ mod tests {
         add_notes(&mut e, t, &[(64, 0, 1)]);
         e.execute("mix.sampler_load", &json!({"track": t.0, "path": wav.to_string_lossy(), "params": {"root_note": 64, "loop_mode": 1}})).unwrap();
         let before = render(&e, 1);
-        let path = d.join("song.scraft");
+        let path = d.join("song.transit");
         e.execute("session.save_as", &json!({"path": path.to_string_lossy()})).unwrap();
         std::fs::remove_file(&wav).unwrap();
         let mut e2 = Engine::default();

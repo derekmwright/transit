@@ -31,7 +31,7 @@ impl StudioApp {
     }
 
     pub fn save_as(&mut self) -> bool {
-        let name = format!("{}.scraft", self.engine.session().name);
+        let name = format!("{}.transit", self.engine.session().name);
         let Some(path) = self.services.pick_save.as_ref().and_then(|f| f(&name)) else { return false };
         self.run("session.save_as", json!({"path": path, "replace": true})).is_ok()
     }

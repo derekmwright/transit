@@ -1,6 +1,6 @@
 //! transit desktop app: the studio UI over the transit engine.
 //!
-//! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.scraft]`
+//! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.transit]`
 //!
 //! `--control <port>` (or `TRANSIT_CONTROL_PORT`) starts a localhost JSON-lines control server
 //! (`0` picks a free port and prints it). Connections must start with `auth <token>`, the token in the
@@ -145,7 +145,7 @@ impl eframe::App for App {
 
 fn open_path(app: &mut StudioApp, p: &str) {
     let lower = p.to_ascii_lowercase();
-    if lower.ends_with(".scraft") {
+    if lower.ends_with(".transit") || lower.ends_with(".scraft") {
         app.run_or_ask("session.open", serde_json::json!({"path": p}));
         return;
     }
@@ -214,7 +214,7 @@ fn services() -> Services {
                 return d.pick_folder().map(|p| p.to_string_lossy().into_owned());
             }
             let d = match purpose {
-                "session.open" => d.add_filter("Session", &["scraft"]),
+                "session.open" => d.add_filter("Session", &["transit", "scraft"]),
                 _ => d.add_filter("Audio", &["wav", "wave", "aif", "aiff", "flac", "mp3", "ogg"]),
             };
             d.pick_file().map(|p| p.to_string_lossy().into_owned())
@@ -224,7 +224,7 @@ fn services() -> Services {
             let ext = std::path::Path::new(default).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
             let d = match ext.as_str() {
                 "wav" | "aif" | "aiff" | "flac" => rfd::FileDialog::new().add_filter("Audio", &[ext.as_str()]),
-                _ => rfd::FileDialog::new().add_filter("Session", &["scraft"]),
+                _ => rfd::FileDialog::new().add_filter("Session", &["transit"]),
             };
             d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
         })),

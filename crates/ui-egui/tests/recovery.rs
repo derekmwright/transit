@@ -34,7 +34,7 @@ fn eventually(done: impl Fn() -> bool) -> bool {
 
 fn autosaved(root: &Path) -> String {
     let folders = std::fs::read_dir(root).into_iter().flatten().flatten();
-    folders.map(|d| std::fs::read_to_string(d.path().join("session.scraft")).unwrap_or_default()).collect()
+    folders.map(|d| std::fs::read_to_string(d.path().join("session.transit")).unwrap_or_default()).collect()
 }
 
 fn launch(root: &Path) -> SoundApp {
@@ -49,7 +49,7 @@ fn an_exit_without_quit_offers_unsaved_changes_at_the_next_launch() {
     let _one = one_at_a_time();
     let dir = folder("recovery-quit");
     let root = dir.join("Autosave");
-    let path = dir.join("Song.scraft");
+    let path = dir.join("Song.transit");
     let mut first = launch(&root);
     first.run("session.save_as", json!({"path": path})).unwrap();
     first.run("track.new", json!({"name": "Vocal"})).unwrap();

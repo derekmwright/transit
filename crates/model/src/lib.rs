@@ -33,8 +33,8 @@ pub use route_graph::{
     disable_hardware_conflicts, hardware_conflict, hardware_problem, new_cycle, new_hardware_problem, would_create_cycle, would_create_cycle_all,
 };
 pub use session::{
-    BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,
-    ZoomState, ZoomToggle, truncate_chars,
+    BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, LEGACY_SESSION_EXTENSION, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session,
+    SessionError, Tool, ZoomState, ZoomToggle, is_legacy_session_file, is_session_file, truncate_chars,
 };
 pub use source::{Source, SourceAudio, SourcePool, VideoSource};
 pub use track::{Frozen, Playlist, TRACK_COLORS, Track, TrackHeight, TrackKind};

@@ -78,7 +78,7 @@ fn refused_any(r: Result<serde_json::Value, EngineError>) -> String {
 fn temp(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("transit-hwins-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join("s.scraft")
+    dir.join("s.transit")
 }
 
 #[test]

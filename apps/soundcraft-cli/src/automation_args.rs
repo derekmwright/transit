@@ -53,13 +53,13 @@ mod tests {
     #[test]
     fn roots_are_taken_once_and_other_arguments_are_left() {
         let mut roots = AutomationArgs::new(None, None);
-        let mut args = ["a folder".to_owned(), "song.scraft".to_owned()].into_iter();
+        let mut args = ["a folder".to_owned(), "song.transit".to_owned()].into_iter();
         assert!(roots.consume("--automation-read-root", &mut args).unwrap());
         assert!(roots.consume("--automation-write-root=out", &mut args).unwrap());
         assert!(!roots.consume("--demo", &mut args).unwrap());
         assert_eq!(roots.read_root, Some("a folder".into()));
         assert_eq!(roots.write_root, Some("out".into()));
-        assert_eq!(args.next().as_deref(), Some("song.scraft"));
+        assert_eq!(args.next().as_deref(), Some("song.transit"));
         assert!(roots.consume("--automation-read-root=other", &mut args).is_err());
         assert_eq!(roots.read_root, Some("a folder".into()));
     }

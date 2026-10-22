@@ -8,7 +8,7 @@ fn nothing_replaces_or_quits_a_session_while_it_records() {
     e.transport.recording = true;
     for (id, params) in [
         ("session.new", json!({})),
-        ("session.open", json!({"path": "Song.scraft"})),
+        ("session.open", json!({"path": "Song.transit"})),
         ("session.close", json!({})),
         ("session.revert", json!({})),
         ("app.quit", json!({})),

@@ -1,9 +1,9 @@
 //! `soundcraft-cli`: SoundCraft without a window.
 //!
 //! ```text
-//! soundcraft-cli info FILE                       audio file or .scraft summary
+//! soundcraft-cli info FILE                       audio file or .transit summary
 //! soundcraft-cli convert IN OUT [--bit-depth 16|24|32f] [--rate HZ] [--normalize]
-//! soundcraft-cli run [--in S.scraft | --demo] [--cmd ID[=JSON]]… [--bounce OUT] [--start T --end T] [--save S.scraft] [--inspect]
+//! soundcraft-cli run [--in S.transit | --demo] [--cmd ID[=JSON]]… [--bounce OUT] [--start T --end T] [--save S.transit] [--inspect]
 //! soundcraft-cli script FILE [--in S | --demo] [--save S] [--bounce OUT]   (one `ID JSON` per line)
 //! soundcraft-cli commands [FILTER]               list commands
 //! soundcraft-cli describe ID                     one command's details
@@ -97,7 +97,7 @@ fn main() -> ExitCode {
 
 fn info(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else { return fail("info FILE") };
-    if path.ends_with(".scraft") {
+    if path.ends_with(".transit") || path.ends_with(".scraft") {
         let mut e = Engine::default();
         match soundcraft_engine::io::open_session(&mut e, path) {
             Ok(missing) => warn_missing(&missing),
