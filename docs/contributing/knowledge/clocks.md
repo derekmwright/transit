@@ -20,6 +20,11 @@ Each stream's callbacks give `Observation`s with a `Stamp` of a `Quality`: `Inva
 (`crates/playback/src/device_clock.rs`). A bounded fit maps B (or arrival) to D with an error
 bound. Code must carry the quality along and degrade, not assume numbers are exact.
 
+Stamps come from the audio backend trait (`crates/audio-backend`): every device block carries a
+`Stamp` in origin-relative nanoseconds with its `Quality`. The cpal adapter
+(`crates/playback/src/backend/cpal.rs`) maps cpal timestamps to stamps; the clock service consumes
+only stamps.
+
 ## Why MIDI timing can be "approximate"
 
 A MIDI event is timestamped in its own backend domain (WinMM). Placing it at a device frame needs

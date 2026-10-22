@@ -25,7 +25,8 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Tempo and meter changes along the timeline, edited by dragging or typing in the transport.
 - Transport metronome button: right-click for click level and count-in bars. Count-in works at bar 1, and recording starts sample-exact at the end of it.
 - Transport load readout (for example "30%  128 @ 48 kHz  ASIO") with an overload warning.
-- Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor (no MIDI recording yet; it is next).
+- Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor. Keys you play live are accented on the piano roll's keyboard.
+- Freeze, Unfreeze and Flatten a track (the snowflake on the track header); a frozen track plays its rendered audio, with its key sources running.
 
 ### Mixer and routing
 
@@ -41,7 +42,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Hosts CLAP and VST3 plug-ins, with their own editor windows, saved state, and reported latency.
 - The device card shows Loading while a heavy plug-in instantiates.
 - Plug-in browser with a background scan and your own search folders.
-- Built-in instruments: Subtractive Synth, Drum Synth, Sampler.
+- Built-in instruments: Subtractive Synth, Drum Synth, Sampler. All built-ins open an editor window: parameter rows, Sampler load or drop, Drum Synth by pad.
 - Built-in dynamics and EQ: Compressor/Limiter, Expander/Gate, De-Esser, Maximizer, Channel Strip, EQ 7-Band, EQ 1-Band.
 - Built-in effects: Room and Plate Reverb, Mod Delay, Chorus, Flanger, Phaser, Saturator, Lo-Fi, Rectifier, Pitch Shifter.
 - Utilities: Gain, Trim, Invert, Time Shift, DC Offset Removal, Signal Generator, Dither.
@@ -50,6 +51,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
+- MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass; each loop pass becomes a take; the lane shows the growing clip while you play.
 
 ### Audio devices
 
@@ -63,18 +65,18 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Bounce in Place turns a track's clips into audio.
 - Full undo history; every edit is a command.
 - Autosave, and sessions saved as versioned, human-readable JSON.
-- Import audio and MIDI files; export MIDI.
+- Import audio and MIDI files; export MIDI. File > Open Recent lists your last ten sessions (Ctrl+Shift+O).
 
 ### Under the hood
 
-- Pure Rust: egui UI on the SoundCraft engine.
+- An audio backend trait sits between the Player and the audio system, with cpal behind it as the first adapter.
 - One renderer: playback and offline render both use the plan renderer; the legacy renderer is gone.
 - Offline render and playback are checked against each other by golden tests.
 - Every edit is a named command, which is what makes undo and the command catalog uniform.
 
 ## Status
 
-Pre-alpha. Windows is tested daily; macOS and Linux build but are untested. Releases are WASAPI-only;
+Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested. Releases are WASAPI-only;
 ASIO is available when you build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
 Expect rough edges and breaking changes to the session format. Back up anything you care about.
 
@@ -116,6 +118,7 @@ disables saving settings.
 
 - Pre-alpha; the session format and UI change freely.
 - A heavy plug-in can still block the UI for the duration of its single create call.
+- MIDI recording has no take file yet (a crash mid-pass loses that pass's MIDI), and Freeze renders a fixed 2 second tail.
 - Windows releases are unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft

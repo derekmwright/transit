@@ -16,6 +16,14 @@ A lost take is a merge-blocking defect. Treat every change here as high risk.
 - **Data safety:** take data is the user's work. Never add a path that can discard captured frames
   on stop, device loss or a full buffer without surfacing it; cap allocations, but never by dropping
   a take silently.
+- **MIDI recording:** `crates/playback/src/midi_capture.rs` is a preallocated lock-free ring (64Ki
+  events, a reserve kept for note-offs) the audio thread fills with each admitted live event and its
+  device frame; the ring is shared by all tracks, and a full ring drops the event and counts it
+  (surfaced as events lost). The same record-start latch and `start/mapping.rs` map frames to the
+  session, so a MIDI take lines up with an audio take. `crates/engine/src/midi_take.rs` assembles
+  takes at Stop: pairs note-ons with note-offs, converts to ticks, merges an overdub into the one
+  clip under the pass, duplicates the playlist when several clips are in the way, and makes one
+  playlist per loop pass. There is no MIDI take file yet (known issue K11).
 
 Tests: `crates/engine/tests/recording.rs`, `crates/playback/tests/monitor_contract.rs`,
 `crates/playback/tests/publication_contract.rs`.
