@@ -36,7 +36,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Hosted plug-ins can take a sidechain key too.
 - Plug-in delay compensation keeps every path time-aligned.
 - Opens every output on your interface; name your own paths and route tracks, buses and sends to any of them.
-- Hardware inserts: send a track through outboard gear on your interface. Choose "Hardware Insert..." in the device chain's "+" menu, then pick a send path and a return path (a pair) on the insert. Audio Devices > I/O > Hardware inserts has a Measure button that plays a click and records the round trip, which delay compensation then uses so the track stays aligned. The insert shows Ready, Unmeasured, No input, Missing send, Missing return or Disabled, with the reason. A route to a path an insert sends on is refused.
+- Hardware inserts: send a track through outboard gear on your interface. Choose "Hardware Insert..." in the device chain's "+" menu, then pick a send path and a return path (a pair) on the insert. Audio Devices > I/O > Hardware inserts has a Measure button that plays a click train and records the round trip, which delay compensation then uses so the track stays aligned. Measure runs in the background with a progress count (n/8 clicks) and a Cancel button, so the UI stays responsive. The insert shows Ready, Unmeasured, No input, Missing send, Missing return or Disabled, with the reason. A route to a path an insert sends on is refused.
 
 ### Instruments and effects
 
@@ -61,7 +61,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 - Audio Devices window to pick the driver (WASAPI, or ASIO in builds you make yourself), device and buffer size.
 - Named input and output paths, saved per machine.
-- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. `audio-bench --backend wasapi` measures it.
+- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. `audio-bench --backend wasapi` measures it.
 - Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated".
 - Tracks, buses and sends route to any output path, with latency aligned across them.
 
@@ -72,7 +72,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Bounce in Place turns a track's clips into audio.
 - Full undo history; every edit is a command.
 - Autosave, and sessions saved as versioned, human-readable JSON.
-- A launch splash with plug-in scan progress, and Help > About with version info.
+- A launch splash that reports the audio device opening first, then plug-in scan progress, and Help > About with version info.
 - Import audio and MIDI files; export MIDI. File > Open Recent lists your last ten sessions (Ctrl+Shift+O).
 
 ### Under the hood
@@ -84,7 +84,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 ## Status
 
-Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested. Releases are WASAPI-only;
+Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). Releases are WASAPI-only;
 ASIO is available when you build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
 Expect rough edges and breaking changes to the session format. Back up anything you care about.
 
