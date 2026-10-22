@@ -35,13 +35,41 @@ pub struct FakeBackend {
     attempts: Vec<OpenRequest>,
     capture_channels: u16,
     duplex: bool,
+    /// Channel names (inputs, outputs) the device reports.
+    names: (Vec<String>, Vec<String>),
+    /// The latency each opened stream reports.
+    latency: Option<Duration>,
 }
 
 impl FakeBackend {
     /// A system named "Fake" with one device that opens in `format`.
     pub fn new(format: Format) -> Self {
         let request = OpenRequest { format, period: Period::Default, mode: Mode::Shared, origin: crate::HostOrigin::default(), calibration: None };
-        Self { state: Arc::default(), name: "Fake device".into(), system: "Fake".into(), attempts: vec![request], capture_channels: 0, duplex: false }
+        Self {
+            state: Arc::default(),
+            name: "Fake device".into(),
+            system: "Fake".into(),
+            attempts: vec![request],
+            capture_channels: 0,
+            duplex: false,
+            names: (Vec::new(), Vec::new()),
+            latency: None,
+        }
+    }
+    /// The system and device names (for example "ASIO" and a driver's registry name).
+    pub fn named(mut self, system: &str, device: &str) -> Self {
+        (self.system, self.name) = (system.into(), device.into());
+        self
+    }
+    /// The channel names the device reports (inputs, outputs), as `getChannelInfo` would.
+    pub fn with_channel_names(mut self, inputs: Vec<String>, outputs: Vec<String>) -> Self {
+        self.names = (inputs, outputs);
+        self
+    }
+    /// The latency every stream reports in its [`Achieved`] and [`Stream::latency`].
+    pub fn with_latency(mut self, latency: Duration) -> Self {
+        self.latency = Some(latency);
+        self
     }
     /// Plan these requests, in order, instead of one.
     pub fn with_attempts(mut self, attempts: Vec<OpenRequest>) -> Self {
@@ -113,8 +141,8 @@ impl FakeBackend {
             return Err(error);
         }
         Ok((
-            Box::new(FakeStream { state: Arc::clone(&self.state), direction }),
-            Achieved { buffer_frames: request.period.frames(), ..Achieved::requested(request.format, request.period) },
+            Box::new(FakeStream { state: Arc::clone(&self.state), direction, latency: self.latency }),
+            Achieved { buffer_frames: request.period.frames(), latency: self.latency, ..Achieved::requested(request.format, request.period) },
         ))
     }
 }
@@ -140,6 +168,12 @@ impl Backend for FakeBackend {
     }
     fn capture_with_render(&self, _render: &Endpoint) -> bool {
         self.duplex && self.capture_channels > 0
+    }
+    fn channel_names(&self, _endpoint: &Endpoint, direction: Direction) -> Vec<String> {
+        match direction {
+            Direction::Input => self.names.0.clone(),
+            Direction::Output => self.names.1.clone(),
+        }
     }
     fn capture_format(&self, _endpoint: &Endpoint, rate: Option<u32>) -> Result<Format, String> {
         let first = self.attempts.first().ok_or("no input")?.format;
@@ -183,6 +217,7 @@ impl BackendFactory for FakeBackend {
 struct FakeStream {
     state: Arc<Mutex<State>>,
     direction: Direction,
+    latency: Option<Duration>,
 }
 
 impl FakeStream {
@@ -205,7 +240,7 @@ impl Stream for FakeStream {
         Ok(())
     }
     fn latency(&self) -> Option<Duration> {
-        None
+        self.latency
     }
     fn thread_priority(&self) -> WorkerPriority {
         WorkerPriority::Unobserved

@@ -528,6 +528,12 @@ pub trait Backend {
     fn paired_input_name(&self, _render: &Endpoint) -> Option<String> {
         None
     }
+    /// The names of `endpoint`'s channels in `direction`, in device channel order, where the
+    /// system reports them (ASIO: `getChannelInfo`); empty when it does not. For a duplex endpoint
+    /// the input names are the capture side's.
+    fn channel_names(&self, _endpoint: &Endpoint, _direction: Direction) -> Vec<String> {
+        Vec::new()
+    }
     /// Open a render stream, not started. The adapter owns the sample-format fan-out.
     fn open_render(
         &self,
