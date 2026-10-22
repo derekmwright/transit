@@ -864,9 +864,12 @@ impl StudioApp {
             self.stop_for_reopen();
             self.status = reopen_note(&self.reopen, recording, playing);
         }
-        let cfg = self.ui.audio.clone();
-        let blocked = self.audio_devices.panel.is_some() || self.player.as_ref().is_some_and(|p| p.host_blocked(&cfg));
-        if !self.reopen.due(now, blocked) {
+        // The backend is asked only once an attempt is due, not every frame.
+        if !self.reopen.due(now, false) {
+            return;
+        }
+        let blocked = self.audio_devices.panel.is_some() || self.player.as_ref().is_some_and(|p| p.host_blocked(&self.ui.audio));
+        if blocked {
             return;
         }
         if self.recording_active() {
