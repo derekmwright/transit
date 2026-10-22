@@ -274,7 +274,12 @@ Hardware (2026-10-22, `cargo test -p soundcraft-playback --features native-asio 
 hardware_player_opens_native_asio --nocapture --test-threads 1`): the whole Player path opens the
 Scarlett at 48 kHz, 64 frames (2 in / 2 out, `i32`, 2.9 ms out / 3.9 ms in) and the Model 12 at
 44.1 kHz, 256 frames (12 in / 10 out, `i24`, 15.8 ms out / 6.8 ms in) and runs two seconds with no
-backend error.
+backend error. The ADR 0015 hardware-insert click train through the Player
+(`hardware_player_measures_a_hardware_insert_on_the_*`, on the bench's loopback cables) measured
+326 frames (6.79 ms) on the Scarlett, output 2 to input 2 at 64 frames, against the bench's 294 to 300
+(the probe's view includes the input ring, known issue K22), and 984 frames (22.3 ms) on the Model 12,
+output 2 to input 1, every click found; without clearing the input ring after the open the Model 12
+read 1239 frames, one buffer more.
 
 ## Next (slice d)
 
