@@ -2,7 +2,8 @@
 //! these pin the bytes a device buffer receives: a fixed click session rendered through the real
 //! callback adapter, and a fixed synthetic render through the scratch chunking, for each sample
 //! format. The fixture was captured from the code before the backend trait; the trait path must
-//! reproduce it bit for bit. Set `DEVICE_GOLDEN_OUT=<file>` to print a new fixture instead.
+//! reproduce it bit for bit. The synthetic signal uses only exact IEEE arithmetic (no libm `sin`,
+//! whose last bit differs between platforms), so the digests are the same on every target. Set `DEVICE_GOLDEN_OUT=<file>` to print a new fixture instead.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use cpal::{FromSample, SizedSample};
@@ -66,7 +67,7 @@ fn synthetic_bytes<T: SizedSample + FromSample<f32> + Wire>() -> Vec<u8> {
                 3 => f32::MIN_POSITIVE,
                 4 => 2.5,
                 5 => -2.5,
-                _ => (n as f32 * 0.37).sin() * 1.2,
+                _ => ((n.wrapping_mul(2_654_435_761) >> 8) as f32 / 8_388_608.0 - 1.0) * 1.2,
             };
             n += 1;
         }

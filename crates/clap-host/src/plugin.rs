@@ -227,7 +227,7 @@ impl Shared {
         if !self.link.available() && self.host.callback.load(Ordering::Relaxed) {
             // No editor handle runs `idle` for this plug-in: run it here for `on_main_thread`.
             // (Its edit queue has no reader without an editor; this drains it too.)
-            let _ = self.link.idle();
+            let _ = self.link.idle_headless();
             out.callbacks += 1;
         }
         if self.rescan() {
@@ -1042,7 +1042,7 @@ struct ClapEditor {
 impl PluginEditor for ClapEditor {
     fn open(&mut self) -> Result<(), String> {
         // Edits reported before the editor opened are stale.
-        let _ = self.link.idle();
+        let _ = self.link.idle_headless();
         self.link.open(self.info.name)
     }
 

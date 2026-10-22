@@ -1021,7 +1021,20 @@ impl GuiLink {
     /// Main-thread housekeeping: runs a requested `on_main_thread`, follows the plugin's
     /// show/hide/closed requests, and returns the parameter edits reported since the last call.
     pub fn idle(&self) -> Vec<(u32, f64)> {
-        if !on_main_thread() {
+        self.idle_on(on_main_thread())
+    }
+
+    /// [`GuiLink::idle`] for a plugin without an editor, run by the instance's owner thread (the
+    /// thread that created it, which is the host's main thread for CLAP). With no GUI there is no
+    /// AppKit work, so the process-main-thread gate of `idle` does not apply: it would otherwise
+    /// skip `on_main_thread` whenever the owner thread is not the process main thread (the test
+    /// harness on macOS).
+    pub fn idle_headless(&self) -> Vec<(u32, f64)> {
+        self.idle_on(true)
+    }
+
+    fn idle_on(&self, main: bool) -> Vec<(u32, f64)> {
+        if !main {
             return Vec::new();
         }
         let mut g = self.lock();
