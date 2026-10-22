@@ -29,6 +29,8 @@ silenced while it is open. What changes:
   settings forbid it); a gone endpoint is `DeviceNotAvailable`. No raw mode, no `AUTOCONVERTPCM`.
 - **Calibration.** A loopback calibration is keyed by mode (`"shared"` or `"exclusive"`); measure each.
 
+On Windows, native WASAPI gives any interface a dependable, calibrated stereo path with no SDK and no extra driver install. How many channels it sees is decided by the vendor's WDM driver: the TASCAM Model 12 registers one stereo playback and one stereo recording endpoint, so WASAPI shows 2 in and 2 out on it in every mode, and individual channels cannot be recorded over WASAPI. Multichannel and tracking-grade latency on Windows are the ASIO path (a native ASIO backend is in progress).
+
 On the Scarlett 2i2 exclusive mode at 480 frames still measures about 223 ms round trip: that latency is
 in the Focusrite WDM driver, and ASIO is the low-latency path there. The app opens shared by default; exclusive is available via the "Take exclusive control of the device" checkbox (ADR 0016, amendment 2), because on a Model 12 it measures about 276 ms with silence on about half the opens. The cpal adapter opens shared
 streams only; it refuses `Mode::Exclusive`.
