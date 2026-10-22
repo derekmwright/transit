@@ -1200,6 +1200,57 @@ fn a_driver_reset_request_stops_the_output_and_says_so_once() {
     assert_eq!(recorder.trouble(), Some(crate::record::Trouble::Device(crate::RESET_REQUESTED_TEXT.into())));
 }
 
+/// The data frames and block align of a WAV file.
+fn wav_data_frames(path: &std::path::Path) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    let (mut i, mut align) = (12, 0u16);
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+        if id == b"fmt " {
+            align = u16::from_le_bytes(bytes[i + 20..i + 22].try_into().unwrap());
+        }
+        if id == b"data" {
+            return (len.min(bytes.len() - i - 8) as u64) / u64::from(align.max(1));
+        }
+        i += 8 + len + (len & 1);
+    }
+    panic!("no data chunk");
+}
+
+/// Escaped defect (review B1 of ASIO slice d1): blocks the driver delivered after its reset
+/// request (or after a stall it resumed from) landed in the take until the UI's next frame
+/// finished it. The error callback now closes the take's input at once.
+#[test]
+fn samples_after_a_reset_request_or_a_stall_never_land_in_the_take() {
+    use ab::fake::SliceSource;
+    const BLOCK: usize = 256;
+    for error in [ab::StreamError::ResetRequested, ab::StreamError::Stalled] {
+        let fake = model12();
+        let cfg = asio_config();
+        let player = open_asio(&fake, &cfg);
+        let mut recorder = player.open_input(&cfg).unwrap();
+        let dir = std::env::temp_dir().join(format!("transit-d1-b1-{}-{error:?}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("take.wav");
+        recorder.arm(vec![(soundcraft_model::TrackId(1), vec![0], path.clone())]).unwrap();
+        let format = ab::Format::new(48_000, 12, ab::SampleFormat::F32);
+        let (before, after) = (vec![0.25f32; BLOCK * 12], vec![0.75f32; BLOCK * 12]);
+        for _ in 0..4 {
+            assert!(fake.pump_capture(BLOCK, ab::Stamp::INVALID, format, &mut SliceSource { data: &before, channels: 12 }));
+        }
+        assert!(fake.inject_error(ab::Direction::Input, error));
+        assert!(fake.inject_error(ab::Direction::Output, error));
+        for _ in 0..4 {
+            // The driver keeps calling back until the host stops it (the UI does at its next frame).
+            assert!(fake.pump_capture(BLOCK, ab::Stamp::INVALID, format, &mut SliceSource { data: &after, channels: 12 }));
+        }
+        let (takes, _) = recorder.finish();
+        assert_eq!(wav_data_frames(&takes[0].1), 4 * BLOCK as u64, "{error:?}: the take ends at the request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn a_driver_the_watchdog_found_stalled_stops_the_output_and_is_reopened_like_a_reset() {
     let fake = model12();

@@ -1198,8 +1198,23 @@ fn a_driver_reset_reopens_the_native_asio_output_and_input_without_user_action()
     assert_eq!(driver.opens().len(), opens + 2, "once");
 }
 
+/// Delivers `blocks` capture blocks of 256 frames, every sample `value`, from a thread of its own.
+fn pump_capture(driver: &transit_audio_backend::fake::FakeBackend, blocks: usize, value: f32) {
+    use transit_audio_backend as ab;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let data = [value; 512];
+            for _ in 0..blocks {
+                let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+                assert!(driver.pump_capture(256, ab::Stamp::INVALID, format, &mut ab::fake::SliceSource { data: &data, channels: 2 }));
+            }
+        });
+    });
+}
+
 /// A reset while recording ends the take there and keeps it (it is never spliced onto the reopened
-/// stream), then the device reopens.
+/// stream), then the device reopens. The audio take holds what was captured up to the request and
+/// nothing the driver delivered after it.
 #[test]
 fn a_driver_reset_while_recording_ends_the_take_keeps_it_and_then_reopens() {
     use soundcraft_playback::record::start::Point;
@@ -1209,7 +1224,14 @@ fn a_driver_reset_while_recording_ends_the_take_keeps_it_and_then_reopens() {
     let again = driver.clone();
     let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
     let track = soundcraft_model::TrackId(t.app.run("track.new", json!({"kind": "midi"})).unwrap()["tracks"][0].as_u64().unwrap());
+    t.app.add_track("audio").unwrap();
+    let audio = t.app.engine.session().tracks.iter().find(|tr| tr.id != track).unwrap().id;
+    t.app.engine.session_mut().track_mut(audio).unwrap().mixer.input_monitor = true;
     run(&mut t, &driver, 10);
+    let dir = std::env::temp_dir().join(format!("transit-d1-ui-take-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    t.app.recorder.as_mut().expect("the monitored track took the input").arm(vec![(audio, vec![0], dir.join("take.wav"))]).unwrap();
+    pump_capture(&driver, 4, 0.25);
     t.app.take_plan = Some(soundcraft_engine::io::Recording {
         start: 0,
         pass: None,
@@ -1228,15 +1250,22 @@ fn a_driver_reset_while_recording_ends_the_take_keeps_it_and_then_reopens() {
     let start = Point { host_ns: 0, output_frame: 0, position: Position { sample: 0, fraction: 0, denominator: 1 } };
     t.app.finished_test_midi =
         Some(soundcraft_playback::MidiTake { tracks: vec![track], start: Some(start), events, dropped: 0, device_rate: 48_000 });
+    assert!(inject(&driver, ab::Direction::Input, ab::StreamError::ResetRequested));
     assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    // The driver goes on calling back until the app stops it at its next frame.
+    pump_capture(&driver, 4, 0.75);
     run(&mut t, &driver, 1);
     assert_eq!(t.app.status, "Recording ended: driver reset. The take is kept up to there. Reopening the device.");
     assert_eq!(t.app.engine.session().track(track).unwrap().clips().len(), 1, "the take is kept");
+    let audio_clips = t.app.engine.session().track(audio).unwrap().clips().to_vec();
+    assert_eq!(audio_clips.len(), 1, "the audio take is kept");
+    assert_eq!(audio_clips[0].length, 1024, "up to the request: none of the blocks after it");
     run(&mut t, &driver, 30);
     assert!(!t.app.recording_active());
     assert_eq!(driver.opens().len(), 4, "then the device reopened");
     assert_eq!(t.app.engine.session().track(track).unwrap().clips().len(), 1, "and nothing was spliced onto the take");
     assert_eq!(t.app.reopen.reopened(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A driver the backend's watchdog found had stopped calling back takes the same reopen path,

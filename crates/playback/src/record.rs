@@ -273,6 +273,12 @@ fn capture_callbacks(
             ab::StreamError::Stalled => DRIVER_STALLED,
             ab::StreamError::Other => return,
         };
+        // After a reset request or a stall the driver may go on calling back (at another rate, or
+        // after a gap) until the app stops it at its next frame: the take ends here, at once, so
+        // no such block joins it. One atomic; `finish` still joins the writer as usual.
+        if matches!(e, ab::StreamError::ResetRequested | ab::StreamError::Stalled) {
+            errors.stop_capture();
+        }
         let _ = errors.fault.compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
     };
     (Box::new(capture), Box::new(error))

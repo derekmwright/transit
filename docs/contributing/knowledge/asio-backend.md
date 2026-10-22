@@ -309,8 +309,12 @@ Code: `crates/playback/src/reopen.rs` (`Reopener`), `Player::reopen_cause` and `
   is picked up. Monitoring and armed tracks take the reopened input again (`ensure_input`). The
   plug-ins keep their live state (`capture_states_for_reopen`), but they are re-created and their
   editors close and reopen, as on Reconnect (known issue K32).
-- **Never a splice.** On the reset the transport stops for good (`stop_for_reopen`): a take in
-  progress ends there and is kept ("Recording ended: driver reset. The take is kept up to there.
+- **Never a splice.** The input's error callback closes the take's input the moment the reset (or
+  a stall) is delivered (one atomic, `Shared::stop_capture`), so the blocks a driver goes on
+  delivering until the app stops it (at another rate after a rate change, or after the gap of a
+  stall it resumed from) never join the take (test
+  `samples_after_a_reset_request_or_a_stall_never_land_in_the_take`). At its next frame the app
+  stops the transport for good (`stop_for_reopen`): the take in progress ends there and is kept ("Recording ended: driver reset. The take is kept up to there.
   Reopening the device."), and since the faulted runtime acknowledges nothing, the transport is
   stopped on the UI side; the runtime gets no more session, I/O or transport work until it is
   replaced. Recording resumes only when the user records again.
