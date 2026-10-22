@@ -243,7 +243,8 @@ fn asio_devices() -> Value {
     json!({"systems": [
         {"name": "WASAPI", "is_default": true, "outputs": [{"name": "Speakers (Realtek)", "is_default": true}], "inputs": []},
         {"name": "ASIO",
-         "outputs": [{"name": MODEL12, "max_channels": 10, "is_default": true}, {"name": "Focusrite USB ASIO", "max_channels": 2}],
+         "outputs": [{"name": MODEL12, "max_channels": 10, "is_default": true}, {"name": "Focusrite USB ASIO", "max_channels": 2},
+                     {"name": "Old Interface ASIO", "max_channels": 2}],
          "inputs": [{"name": MODEL12, "max_channels": 12, "is_default": true}, {"name": "Focusrite USB ASIO", "max_channels": 2}],
          "diagnostics": ["Old Interface ASIO: init failed: No device connected"]}
     ]})
@@ -256,11 +257,21 @@ fn the_asio_system_lists_its_drivers_and_says_which_failed_to_load() {
     t.open_window();
     assert!(t.layout()["diagnostics"].as_array().unwrap().is_empty(), "WASAPI has none");
     t.pick("system", "ASIO");
-    assert_eq!(t.layout()["diagnostics"], json!(["Not loaded: Old Interface ASIO: init failed: No device connected"]));
+    assert!(t.layout()["diagnostics"].as_array().unwrap().is_empty(), "the selected driver loaded: nothing is said");
+    t.pick("output", "Old Interface ASIO · 2 ch");
+    assert_eq!(t.layout()["diagnostics"], json!(["Old Interface ASIO: init failed: No device connected"]));
     t.click(mid(t.control_rect("output")));
     let outputs: Vec<String> =
         t.layout()["items"].as_array().unwrap().iter().filter(|i| i["value"] == "output").map(|i| i["label"].as_str().unwrap().to_string()).collect();
-    assert_eq!(outputs, ["System default".to_string(), format!("{MODEL12} · 10 ch"), "Focusrite USB ASIO · 2 ch".to_string()]);
+    assert_eq!(
+        outputs,
+        [
+            "System default".to_string(),
+            format!("{MODEL12} · 10 ch"),
+            "Focusrite USB ASIO · 2 ch".to_string(),
+            "Old Interface ASIO · 2 ch".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -1151,4 +1162,30 @@ fn the_calibration_command_wraps_inside_the_window_and_has_a_copy_button() {
     assert!(text[2] <= window[2] + 0.5, "the wrapped command stays inside the window: {text:?} in {window:?}");
     assert!(text[3] - text[1] > 20.0, "the long command wraps onto more than one line: {text:?}");
     assert!(copy[2] <= window[2], "the Copy button is inside the window");
+}
+
+#[test]
+fn only_the_selected_asio_driver_says_why_it_did_not_load() {
+    let mut t = T::new();
+    t.control(
+        "audio.fake_devices",
+        json!({"systems": [
+            {"name": "WASAPI", "is_default": true, "outputs": [{"name": "Speakers (Realtek)", "is_default": true}], "inputs": []},
+            {"name": "ASIO",
+             "outputs": [{"name": "Good ASIO", "max_channels": 2, "is_default": true}, {"name": "Move", "max_channels": 2}, {"name": "Overbridge 1", "max_channels": 2}, {"name": "Maschine", "max_channels": 2}],
+             "inputs": [{"name": "Good ASIO", "max_channels": 2, "is_default": true}],
+             "diagnostics": [
+                "Move: ASIO driver \"Move\": init failed: No device is connected to the PC.",
+                "Overbridge 1: ASIO driver \"Overbridge 1\": init failed: No device is connected to the PC.",
+                "Maschine: ASIO driver \"Maschine\": init failed: No device is connected to the PC."]}
+        ]}),
+    )
+    .unwrap();
+    t.open_window();
+    t.pick("system", "ASIO");
+    assert!(t.layout()["diagnostics"].as_array().unwrap().is_empty(), "a loaded driver is selected: nothing is said");
+    t.pick("output", "Move · 2 ch");
+    assert_eq!(t.layout()["diagnostics"], json!(["Move: init failed: No device is connected to the PC."]));
+    t.pick("output", "Good ASIO · 2 ch");
+    assert!(t.layout()["diagnostics"].as_array().unwrap().is_empty());
 }

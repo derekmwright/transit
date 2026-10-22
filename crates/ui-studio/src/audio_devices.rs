@@ -778,11 +778,18 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let (rect, text) = choose(ui, "output", audio_on, &mut draft.output, &outs, &mut lay.items);
                 controls.push((text, "output", rect));
                 ui.end_row();
-                // The drivers that failed to load are said under the list, with why.
-                for problem in sys.map(|s| s.diagnostics.as_slice()).unwrap_or_default() {
+                // Only the selected driver's own diagnostic is said under the list (a driver that
+                // failed to load or open, with why); the others show nothing.
+                let selected_output =
+                    draft.output.clone().or_else(|| sys.and_then(|s| s.outputs.iter().find(|d| d.is_default)).map(|d| d.name.clone()));
+                let selected_problem = selected_output
+                    .as_deref()
+                    .and_then(|name| sys.and_then(|s| s.diagnostics.iter().find(|p| p.strip_prefix(name).is_some_and(|r| r.starts_with(": ")))));
+                if let Some(problem) = selected_problem {
                     ui.label("");
-                    let line = format!("Not loaded: {problem}");
+                    let line = short_problem(problem);
                     let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.0)).wrap());
+                    let shown = shown.on_hover_text(problem);
                     controls.push((line.clone(), "diagnostic", shown.rect));
                     lay.diagnostics.push(line);
                     ui.end_row();
@@ -1046,6 +1053,17 @@ pub fn achieved_detail(sample: Option<impl std::fmt::Debug>, latency: Option<std
         detail.push_str(&format!(" · {:.1} ms {direction}", latency.as_secs_f64() * 1000.0));
     }
     detail
+}
+
+/// "<driver>: <reason>" for a diagnostic, without the repeated `ASIO driver "<driver>": ` prefix.
+fn short_problem(problem: &str) -> String {
+    if let Some((driver, reason)) = problem.split_once(": ") {
+        let prefix = format!("ASIO driver \"{driver}\": ");
+        if let Some(rest) = reason.strip_prefix(&prefix) {
+            return format!("{driver}: {rest}");
+        }
+    }
+    problem.to_string()
 }
 
 /// `audio.fake_devices {systems: [{name, is_default?, outputs: [...], inputs: [...], diagnostics?: [...]}]}`:
