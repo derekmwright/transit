@@ -9,6 +9,7 @@ row, never a longer file.
 | [`evidence/`](evidence/README.md) | What proves a change: the gate commands, refutation review, the escape record, how to write a test that is evidence, hardware evidence and CI. |
 | [`../known-issues/`](../known-issues/README.md) | Defects we know about, each with a status and the gate or follow-up. |
 | [`../adr/`](../adr/README.md) | Decisions and their reasons. Maintained by the project owner. |
+| [`../principles.md`](../principles.md) | The engineering principles: what gets built first, and the three feature areas. |
 | [`../building.md`](../building.md), [`../releasing.md`](../releasing.md) | Build, run, release. |
 | [`../architecture.md`](../architecture.md) | One-page overview that points into `knowledge/`. |
 
