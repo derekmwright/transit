@@ -241,6 +241,19 @@ fn the_drum_synth_lists_its_parameters_by_pad() {
     assert_eq!(w.rows.len(), info("drum_synth").params.len());
 }
 
+#[test]
+fn a_factory_instrument_preset_applies_without_a_config_directory() {
+    let mut t = T::new();
+    let (tr, _) = open_plugin(&mut t, "subtractive_synth");
+    t.app.services.config_dir = None;
+    assert_ne!(t.param(tr, None, "cutoff"), Some(1400.0));
+    let preset = t.window(tr).preset;
+    t.click(mid(preset), 1);
+    // The menu has its Factory heading, Init, then Soft Pad.
+    t.click(((preset[0] + preset[2]) / 2.0, preset[3] + 52.0), 1);
+    assert_eq!(t.param(tr, None, "cutoff"), Some(1400.0));
+}
+
 /// A track with `plugin` open in its editor: an instrument for the synth, an insert otherwise.
 fn open_plugin(t: &mut T, plugin: &str) -> (TrackId, Option<usize>) {
     if info(plugin).is_instrument {

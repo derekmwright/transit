@@ -194,13 +194,13 @@ pub fn control(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &In
     });
     *out = [r.response.rect.min.x, r.response.rect.min.y, r.response.rect.max.x, r.response.rect.max.y];
     ui.data_mut(|d| d.insert_temp(name_id, name));
-    let Some(root) = root else { return };
     if let Some((n, p)) = pick {
         match p {
             Ok(p) => app.apply_preset(key, info, &n, &p),
             Err(e) => app.status = format!("Preset: {e}"),
         }
     }
+    let Some(root) = root else { return };
     if let Some(n) = save {
         let values: BTreeMap<String, f32> =
             info.params.iter().map(|p| (p.id.to_string(), p.clamp(ins.params.get(p.id).copied().unwrap_or(p.default)))).collect();
