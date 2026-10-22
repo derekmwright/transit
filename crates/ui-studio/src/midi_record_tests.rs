@@ -470,7 +470,7 @@ fn a_wrapped_recording_stops_where_the_capture_got_to_not_where_the_cycle_wrappe
     tick(&mut app, 5 * BEAT + BEAT / 2);
     tick(&mut app, 4 * BEAT + BEAT / 5);
     let live = app.midi_live.as_ref().expect("the pass is drawn");
-    assert_eq!(live.end, 6 * BEAT + BEAT / 5, "the lap is counted: the playhead wrapped to 4.2 beats but 1.2 beats have been recorded");
+    assert_eq!((live.start, live.end), (4 * BEAT, 4 * BEAT + BEAT / 5), "after the wrap the lap under way is drawn from the loop start");
     tick(&mut app, 4 * BEAT + BEAT * 7 / 10);
     app.stop_play();
     let tr = app.engine.session().track(t).unwrap().clone();

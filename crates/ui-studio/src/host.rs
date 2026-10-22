@@ -701,8 +701,19 @@ impl StudioApp {
         let now = start + self.recording_elapsed(start);
         let cut = soundcraft_engine::midi_take::Cut { start, pass: plan.pass, punch: plan.punch, stop: now - start };
         let s = self.engine.session();
-        let built = soundcraft_engine::midi_take::build(&s.tempo, s.sample_rate, &events, &cut);
-        self.midi_live = Some(MidiLive { tracks: take.tracks.clone(), start, end: now, built });
+        let cycle = s.edit.cycle_range();
+        let wrap = (s.edit.loop_playback && plan.pass.is_none() && !cycle.is_empty()).then_some(cycle);
+        let mut built = soundcraft_engine::midi_take::build_wrapping(&s.tempo, s.sample_rate, &events, &cut, wrap);
+        // After a wrap only the lap under way is drawn, from the loop start to the playhead.
+        let (start, end) = match self.record_clock.filter(|c| c.laps > 0 && wrap.is_some()) {
+            Some(c) => {
+                let lap = usize::try_from(c.laps / cycle.len().max(1)).unwrap_or(0);
+                built.retain(|b| b.pass == lap);
+                (cycle.start, c.last)
+            }
+            None => (start, now),
+        };
+        self.midi_live = Some(MidiLive { tracks: take.tracks.clone(), start, end, built });
     }
 
     /// Take the input once (for recording and input monitoring) from the player and feed the

@@ -12,6 +12,8 @@
 //! - **Loop record:** each pass is its own clip on its own playlist (a take lane), as audio does.
 //! - **Transport wrap:** a recording that started inside the cycle and ran past its end (Cycle on,
 //!   Loop Record off) is cut at each wrap the same way: a clip per pass, never discarded.
+//!   A note held across the loop end is cut at the wrap: its tail is not continued into the next
+//!   pass, which starts clean.
 //! - **Nothing played:** no clip.
 
 use crate::Engine;
@@ -105,10 +107,11 @@ struct Segment {
     origin: Samples,
 }
 
-/// Does a recording that started inside `wrap` (the loop region the transport cycles over) run
-/// past the loop end, so the transport wrapped while recording?
+/// Does a recording that started at or before the loop end of `wrap` (the loop region the
+/// transport cycles over) run past it, so the transport wrapped while recording? The player wraps
+/// at the loop end from any position before it, so a start ahead of the loop counts too.
 fn wrapped(cut: &Cut, wrap: Option<Range>, last: Samples) -> Option<Range> {
-    let w = wrap.filter(|w| cut.pass.is_none() && !w.is_empty() && w.contains(cut.start))?;
+    let w = wrap.filter(|w| cut.pass.is_none() && !w.is_empty() && cut.start >= 0 && cut.start < w.end)?;
     (last >= w.end - cut.start).then_some(w)
 }
 
@@ -606,6 +609,23 @@ mod tests {
         assert_eq!(notes_of(&e, ids[0]), vec![(60, 0, TICKS_PER_QUARTER / 2)]);
         assert_eq!(notes_of(&e, ids[1]), vec![(62, TICKS_PER_QUARTER / 2, TICKS_PER_QUARTER / 2)]);
         assert_eq!(notes_of(&e, ids[2]), vec![(64, TICKS_PER_QUARTER / 4, TICKS_PER_QUARTER / 4)]);
+    }
+
+    /// Record on the fly with the playhead before the loop: the player wraps at the loop end all
+    /// the same, so the second lap's notes belong at the loop start, not past the loop end.
+    #[test]
+    fn a_take_latched_before_the_loop_still_splits_at_the_wrap() {
+        let (mut e, t) = midi_engine();
+        e.session_mut().edit.loop_playback = true;
+        e.session_mut().edit.loop_range = Range::new(96_000, 144_000);
+        let events = on_track(t, vec![on(10_000, 60), off(11_000, 60), on(108_000, 62), off(109_000, 62)]);
+        let ids = place_midi_recording(&mut e, &plan(48_000, None), &events, 0);
+        assert_eq!(ids.len(), 2, "the lap before the wrap and the lap after it");
+        let tr = e.session().track(t).unwrap();
+        assert_eq!(tr.playlists[0].clips[0].range(), Range::new(48_000, 144_000));
+        assert_eq!(tr.playlists[1].clips[0].range(), Range::new(96_000, 144_000));
+        let tick = |samples: Samples| e.session().tempo.samples_to_ticks(samples, e.session().sample_rate);
+        assert_eq!(notes_of(&e, ids[1])[0].1, tick(96_000 + 12_000) - tick(96_000), "the second note sits 12,000 samples into the loop");
     }
 
     #[test]
