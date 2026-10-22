@@ -242,7 +242,8 @@ impl IComponentTrait for GainProcessor {
             return kResultFalse;
         }
         let g = f64::from_le_bytes(bytes);
-        if !(0.0..=1.0).contains(&g) {
+        // Negative sentinels exercise host error paths without a third-party plug-in.
+        if !(0.0..=1.0).contains(&g) && g != -1.0 && g != -3.0 {
             return kResultFalse;
         }
         self.gain.store(g.to_bits(), Ordering::Relaxed);
@@ -291,6 +292,9 @@ impl IAudioProcessorTrait for GainProcessor {
         kNotImplemented
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        if f64::from_bits(self.gain.load(Ordering::Relaxed)) == -3.0 {
+            return kInternalError;
+        }
         let d = unsafe { &*data };
         assert!(!d.processContext.is_null());
         let probes = probes();
@@ -689,6 +693,9 @@ impl IEditControllerTrait for GainController {
         let mut bytes = [0u8; 8];
         let mut n = 0;
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
+            if f64::from_le_bytes(bytes) == -1.0 {
+                return kInternalError;
+            }
             self.gain.store(f64::from_le_bytes(bytes).to_bits(), Ordering::Relaxed);
         }
         kResultOk
@@ -699,6 +706,9 @@ impl IEditControllerTrait for GainController {
         let mut bytes = [0u8; 8];
         let mut n = 0;
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {
+            if f64::from_le_bytes(bytes) == -2.0 {
+                return kInternalError;
+            }
             self.freq.store(f64::from_le_bytes(bytes).clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
         if unsafe { s.read(bytes.as_mut_ptr().cast(), 8, &mut n) } == kResultOk && n == 8 {

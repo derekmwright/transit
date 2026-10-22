@@ -37,8 +37,9 @@ pub fn sidechain_fixture_dir() -> &'static Path {
 }
 
 fn install(features: &[&str], target_dir: &str, install_dir: &str, name: &str, plugins: usize) -> PathBuf {
+    soundcraft_clap_host::set_scan_extra_dirs_only(true);
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/Cargo.toml");
-    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(target_dir);
+    let target = Path::new(option_env!("CARGO_TARGET_TMPDIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))).join(target_dir);
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let st = Command::new(cargo)
         .args(["build", "--quiet", "--manifest-path"])
@@ -58,7 +59,8 @@ fn install(features: &[&str], target_dir: &str, install_dir: &str, name: &str, p
         "libclap_fixture.so"
     };
     let built = target.join("debug").join(lib);
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{install_dir}-{}", std::process::id()));
+    let dir = Path::new(option_env!("CARGO_TARGET_TMPDIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")))
+        .join(format!("{install_dir}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     if cfg!(target_os = "macos") {
         // Install as a real macOS bundle to exercise bundle resolution.
@@ -69,6 +71,15 @@ fn install(features: &[&str], target_dir: &str, install_dir: &str, name: &str, p
         std::fs::create_dir_all(dir.join("vendor")).unwrap();
         std::fs::copy(&built, dir.join(format!("vendor/{name}.clap"))).unwrap();
     }
-    assert_eq!(soundcraft_clap_host::add_search_dir(&dir), plugins);
+    if plugins > 0 {
+        assert_eq!(soundcraft_clap_host::add_search_dir(&dir), plugins);
+    }
     dir
+}
+
+/// Private-FFI unit tests load through their own crate instance, avoiding a second module entry.
+#[allow(dead_code)]
+pub fn unregistered_fixture_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| install(&[], "clap-fixture-target", "clap-unit-fixture-install", "Fixture", 0))
 }

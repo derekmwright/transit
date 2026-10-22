@@ -33,7 +33,7 @@ struct Registry {
     /// number of distinct installed plugins).
     infos: HashMap<String, &'static PluginInfo>,
     /// Ids that failed to instantiate (not retried every UI frame).
-    failed: HashSet<String>,
+    failed: HashMap<String, Vst3Error>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -443,8 +443,8 @@ fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
 /// Finds the descriptor, loads its binary and creates an instance plus its (cached) info.
 fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Error> {
     let cid = parse_id(id).ok_or_else(|| Vst3Error::NotFound(id.to_string()))?;
-    if lock().failed.contains(id) {
-        return Err(Vst3Error::Instantiate(id.to_string(), "failed before".into()));
+    if let Some(error) = lock().failed.get(id) {
+        return Err(error.clone());
     }
     let known = {
         let r = lock();
@@ -469,7 +469,7 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
             Ok((inst, info))
         }
         Err(e) => {
-            r.failed.insert(id.to_string());
+            r.failed.insert(id.to_string(), e.clone());
             Err(e)
         }
     }
@@ -497,7 +497,7 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         if let Some(i) = r.infos.get(id) {
             return Some(*i);
         }
-        if r.failed.contains(id) {
+        if r.failed.contains_key(id) {
             return None;
         }
     }
@@ -508,6 +508,16 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_instantiation_retains_the_original_failure() {
+        let id = "vst3:12121212121212121212121212121212";
+        let error = Vst3Error::Instantiate(id.into(), "fixture initialization was refused".into());
+        lock().failed.insert(id.into(), error.clone());
+        let again = instantiate_raw(id).err();
+        lock().failed.remove(id);
+        assert_eq!(again, Some(error));
+    }
 
     #[test]
     fn unit_labels_map() {

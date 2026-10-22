@@ -20,6 +20,8 @@ log.workspace = true
 unsafe_code = "deny"
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"

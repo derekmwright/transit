@@ -30,8 +30,10 @@ pub fn slow_fixture_dir() -> &'static Path {
 
 fn install(features: &[&str], target_dir: &str, install_dir: &str, plugins: usize) -> PathBuf {
     {
+        soundcraft_vst3_host::set_scan_extra_dirs_only(true);
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/Cargo.toml");
-        let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join(target_dir);
+        let target =
+            Path::new(option_env!("CARGO_TARGET_TMPDIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp"))).join(target_dir);
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let st = Command::new(cargo)
             .args(["build", "--quiet", "--manifest-path"])
@@ -51,13 +53,23 @@ fn install(features: &[&str], target_dir: &str, install_dir: &str, plugins: usiz
             ("libvst3_fixture.so", if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
         };
         let built = target.join("debug").join(lib);
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{install_dir}-{}", std::process::id()));
+        let dir = Path::new(option_env!("CARGO_TARGET_TMPDIR").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tmp")))
+            .join(format!("{install_dir}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Install as a real bundle to exercise bundle resolution and the module entry.
         let bin = dir.join("vendor/Fixture.vst3/Contents").join(folder);
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::copy(&built, bin.join(exe)).unwrap();
-        assert_eq!(soundcraft_vst3_host::add_search_dir(&dir), plugins, "the fixture's plug-ins");
+        if plugins > 0 {
+            assert_eq!(soundcraft_vst3_host::add_search_dir(&dir), plugins, "the fixture's plug-ins");
+        }
         dir
     }
+}
+
+/// Private-FFI unit tests load through their own crate instance, avoiding a second module entry.
+#[allow(dead_code)]
+pub fn unregistered_fixture_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| install(&[], "vst3-fixture-target", "vst3-unit-fixture-install", 0))
 }

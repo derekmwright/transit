@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-vst3 = "0.3"
+vst3 = "=0.3.0"
 
 [features]
 # Builds a binary that lists only the sidechain plug-ins (ADR 0015 slice c, see src/lib.rs).

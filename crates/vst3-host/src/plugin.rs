@@ -47,6 +47,7 @@ use crate::gate::{Gate, MAX_CHANNELS};
 use crate::params::{ParamCurves, PendingParams};
 use soundcraft_dsp::event::{Message, PluginEvent};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::thread::ThreadId;
@@ -94,26 +95,7 @@ fn status_from_tail(tail: u32) -> ProcessStatus {
     if tail == u32::MAX { ProcessStatus::Continue } else { ProcessStatus::Tail }
 }
 
-/// What one [`crate::service_requests`] call did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Serviced {
-    /// Instances deactivated and reactivated (`kLatencyChanged`, `kIoChanged`).
-    pub restarted: usize,
-    /// Reactivations waiting because the instance was busy on the audio thread.
-    pub restarts_waiting: usize,
-    /// `IMidiMapping` tables re-read and published (`kMidiCCAssignmentChanged`).
-    pub midi_maps: usize,
-    /// Parameter value re-reads finished (`kParamValuesChanged`).
-    pub value_rescans: usize,
-    /// Requests this host cannot honor (`kReloadComponent`), logged.
-    pub unsupported: usize,
-    /// Reactivations the plug-in refused (logged; not retried until it asks again).
-    pub failed: usize,
-    /// Instances with a request still in progress after this call: call again soon.
-    pub pending: usize,
-    /// Instances skipped because this is not the thread that created them.
-    pub other_thread: usize,
-}
+use crate::Serviced;
 
 /// The MIDI controller → parameter table of all 16 channels (channel-major, see
 /// `Instance::midi_mapping`), written on the main thread and read on the audio thread as one
@@ -444,6 +426,8 @@ impl Shared {
 pub struct Vst3Plugin {
     shared: Arc<Shared>,
     info: &'static PluginInfo,
+    /// Built at creation; automation lookup never scans or allocates.
+    param_index: HashMap<&'static str, usize>,
     /// VST3 id of each `info.params` entry (same order).
     ids: Vec<u32>,
     maps: Vec<Mapping>,
@@ -564,6 +548,7 @@ impl Vst3Plugin {
         lock(live()).push(Arc::downgrade(&shared));
         let mut p = Vst3Plugin {
             info,
+            param_index: info.params.iter().enumerate().rev().map(|(i, p)| (p.id, i)).collect(),
             values: Vec::with_capacity(ids.len()),
             host_set: vec![false; ids.len()],
             curves_seen: curves.generation(),
@@ -655,7 +640,7 @@ impl Vst3Plugin {
     }
 
     fn converter(&self, link: Arc<crate::ffi::EditorLink>) -> Converter {
-        Converter { link, info: self.info, ids: self.ids.clone(), maps: self.maps.clone() }
+        Converter { link, info: self.info, param_index: self.param_index.clone(), ids: self.ids.clone(), maps: self.maps.clone() }
     }
 
     /// Converts the host-set plain value of parameter `i` and queues it for the next block (and
@@ -893,7 +878,6 @@ impl Vst3Plugin {
                         }
                     }
                 }
-                Err(e) => log::debug!("{}: {e}", self.info.id),
                 _ => {}
             }
             start += n;
@@ -945,7 +929,7 @@ impl Plugin for Vst3Plugin {
     /// Runs on the audio thread (automation): converts through the sampled curves, never the
     /// controller, and queues without allocating.
     fn set_param(&mut self, id: &str, value: f32) -> bool {
-        let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return false };
+        let Some(i) = self.param_index.get(id).copied() else { return false };
         let Some(pi) = self.info.params.get(i) else { return false };
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
@@ -961,7 +945,7 @@ impl Plugin for Vst3Plugin {
     /// Like `set_param`, but the point reaches the plug-in at `offset` within the next block, in
     /// a queue of its own with every other point of that parameter.
     fn set_param_at(&mut self, offset: u32, id: &str, value: f32) -> bool {
-        let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return false };
+        let Some(i) = self.param_index.get(id).copied() else { return false };
         let (Some(pi), Some(&pid)) = (self.info.params.get(i), self.ids.get(i)) else { return false };
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
@@ -982,7 +966,7 @@ impl Plugin for Vst3Plugin {
     }
 
     fn param(&self, id: &str) -> Option<f32> {
-        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let i = self.param_index.get(id).copied()?;
         self.values.get(i).copied()
     }
 
@@ -1164,6 +1148,7 @@ impl Plugin for Vst3Plugin {
 /// state reader).
 #[derive(Clone)]
 struct Converter {
+    param_index: HashMap<&'static str, usize>,
     link: Arc<EditorLink>,
     info: &'static PluginInfo,
     ids: Vec<u32>,
@@ -1243,7 +1228,7 @@ impl PluginEditor for Vst3Editor {
     }
 
     fn set_param(&mut self, id: &str, value: f32) {
-        let Some(i) = self.conv.info.params.iter().position(|p| p.id == id) else { return };
+        let Some(i) = self.conv.param_index.get(id).copied() else { return };
         if let (Some(&vid), Some(n)) = (self.conv.ids.get(i), self.conv.normalized(i, value)) {
             self.conv.link.set_normalized(vid, n);
         }

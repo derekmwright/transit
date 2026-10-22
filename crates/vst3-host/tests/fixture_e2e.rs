@@ -326,8 +326,9 @@ fn host_set_controller_param_survives_state_round_trip() {
 fn editor_view_is_probed_and_edits_come_back_as_plain_values() {
     let id = id_of("Fixture Gain");
     let mut p = soundcraft_vst3_host::instantiate_plugin(&id).unwrap();
-    // Editor windows are hosted on macOS and Windows; elsewhere the probe reports "unsupported".
-    if cfg!(any(target_os = "macos", windows)) {
+    // Windows permits the creating test thread; macOS requires the process main thread
+    // (covered by editor_main_thread), and other platforms have no host windows.
+    if cfg!(windows) {
         assert_eq!(p.editor_size(), Ok((320, 240)));
     } else {
         assert!(p.editor_size().is_err());
@@ -336,11 +337,13 @@ fn editor_view_is_probed_and_edits_come_back_as_plain_values() {
     // The fixture "edits" Gain to 0.9 (normalized) when it gets the component handler.
     assert_eq!(ed.idle(), vec![("7".to_string(), 1.8)]);
     assert!(ed.idle().is_empty());
-    if cfg!(any(target_os = "macos", windows)) {
-        assert!(ed.open().unwrap_err().contains("main thread"), "test threads are not the main thread");
-    } else {
-        assert!(ed.open().is_err(), "unsupported elsewhere");
-    }
+    // A foreign thread is refused before creating a window, whatever the owner's name.
+    ed = std::thread::spawn(move || {
+        assert!(ed.open().is_err(), "another thread cannot open this instance's editor");
+        ed
+    })
+    .join()
+    .unwrap();
     assert!(!ed.is_open());
     // The synth's controller has no view.
     let synth = soundcraft_vst3_host::instantiate_plugin(&id_of("Fixture Synth")).unwrap();

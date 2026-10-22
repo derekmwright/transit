@@ -15,18 +15,18 @@ log.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 serde_json.workspace = true
-vst3 = "0.3"
-libloading = "0.8"
+vst3 = "=0.3.0"
+libloading = "=0.8.9"
 
 # The macOS editor host window (an NSWindow whose content view the plugin's IPlugView attaches to).
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSString"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSGraphics"] }
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSGraphics"] }
 
 # The Windows editor host window (a top-level HWND the plugin view's child window lives in).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [[test]]
 name = "editor_main_thread"
@@ -59,6 +59,8 @@ harness = false
 unsafe_code = "deny"
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"

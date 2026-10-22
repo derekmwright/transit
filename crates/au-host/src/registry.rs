@@ -29,7 +29,7 @@ struct Registry {
     /// One leaked `PluginInfo` per plugin type that was actually instantiated.
     infos: HashMap<String, &'static PluginInfo>,
     /// Ids that failed to instantiate (not retried every UI frame).
-    failed: HashSet<String>,
+    failed: HashMap<String, AuError>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -169,8 +169,8 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, u32), AuE
     let (ty, sub, manu) = parse_id(id).ok_or_else(|| AuError::NotFound(id.to_string()))?;
     let desc = {
         let mut r = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        if r.failed.contains(id) {
-            return Err(AuError::Instantiate(id.to_string(), "failed before".into()));
+        if let Some(error) = r.failed.get(id) {
+            return Err(error.clone());
         }
         ensure_scanned(&mut r).iter().find(|d| d.id == id).cloned().ok_or_else(|| AuError::NotFound(id.to_string()))?
     };
@@ -190,8 +190,9 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo, u32), AuE
             Ok((inst, info, ty))
         }
         Err(e) => {
-            r.failed.insert(id.to_string());
-            Err(AuError::Instantiate(id.to_string(), e))
+            let error = AuError::Instantiate(id.to_string(), e);
+            r.failed.insert(id.to_string(), error.clone());
+            Err(error)
         }
     }
 }
@@ -216,7 +217,7 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         if let Some(i) = r.infos.get(id) {
             return Some(*i);
         }
-        if r.failed.contains(id) {
+        if r.failed.contains_key(id) {
             return None;
         }
     }
@@ -227,6 +228,16 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_instantiation_retains_the_original_failure() {
+        let id = "au:aufx:1212:1212";
+        let error = AuError::Instantiate(id.into(), "fixture initialization was refused".into());
+        registry().lock().unwrap_or_else(PoisonError::into_inner).failed.insert(id.into(), error.clone());
+        let again = instantiate_raw(id).err();
+        registry().lock().unwrap_or_else(PoisonError::into_inner).failed.remove(id);
+        assert_eq!(again, Some(error));
+    }
 
     fn raw(unit: u32, min: f32, max: f32, default: f32, flags: u32) -> RawParam {
         RawParam {

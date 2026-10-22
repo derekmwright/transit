@@ -10,10 +10,6 @@
 //! in-process can't prevent that. What this module guarantees is that *SoundCraft* never hands
 //! the plugin dangling or mis-sized pointers and never reads plugin strings beyond their bounds.
 
-// VST3 enum constants are `c_int` on Windows and `c_uint` elsewhere, so casts that are no-ops on
-// one platform are needed on another.
-#![allow(clippy::unnecessary_cast)]
-
 use crate::{Vst3Error, scan};
 use soundcraft_dsp::Transport;
 use std::ffi::{c_char, c_int, c_void};
@@ -166,12 +162,8 @@ fn os_thread() -> usize {
     }
     #[cfg(windows)]
     {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThreadId() -> u32;
-        }
         // SAFETY: `GetCurrentThreadId` takes no arguments and cannot fail.
-        unsafe { GetCurrentThreadId() as usize }
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() as usize }
     }
 }
 
@@ -586,6 +578,7 @@ impl Bundle {
             }
         }
         inst.editor = Arc::new(EditorLink {
+            main: std::thread::current().id(),
             inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), controller: inst.controller.clone(), ..EditorInner::default() }),
         });
         Ok(inst)
@@ -1523,6 +1516,7 @@ impl IBStreamTrait for MemoryStream {
         let mut g = self.lock();
         let len = i64::try_from(g.0.len()).unwrap_or(i64::MAX);
         let cur = i64::try_from(g.1).unwrap_or(0);
+        #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
         let base = match mode as u32 {
             x if x == sb::IBStream_::IStreamSeekMode_::kIBSeekSet as u32 => 0,
             x if x == sb::IBStream_::IStreamSeekMode_::kIBSeekCur as u32 => cur,
@@ -1796,7 +1790,7 @@ impl Instance {
 
     /// Restores a [`EditorLink::save_state`] blob (or a bare component state): component
     /// `setState`, then the controller's `setComponentState` and `setState`. `false` when the
-    /// blob is malformed or the component refuses it.
+    /// blob is malformed or a component/controller refuses its state.
     pub fn load_state(&self, data: &[u8]) -> bool {
         let Some((comp, ctrl)) = split_state(data) else { return false };
         let stream = MemoryStream::new(comp.to_vec());
@@ -1808,12 +1802,17 @@ impl Instance {
         if let Some(c) = &self.controller {
             stream.lock().1 = 0;
             // SAFETY: valid controller; the same stream, rewound.
-            unsafe { c.setComponentState(s.as_ptr()) };
+            let result = unsafe { c.setComponentState(s.as_ptr()) };
+            // A controller may leave component-state synchronization unimplemented.
+            if !ok(result) && result != sb::kNotImplemented {
+                return false;
+            }
             if !ctrl.is_empty() {
                 let cs = MemoryStream::new(ctrl.to_vec());
-                if let Some(r) = cs.as_com_ref::<sb::IBStream>() {
-                    // SAFETY: valid controller; the stream lives on this frame for the call.
-                    unsafe { c.setState(r.as_ptr()) };
+                let Some(r) = cs.as_com_ref::<sb::IBStream>() else { return false };
+                // SAFETY: valid controller; the stream lives on this frame for the call.
+                if !ok(unsafe { c.setState(r.as_ptr()) }) {
+                    return false;
                 }
             }
         }
@@ -2026,6 +2025,8 @@ impl Instance {
             unsafe { self.component.activateBus(event as sv::MediaType, din as sv::BusDirection, 0, 1) };
         }
         self.event_in = layout.event_input;
+        // SDK enum constants are signed on Windows and unsigned on Unix.
+        #[allow(clippy::unnecessary_cast)]
         let sample32 = sv::SymbolicSampleSizes_::kSample32 as i32;
         // SAFETY: valid processor.
         if !ok(unsafe { p.canProcessSampleSize(sample32) }) {
@@ -2033,6 +2034,7 @@ impl Instance {
         }
         let max = i32::try_from(max_frames).unwrap_or(i32::MAX);
         let mut setup = sv::ProcessSetup {
+            #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
             processMode: sv::ProcessModes_::kRealtime as i32,
             symbolicSampleSize: sample32,
             maxSamplesPerBlock: max,
@@ -2091,14 +2093,14 @@ impl Instance {
         offset: u32,
         project_time: i64,
         transport: Option<&Transport>,
-    ) -> Result<u32, Vst3Error> {
+    ) -> Result<u32, sb::tresult> {
         if !self.active {
-            return Err(Vst3Error::Process("not active".into()));
+            return Err(sb::kNotInitialized);
         }
         if frames == 0 || frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
-            return Err(Vst3Error::Process("block larger than the configured size".into()));
+            return Err(sb::kInvalidArgument);
         }
-        let p = self.processor.clone().ok_or_else(|| Vst3Error::Process("no audio processor".into()))?;
+        let p = self.processor.clone().ok_or(sb::kNoInterface)?;
         if !self.processing {
             // Many plugins return kNotImplemented here; that is not an error.
             // SAFETY: valid, active processor.
@@ -2125,7 +2127,9 @@ impl Instance {
             None => self.context.projectTimeSamples = project_time,
         }
         let mut data = sv::ProcessData {
+            #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
             processMode: sv::ProcessModes_::kRealtime as i32,
+            #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
             symbolicSampleSize: sv::SymbolicSampleSizes_::kSample32 as i32,
             numSamples: i32::try_from(frames).unwrap_or(0),
             numInputs: i32::try_from(inputs.bufs.len()).unwrap_or(0),
@@ -2143,7 +2147,7 @@ impl Instance {
         // parameter/event objects and the context are owned by `self` and untouched until the
         // call returns.
         let r = unsafe { p.process(&mut data) };
-        if ok(r) { Ok(dropped) } else { Err(Vst3Error::Process(format!("process returned {r}"))) }
+        if ok(r) { Ok(dropped) } else { Err(r) }
     }
 }
 
@@ -2248,12 +2252,23 @@ struct EditorInner {
 /// `getState` on the UI thread). All such calls happen under this lock, and the instance closes
 /// the view and drops the component and controller references under the same lock before it
 /// terminates, so a handle never calls into a dead plugin.
-#[derive(Default)]
 pub(crate) struct EditorLink {
+    /// GUI/controller calls belong to the instance's creating thread, regardless of its name.
+    main: std::thread::ThreadId,
     inner: Mutex<EditorInner>,
 }
 
+impl Default for EditorLink {
+    fn default() -> Self {
+        Self { main: std::thread::current().id(), inner: Mutex::new(EditorInner::default()) }
+    }
+}
+
 impl EditorLink {
+    fn on_main_thread(&self) -> bool {
+        self.main == std::thread::current().id() && window::on_main_thread()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, EditorInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -2273,6 +2288,9 @@ impl EditorLink {
     /// Creates the view, checks it supports this platform's window type and reads its size,
     /// without attaching it anywhere. For diagnostics and tests.
     pub fn probe(&self) -> Result<(u32, u32), String> {
+        if !self.on_main_thread() {
+            return Err("plugin editor belongs to another thread".into());
+        }
         let g = self.lock();
         let view = EditorLink::create_view(&g)?;
         let platform = window::PLATFORM_TYPE.ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
@@ -2291,7 +2309,7 @@ impl EditorLink {
 
     /// Opens (or raises) the editor in a host window. Main thread only.
     pub fn open(&self, title: &str) -> Result<(), String> {
-        if !window::on_main_thread() {
+        if !self.on_main_thread() {
             return Err("plugin editors must be opened on the main thread".into());
         }
         let platform = window::PLATFORM_TYPE.ok_or_else(|| "VST3 editors are not hosted on this platform yet".to_string())?;
@@ -2386,7 +2404,7 @@ impl EditorLink {
 
     /// Closes the editor. Main thread only (no-op elsewhere).
     pub fn close(&self) {
-        if window::on_main_thread() {
+        if self.on_main_thread() {
             EditorLink::teardown(&mut self.lock());
         }
     }
@@ -2394,7 +2412,7 @@ impl EditorLink {
     pub fn is_open(&self) -> bool {
         let g = self.lock();
         match &g.window {
-            Some(w) if window::on_main_thread() => w.is_visible(),
+            Some(w) if self.on_main_thread() => w.is_visible(),
             Some(_) => true,
             None => false,
         }
@@ -2402,7 +2420,7 @@ impl EditorLink {
 
     /// Main-thread housekeeping: tears the view down when the user closed its window.
     pub fn idle(&self) {
-        if !window::on_main_thread() {
+        if !self.on_main_thread() {
             return;
         }
         let mut g = self.lock();
@@ -2434,7 +2452,7 @@ impl EditorLink {
 
     /// Shows a value change in the editor (`setParamNormalized`, main thread).
     pub fn set_normalized(&self, id: u32, n: f64) {
-        if !window::on_main_thread() || !n.is_finite() {
+        if !self.on_main_thread() || !n.is_finite() {
             return;
         }
         let g = self.lock();
@@ -2450,7 +2468,7 @@ impl EditorLink {
         let mut g = self.lock();
         let mut leaked = false;
         if g.view.is_some() || g.window.is_some() {
-            if window::on_main_thread() {
+            if self.on_main_thread() {
                 EditorLink::teardown(&mut g);
             } else {
                 // Window calls are main-thread only; leak the view and window rather than crash.
@@ -2591,9 +2609,18 @@ mod window {
 
     pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeHWND);
 
-    /// Rust names the process's first thread "main"; the app runs its UI (and message loop) there.
+    /// Windows permits GUI creation on any thread; the editor link checks its creating thread.
     pub fn on_main_thread() -> bool {
-        std::thread::current().name() == Some("main")
+        true
+    }
+
+    fn owns_window(hwnd: HWND) -> bool {
+        // SAFETY: these Win32 queries accept any handle (invalid returns 0), require no buffers,
+        // and only compare the window's owning thread with the caller before GUI operations.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, std::ptr::null_mut())
+                == windows_sys::Win32::System::Threading::GetCurrentThreadId()
+        }
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -2662,7 +2689,7 @@ mod window {
     impl HostWindow {
         fn live(&self) -> Option<HWND> {
             // SAFETY: `IsWindow` accepts any value and only reports whether it names a window.
-            (on_main_thread() && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
+            (owns_window(self.hwnd) && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
         }
 
         pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
@@ -2734,7 +2761,7 @@ mod window {
     /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
     pub fn resize(window: *mut c_void, w: f64, h: f64) {
         // SAFETY: `IsWindow` accepts any value.
-        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
+        if !owns_window(window) || window.is_null() || unsafe { IsWindow(window) } == 0 {
             return;
         }
         // SAFETY: a live window of this thread; style values are read, not changed.
@@ -2785,6 +2812,59 @@ mod host_object_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn editor_thread_is_its_creator_not_a_name() {
+        let link = Arc::new(EditorLink::default());
+        assert!(link.on_main_thread(), "a host thread need not be named main");
+        assert!(!std::thread::spawn(move || link.on_main_thread()).join().unwrap(), "another thread cannot drive this editor");
+    }
+
+    fn gain_instance() -> Instance {
+        crate::set_scan_extra_dirs_only(true);
+        let descriptors = crate::scan_paths(&[fixture::unregistered_fixture_dir().to_path_buf()]);
+        let d = descriptors.iter().find(|d| d.name == "Fixture Gain").unwrap();
+        Bundle::load(&d.path).unwrap().instantiate(&crate::parse_id(&d.id).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn processing_failures_do_not_allocate() {
+        let mut inst = gain_instance();
+        let mut inputs = BusBuffers::new(&[2], 64);
+        let mut outputs = BusBuffers::new(&[2], 64);
+        for case in 0..4 {
+            if case == 1 {
+                inst.configure(48_000.0, 64, false).unwrap();
+            }
+            let processor = if case == 2 { inst.processor.take() } else { None };
+            if case == 3 {
+                assert!(inst.load_state(&(-3.0f64).to_le_bytes()));
+            }
+            let frames = if case == 1 { 65 } else { 64 };
+            let (failed, stats) = allocation_probe::measure(|| {
+                let result = inst.process(frames, &mut inputs, &mut outputs, &mut [], &[], 0, 0, None);
+                result.is_err()
+            });
+            if case == 2 {
+                inst.processor = processor;
+            }
+            assert!(failed, "case {case}");
+            assert!(stats.is_zero(), "case {case}: {stats:?}");
+        }
+    }
+
+    #[test]
+    fn controller_state_rejection_is_reported() {
+        let inst = gain_instance();
+        assert!(!inst.load_state(&(-1.0f64).to_le_bytes()), "setComponentState refused");
+        let mut blob = STATE_MAGIC.to_vec();
+        blob.extend_from_slice(&8u32.to_le_bytes());
+        blob.extend_from_slice(&0.5f64.to_le_bytes());
+        blob.extend_from_slice(&8u32.to_le_bytes());
+        blob.extend_from_slice(&(-2.0f64).to_le_bytes());
+        assert!(!inst.load_state(&blob), "setState refused");
+    }
 
     /// `IHostApplication::createInstance` as a plug-in calls it (class id = interface id).
     fn create_host_object(host: &ComWrapper<HostContext>, cid: [u8; 16], iid: [u8; 16]) -> (sb::tresult, *mut c_void) {
@@ -2857,6 +2937,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
     fn the_transport_fills_the_process_context() {
         use sv::ProcessContext_::StatesAndFlags_::*;
         // SAFETY: `ProcessContext` is plain data (numbers and small structs); all-zero is valid.
@@ -2937,6 +3018,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_cast)] // SDK enum signedness differs by target.
     fn host_objects_behave() {
         let pc = ParamChanges::new(2, 16);
         let pt = |time, id, seq, value| ParamPoint { time, id, class: 0, seq, value, release: false };
@@ -3006,3 +3088,16 @@ mod tests {
         assert_eq!(hex(&[0xAB; 16]), "AB".repeat(16));
     }
 }
+
+#[cfg(test)]
+#[path = "../../rt/src/testing.rs"]
+#[allow(dead_code)]
+mod allocation_probe;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: allocation_probe::CountingAlloc = allocation_probe::CountingAlloc;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod fixture;

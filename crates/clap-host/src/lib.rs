@@ -5,7 +5,7 @@
 //! plugins exactly like the built-in ones. Plugin ids are `clap:<CLAP plugin id>`; parameter ids
 //! are the CLAP param ids as decimal strings, with their human names in [`PluginInfo::params`].
 //!
-//! This is SoundCraft's single isolated `unsafe` crate (craftrules never-crash): `unsafe` is
+//! This host isolates its SDK interface code in `ffi`: `unsafe` is
 //! denied crate-wide and allowed only in the private `ffi` module. The public API is safe, returns
 //! `Result`/`Option` and never panics. Limits of in-process hosting: a plugin that itself crashes
 //! (segfault) takes the process down with it; we cannot sandbox native code.
@@ -44,7 +44,7 @@ mod registry;
 mod scan_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use plugin::{ClapPlugin, Serviced};
+pub use plugin::ClapPlugin;
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
@@ -92,68 +92,8 @@ pub enum ClapError {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod api {
-    use super::*;
-
-    pub fn cached() -> Option<Vec<ClapDescriptor>> {
-        registry::cached()
-    }
-    pub fn scan() -> Vec<ClapDescriptor> {
-        registry::scan()
-    }
-    pub fn rescan() -> Vec<ClapDescriptor> {
-        registry::rescan()
-    }
-    pub fn set_cache_file(file: Option<PathBuf>) {
-        registry::set_cache_file(file)
-    }
-    pub fn scan_in_background() {
-        registry::scan_in_background()
-    }
-    pub fn rescan_in_background(clear_cache: bool) {
-        registry::rescan_in_background(clear_cache)
-    }
-    pub fn scanning() -> bool {
-        registry::scanning()
-    }
-    pub fn search_dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
-        registry::search_dirs()
-    }
-    pub fn set_extra_dirs(dirs: Vec<PathBuf>) {
-        registry::set_extra_dirs(dirs)
-    }
-    pub fn problems() -> Vec<(PathBuf, String)> {
-        registry::problems()
-    }
-    pub fn progress() -> Option<(usize, usize, PathBuf)> {
-        registry::progress()
-    }
-    pub fn set_scanner(program: Option<PathBuf>) {
-        registry::set_scanner(program)
-    }
-    pub fn scan_reply(file: &Path) -> String {
-        registry::scan_reply(file)
-    }
-    pub fn skip_scan() {
-        registry::skip_scan()
-    }
-    pub fn add_search_dir(dir: &Path) -> usize {
-        registry::add_search_dir(dir)
-    }
-    pub fn scan_paths(dirs: &[PathBuf]) -> Vec<ClapDescriptor> {
-        registry::scan_paths(dirs)
-    }
-    pub fn load_bundle(path: &Path) -> Result<Vec<ClapDescriptor>, ClapError> {
-        registry::load_bundle(path)
-    }
-    pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, ClapError> {
-        registry::instantiate(id)
-    }
-    pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
-        registry::plugin_info(id)
-    }
-    pub fn service_requests() -> Serviced {
-        plugin::service_requests()
-    }
+    pub(crate) use super::plugin::service_requests;
+    pub use super::registry::*;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -210,17 +150,25 @@ mod api {
     }
 }
 
-/// What one [`service_requests`] call did (no plug-ins on this platform).
-#[cfg(target_arch = "wasm32")]
+/// What one [`crate::service_requests`] call did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serviced {
+    /// Instances deactivated and reactivated for `request_restart`.
     pub restarted: usize,
+    /// Restarts waiting for the audio thread to stop processing (done by a later call).
     pub restarts_waiting: usize,
+    /// `on_main_thread` callbacks run for plug-ins without an editor.
     pub callbacks: usize,
+    /// `params.rescan` requests handled.
     pub rescans: usize,
+    /// Restarts the main thread completed itself because no audio callback parked the instance
+    /// within `PARK_DEADLINE` (included in `restarted`).
     pub restarted_without_audio: usize,
+    /// Restarts whose reactivation the plug-in refused (logged; the slot is silent).
     pub failed: usize,
+    /// Instances with a request still in progress after this call: call again soon.
     pub pending: usize,
+    /// Instances skipped because this is not the thread that created them.
     pub other_thread: usize,
 }
 
@@ -408,6 +356,7 @@ mod tests {
 
     #[test]
     fn garbage_files_are_errors_not_crashes() {
+        set_scan_extra_dirs_only(true);
         let d = std::env::temp_dir().join(format!("soundcraft-clap-garbage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("Bundle.clap/Contents/MacOS")).unwrap();

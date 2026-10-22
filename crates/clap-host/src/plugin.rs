@@ -47,6 +47,7 @@ use clap_sys::ext::params::{CLAP_PARAM_RESCAN_ALL, CLAP_PARAM_RESCAN_INFO, CLAP_
 use clap_sys::process::{CLAP_PROCESS_CONTINUE, CLAP_PROCESS_CONTINUE_IF_NOT_QUIET, CLAP_PROCESS_SLEEP, CLAP_PROCESS_TAIL, clap_process_status};
 use soundcraft_dsp::event::{Message, NoteId, PluginEvent};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, ProcessStatus, Transport};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::thread::ThreadId;
@@ -75,27 +76,7 @@ enum NoteMode {
     Midi,
 }
 
-/// What one [`crate::service_requests`] call did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Serviced {
-    /// Instances deactivated and reactivated for `request_restart`.
-    pub restarted: usize,
-    /// Restarts waiting for the audio thread to stop processing (done by a later call).
-    pub restarts_waiting: usize,
-    /// `on_main_thread` callbacks run for plug-ins without an editor.
-    pub callbacks: usize,
-    /// `params.rescan` requests handled.
-    pub rescans: usize,
-    /// Restarts the main thread completed itself because no audio callback parked the instance
-    /// within `PARK_DEADLINE` (included in `restarted`).
-    pub restarted_without_audio: usize,
-    /// Restarts whose reactivation the plug-in refused (logged; the slot is silent).
-    pub failed: usize,
-    /// Instances with a request still in progress after this call: call again soon.
-    pub pending: usize,
-    /// Instances skipped because this is not the thread that created them.
-    pub other_thread: usize,
-}
+use crate::Serviced;
 
 /// What the activation decides: the plugin's audio port buffers, sized on the main thread.
 struct Core {
@@ -394,6 +375,8 @@ pub struct ClapPlugin {
     /// The request flags (also in `shared`), for lock-free reads on the audio thread.
     host: Arc<HostState>,
     info: &'static PluginInfo,
+    /// Built at creation; automation lookup never scans or allocates.
+    param_index: HashMap<&'static str, usize>,
     /// CLAP id of each `info.params` entry (same order).
     ids: Vec<u32>,
     values: Vec<f32>,
@@ -537,6 +520,7 @@ impl ClapPlugin {
             shared,
             host,
             info,
+            param_index: info.params.iter().enumerate().rev().map(|(i, p)| (p.id, i)).collect(),
             ids,
             values,
             queue: Vec::with_capacity(EVENT_CAP),
@@ -607,7 +591,7 @@ impl ClapPlugin {
 
     /// The host-set value of parameter `id`, clamped and noted: (CLAP id, value).
     fn host_value(&mut self, id: &str, value: f32) -> Option<(u32, f64)> {
-        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let i = self.param_index.get(id).copied()?;
         let (Some(pi), Some(&cid)) = (self.info.params.get(i), self.ids.get(i)) else { return None };
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
@@ -781,24 +765,21 @@ impl ClapPlugin {
             self.tail = tail_samples_from(tail);
             self.status = r.as_ref().map_or(ProcessStatus::Continue, |&s| status_from_clap(s, tail));
             self.steady = self.steady.saturating_add(i64::try_from(n).unwrap_or(0));
-            match (r, core.out_main) {
-                (Ok(_), Some(p)) => {
-                    let oc = core.outputs.channels(p);
-                    for (c, dst) in io.iter_mut().take(ch).enumerate() {
-                        let Some(dst) = dst.get_mut(start..start + n) else { continue };
-                        if ch == 1 && oc >= 2 {
-                            if let (Some(l), Some(r)) = (core.outputs.channel(p, 0), core.outputs.channel(p, 1)) {
-                                for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
-                                    *d = 0.5 * (a + b);
-                                }
+            // Failed blocks retain the silence prepared above; never log from this callback.
+            if let (Ok(_), Some(p)) = (r, core.out_main) {
+                let oc = core.outputs.channels(p);
+                for (c, dst) in io.iter_mut().take(ch).enumerate() {
+                    let Some(dst) = dst.get_mut(start..start + n) else { continue };
+                    if ch == 1 && oc >= 2 {
+                        if let (Some(l), Some(r)) = (core.outputs.channel(p, 0), core.outputs.channel(p, 1)) {
+                            for ((d, a), b) in dst.iter_mut().zip(l).zip(r) {
+                                *d = 0.5 * (a + b);
                             }
-                        } else if let Some(src) = core.outputs.channel(p, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
-                            dst.copy_from_slice(src);
                         }
+                    } else if let Some(src) = core.outputs.channel(p, c.min(oc.saturating_sub(1))).and_then(|s| s.get(..n)) {
+                        dst.copy_from_slice(src);
                     }
                 }
-                (Err(e), _) => log::debug!("{}: {e}", self.info.id),
-                _ => {}
             }
             start += n;
         }
@@ -863,7 +844,7 @@ impl Plugin for ClapPlugin {
     }
 
     fn param(&self, id: &str) -> Option<f32> {
-        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let i = self.param_index.get(id).copied()?;
         self.values.get(i).copied()
     }
 

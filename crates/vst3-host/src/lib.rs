@@ -59,7 +59,7 @@ mod registry;
 mod scan_cache;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use plugin::{Serviced, Vst3Plugin};
+pub use plugin::Vst3Plugin;
 
 use soundcraft_dsp::{Category, Plugin, PluginInfo};
 use std::path::{Path, PathBuf};
@@ -121,71 +121,9 @@ pub enum Vst3Error {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod api {
-    use super::*;
-
-    pub fn cached() -> Option<Vec<Vst3Descriptor>> {
-        registry::cached()
-    }
-    pub fn scan() -> Vec<Vst3Descriptor> {
-        registry::scan()
-    }
-    pub fn rescan() -> Vec<Vst3Descriptor> {
-        registry::rescan()
-    }
-    pub fn set_cache_file(file: Option<PathBuf>) {
-        registry::set_cache_file(file)
-    }
-    pub fn scan_in_background() {
-        registry::scan_in_background()
-    }
-    pub fn rescan_in_background(clear_cache: bool) {
-        registry::rescan_in_background(clear_cache)
-    }
-    pub fn scanning() -> bool {
-        registry::scanning()
-    }
-    pub fn search_dirs() -> (Vec<PathBuf>, Vec<PathBuf>) {
-        registry::search_dirs()
-    }
-    pub fn set_extra_dirs(dirs: Vec<PathBuf>) {
-        registry::set_extra_dirs(dirs)
-    }
-    pub fn problems() -> Vec<(PathBuf, String)> {
-        registry::problems()
-    }
-    pub fn progress() -> Option<(usize, usize, PathBuf)> {
-        registry::progress()
-    }
-    pub fn set_scanner(program: Option<PathBuf>) {
-        registry::set_scanner(program)
-    }
-    pub fn scan_reply(file: &Path) -> String {
-        registry::scan_reply(file)
-    }
-    pub fn skip_scan() {
-        registry::skip_scan()
-    }
-    pub fn add_search_dir(dir: &Path) -> usize {
-        registry::add_search_dir(dir)
-    }
-    pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
-        registry::scan_paths(dirs)
-    }
-    pub fn load_bundle(path: &Path) -> Result<Vec<Vst3Descriptor>, Vst3Error> {
-        registry::load_bundle(path)
-    }
-    pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
-        registry::instantiate(id)
-    }
-    pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
-        registry::plugin_info(id)
-    }
-    pub fn shutdown() {
-        ffi::exit_modules();
-    }
-    pub fn service_requests() -> Serviced {
-        plugin::service_requests()
-    }
+    pub(crate) use super::ffi::exit_modules as shutdown;
+    pub(crate) use super::plugin::service_requests;
+    pub use super::registry::*;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -243,17 +181,24 @@ mod api {
     }
 }
 
-/// What one [`service_requests`] call did (no plug-ins on this platform).
-#[cfg(target_arch = "wasm32")]
+/// What one [`crate::service_requests`] call did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serviced {
+    /// Instances deactivated and reactivated (`kLatencyChanged`, `kIoChanged`).
     pub restarted: usize,
+    /// Reactivations waiting because the instance was busy on the audio thread.
     pub restarts_waiting: usize,
+    /// `IMidiMapping` tables re-read and published (`kMidiCCAssignmentChanged`).
     pub midi_maps: usize,
+    /// Parameter value re-reads finished (`kParamValuesChanged`).
     pub value_rescans: usize,
+    /// Requests this host cannot honor (`kReloadComponent`), logged.
     pub unsupported: usize,
+    /// Reactivations the plug-in refused (logged; not retried until it asks again).
     pub failed: usize,
+    /// Instances with a request still in progress after this call: call again soon.
     pub pending: usize,
+    /// Instances skipped because this is not the thread that created them.
     pub other_thread: usize,
 }
 
@@ -491,6 +436,7 @@ mod tests {
 
     #[test]
     fn garbage_files_are_errors_not_crashes() {
+        set_scan_extra_dirs_only(true);
         let d = std::env::temp_dir().join(format!("soundcraft-vst3-garbage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let arch = if cfg!(target_os = "macos") {

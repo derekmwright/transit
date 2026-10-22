@@ -2,6 +2,7 @@
 
 use crate::ffi::Instance;
 use soundcraft_dsp::{Plugin, PluginInfo, Transport};
+use std::collections::HashMap;
 
 /// Most MIDI events queued between two blocks (extra events are dropped).
 const EVENT_CAP: usize = 1024;
@@ -22,6 +23,8 @@ struct MidiEvent {
 pub struct AuPlugin {
     inst: Instance,
     info: &'static PluginInfo,
+    /// Built at creation; automation lookup never scans or allocates.
+    param_index: HashMap<&'static str, usize>,
     /// Audio Unit id of each `info.params` entry (same order).
     ids: Vec<u32>,
     values: Vec<f32>,
@@ -44,6 +47,7 @@ impl AuPlugin {
         AuPlugin {
             inst,
             info,
+            param_index: info.params.iter().enumerate().rev().map(|(i, p)| (p.id, i)).collect(),
             ids,
             values,
             events: Vec::with_capacity(EVENT_CAP),
@@ -108,7 +112,7 @@ impl Plugin for AuPlugin {
     }
 
     fn set_param(&mut self, id: &str, value: f32) -> bool {
-        let Some(i) = self.info.params.iter().position(|p| p.id == id) else { return false };
+        let Some(i) = self.param_index.get(id).copied() else { return false };
         let (Some(pi), Some(&aid)) = (self.info.params.get(i), self.ids.get(i)) else { return false };
         let v = pi.clamp(value);
         if let Some(slot) = self.values.get_mut(i) {
@@ -119,7 +123,7 @@ impl Plugin for AuPlugin {
     }
 
     fn param(&self, id: &str) -> Option<f32> {
-        let i = self.info.params.iter().position(|p| p.id == id)?;
+        let i = self.param_index.get(id).copied()?;
         self.values.get(i).copied()
     }
 

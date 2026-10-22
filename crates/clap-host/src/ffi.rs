@@ -286,6 +286,7 @@ impl Bundle {
         inst.state_ext = inst.extension::<clap_plugin_state>(CLAP_EXT_STATE);
         let gui = inst.extension::<clap_plugin_gui>(CLAP_EXT_GUI);
         inst.gui = Arc::new(GuiLink {
+            main: std::thread::current().id(),
             inner: Mutex::new(GuiInner { plugin, gui, state: inst.state_ext, alive: true, created: false, visible: false, window: None }),
             host: Arc::clone(&inst.state),
         });
@@ -817,6 +818,8 @@ struct GuiInner {
 /// under the same lock before it destroys the plugin, so a handle can never call into a destroyed
 /// plugin.
 pub(crate) struct GuiLink {
+    /// GUI/controller calls belong to the instance's creating thread, regardless of its name.
+    main: std::thread::ThreadId,
     inner: Mutex<GuiInner>,
     host: Arc<HostState>,
 }
@@ -824,6 +827,7 @@ pub(crate) struct GuiLink {
 impl Default for GuiLink {
     fn default() -> Self {
         GuiLink {
+            main: std::thread::current().id(),
             inner: Mutex::new(GuiInner {
                 plugin: std::ptr::null(),
                 gui: std::ptr::null(),
@@ -843,6 +847,10 @@ impl Default for GuiLink {
 unsafe impl Send for GuiInner {}
 
 impl GuiLink {
+    fn on_main_thread(&self) -> bool {
+        self.main == std::thread::current().id() && on_main_thread()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, GuiInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -863,7 +871,7 @@ impl GuiLink {
 
     /// Opens (creates and shows) the plugin's floating editor window.
     pub fn open(&self, title: &str) -> Result<(), String> {
-        if !on_main_thread() {
+        if !self.on_main_thread() {
             return Err("plugin editors must be opened on the main thread".into());
         }
         let mut g = self.lock();
@@ -1007,7 +1015,7 @@ impl GuiLink {
 
     /// Closes (destroys) the editor.
     pub fn close(&self) {
-        if !on_main_thread() {
+        if !self.on_main_thread() {
             return;
         }
         GuiLink::destroy(&mut self.lock());
@@ -1021,7 +1029,7 @@ impl GuiLink {
     /// Main-thread housekeeping: runs a requested `on_main_thread`, follows the plugin's
     /// show/hide/closed requests, and returns the parameter edits reported since the last call.
     pub fn idle(&self) -> Vec<(u32, f64)> {
-        self.idle_on(on_main_thread())
+        self.idle_on(self.on_main_thread())
     }
 
     /// [`GuiLink::idle`] for a plugin without an editor, run by the instance's owner thread (the
@@ -1094,7 +1102,7 @@ impl GuiLink {
     fn kill(&self) {
         let mut g = self.lock();
         if g.created {
-            if on_main_thread() {
+            if self.on_main_thread() {
                 GuiLink::destroy(&mut g);
             } else {
                 log::warn!("clap: editor still open while its plugin is destroyed off the main thread");
@@ -1478,12 +1486,12 @@ impl Instance {
         events: &[Event],
         offset: u32,
         transport: Option<&Transport>,
-    ) -> Result<i32, ClapError> {
+    ) -> Result<i32, &'static str> {
         if !self.active {
-            return Err(ClapError::Process("not active".into()));
+            return Err("not active");
         }
         if frames == 0 || frames > self.max_frames || frames > inputs.frames || frames > outputs.frames {
-            return Err(ClapError::Process("block larger than the activated size".into()));
+            return Err("block larger than the activated size");
         }
         if !self.processing {
             let ok = match self.vt().start_processing {
@@ -1492,11 +1500,11 @@ impl Instance {
                 None => true,
             };
             if !ok {
-                return Err(ClapError::Process("start_processing failed".into()));
+                return Err("start_processing failed");
             }
             self.processing = true;
         }
-        let process = self.vt().process.ok_or_else(|| ClapError::Process("plugin has no process".into()))?;
+        let process = self.vt().process.ok_or("plugin has no process")?;
         self.raw.clear();
         for e in events.iter().take(self.raw.capacity()) {
             self.raw.push(RawEvent::from_event(e, offset));
@@ -1539,7 +1547,7 @@ impl Instance {
             }
         }
         self.out_params.clear();
-        if status == CLAP_PROCESS_ERROR { Err(ClapError::Process("plugin reported a processing error".into())) } else { Ok(status) }
+        if status == CLAP_PROCESS_ERROR { Err("plugin reported a processing error") } else { Ok(status) }
     }
 }
 
@@ -1579,9 +1587,18 @@ mod hostwin {
 
     pub const SUPPORTED: bool = true;
 
-    /// Rust names the process's first thread "main"; the app runs its UI (and message loop) there.
+    /// Windows permits GUI creation on any thread; the editor link checks its creating thread.
     fn on_main_thread() -> bool {
-        std::thread::current().name() == Some("main")
+        true
+    }
+
+    fn owns_window(hwnd: HWND) -> bool {
+        // SAFETY: these Win32 queries accept any handle (invalid returns 0), require no buffers,
+        // and only compare the window's owning thread with the caller before GUI operations.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, std::ptr::null_mut())
+                == windows_sys::Win32::System::Threading::GetCurrentThreadId()
+        }
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -1650,7 +1667,7 @@ mod hostwin {
     impl HostWindow {
         fn live(&self) -> Option<HWND> {
             // SAFETY: `IsWindow` accepts any value and only reports whether it names a window.
-            (on_main_thread() && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
+            (owns_window(self.hwnd) && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
         }
 
         pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
@@ -1722,7 +1739,7 @@ mod hostwin {
     /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
     pub fn resize(window: *mut c_void, w: f64, h: f64) {
         // SAFETY: `IsWindow` accepts any value.
-        if !on_main_thread() || window.is_null() || unsafe { IsWindow(window) } == 0 {
+        if !owns_window(window) || window.is_null() || unsafe { IsWindow(window) } == 0 {
             return;
         }
         // SAFETY: a live window of this thread; style values are read, not changed.
@@ -1765,6 +1782,52 @@ mod hostwin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn editor_thread_is_its_creator_not_a_name() {
+        let link = Arc::new(GuiLink::default());
+        assert!(link.on_main_thread(), "a host thread need not be named main");
+        assert!(!std::thread::spawn(move || link.on_main_thread()).join().unwrap(), "another thread cannot drive this editor");
+    }
+
+    #[test]
+    fn processing_failures_do_not_allocate() {
+        crate::set_scan_extra_dirs_only(true);
+        let descriptors = crate::scan_paths(&[fixture::unregistered_fixture_dir().to_path_buf()]);
+        let d = descriptors.iter().find(|d| !d.is_instrument).unwrap();
+        let mut inst = Bundle::load(&d.path).unwrap().instantiate(&d.plugin_id).unwrap();
+        let mut inputs = PortBuffers::new(&[2], 64);
+        let mut outputs = PortBuffers::new(&[2], 64);
+        let original = inst.plugin;
+        let mut vt = inst.vt();
+        unsafe extern "C" fn refuse_start(_: *const clap_plugin) -> bool {
+            false
+        }
+        unsafe extern "C" fn fail_process(_: *const clap_plugin, _: *const clap_process) -> i32 {
+            CLAP_PROCESS_ERROR
+        }
+        for case in 0..5 {
+            inst.active = case != 0;
+            inst.max_frames = 64;
+            inst.processing = case >= 3;
+            vt.start_processing = Some(refuse_start);
+            vt.process = if case == 3 { None } else { Some(fail_process) };
+            // The copied vtable stays alive until the original pointer is restored below.
+            inst.plugin = &vt;
+            let frames = if case == 1 { 65 } else { 64 };
+            let (failed, stats) = allocation_probe::measure(|| {
+                let result = inst.process(frames, 0, &mut inputs, &mut outputs, &[], 0, None);
+                result.is_err()
+            });
+            // Restore the genuine lifecycle state before any assertion can unwind.
+            inst.plugin = original;
+            inst.active = false;
+            inst.processing = false;
+            assert!(failed, "case {case}");
+            assert!(stats.is_zero(), "case {case}: {stats:?}");
+        }
+    }
 
     #[test]
     fn the_transport_reaches_clap_in_fixed_point() {
@@ -1832,3 +1895,16 @@ mod tests {
         assert!(b.bufs.iter().all(|x| x.constant_mask == 0));
     }
 }
+
+#[cfg(test)]
+#[path = "../../rt/src/testing.rs"]
+#[allow(dead_code)]
+mod allocation_probe;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: allocation_probe::CountingAlloc = allocation_probe::CountingAlloc;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod fixture;

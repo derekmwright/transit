@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-clap-sys = "0.5"
+clap-sys = "=0.5.0"
 
 [features]
 # Builds a binary that lists only the requests plug-in (see src/lib.rs).

@@ -34,7 +34,7 @@ struct Registry {
     /// number of distinct installed plugins).
     infos: HashMap<String, &'static PluginInfo>,
     /// Ids that failed to instantiate (not retried every UI frame).
-    failed: HashSet<String>,
+    failed: HashMap<String, ClapError>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -392,8 +392,8 @@ fn build_info(d: &ClapDescriptor, inst: &Instance) -> &'static PluginInfo {
 /// Finds the descriptor, loads its binary and creates an instance plus its (cached) info.
 fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), ClapError> {
     let plugin_id = parse_id(id).ok_or_else(|| ClapError::NotFound(id.to_string()))?;
-    if lock().failed.contains(id) {
-        return Err(ClapError::Instantiate(plugin_id.to_string(), "failed before".into()));
+    if let Some(error) = lock().failed.get(id) {
+        return Err(error.clone());
     }
     let known = {
         let r = lock();
@@ -418,7 +418,7 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), ClapErro
             Ok((inst, info))
         }
         Err(e) => {
-            r.failed.insert(id.to_string());
+            r.failed.insert(id.to_string(), e.clone());
             Err(e)
         }
     }
@@ -438,10 +438,25 @@ pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         if let Some(i) = r.infos.get(id) {
             return Some(*i);
         }
-        if r.failed.contains(id) {
+        if r.failed.contains_key(id) {
             return None;
         }
     }
     // Instantiate once to learn the parameters (CLAP exposes them only on an instance).
     instantiate_raw(id).ok().map(|(_, info)| info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_instantiation_retains_the_original_failure() {
+        let id = "clap:issue12.cached-failure";
+        let error = ClapError::Instantiate(id.into(), "fixture initialization was refused".into());
+        lock().failed.insert(id.into(), error.clone());
+        let again = instantiate_raw(id).err();
+        lock().failed.remove(id);
+        assert_eq!(again, Some(error));
+    }
 }

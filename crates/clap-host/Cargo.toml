@@ -1,6 +1,6 @@
 [package]
 name = "soundcraft-clap-host"
-description = "transit CLAP plugin host: scans, loads and runs third-party CLAP plugins behind the safe soundcraft-dsp Plugin trait (the only crate with unsafe code)"
+description = "transit CLAP plugin host: scans, loads and runs third-party CLAP plugins behind the safe soundcraft-dsp Plugin trait"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ log.workspace = true
 
 # The Windows host window for embedded editors (a top-level HWND the plugin parents its GUI in).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [[test]]
 name = "editor_main_thread"
@@ -23,8 +23,8 @@ harness = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 serde_json.workspace = true
-clap-sys = "0.5"
-libloading = "0.8"
+clap-sys = "=0.5.0"
+libloading = "=0.8.9"
 
 # The isolated unsafe helper crate (craftrules never-crash): this crate opts out of the workspace
 # `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and allows it solely on the
@@ -33,6 +33,8 @@ libloading = "0.8"
 unsafe_code = "deny"
 
 [lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 dbg_macro = "warn"
 todo = "warn"
 too_many_arguments = "allow"
