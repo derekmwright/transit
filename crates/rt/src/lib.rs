@@ -1,7 +1,7 @@
 //! Realtime OS support for the audio engine: raise an audio worker thread to the operating
 //! system's realtime scheduling class, and put it back.
 //!
-//! ADR 0013: all new `unsafe` in the fork lives in this crate, behind the safe functions below.
+//! ADR 0013: realtime OS support lives in this crate, behind the safe functions below.
 //! Callers (the mix render pool) stay `unsafe`-free. Each platform has its own module:
 //!
 //! | Platform | Mechanism | Fallback inside the platform |

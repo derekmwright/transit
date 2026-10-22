@@ -1,8 +1,7 @@
 //! macOS: the Mach `THREAD_TIME_CONSTRAINT_POLICY` (the class Core Audio's own I/O thread uses).
 //!
-//! **Untested on hardware.** Written from the documented API (`<mach/thread_policy.h>` and the
-//! `libc` declarations) and reviewed, but not yet compiled for or run on a Mac: ADR 0013 requires
-//! the macOS CI leg before a merged change relies on it.
+//! Compiled and tested in both macOS CI legs (ADR 0013, section 5). Device-level hardware
+//! measurements remain separate from these scheduling tests.
 //!
 //! The policy needs no privilege. Its numbers are in Mach absolute time units, converted from
 //! nanoseconds with `mach_timebase_info`. Period 0 means "not periodic": the render workers
@@ -45,16 +44,19 @@ fn this_thread() -> libc::thread_t {
 /// Nanoseconds to Mach absolute time units, saturating; `None` if the timebase is unavailable.
 ///
 /// `libc` deprecates `mach_timebase_info` (the struct and the function) in favor of `mach2`,
-/// which would be a second binding crate for one call; hence the allow on the whole function.
-#[allow(deprecated)]
+/// which would be a second binding crate for one call; only those uses are allowed below.
 fn ns_to_abs(ns: u32) -> Option<u32> {
+    #[allow(deprecated)]
     let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
     // SAFETY: `tb` is a live, writable `mach_timebase_info` the call fills in.
+    #[allow(deprecated)]
     let rc = unsafe { libc::mach_timebase_info(&raw mut tb) };
-    if rc != libc::KERN_SUCCESS || tb.numer == 0 {
+    #[allow(deprecated)]
+    let (numer, denom) = (tb.numer, tb.denom);
+    if rc != libc::KERN_SUCCESS || numer == 0 {
         return None;
     }
-    let abs = u64::from(ns) * u64::from(tb.denom) / u64::from(tb.numer);
+    let abs = u64::from(ns) * u64::from(denom) / u64::from(numer);
     Some(u32::try_from(abs).unwrap_or(u32::MAX))
 }
 

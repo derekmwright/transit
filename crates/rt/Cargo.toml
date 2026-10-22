@@ -19,10 +19,10 @@ log.workspace = true
 
 # Both already in the dependency tree (cpal, clap-host, vst3-host): no new dependency family.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-libc = "0.2"
+libc = "=0.2.190"
 
 # ADR 0013: this crate is where new `unsafe` lives. It opts out of the workspace
 # `unsafe_code = "forbid"` for itself only; every block carries a `// SAFETY:` comment and every

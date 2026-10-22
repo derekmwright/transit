@@ -6,8 +6,8 @@
 //! (it would add a D-Bus dependency); a desktop without realtime limits gets `Denied` and the
 //! thread keeps its normal priority.
 //!
-//! Not yet run on Linux hardware: compiled and reviewed only, until the CI matrix adds Linux
-//! (ADR 0013, 5).
+//! Compiled and tested in the Linux CI leg (ADR 0013, section 5); device-level hardware
+//! measurements remain separate from these scheduling tests.
 
 use crate::{Level, Promotion};
 use std::cell::Cell;
