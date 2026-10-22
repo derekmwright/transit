@@ -270,10 +270,12 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Based on SoundCraft by storytold").color(TOKENS.text_dim));
-                        ui.hyperlink_to("github.com/storytold/soundcraft", "https://github.com/storytold/soundcraft");
-                    });
+                    let b = ui.button("About transit…");
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "About transit…".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        app.about.open = true;
+                        ui.close();
+                    }
                 });
                 app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Help".into(), String::new(), help.response.rect));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

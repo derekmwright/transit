@@ -6,6 +6,7 @@
 //! Nothing here depends on `soundcraft-ui-egui`.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod about;
 pub mod actions;
 pub mod arrange;
 mod audio_connection;
@@ -34,6 +35,7 @@ pub mod mixer;
 pub mod plugin_scan;
 pub mod recent;
 pub mod shortcuts;
+pub mod splash;
 pub mod telemetry;
 pub mod tempo_edit;
 pub mod theme;
@@ -310,6 +312,10 @@ pub struct StudioApp {
     pub imports: import::ImportQueue,
     /// Help > Keyboard Shortcuts as last drawn (slice 5).
     pub shortcuts_window: menus::ShortcutsLayout,
+    /// Help > About transit: open flag and last frame's layout.
+    pub about: about::AboutState,
+    /// The launch splash (shown while plug-ins scan or the first device opens).
+    pub splash: splash::SplashState,
     /// The output-callback telemetry readout and its window (polled a few times a second).
     pub telemetry: telemetry::TelemetryState,
     /// Slice 6: the name being typed, the bounce dialog and job, take lanes, the undo history.
@@ -386,6 +392,8 @@ impl StudioApp {
             browser: browser::BrowserState::default(),
             imports: import::ImportQueue::default(),
             shortcuts_window: menus::ShortcutsLayout::default(),
+            about: about::AboutState::default(),
+            splash: splash::SplashState::default(),
             telemetry: telemetry::TelemetryState::default(),
             finish: finish::FinishState::default(),
             auto: automation::AutoState::default(),
@@ -828,7 +836,9 @@ impl StudioApp {
         if !keys::pane(self, ui) {
             mixer::panes(self, ui);
         }
-        if self.ui.mixer_full {
+        if splash::update(self, &ctx) {
+            splash::show(self, ui);
+        } else if self.ui.mixer_full {
             mixer::show_full(self, ui);
         } else {
             arrange::show(self, ui);
@@ -840,6 +850,7 @@ impl StudioApp {
         finish::history_window(self, &ctx);
         menus::recovery(self, &ctx);
         menus::shortcuts_window(self, &ctx);
+        about::window(self, &ctx);
         telemetry::window(self, &ctx);
         audio_devices::window(self, &ctx);
         builtin_editor::windows(self, &ctx);
@@ -896,6 +907,8 @@ impl StudioApp {
             "browser": self.browser.layout,
             "imports": self.imports.layout,
             "shortcuts": self.shortcuts_window,
+            "about": self.about,
+            "splash": self.splash,
             "telemetry": self.telemetry.layout,
             "finish": self.finish.inspect(),
             "automation": self.auto.layout,
@@ -948,3 +961,6 @@ mod tempo_tests;
 mod transport_tests;
 #[cfg(test)]
 mod width_history_tests;
+
+#[cfg(test)]
+mod about_splash_tests;

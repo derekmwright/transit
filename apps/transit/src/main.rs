@@ -338,6 +338,8 @@ fn main() -> eframe::Result {
             // The plug-in scan cache is SoundCraft's, shared; runs without preferences keep none.
             let cache = config::soundcraft_dir().filter(|_| prefs_enabled());
             soundcraft_ui_studio::plugin_scan::start(&app.ui.plugin_dirs, cache.as_deref(), std::env::current_exe().ok());
+            app.splash.arm();
+            app.about.app_version = env!("CARGO_PKG_VERSION").to_string();
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
                 app = app.with_control(rx);

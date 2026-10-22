@@ -141,6 +141,8 @@ impl Icon {
 #[derive(Default)]
 struct Cache {
     textures: HashMap<(Icon, u32), egui::TextureHandle>,
+    /// The wordmark by (dark theme, pixel width).
+    wordmarks: HashMap<(bool, u32), egui::TextureHandle>,
     rasterized: usize,
 }
 
@@ -179,6 +181,50 @@ fn texture(ctx: &egui::Context, icon: Icon, px: u32) -> Option<egui::TextureHand
         c.rasterized += 1;
     }
     Some(tex)
+}
+
+const WORDMARK_WHITE: &[u8] = include_bytes!("../../../assets/brand/transit-wordmark-white.svg");
+const WORDMARK_GRAPHITE: &[u8] = include_bytes!("../../../assets/brand/transit-wordmark-graphite.svg");
+
+/// The wordmark's aspect (width over height): the artboard is 2172 x 724, scaled, never stretched.
+pub const WORDMARK_ASPECT: f32 = 3.0;
+
+/// The wordmark rasterized `px` pixels wide: the white artwork for the dark theme, the graphite
+/// for the light one. Cached like an icon; never tinted (the brand forbids recoloring).
+fn wordmark_texture(ctx: &egui::Context, dark: bool, px: u32) -> Option<egui::TextureHandle> {
+    let cache = shared(ctx);
+    if let Some(t) = cache.lock().ok().and_then(|c| c.wordmarks.get(&(dark, px)).cloned()) {
+        return Some(t);
+    }
+    let svg = if dark { WORDMARK_WHITE } else { WORDMARK_GRAPHITE };
+    let hint = egui::SizeHint::Width(px);
+    let image = match egui_extras::image::load_svg_bytes_with_size(svg, hint, &resvg::usvg::Options::default()) {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("wordmark: {e}");
+            return None;
+        }
+    };
+    let tex = ctx.load_texture(format!("wordmark-{dark}-{px}"), image, egui::TextureOptions::LINEAR);
+    if let Ok(mut c) = cache.lock() {
+        c.wordmarks.insert((dark, px), tex.clone());
+        c.rasterized += 1;
+    }
+    Some(tex)
+}
+
+/// Paint the wordmark `width` points wide, centered horizontally on `center_x` with its top at
+/// `top`, in the current theme's artwork. Returns the rectangle it occupies.
+pub fn paint_wordmark(p: &egui::Painter, center_x: f32, top: f32, width: f32) -> Rect {
+    let ppp = p.ctx().pixels_per_point();
+    let px = (width * ppp).round().max(1.0) as u32;
+    let w = px as f32 / ppp;
+    let r = Rect::from_min_size(pos2(center_x - w / 2.0, top), vec2(w, w / WORDMARK_ASPECT));
+    let dark = crate::theme::current() == egui::Theme::Dark;
+    if let Some(tex) = wordmark_texture(p.ctx(), dark, px) {
+        p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), crate::theme::UNTINTED);
+    }
+    r
 }
 
 /// How many icon rasterizations have run on this context.

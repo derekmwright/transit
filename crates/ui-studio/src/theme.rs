@@ -173,6 +173,9 @@ pub fn current() -> egui::Theme {
     if LIGHT_NOW.with(Cell::get) { egui::Theme::Light } else { egui::Theme::Dark }
 }
 
+/// The image tint that leaves a texture's own colors alone (the wordmark is never recolored).
+pub const UNTINTED: Color32 = Color32::WHITE;
+
 /// The spacing grid: margins and gaps are multiples of 8 px (4 px half steps inside dense rows).
 pub const SPACE: f32 = 8.0;
 /// Corner radius of buttons, cards, clips, menus and windows.

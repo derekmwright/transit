@@ -95,3 +95,27 @@ pub fn inspect() -> serde_json::Value {
         "clap": count(soundcraft_clap_host::cached().map(|l| l.len())),
     })
 }
+
+/// Where a running scan is, for the launch splash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProgress {
+    /// The format being scanned ("VST3" or "CLAP").
+    pub format: &'static str,
+    /// Files done so far (the one loading counts as in progress, so this is its 1-based index).
+    pub index: usize,
+    /// Plug-in files found to scan.
+    pub total: usize,
+    /// The folder holding the file being loaded.
+    pub folder: String,
+}
+
+/// The running scan's counts; `None` when no scan runs or it only reuses the cache file.
+pub fn progress() -> Option<ScanProgress> {
+    if state() != "running" {
+        return None;
+    }
+    let at = soundcraft_vst3_host::progress().map(|p| ("VST3", p)).or_else(|| soundcraft_clap_host::progress().map(|p| ("CLAP", p)))?;
+    let (format, (i, n, file)) = at;
+    let folder = file.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(ScanProgress { format, index: (i + 1).min(n), total: n, folder })
+}
