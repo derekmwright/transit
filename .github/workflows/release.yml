@@ -180,7 +180,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then export TRANSIT_VERSION="${GITHUB_REF_NAME#v}"; fi
           chmod +x packaging/macos/package.sh
           DIST="$PWD/dist-dmg" packaging/macos/package.sh --arch aarch64
-          cp dist-dmg/transit-*-macos-aarch64.dmg .
+          cp dist-dmg/transit-v*-macos-arm64.dmg .
       - name: Package (macOS, Linux)
         if: runner.os != 'Windows'
         shell: bash

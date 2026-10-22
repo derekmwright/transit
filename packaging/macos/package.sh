@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build, sign and (optionally) notarize the macOS release artifacts:
 #
-#   $DIST/transit-<version>-macos-<arch>.dmg          transit.app on a drag-to-Applications DMG
+#   $DIST/transit-v<version>-macos-<arch>.dmg         transit.app on a drag-to-Applications DMG
 #
 # Usage: packaging/macos/package.sh [--arch universal|aarch64|x86_64] [--skip-build]
 #
@@ -39,7 +39,9 @@ IDENTITY="${MACOS_SIGN_IDENTITY:--}"
 SHORT_VERSION="${VERSION%%-*}"
 WORK="$CARGO_TARGET_DIR/macos-package"
 APP="$WORK/transit.app"
-DMG="$DIST/transit-$VERSION-macos-$ARCH.dmg"
+# Same target name as the release tarball: aarch64 is "arm64" in file names.
+ARCH_NAME="$ARCH"; [ "$ARCH" = aarch64 ] && ARCH_NAME=arm64
+DMG="$DIST/transit-v$VERSION-macos-$ARCH_NAME.dmg"
 
 NOTARIZE=0
 if [ "$IDENTITY" = "-" ]; then
