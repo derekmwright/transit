@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
-default-members = ["crates/*", "apps/*", "xtask"]
+members = ["crates/*", "apps/*", "tools/audio-bench", "xtask"]
+default-members = ["crates/*", "apps/*", "tools/audio-bench", "xtask"]
 
 [workspace.package]
 version = "0.8.0"

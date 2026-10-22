@@ -1,0 +1,23 @@
+[package]
+name = "audio-bench"
+description = "Audio backend benchmark harness (ADR 0016 slice b): callback jitter, achieved period, xruns and loopback round trip through the backend trait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Measure the ASIO host on Windows (see `soundcraft-playback`'s `asio` feature for its build needs).
+asio = ["soundcraft-playback/asio"]
+
+[dependencies]
+soundcraft-audio-backend.workspace = true
+soundcraft-playback.workspace = true
+
+[dev-dependencies]
+soundcraft-rt = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -41,7 +41,7 @@ const LAYERS: &[(&str, u8)] = &[
 /// Standalone format crates: no workspace dependencies at all (publishable on their own).
 const STANDALONE: &[&str] = &["time", "audio-io", "midi-io", "midi", "video", "dsp"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
-const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask"];
+const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask", "audio-bench"];
 
 fn layers() -> Result<(), String> {
     let out =
@@ -168,6 +168,20 @@ fn rt_targets() -> Result<(), String> {
     Ok(())
 }
 
+/// `cargo xtask audio-bench <options>`: the backend benchmark harness (ADR 0016), `tools/audio-bench`.
+/// It lives in its own crate because it depends on playback (xtask has no workspace dependencies).
+/// Release build: the figures are timings. See `docs/benchmarks/README.md`.
+fn audio_bench(args: &[String]) -> Result<(), String> {
+    let mut command = vec!["run".to_string(), "-q".into(), "--release".into(), "-p".into(), "audio-bench".into(), "--".into()];
+    command.extend(args.iter().cloned());
+    cargo(&command.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The device-free mode, for CI: opens no audio device.
+fn audio_bench_fake() -> Result<(), String> {
+    cargo(&["run", "-q", "-p", "audio-bench", "--", "--backend", "fake", "--seconds", "2", "--loopback"])
+}
+
 fn ci() -> Result<(), String> {
     let steps: Vec<(&str, Box<dyn Fn() -> Result<(), String>>)> = vec![
         ("fmt", Box::new(|| cargo(&["fmt", "--all", "--", "--check"]))),
@@ -177,6 +191,7 @@ fn ci() -> Result<(), String> {
         ("layers", Box::new(layers)),
         ("wasm", Box::new(wasm)),
         ("rt-targets", Box::new(rt_targets)),
+        ("audio-bench-fake", Box::new(audio_bench_fake)),
     ];
     let mut summary = Vec::new();
     for (name, f) in &steps {
@@ -202,9 +217,10 @@ fn main() -> ExitCode {
         Some("parity") => parity(),
         Some("wasm") => wasm(),
         Some("rt-targets") => rt_targets(),
+        Some("audio-bench") => audio_bench(args.get(1..).unwrap_or(&[])),
         Some("version") => version::run(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|version>".into()),
+        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|version>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
