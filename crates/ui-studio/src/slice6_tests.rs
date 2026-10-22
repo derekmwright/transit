@@ -1026,3 +1026,53 @@ fn flatten_turns_the_track_to_audio_in_one_undo_step() {
     assert_eq!(t.app.engine.session().track(tr).unwrap().kind, soundcraft_model::TrackKind::Instrument);
     assert!(t.app.engine.session().track(tr).unwrap().mixer.inserts[0].is_some());
 }
+
+#[test]
+fn stems_by_output_path_start_one_job_with_the_checked_paths() {
+    let dir = Dir::new("stems");
+    let mut t = T::new();
+    t.app.engine.set_io_map(soundcraft_model::IoMap::for_device("test", "test", 2, 6));
+    t.midi_clip();
+    let (cue, _) = t.midi_clip();
+    t.app.run("track.output", json!({"tracks": [cue.0], "output": "Out 3-4"})).unwrap();
+    t.app.open_bounce();
+    t.frames(3);
+    // Main and the routed path start checked; the unrouted one is listed, unchecked.
+    let form = t.app.finish.bounce_form.clone().unwrap();
+    let shown: Vec<_> = form.paths.iter().map(|c| (c.name.as_str(), c.routed, c.checked)).collect();
+    assert_eq!(shown, [("Out 1-2", true, true), ("Out 3-4", true, true), ("Out 5-6", false, false)]);
+    let lay = t.app.finish.layout.bounce.clone().unwrap();
+    assert!(lay.paths.is_empty(), "the path list shows in the by-path mode only");
+    t.click(mid(lay.modes.iter().find(|m| m.value == "paths").unwrap().rect));
+    let lay = t.app.finish.layout.bounce.clone().unwrap();
+    assert_eq!(lay.paths.len(), 3);
+    // Uncheck Out 3-4, check the unrouted Out 5-6, normalize each file to its own peak.
+    t.click(mid(lay.paths.iter().find(|m| m.value == "Out 3-4").unwrap().rect));
+    t.click(mid(lay.paths.iter().find(|m| m.value == "Out 5-6").unwrap().rect));
+    t.click(mid(t.app.finish.layout.bounce.clone().unwrap().normalize));
+    let each = t.app.finish.layout.bounce.clone().unwrap().norm_modes.iter().find(|m| m.value == "each").unwrap().rect;
+    t.click(mid(each));
+    if let Some(f) = &mut t.app.finish.bounce_form {
+        f.dir = dir.0.to_string_lossy().into_owned();
+    }
+    t.frames(2);
+    let ok = t.app.finish.layout.bounce.clone().unwrap().ok;
+    t.click(mid(ok));
+    let request = t.app.finish.paths_request.clone().expect("the form started a job");
+    assert_eq!(request["paths"], json!(["Out 1-2", "Out 5-6"]));
+    assert_eq!(request["normalize"], json!("each"));
+    assert_eq!(request["dir"], json!(dir.0.to_string_lossy()));
+    for _ in 0..50 {
+        if t.app.finish.path_job.is_none() {
+            break;
+        }
+        t.frames(5);
+    }
+    assert!(t.app.finish.path_job.is_none(), "the stems finished");
+    assert!(t.app.status.starts_with("Bounced 2 stems"), "{}", t.app.status);
+    assert!(t.app.status.contains("Out 5-6"), "the silent path is reported: {}", t.app.status);
+    let mut files: Vec<_> = std::fs::read_dir(&dir.0).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    files.sort();
+    assert_eq!(files, ["Untitled_Out 1-2.wav", "Untitled_Out 5-6.wav"]);
+    assert!(t.app.dialog.is_none());
+}

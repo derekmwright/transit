@@ -62,8 +62,8 @@ use soundcraft_dsp::pan::{PanLaw, SpeakerPos, SurroundParams, gains};
 use soundcraft_dsp::{Plugin, ProcessStatus, SampleSource, Transport, db_to_gain};
 use soundcraft_midi::CtrlKind;
 use soundcraft_model::{
-    AutoParam, BusId, ChannelFormat, Clip, ClipContent, Route, RouteCycle, RouteScratch, SEND_SLOTS, Session, SourceAudio, Speaker, SurroundPan,
-    Track, TrackId, TrackKind,
+    AutoParam, BusId, ChannelFormat, Clip, ClipContent, IoMap, Route, RouteCycle, RouteScratch, SEND_SLOTS, Session, SourceAudio, Speaker,
+    SurroundPan, Track, TrackId, TrackKind,
 };
 use soundcraft_time::{Range, Samples, TICKS_PER_QUARTER};
 use std::ops::Bound;
@@ -2794,6 +2794,9 @@ pub struct RangeRender {
     done: usize,
     total: usize,
     latency: usize,
+    /// The output paths this render fills after Main's channels in `tmp`, in order (empty unless
+    /// built by [`RangeRender::try_new_paths`]).
+    sinks: Vec<SinkSpec>,
 }
 
 impl RangeRender {
@@ -2803,17 +2806,30 @@ impl RangeRender {
         Self::try_new(s, bus, range, block).unwrap_or_else(|err| {
             log::error!("offline render: the session could not be compiled: {err:?}");
             let target = Self::target(s, block);
-            RangeRender { eng: MixEngine::realtime(target), bus, tmp: Vec::new(), start: range.start, done: 0, total: 0, latency: 0 }
+            RangeRender {
+                eng: MixEngine::realtime(target),
+                bus,
+                tmp: Vec::new(),
+                start: range.start,
+                done: 0,
+                total: 0,
+                latency: 0,
+                sinks: Vec::new(),
+            }
         })
     }
 
     /// The headless target an offline render compiles for: the session's rate, no device.
     fn target(s: &Session, block: usize) -> RenderTarget {
+        Self::target_for(s, block, 0)
+    }
+
+    fn target_for(s: &Session, block: usize, out_channels: u16) -> RenderTarget {
         RenderTarget {
             device: DeviceGeneration(0),
             sample_rate: s.sample_rate.hz(),
             max_block: u32::try_from(block).unwrap_or(u32::MAX),
-            out_channels: 0,
+            out_channels,
             in_channels: 0,
         }
         .normalized()
@@ -2827,9 +2843,26 @@ impl RangeRender {
 
     /// [`RangeRender::new`], or why the session could not be compiled into a plan.
     pub fn try_new(s: &Session, bus: Option<BusId>, range: Range, block: usize) -> Result<Self, CompileError> {
-        let target = Self::target(s, block);
+        Self::build(s, bus, range, block, None)
+    }
+
+    /// A render of Main and every output path of `io` that `s` routes to, through the one plan
+    /// renderer, with a headless target sized to `io`'s opened outputs. [`RangeRender::next_block`]
+    /// returns Main's channels, then each sink's in [`RangeRender::sinks`] order. Every sink is
+    /// delayed to the one device latency Main has (ADR 0015 section 6), and the latency is skipped
+    /// from all of them together, so the files line up with each other and with a plain main bounce.
+    pub fn try_new_paths(s: &Session, range: Range, block: usize, io: &IoMap) -> Result<Self, CompileError> {
+        Self::build(s, None, range, block, Some(io))
+    }
+
+    fn build(s: &Session, bus: Option<BusId>, range: Range, block: usize, io: Option<&IoMap>) -> Result<Self, CompileError> {
+        let target = Self::target_for(s, block, io.map_or(0, |m| m.outputs));
         let mut eng = MixEngine::realtime(target);
         let mut compiler = PlanCompiler::new(target, Self::limits()).skipping_inactive_instances();
+        let sinks = io.map(|m| plan_sinks(s, m, target.out_channels).sinks).unwrap_or_default();
+        if let Some(m) = io {
+            compiler.set_io(Arc::new(m.clone()));
+        }
         let (sr, max_block) = (target.sample_rate as f32, target.block());
         let mut make = |spec: &InstanceSpec, _: SlotGen| create_instance(&spec.id, spec.state.as_deref(), sr, max_block, spec.ch);
         let next = compiler.active().checked_next().ok_or(CompileError::GenerationExhausted)?;
@@ -2840,9 +2873,15 @@ impl RangeRender {
             log::error!("offline render: the engine refused its first plan: {adoption:?}");
         }
         let nch = source_channels(s, bus);
-        let tmp = vec![vec![0.0f32; eng.max_block()]; nch];
+        let width = nch + sinks.iter().map(|k| k.dest.len()).sum::<usize>();
+        let tmp = vec![vec![0.0f32; eng.max_block()]; width];
         let len = if nch == 0 || adoption != Adoption::Adopted { 0 } else { usize::try_from(range.len().max(0)).unwrap_or(0) };
-        Ok(RangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0 })
+        Ok(RangeRender { eng, bus, tmp, start: range.start, done: 0, total: len, latency: 0, sinks })
+    }
+
+    /// The output paths after Main's channels in each block, in order (see [`RangeRender::try_new_paths`]).
+    pub fn sinks(&self) -> &[SinkSpec] {
+        &self.sinks
     }
 
     fn render(&mut self, pos: Samples, n: usize) {

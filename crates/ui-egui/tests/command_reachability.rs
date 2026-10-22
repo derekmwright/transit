@@ -16,6 +16,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "edit.paste_clip_gain",
     "edit.squash_undo", // studio UI composite helper; old UI has no composite steps
     "event.midi_note",
+    "file.bounce_paths", // studio UI only (Bounce dialog, "Stems by output path"); the old UI has no named I/O paths
     "file.bounce_stems",
     "file.commit_import", // studio UI only (async import, L30); the old UI imports synchronously
     "markers.next",

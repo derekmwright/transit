@@ -40,7 +40,7 @@ mod view_more;
 mod vst3;
 mod zoom_toggle;
 
-pub use file::bounce_job;
+pub use file::{bounce_job, bounce_paths_job};
 
 pub(crate) use edit::remember_selection;
 

@@ -441,7 +441,7 @@ mod tests {
     /// Every file a command reads or writes by path goes through `io` (`read_file`, `write_file`
     /// and the other checked helpers there), which check the roots. Engine code that reaches for
     /// the file system itself would bypass them, so none may: every file under `src/` except
-    /// `io.rs`, this module and the test files. Audio is decoded into the session when it enters
+    /// `io.rs` and its `io/` submodules, this module and the test files. Audio is decoded into the session when it enters
     /// it (import, open, sampler load), so playback and bounce read nothing from disk and need no
     /// check of their own. Plug-in scans live in the host crates. The one engine module that reads
     /// and writes a fixed folder is `autosave.rs`: crash-recovery copies in the app's own data
@@ -467,7 +467,9 @@ mod tests {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // `io` and this module are the checked gateway; `autosave` writes the app's own
             // recovery folder; `tests*.rs` are test-only modules.
-            if path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs") || name.starts_with("tests") {
+            let gateway = path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs");
+            // `io/` holds submodules of `io.rs` (the bounce writers), behind the same checks.
+            if gateway || path.starts_with(src.join("io")) || name.starts_with("tests") {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();

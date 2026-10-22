@@ -60,6 +60,23 @@ pub struct BounceForm {
     pub bit_depth: String,
     pub normalize: bool,
     pub path: String,
+    /// Stems by output path instead of one mix (ADR 0015 slice e).
+    pub by_path: bool,
+    /// The machine's output paths, as listed when the form opened.
+    pub paths: Vec<PathChoice>,
+    /// With `normalize` in the by-path mode: one shared gain (relative levels hold) or one per file.
+    pub joint: bool,
+    /// The folder the stems go to.
+    pub dir: String,
+}
+
+/// One output path in the by-path mode.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PathChoice {
+    pub name: String,
+    /// Something is routed to it (Main always is): shown checked; the others are dimmed.
+    pub routed: bool,
+    pub checked: bool,
 }
 
 /// One take lane as last drawn.
@@ -94,6 +111,13 @@ pub struct BounceLayout {
     pub window: R4,
     pub ranges: Vec<MenuItem>,
     pub sources: Vec<MenuItem>,
+    /// "Mix" and "Stems by output path".
+    pub modes: Vec<MenuItem>,
+    /// The output paths' checkboxes in the by-path mode (value: the path name).
+    pub paths: Vec<MenuItem>,
+    /// "Joint" and "Each file" (value `joint` or `each`).
+    pub norm_modes: Vec<MenuItem>,
+    pub dir: R4,
     pub formats: Vec<MenuItem>,
     pub depths: Vec<MenuItem>,
     pub normalize: R4,
@@ -132,6 +156,10 @@ pub struct FinishState {
     pub bounce_form: Option<BounceForm>,
     /// The bounce being rendered, a slice per frame.
     pub job: Option<soundcraft_engine::io::Bounce>,
+    /// The stems by output path being rendered, a slice per frame (instead of `job`).
+    pub path_job: Option<soundcraft_engine::io::PathBounce>,
+    /// The parameters of the last `file.bounce_paths` job the form started.
+    pub paths_request: Option<Value>,
     /// Gestures started (each composite gets its own merge key).
     serial: u64,
     pub layout: FinishLayout,
@@ -177,7 +205,12 @@ pub fn fit_extension(path: &std::path::Path, format: &str) -> std::path::PathBuf
 
 impl std::fmt::Debug for FinishState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FinishState").field("rename", &self.rename).field("bounce_form", &self.bounce_form).field("job", &self.job.is_some()).finish()
+        f.debug_struct("FinishState")
+            .field("rename", &self.rename)
+            .field("bounce_form", &self.bounce_form)
+            .field("job", &self.job.is_some())
+            .field("path_job", &self.path_job.is_some())
+            .finish()
     }
 }
 
@@ -186,7 +219,10 @@ impl FinishState {
         json!({
             "rename": self.rename.as_ref().map(|r| json!({"target": r.target, "text": r.text, "rect": r.rect})),
             "bounce_form": self.bounce_form,
-            "bouncing": self.job.as_ref().map(|j| json!({"progress": j.progress(), "path": j.path(), "cancel": self.cancel})),
+            "bouncing": self.job.as_ref().map(|j| json!({"progress": j.progress(), "path": j.path(), "cancel": self.cancel})).or_else(|| {
+                self.path_job.as_ref().map(|j| json!({"progress": j.progress(), "dir": j.dir(), "files": j.files(), "cancel": self.cancel}))
+            }),
+            "paths_request": self.paths_request,
             "layout": self.layout,
         })
     }
@@ -199,11 +235,12 @@ pub fn rect(r: R4) -> Rect {
 /// A session-replacing command while a bounce holds its own copy of the session is refused (two
 /// large sessions could run out of memory); Quit cancels the bounce.
 pub fn refuses(app: &mut StudioApp, id: &str) -> bool {
-    if app.finish.job.is_none() {
+    if app.finish.job.is_none() && app.finish.path_job.is_none() {
         return false;
     }
     if id == "app.quit" {
         app.finish.job = None;
+        app.finish.path_job = None;
         app.dialog = None;
         return false;
     }
@@ -356,7 +393,7 @@ impl StudioApp {
 
     /// File > Bounce…: open the form with the selection (or the whole song) and the main mix.
     pub fn open_bounce(&mut self) {
-        if self.finish.job.is_some() || self.dialog.is_some() {
+        if self.finish.job.is_some() || self.finish.path_job.is_some() || self.dialog.is_some() {
             return;
         }
         let s = self.engine.session();
@@ -371,8 +408,23 @@ impl StudioApp {
             bit_depth: "24".into(),
             normalize: false,
             path: dir.join(name).to_string_lossy().into_owned(),
+            by_path: false,
+            paths: self.path_choices(),
+            joint: true,
+            dir: dir.join("Stems").to_string_lossy().into_owned(),
         });
         self.dialog = Some(Dialog::Bounce);
+    }
+
+    /// The output paths of this machine for the by-path mode: routed ones (and Main) start checked.
+    fn path_choices(&self) -> Vec<PathChoice> {
+        let (s, io) = (self.engine.session(), self.engine.io_map());
+        io.paths_of(soundcraft_model::IoDirection::Output)
+            .map(|p| {
+                let routed = p.name.eq_ignore_ascii_case(&io.main) || soundcraft_engine::io::is_routed(s, &p.name);
+                PathChoice { name: p.name.clone(), routed, checked: routed }
+            })
+            .collect()
     }
 
     /// Start the bounce the form describes: `file.bounce_mix`'s job, rendered a slice per frame.
@@ -387,6 +439,9 @@ impl StudioApp {
             }
             BounceRange::Whole => (0, s.content_end().max(1)),
         };
+        if f.by_path {
+            return self.start_bounce_paths(&f, start, end);
+        }
         let mut path = std::path::PathBuf::from(f.path.trim());
         if f.path.trim().is_empty() || path.file_name().is_none() {
             self.status = "Choose where to write the bounce.".into();
@@ -425,9 +480,51 @@ impl StudioApp {
         }
     }
 
+    /// Start the stems the form describes: the `file.bounce_paths` job with the checked paths,
+    /// rendered a slice per frame. The request is kept in `finish.paths_request`.
+    fn start_bounce_paths(&mut self, f: &BounceForm, start: i64, end: i64) -> Result<(), String> {
+        let dir = f.dir.trim();
+        if dir.is_empty() {
+            self.status = "Choose a folder for the stems.".into();
+            return Err(self.status.clone());
+        }
+        let picked: Vec<&str> = f.paths.iter().filter(|c| c.checked).map(|c| c.name.as_str()).collect();
+        if picked.is_empty() {
+            self.status = "Check at least one output path.".into();
+            return Err(self.status.clone());
+        }
+        let normalize = match (f.normalize, f.joint) {
+            (false, _) => json!(false),
+            (true, true) => json!("joint"),
+            (true, false) => json!("each"),
+        };
+        let p =
+            json!({"dir": dir, "paths": picked, "format": f.format, "bit_depth": f.bit_depth, "normalize": normalize, "start": start, "end": end});
+        self.capture_plugin_states()?;
+        match soundcraft_engine::cmd::bounce_paths_job(&self.engine, &p) {
+            Ok(job) if job.files().iter().any(|x| x.exists()) && self.finish.replace != Replace::Yes => {
+                self.finish.replace = Replace::Asking;
+                self.status = "Some stem files exist".into();
+                Err(self.status.clone())
+            }
+            Ok(job) => {
+                self.finish.replace = Replace::No;
+                self.status = format!("Bouncing {} stems to {dir}...", job.files().len());
+                self.finish.path_job = Some(job);
+                self.finish.paths_request = Some(p);
+                self.finish.bounce_form = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.status = e.to_string();
+                Err(e.to_string())
+            }
+        }
+    }
+
     /// Cancel the bounce form or the bounce being rendered (its part file is removed).
     pub fn cancel_bounce(&mut self) {
-        if self.finish.job.take().is_some() {
+        if self.finish.job.take().is_some() || self.finish.path_job.take().is_some() {
             self.status = "Bounce cancelled".into();
         }
         self.finish.bounce_form = None;
@@ -576,6 +673,9 @@ pub fn rename_field(app: &mut StudioApp, ctx: &egui::Context) {
 
 /// Render the running bounce for a moment (30 ms) each frame.
 pub fn step_bounce(app: &mut StudioApp, ctx: &egui::Context) {
+    if app.finish.path_job.is_some() {
+        return step_path_bounce(app, ctx);
+    }
     let Some(job) = &mut app.finish.job else { return };
     let until = std::time::Instant::now() + std::time::Duration::from_millis(30);
     let path = job.path().to_string_lossy().into_owned();
@@ -592,6 +692,30 @@ pub fn step_bounce(app: &mut StudioApp, ctx: &egui::Context) {
         Err(e) => e.to_string(),
     };
     app.finish.job = None;
+    if matches!(app.dialog, Some(Dialog::Bounce)) {
+        app.dialog = None;
+    }
+}
+
+/// [`step_bounce`] for stems by output path.
+fn step_path_bounce(app: &mut StudioApp, ctx: &egui::Context) {
+    let Some(job) = &mut app.finish.path_job else { return };
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(30);
+    let dir = job.dir().to_string_lossy().into_owned();
+    app.status = match job.step(|| std::time::Instant::now() < until) {
+        Ok(None) => {
+            ctx.request_repaint();
+            return;
+        }
+        Ok(Some(done)) => {
+            let empty: Vec<&str> = done.stems.iter().filter(|s| s.empty).map(|s| s.path.as_str()).collect();
+            app.finish.layout.last_bounce = Some(json!({"dir": dir, "files": done.stems.len(), "empty": empty}));
+            let note = if empty.is_empty() { String::new() } else { format!("; silent: {}", empty.join(", ")) };
+            format!("Bounced {} stems to {dir}{note}", done.stems.len())
+        }
+        Err(e) => e.to_string(),
+    };
+    app.finish.path_job = None;
     if matches!(app.dialog, Some(Dialog::Bounce)) {
         app.dialog = None;
     }
@@ -614,8 +738,12 @@ fn choices(ui: &mut egui::Ui, current: &str, items: &[(String, String)], out: &m
 
 /// File > Bounce: the form, then the progress window with Cancel (or Escape).
 pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
-    if let Some(job) = &app.finish.job {
-        let (name, progress) = (job.path().file_name().unwrap_or_default().to_string_lossy().into_owned(), job.progress());
+    let running = match (&app.finish.job, &app.finish.path_job) {
+        (Some(j), _) => Some((j.path().file_name().unwrap_or_default().to_string_lossy().into_owned(), j.progress())),
+        (None, Some(j)) => Some((format!("{} stems", j.files().len()), j.progress())),
+        (None, None) => None,
+    };
+    if let Some((name, progress)) = running {
         let mut cancel = ctx.input(|i| hit(i, A::DialogCancel));
         egui::Modal::new(egui::Id::new("bounce_progress")).show(ctx, |ui| {
             ui.set_width(320.0);
@@ -665,11 +793,26 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
         if let Some(v) = choices(ui, cur, &items, &mut lay.ranges) {
             f.range = if v == "selection" { BounceRange::Selection } else { BounceRange::Whole };
         }
-        ui.label(egui::RichText::new("Source").color(TOKENS.text_dim));
-        let mut items = vec![("Main mix".to_string(), "main".to_string())];
-        items.extend(s.busses.iter().map(|b| (crate::mixer::bus_label(&s, b.id), b.name.clone())));
-        if let Some(v) = choices(ui, &f.source, &items, &mut lay.sources) {
-            f.source = v;
+        ui.label(egui::RichText::new("Kind").color(TOKENS.text_dim));
+        let items = [("Mix".to_string(), "mix".to_string()), ("Stems by output path".to_string(), "paths".to_string())];
+        if let Some(v) = choices(ui, if f.by_path { "paths" } else { "mix" }, &items, &mut lay.modes) {
+            f.by_path = v == "paths";
+        }
+        if f.by_path {
+            ui.label(egui::RichText::new("Output paths").color(TOKENS.text_dim));
+            for c in &mut f.paths {
+                let label = if c.routed { c.name.clone() } else { format!("{} (nothing routed: renders silence)", c.name) };
+                let text = egui::RichText::new(label).color(if c.routed { TOKENS.text } else { TOKENS.text_dim });
+                let b = ui.checkbox(&mut c.checked, text);
+                lay.paths.push(MenuItem::at(ui, c.name.clone(), c.name.clone(), b.rect));
+            }
+        } else {
+            ui.label(egui::RichText::new("Source").color(TOKENS.text_dim));
+            let mut items = vec![("Main mix".to_string(), "main".to_string())];
+            items.extend(s.busses.iter().map(|b| (crate::mixer::bus_label(&s, b.id), b.name.clone())));
+            if let Some(v) = choices(ui, &f.source, &items, &mut lay.sources) {
+                f.source = v;
+            }
         }
         ui.label(egui::RichText::new("Format").color(TOKENS.text_dim));
         let items: Vec<(String, String)> =
@@ -684,14 +827,32 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
         }
         let n = ui.checkbox(&mut f.normalize, "Normalize to -0.1 dBFS");
         lay.normalize = crate::arrange::r4(n.rect);
-        ui.label(egui::RichText::new("Destination").color(TOKENS.text_dim));
-        ui.horizontal(|ui| {
-            let field = ui.add(egui::TextEdit::singleline(&mut f.path).id(path_id).desired_width(320.0));
-            lay.path = crate::arrange::r4(field.rect);
-            let b = ui.button("Choose…");
-            lay.choose = crate::arrange::r4(b.rect);
-            choose = b.clicked();
-        });
+        if f.by_path && f.normalize {
+            let items =
+                [("Joint: keep relative levels".to_string(), "joint".to_string()), ("Each file to its own peak".to_string(), "each".to_string())];
+            if let Some(v) = choices(ui, if f.joint { "joint" } else { "each" }, &items, &mut lay.norm_modes) {
+                f.joint = v == "joint";
+            }
+        }
+        if f.by_path {
+            ui.label(egui::RichText::new("Folder (files are named after the session and the path)").color(TOKENS.text_dim));
+            ui.horizontal(|ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut f.dir).id(path_id).desired_width(320.0));
+                lay.dir = crate::arrange::r4(field.rect);
+                let b = ui.button("Choose…");
+                lay.choose = crate::arrange::r4(b.rect);
+                choose = b.clicked();
+            });
+        } else {
+            ui.label(egui::RichText::new("Destination").color(TOKENS.text_dim));
+            ui.horizontal(|ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut f.path).id(path_id).desired_width(320.0));
+                lay.path = crate::arrange::r4(field.rect);
+                let b = ui.button("Choose…");
+                lay.choose = crate::arrange::r4(b.rect);
+                choose = b.clicked();
+            });
+        }
         ui.add_space(crate::theme::SPACE);
         ui.horizontal(|ui| {
             let b = ui.button(format!("Bounce   {}", label(A::Bounce)));
@@ -704,7 +865,19 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
     });
     lay.window = crate::arrange::r4(resp.response.rect);
     app.finish.layout.bounce = Some(lay);
-    if choose {
+    if choose && f.by_path {
+        // The host offers a save dialog only: the folder of the file picked is the folder.
+        let name = format!("{}_stems", soundcraft_engine::io::sanitize_name(&s.name));
+        if let Some(p) = app
+            .services
+            .pick_save
+            .as_ref()
+            .and_then(|pick| pick(&name))
+            .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_string_lossy().into_owned()))
+        {
+            f.dir = p;
+        }
+    } else if choose {
         let named = fit_extension(std::path::Path::new(&f.path), &f.format);
         let name = named.file_name().map_or_else(|| "bounce.wav".to_string(), |n| n.to_string_lossy().into_owned());
         if let Some(p) = app.services.pick_save.as_ref().and_then(|pick| pick(&name)) {
@@ -723,12 +896,12 @@ pub fn bounce_dialog(app: &mut StudioApp, ctx: &egui::Context) {
 /// the form with nothing written.
 fn replace_question(app: &mut StudioApp, ctx: &egui::Context, f: &BounceForm) {
     let path = fit_extension(std::path::Path::new(f.path.trim()), &f.format);
-    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let name = if f.by_path { "Some of the stem files".to_string() } else { path.file_name().unwrap_or_default().to_string_lossy().into_owned() };
     let (mut yes, mut no) = (false, false);
     egui::Modal::new(egui::Id::new("bounce_replace")).show(ctx, |ui| {
         ui.set_width(380.0);
         ui.label(egui::RichText::new("Replace existing file?").strong());
-        ui.label(egui::RichText::new(format!("{name} already exists.")).color(TOKENS.text_dim));
+        ui.label(egui::RichText::new(format!("{name} already {}.", if f.by_path { "exist" } else { "exists" })).color(TOKENS.text_dim));
         ui.add_space(crate::theme::SPACE);
         ui.horizontal(|ui| {
             let r = ui.button("Replace");

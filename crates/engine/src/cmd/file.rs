@@ -115,6 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let files = crate::io::bounce_stems_with(e, &dir, r, &soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: true, bwf: None }, fold)?;
             Ok(json!({"files": files}))
         }),
+        cmd!(noundo "file.bounce_paths", "Bounce Stems by Output Path...", [], None, "{dir, paths?: [output path name | main] | all (default: every routed path), format?: wav|aiff|flac, bit_depth?: 16|24|32f, start?, end?, normalize?: false|true|joint|each, dither?: true}", has_tracks, bounce_paths),
         cmd!(noundo "file.export_midi", "MIDI...", ["File", "Export"], None, "{path, tracks?}", always, |e, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.export_midi", "`path` required"))?.to_string();
             let only = if p.get("tracks").is_some() || p.get("track").is_some() { Some(tracks_param(e, "file.export_midi", p)?) } else { None };
@@ -397,6 +398,69 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
     let fold = fold_down_param(p, "file.bounce_mix")?;
     let bus = bounce_bus(e, p)?;
     crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, normalize, fold)
+}
+
+/// `file.bounce_paths`: one file per output path, in one pass.
+fn bounce_paths(e: &mut Engine, p: &Value) -> Result<Value> {
+    let job = bounce_paths_job(e, p)?;
+    let seconds = e.session().sample_rate.seconds(job.range().len());
+    let dir = job.dir().to_string_lossy().into_owned();
+    let done = job.run()?;
+    let files: Vec<Value> = done
+        .stems
+        .iter()
+        .map(|s| {
+            json!({
+                "path": s.path,
+                "file": s.file.to_string_lossy(),
+                "bytes": s.bytes,
+                "channels": s.channels,
+                "peak_db": s.peak_db,
+                "routed": s.routed,
+                "empty": s.empty,
+            })
+        })
+        .collect();
+    let empty: Vec<&str> = done.stems.iter().filter(|s| s.empty).map(|s| s.path.as_str()).collect();
+    Ok(json!({"dir": dir, "seconds": seconds, "files": files, "empty": empty, "joint_gain_db": done.joint_gain_db}))
+}
+
+/// The bounce `file.bounce_paths` runs for `p`, not rendered yet.
+pub fn bounce_paths_job(e: &Engine, p: &Value) -> Result<crate::io::PathBounce> {
+    use crate::io::PathNormalize;
+    const ID: &str = "file.bounce_paths";
+    let dir = str_param(p, "dir").ok_or_else(|| bad(ID, "`dir` required"))?.to_string();
+    let r = range_param(e, ID, p)?;
+    let r = if r.is_empty() { soundcraft_time::Range::new(0, e.session().content_end().max(1)) } else { r };
+    let format_name = str_param(p, "format").unwrap_or("wav");
+    let format = soundcraft_audio_io::encode_format_for(format_name)
+        .ok_or_else(|| bad(ID, format!("cannot write `{format_name}` files (supported: {})", soundcraft_audio_io::ENCODE_EXTENSIONS)))?;
+    let bit_depth = match p.get("bit_depth").map(|b| b.to_string().trim_matches('"').to_string()).as_deref() {
+        Some("16") => soundcraft_audio_io::BitDepth::Int16,
+        Some("32") | Some("32f") => soundcraft_audio_io::BitDepth::Float32,
+        _ => soundcraft_audio_io::BitDepth::Int24,
+    };
+    let opts = soundcraft_audio_io::EncodeOptions { format, bit_depth, dither: bool_or(p, "dither", true), bwf: None };
+    let normalize = match p.get("normalize") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => PathNormalize::Off,
+        Some(Value::Bool(true)) => PathNormalize::Joint,
+        Some(Value::String(m)) if m.eq_ignore_ascii_case("joint") => PathNormalize::Joint,
+        Some(Value::String(m)) if m.eq_ignore_ascii_case("each") => PathNormalize::Each,
+        Some(Value::String(m)) if m.eq_ignore_ascii_case("off") || m.is_empty() => PathNormalize::Off,
+        Some(other) => return Err(bad(ID, format!("`normalize` is true, false, \"joint\" or \"each\", not {other}"))),
+    };
+    let paths: Vec<String> = match p.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(a)) if a.eq_ignore_ascii_case("all") => Vec::new(),
+        Some(Value::Array(a)) => {
+            a.iter().map(|v| v.as_str().map(str::to_string).ok_or_else(|| bad(ID, "`paths` holds names"))).collect::<Result<_>>()?
+        }
+        Some(_) => return Err(bad(ID, "`paths` is a list of output path names, or \"all\"")),
+    };
+    if matches!(p.get("paths"), Some(Value::Array(a)) if a.is_empty()) {
+        return Err(bad(ID, "`paths` is empty: name at least one output path, or use \"all\""));
+    }
+    crate::io::PathBounce::new(e.session_arc(), e.io_map(), std::path::Path::new(&dir), r, &opts, &paths, normalize)
 }
 
 /// Write the score of the chosen MIDI tracks as MusicXML (or SVG when `svg`).

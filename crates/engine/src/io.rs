@@ -483,6 +483,9 @@ pub fn export_midi(e: &Engine, only: Option<&[TrackId]>) -> Result<Vec<u8>> {
     soundcraft_midi::write_smf(&smf).map_err(|err| EngineError::Io(err.to_string()))
 }
 
+mod paths;
+pub use paths::{PathBounce, PathBounced, PathNormalize, PathStem, bounce_paths, is_routed, routed_paths};
+
 /// A bounce of the main mix, or of one bus, over a range, written to its file block by block so no
 /// bounce has to fit in memory, and rendered a slice at a time ([`Bounce::step`]) so a UI can show
 /// progress. The file appears at its path only once complete; a bounce that fails, or is dropped
