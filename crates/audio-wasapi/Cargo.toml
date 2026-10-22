@@ -1,6 +1,6 @@
 [package]
 name = "transit-audio-wasapi"
-description = "SoundCraft native WASAPI backend: shared low-latency render through IAudioClient3 (ADR 0016); empty on other platforms"
+description = "transit native WASAPI backend: shared low-latency render and capture through IAudioClient3, duplex pairing, loopback calibration (ADR 0016); empty on other platforms"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

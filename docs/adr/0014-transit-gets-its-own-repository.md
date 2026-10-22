@@ -73,6 +73,7 @@ Renamed today: `transit-rt`, `transit-midi-io`, `transit-audio-backend`, `transi
 Sweep checklist for the inherited crates, so the rest is one mechanical job later:
 
 - Cargo package names and `[lib]` names; every `use` path and dependency entry.
+- The `description` field of the manifest follows the name.
 - `xtask` tables (`LAYERS`, `EXEMPT`, `WASM`, the unsafe allowlist) and the prefix handling in `layers`.
 - Workflow files under `.github/workflows`.
 - `docs/adr` and `docs/contributing` mentions; `ATTRIBUTION.md`.

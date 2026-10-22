@@ -1,6 +1,6 @@
 [package]
 name = "transit"
-description = "transit desktop app: the studio UI over the SoundCraft engine"
+description = "transit desktop app: the studio UI over the engine"
 version = "0.1.0-alpha.1"
 edition.workspace = true
 license.workspace = true

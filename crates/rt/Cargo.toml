@@ -1,6 +1,6 @@
 [package]
 name = "transit-rt"
-description = "SoundCraft realtime OS support: promotes audio worker threads (MMCSS, SCHED_FIFO, Mach time constraint) behind a safe API (ADR 0013: the only home for new unsafe)"
+description = "transit realtime OS support: promotes audio worker threads (MMCSS, SCHED_FIFO, Mach time constraint) behind a safe API (ADR 0013: the only home for new unsafe)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

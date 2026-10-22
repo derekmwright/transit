@@ -1,6 +1,6 @@
 [package]
 name = "transit-midi-io"
-description = "SoundCraft MIDI device transport: midir-backed port enumeration, hot-plug polling, and a preallocated lock-free input ring with arrival timestamps"
+description = "transit MIDI device transport: midir-backed port enumeration, hot-plug polling, and a preallocated lock-free input ring with arrival timestamps"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
