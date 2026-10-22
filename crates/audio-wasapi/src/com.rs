@@ -515,6 +515,18 @@ fn origin_pair(origin: ab::HostOrigin) -> Result<(u64, i64), ab::OpenError> {
     Ok((qpc_100ns, origin_ns))
 }
 
+/// The QPC now, in 100 ns units; allocation-free, for the capture callback instant.
+fn qpc_100ns() -> u64 {
+    let (mut ticks, mut frequency) = (0i64, 0i64);
+    // SAFETY: QueryPerformanceCounter and QueryPerformanceFrequency fill live i64s and cannot
+    // fail on Windows XP and later; a failure would leave zeros, which gives a zero time.
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut ticks);
+        let _ = QueryPerformanceFrequency(&mut frequency);
+    }
+    (ticks.unsigned_abs() as u128 * 10_000_000 / frequency.unsigned_abs().max(1) as u128) as u64
+}
+
 fn unsafe_frequency(clock: &IAudioClock) -> Result<u64, ab::OpenError> {
     // SAFETY: `GetFrequency` on a live clock service of an initialized client.
     unsafe { clock.GetFrequency() }.map_err(|e| open_error("GetFrequency", &e))
@@ -651,7 +663,7 @@ impl LiveCapture {
         let (qpc_100ns, origin_ns) = origin_pair(origin)?;
         // SAFETY: `Start` on an initialized client whose event handle is set; it is called once.
         unsafe { self.client.Start() }.map_err(|e| open_error("Start", &e))?;
-        Ok(CaptureStamper::new(qpc_100ns, origin_ns, self.fmt.rate, self.calibration))
+        Ok(CaptureStamper::new(qpc_100ns, origin_ns, self.calibration))
     }
 }
 
@@ -710,6 +722,7 @@ impl CaptureDevice for LiveCapture {
                 timestamp_error: flags & BUFFER_TIMESTAMP_ERROR != 0,
                 device_position: position,
                 qpc_100ns: qpc,
+                read_qpc_100ns: qpc_100ns(),
             };
             let capture = &self.capture;
             // If `fill` unwinds, hand the packet back unread so the buffer is never left outstanding.

@@ -31,6 +31,9 @@ pub(crate) struct Packet {
     pub(crate) device_position: u64,
     /// The QPC time of the packet's first frame, in 100 ns units.
     pub(crate) qpc_100ns: u64,
+    /// The QPC time read right after GetBuffer returned the packet (the callback instant), in
+    /// 100 ns units.
+    pub(crate) read_qpc_100ns: u64,
 }
 
 /// The calls the loop makes on a started capture client.
@@ -50,20 +53,19 @@ pub(crate) trait CaptureDevice {
 pub(crate) struct CaptureStamper {
     origin_qpc: u64,
     origin_ns: i64,
-    rate: u32,
     calibration: Option<Calibration>,
     last: Held,
 }
 
 impl CaptureStamper {
-    pub(crate) fn new(origin_qpc_100ns: u64, origin_ns: i64, rate: u32, calibration: Option<Calibration>) -> Self {
-        Self { origin_qpc: origin_qpc_100ns, origin_ns, rate, calibration, last: Held::default() }
+    pub(crate) fn new(origin_qpc_100ns: u64, origin_ns: i64, calibration: Option<Calibration>) -> Self {
+        Self { origin_qpc: origin_qpc_100ns, origin_ns, calibration, last: Held::default() }
     }
 
     /// In the stamps' own time, from the packet's QPC alone (the capture client's audio clock is not
     /// read: it can report zero on real devices). The frame time is the QPC of the packet's first
-    /// frame, moved earlier by the calibrated round trip when there is one; the callback time is that
-    /// QPC plus the packet's duration, when the packet was complete and readable. A
+    /// frame, moved earlier by the calibrated round trip when there is one; the callback time is the QPC
+    /// read when the packet was taken (the capture pipeline delays a packet well past its last frame). A
     /// real discontinuity (discontinuity, which the caller has already cleared for the stream's first
     /// packet, whose flag is expected and means no loss), a timestamp error or a missing host time gives
     /// an invalid stamp (the clock fit restarts) and forgets the history.
@@ -72,11 +74,9 @@ impl CaptureStamper {
         if packet.timestamp_error || discontinuity || packet.frames == 0 {
             return self.invalid();
         }
-        let first = relative_ns(packet.qpc_100ns, self.origin_qpc, self.origin_ns);
-        let duration = i64::try_from(u128::from(packet.frames) * 1_000_000_000 / u128::from(self.rate.max(1))).unwrap_or(i64::MAX);
-        let callback = first.saturating_add(duration);
+        let callback = relative_ns(packet.read_qpc_100ns, self.origin_qpc, self.origin_ns);
         let round_trip = self.calibration.map_or(0, |c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
-        let frame = first.saturating_sub(round_trip);
+        let frame = relative_ns(packet.qpc_100ns, self.origin_qpc, self.origin_ns).saturating_sub(round_trip);
         let (callback, frame, host) = self.last.hold(callback, frame, host_ns, true);
         let (quality, offset_uncertainty_ns) = quality_of(self.calibration);
         Stamp { host_callback_ns: host, backend_callback_ns: callback, backend_frame_ns: frame, quality, offset_uncertainty_ns }
@@ -254,6 +254,8 @@ mod tests {
     use transit_rt::testing::measure;
 
     const RATE: u32 = 48_000;
+    /// The scripted delay between a packet's last frame and the read, in 100 ns units (8 ms).
+    const READ_DELAY_100NS: u64 = 80_000;
     const PERIOD: u32 = 128;
     const CHANNELS: usize = 2;
     const ORIGIN_QPC: u64 = 5_000_000;
@@ -370,6 +372,8 @@ mod tests {
                 timestamp_error: scripted.timestamp_error,
                 device_position: self.position,
                 qpc_100ns: self.qpc_of(self.position),
+                // The packet is read after its last frame plus the capture pipeline's delay.
+                read_qpc_100ns: self.qpc_of(self.position + u64::from(scripted.frames)) + READ_DELAY_100NS,
             };
             let len = scripted.frames as usize * CHANNELS * 4;
             // Sample k of the device is the float k / 1000 in each packet, so a test can see order.
@@ -393,7 +397,7 @@ mod tests {
         CaptureConfig {
             format: Format::new(RATE, CHANNELS as u16, SampleFormat::F32),
             wire: Wire::F32,
-            stamper: CaptureStamper::new(ORIGIN_QPC, 0, RATE, calibration),
+            stamper: CaptureStamper::new(ORIGIN_QPC, 0, calibration),
             origin: HostOrigin::default(),
             timeout_ms: 250,
             filled: Arc::new(AtomicU64::new(0)),
@@ -600,22 +604,32 @@ mod tests {
 
     #[test]
     fn a_missing_host_time_gives_an_invalid_stamp() {
-        let mut stamper = CaptureStamper::new(ORIGIN_QPC, 0, RATE, None);
-        let packet =
-            Packet { frames: PERIOD, silent: false, discontinuity: false, timestamp_error: false, device_position: 0, qpc_100ns: ORIGIN_QPC };
+        let mut stamper = CaptureStamper::new(ORIGIN_QPC, 0, None);
+        let packet = Packet {
+            frames: PERIOD,
+            silent: false,
+            discontinuity: false,
+            timestamp_error: false,
+            device_position: 0,
+            qpc_100ns: ORIGIN_QPC,
+            read_qpc_100ns: ORIGIN_QPC,
+        };
         assert_eq!(stamper.stamp(&packet, false, None).quality, Quality::Invalid);
         assert_ne!(stamper.stamp(&packet, false, Some(1)).quality, Quality::Invalid);
     }
 
     #[test]
-    fn the_callback_is_one_packet_duration_after_the_frame_and_no_stamp_is_invalid() {
+    fn the_callback_is_the_read_time_and_no_stamp_is_invalid() {
         let mut device = Fake::wakes(10);
         let run = drive(&mut device, &config(None));
-        let duration = i64::from(PERIOD) * 1_000_000_000 / i64::from(RATE);
+        let duration = ((u64::from(PERIOD) * 10_000_000 / u64::from(RATE) + READ_DELAY_100NS) * 100) as i64;
         assert_eq!(run.seen.len(), 10);
         for seen in &run.seen {
             assert_ne!(seen.stamp.quality, Quality::Invalid);
-            assert_eq!(seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns, duration);
+            assert!(
+                (seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns - duration).abs() <= 100,
+                "the read is the period plus the delay after the frame"
+            );
         }
     }
 
@@ -624,6 +638,7 @@ mod tests {
         let mut device = Fake::wakes(10);
         let run = drive(&mut device, &config(None));
         let period_ns = i64::from(PERIOD) * 1_000_000_000 / i64::from(RATE);
+        let read_ns = ((u64::from(PERIOD) * 10_000_000 / u64::from(RATE) + READ_DELAY_100NS) * 100) as i64;
         for pair in run.seen.windows(2) {
             let (a, b) = (pair[0].stamp, pair[1].stamp);
             assert!(b.host_callback_ns > a.host_callback_ns, "host time strictly increases");
@@ -631,8 +646,9 @@ mod tests {
             assert!(b.backend_callback_ns >= a.backend_callback_ns);
         }
         for seen in &run.seen {
-            // The frame time is the packet's first frame; the callback is one packet duration later.
-            assert_eq!(seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns, period_ns);
+            // The frame time is the packet's first frame; the callback is the read, one period
+            // plus the scripted delay later.
+            assert!((seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns - read_ns).abs() <= 100);
         }
         assert_eq!(run.seen[0].stamp.backend_frame_ns, 0, "the first packet starts at the origin instant");
     }

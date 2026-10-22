@@ -57,8 +57,8 @@ The native backend opens capture as its own endpoint, client, thread and positio
 captures its `(QPC, Instant)` pair at its own `start()` against the Player's one `HostOrigin`, so the
 stamps of the two streams are comparable in host nanoseconds, and each has its own `ClockKey`. A
 capture packet's frame time is the QPC `GetBuffer` reports for its first frame; its callback time is
-that QPC plus the packet's duration (the capture client's own audio clock reads zero on real
-devices and is not used). A `DATA_DISCONTINUITY` or `TIMESTAMP_ERROR` packet is
+the QPC read when the packet is taken (on the Scarlett in shared mode that is about 18 ms after its
+first frame; the capture client's own audio clock reads zero on real devices and is not used). A `DATA_DISCONTINUITY` or `TIMESTAMP_ERROR` packet is
 delivered with an invalid stamp (the fit restarts) and counted; a `SILENT` packet is delivered as
 zeros. Stamps never step backward and host time strictly increases (`render_loop::Held`).
 
