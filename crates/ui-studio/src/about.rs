@@ -1,4 +1,4 @@
-//! Help > About transit: the wordmark, the version, the credit to SoundCraft, the licenses and a
+//! Help > About transit: the wordmark, the version, the repository link, the fork credit to SoundCraft, the licenses and a
 //! button that copies the facts a bug report needs.
 
 use crate::StudioApp;
@@ -6,9 +6,12 @@ use crate::arrange::{R4, r4};
 use crate::theme::{SPACE, TOKENS};
 
 /// Where transit's code is based, and the credit link (moved here from the Help menu).
-const CREDIT: &str = "Based on SoundCraft by storytold";
+const CREDIT: &str = "Forked from SoundCraft by storytold, October 2026";
 const CREDIT_LINK: &str = "github.com/storytold/soundcraft";
 const CREDIT_URL: &str = "https://github.com/storytold/soundcraft";
+/// transit's own repository, linked above the lineage lines.
+const REPO_LINK: &str = "github.com/derekmwright/transit";
+const REPO_URL: &str = "https://github.com/derekmwright/transit";
 const LICENSES: &str = "MIT OR Apache-2.0";
 /// Wordmark width in points.
 const WORDMARK_W: f32 = 260.0;
@@ -23,6 +26,7 @@ pub struct AboutState {
     pub wordmark: R4,
     /// The "transit <version>" line.
     pub version: String,
+    pub repo: String,
     pub credit: String,
     pub licenses: String,
     pub copy: R4,
@@ -37,9 +41,9 @@ pub fn version_line(app: &StudioApp) -> String {
     format!("transit {v}")
 }
 
-/// The text "Copy version info" copies: version, OS, and the audio device when one is open.
+/// The text "Copy version info" copies: version, repository, OS, and the audio device when one is open.
 pub fn version_info(app: &StudioApp) -> String {
-    let mut out = format!("{}\nOS: {} {}\n", version_line(app), std::env::consts::OS, std::env::consts::ARCH);
+    let mut out = format!("{}\n{REPO_URL}\nOS: {} {}\n", version_line(app), std::env::consts::OS, std::env::consts::ARCH);
     match &app.player {
         Some(p) => {
             let frames = p.device_buffer.map_or("default".to_string(), |b| b.to_string());
@@ -79,6 +83,8 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 s.version = version.clone();
                 ui.label(egui::RichText::new(&s.version).strong().size(16.0).color(TOKENS.text));
                 ui.add_space(SPACE / 2.0);
+                s.repo = REPO_URL.to_string();
+                ui.hyperlink_to(REPO_LINK, REPO_URL);
                 s.credit = CREDIT.to_string();
                 ui.label(egui::RichText::new(CREDIT).color(TOKENS.text_dim));
                 ui.hyperlink_to(CREDIT_LINK, CREDIT_URL);

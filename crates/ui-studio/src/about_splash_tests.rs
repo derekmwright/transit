@@ -80,7 +80,8 @@ fn the_help_menu_opens_about_with_wordmark_version_and_credit() {
     let about = t.inspect()["about"].clone();
     assert_eq!(about["open"], true);
     assert_eq!(about["version"], "transit 9.9.9-test");
-    assert_eq!(about["credit"], "Based on SoundCraft by storytold");
+    assert_eq!(about["credit"], "Forked from SoundCraft by storytold, October 2026");
+    assert_eq!(about["repo"], "https://github.com/derekmwright/transit");
     assert_eq!(about["licenses"], "MIT OR Apache-2.0");
     let w = rect(&about["wordmark"]);
     assert!((w[2] - w[0] - 260.0).abs() < 1.5, "260 points wide: {w:?}");
@@ -120,6 +121,7 @@ fn copy_version_info_puts_the_facts_on_the_clipboard_and_close_closes() {
         ),
         "{text}"
     );
+    assert!(text.contains("https://github.com/derekmwright/transit"), "{text}");
     assert!(text.contains(&format!("OS: {}", std::env::consts::OS)), "{text}");
     assert!(text.contains("Audio: no device open"), "{text}");
     let close = rect(&t.inspect()["about"]["close"]);
