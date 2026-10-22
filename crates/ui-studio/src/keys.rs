@@ -16,6 +16,7 @@ pub use step::StepState;
 
 use crate::StudioApp;
 use crate::arrange::R4;
+use crate::grid::{self, GridMode, GridView};
 use crate::mixer::MenuItem;
 use crate::theme::{self, TOKENS};
 use egui::{Align2, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
@@ -35,31 +36,28 @@ const EDGE: f32 = 6.0;
 /// Pane height limits.
 const MIN_H: f32 = 160.0;
 
-/// The grid: note values plus off. Serialized as the label ("1/16", "1/8T", "off").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The Grid menu's entries. Each one sets the piano roll's [`GridView`]: "Adaptive" follows the
+/// zoom, the note values pin [`GridMode::Fixed`] (triplets also turn the triplet scaling on),
+/// "Off" switches snapping off. Ctrl+1 and Ctrl+2 can pin divisions the menu does not list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Snap {
-    #[serde(rename = "1/4")]
+    Adaptive,
     Quarter,
-    #[serde(rename = "1/8")]
     Eighth,
-    #[serde(rename = "1/16")]
     Sixteenth,
-    #[serde(rename = "1/32")]
     ThirtySecond,
-    #[serde(rename = "1/8T")]
     EighthTriplet,
-    #[serde(rename = "1/16T")]
     SixteenthTriplet,
-    #[serde(rename = "off")]
     Off,
 }
 
 impl Snap {
-    pub const ALL: [Snap; 7] =
-        [Snap::Quarter, Snap::Eighth, Snap::Sixteenth, Snap::ThirtySecond, Snap::EighthTriplet, Snap::SixteenthTriplet, Snap::Off];
+    pub const ALL: [Snap; 8] =
+        [Snap::Adaptive, Snap::Quarter, Snap::Eighth, Snap::Sixteenth, Snap::ThirtySecond, Snap::EighthTriplet, Snap::SixteenthTriplet, Snap::Off];
 
     pub fn label(self) -> &'static str {
         match self {
+            Snap::Adaptive => "Adaptive",
             Snap::Quarter => "1/4",
             Snap::Eighth => "1/8",
             Snap::Sixteenth => "1/16",
@@ -70,23 +68,51 @@ impl Snap {
         }
     }
 
-    /// Grid spacing in ticks; `None` when off.
-    pub fn ticks(self) -> Option<i64> {
+    /// The pinned division (before the triplet scaling) and whether it is a triplet; `None` for
+    /// the entries that are not a note value.
+    fn fixed(self) -> Option<(i64, bool)> {
         match self {
-            Snap::Quarter => Some(PPQ),
-            Snap::Eighth => Some(PPQ / 2),
-            Snap::Sixteenth => Some(PPQ / 4),
-            Snap::ThirtySecond => Some(PPQ / 8),
-            Snap::EighthTriplet => Some(PPQ / 3),
-            Snap::SixteenthTriplet => Some(PPQ / 6),
-            Snap::Off => None,
+            Snap::Quarter => Some((PPQ, false)),
+            Snap::Eighth => Some((PPQ / 2, false)),
+            Snap::Sixteenth => Some((PPQ / 4, false)),
+            Snap::ThirtySecond => Some((PPQ / 8, false)),
+            Snap::EighthTriplet => Some((PPQ / 2, true)),
+            Snap::SixteenthTriplet => Some((PPQ / 4, true)),
+            Snap::Adaptive | Snap::Off => None,
         }
     }
 
-    /// The length of a new note and of a nudge: the grid, or a sixteenth when off.
-    pub fn step(self) -> i64 {
-        self.ticks().unwrap_or(PPQ / 4)
+    /// Choose this entry on the piano roll's grid.
+    pub fn apply(self, g: &mut GridView) {
+        match (self, self.fixed()) {
+            (Snap::Off, _) => g.snap_enabled = false,
+            (_, Some((base, triplet))) => *g = GridView { mode: GridMode::Fixed(base), triplet, snap_enabled: true },
+            _ => *g = GridView::default(),
+        }
     }
+
+    /// The entry that matches `g`, when there is one (a division pinned by Ctrl+1 may have none).
+    pub fn of(g: &GridView) -> Option<Snap> {
+        if !g.snap_enabled {
+            return Some(Snap::Off);
+        }
+        match g.mode {
+            GridMode::Adaptive if !g.triplet => Some(Snap::Adaptive),
+            GridMode::Adaptive => None,
+            GridMode::Fixed(t) => Snap::ALL.into_iter().find(|s| s.fixed() == Some((t, g.triplet))),
+        }
+    }
+}
+
+/// Points per tick at the piano roll's horizontal zoom (the lines, the snap and the step length all ask this).
+fn keys_ppt(prefs: &KeysPrefs) -> f64 {
+    f64::from(prefs.px_per_quarter.clamp(8.0, 800.0)) / PPQ as f64
+}
+
+/// The piano roll's grid step in ticks at its zoom: what the lines are drawn at, what notes snap
+/// to (when snapping is on), and the length of a new or step-entered note.
+pub fn keys_grid_step(s: &Session, prefs: &KeysPrefs) -> i64 {
+    crate::grid::ticks(keys_ppt(prefs), crate::grid::bar_ticks(s), &prefs.grid)
 }
 
 /// The piano roll's view preferences (saved with the UI state; never in the document).
@@ -103,7 +129,13 @@ pub struct KeysPrefs {
     pub key_h: f32,
     /// Play notes on the clip's instrument as they are placed, clicked or dragged.
     pub audition: bool,
-    pub snap: Snap,
+    /// The grid: adaptive to the zoom or pinned, triplets, snap on or off (the arrangement has its own).
+    pub grid: GridView,
+    /// Step entry: enter every note at `step_velocity` instead of the velocity it was played at.
+    pub step_fixed: bool,
+    /// The velocity of step-entered notes when `step_fixed`.
+    #[serde(deserialize_with = "read_velocity")]
+    pub step_velocity: u8,
     /// Explicit velocity for new notes and audition; note edits never change it.
     #[serde(deserialize_with = "read_velocity")]
     pub velocity: u8,
@@ -116,7 +148,17 @@ fn read_velocity<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error>
 
 impl Default for KeysPrefs {
     fn default() -> Self {
-        KeysPrefs { show: false, height: 340.0, px_per_quarter: 60.0, key_h: 16.0, audition: true, snap: Snap::Sixteenth, velocity: 100 }
+        KeysPrefs {
+            show: false,
+            height: 340.0,
+            px_per_quarter: 60.0,
+            key_h: 16.0,
+            audition: true,
+            grid: GridView::default(),
+            step_fixed: false,
+            step_velocity: 100,
+            velocity: 100,
+        }
     }
 }
 
@@ -220,6 +262,11 @@ pub struct KeysLayout {
     /// The clip-end handle in the ruler (slice 6): drag to lengthen or shorten the clip.
     pub end_handle: R4,
     pub grid_ticks: Option<i64>,
+    /// The grid step in force (ticks) even with snap off, and the corner's text.
+    pub grid_step: i64,
+    pub grid_text: String,
+    /// Step velocity control.
+    pub step_velocity: R4,
     pub notes: Vec<NoteRect>,
     /// Instrument/MIDI tracks with no clips, which show the "create a clip" hint (set by the arrangement).
     pub hint_tracks: Vec<u64>,
@@ -253,6 +300,8 @@ pub struct KeysState {
     pub last_audition: Option<(u8, u8)>,
     /// Step entry (session state, never saved).
     pub step: StepState,
+    /// Fractional velocity carried between frames of a drag on the step velocity control.
+    step_vel_drag: f32,
     /// Velocity per pitch of the keys held on an armed MIDI input (0 = up). Session state.
     pub live: [u8; 128],
     /// The tracks' MIDI inputs as last seen: a change lets go of every live key.
@@ -277,6 +326,7 @@ impl Default for KeysState {
             auditions: 0,
             last_audition: None,
             step: StepState::default(),
+            step_vel_drag: 0.0,
             live: [0; 128],
             live_inputs: Vec::new(),
             serial: 0,
@@ -334,7 +384,10 @@ struct Map {
     top: f32,
     kh: f32,
     c0: i64,
+    /// The snap step: `None` when snapping is off.
     grid: Option<i64>,
+    /// The grid step in force whether or not it snaps: the lines, new-note and nudge length.
+    step: i64,
 }
 
 impl Map {
@@ -435,6 +488,11 @@ impl StudioApp {
         self.engine.end_merge();
         self.keys.serial += 1;
         format!("keys:{}", self.keys.serial)
+    }
+
+    /// The grid step in ticks at the piano roll's zoom ([`keys_grid_step`], whether or not it snaps).
+    pub fn keys_step(&self) -> i64 {
+        keys_grid_step(self.engine.session(), &self.ui.keys)
     }
 
     fn keys_exec(&mut self, id: &str, params: Value, key: &str) -> Result<Value, String> {
@@ -549,7 +607,7 @@ impl StudioApp {
     pub fn keys_duplicate(&mut self) -> Result<(), String> {
         let sel = self.keys.selection.clone();
         let (Some(a), Some(b)) = (sel.iter().map(|n| n.start).min(), sel.iter().map(Note::end).max()) else { return Ok(()) };
-        let g = self.ui.keys.snap.step();
+        let g = self.keys_step();
         let by = ((b - a + g - 1) / g).max(1) * g;
         let copies: Vec<Note> = sel.iter().map(|n| shifted(n, by, 0)).collect();
         self.keys.selection = self.keys_add(&copies)?;
@@ -561,7 +619,7 @@ impl StudioApp {
     pub fn keys_quantize(&mut self) -> Result<(), String> {
         let Some(clip) = self.keys.clip else { return Err("no clip".into()) };
         let notes = self.keys_notes();
-        let g = self.ui.keys.snap.step();
+        let g = self.keys_step();
         let opts = soundcraft_midi::ops::QuantizeOptions { grid_ticks: g, ..Default::default() };
         let sel = self.keys.selection.clone();
         let whole = sel.is_empty() || resolve(&notes, &sel).len() == notes.len();
@@ -640,6 +698,18 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         }
         return;
     }
+    // The grid (Ableton's Ctrl+1 to 4, as in the arrangement; the piano roll has its own view).
+    let (finer, wider) = (pressed(ctx, A::NotesGridNarrow), pressed(ctx, A::NotesGridWiden));
+    if finer || wider {
+        let (ppt, bar) = (keys_ppt(&app.ui.keys), grid::bar_ticks(app.engine.session()));
+        grid::step(&mut app.ui.keys.grid, ppt, bar, finer);
+    }
+    if pressed(ctx, A::NotesGridTriplet) {
+        app.ui.keys.grid.triplet = !app.ui.keys.grid.triplet;
+    }
+    if pressed(ctx, A::NotesGridSnap) {
+        app.ui.keys.grid.snap_enabled = !app.ui.keys.grid.snap_enabled;
+    }
     if pressed(ctx, A::StepToggle) {
         app.step_toggle();
     }
@@ -650,6 +720,18 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
         }
         if pressed(ctx, A::StepRest) {
             app.step_rest();
+        }
+        if pressed(ctx, A::StepCursorLeft) {
+            app.step_move(-1);
+        }
+        if pressed(ctx, A::StepCursorRight) {
+            app.step_move(1);
+        }
+        if pressed(ctx, A::StepHome) {
+            app.step_home();
+        }
+        if pressed(ctx, A::StepEnd) {
+            app.step_end();
         }
         for (action, ticks) in [
             (A::StepWhole, PPQ * 4),
@@ -679,7 +761,7 @@ pub fn shortcuts(app: &mut StudioApp, ctx: &egui::Context) {
     if pressed(ctx, A::NotesTransposeDown) {
         let _ = app.keys_transpose(-12);
     }
-    let step = app.ui.keys.snap.step();
+    let step = app.keys_step();
     let nudges = [
         (A::NotesOctaveUp, 0, 12),
         (A::NotesOctaveDown, 0, -12),
@@ -759,7 +841,10 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
 
     let prefs = app.ui.keys.clone();
     let kh = prefs.key_h.clamp(6.0, 40.0);
-    let ppt = f64::from(prefs.px_per_quarter.clamp(8.0, 800.0)) / PPQ as f64;
+    let ppt = keys_ppt(&prefs);
+    let step = keys_grid_step(&s, &prefs);
+    // The corner has room for little: "Auto 1/16", "Grid: 1/8T", "Snap off".
+    let grid_text = grid::label_at(ppt, grid::bar_ticks(&s), &prefs.grid).replace("Adaptive", "Auto");
     let rows = grid.height() / kh;
     if app.keys.fit {
         app.keys.fit = false;
@@ -774,7 +859,17 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     app.keys.top = app.keys.top.clamp((rows - 1.0).min(127.0), 127.0);
     app.keys.scroll = app.keys.scroll.max(-(cv.c0 as f64));
     let step_cur = app.step_cursor(ppt, grid.width());
-    let map = Map { gx0: grid.min.x, gy0: grid.min.y, ppt, scroll: app.keys.scroll, top: app.keys.top, kh, c0: cv.c0, grid: prefs.snap.ticks() };
+    let map = Map {
+        gx0: grid.min.x,
+        gy0: grid.min.y,
+        ppt,
+        scroll: app.keys.scroll,
+        top: app.keys.top,
+        kh,
+        c0: cv.c0,
+        grid: prefs.grid.snap_enabled.then_some(step),
+        step,
+    };
     // Drop selected notes that no longer exist (undo, another view).
     let present = resolve(&cv.notes, &app.keys.selection);
     if present.len() != app.keys.selection.len() {
@@ -833,9 +928,13 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     }
     let lp = ui.painter();
     lp.rect_filled(corner, 0.0, TOKENS.ruler);
-    if let Some((pitch, _)) = layout.live.last() {
-        lp.text(corner.center(), Align2::CENTER_CENTER, soundcraft_midi::note_name(*pitch), FontId::proportional(12.0), TOKENS.accent);
-    }
+    let cp = lp.with_clip_rect(corner);
+    match layout.live.last() {
+        Some((pitch, _)) => {
+            cp.text(corner.center(), Align2::CENTER_CENTER, soundcraft_midi::note_name(*pitch), FontId::proportional(12.0), TOKENS.accent)
+        }
+        None => cp.text(corner.center(), Align2::CENTER_CENTER, &grid_text, FontId::proportional(9.5), TOKENS.text_dim),
+    };
     lp.rect_filled(vel_label, 0.0, TOKENS.panel);
     lp.text(pos2(vel_label.min.x + 8.0, vel_label.min.y + 10.0), Align2::LEFT_CENTER, "Velocity", FontId::proportional(10.5), TOKENS.text_dim);
     lp.line_segment([pos2(area.min.x, vel.min.y - 0.5), pos2(area.max.x, vel.min.y - 0.5)], Stroke::new(1.0, TOKENS.line));
@@ -851,7 +950,9 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     layout.key_h = kh;
     layout.clip_start_ticks = cv.c0;
     layout.clip_ticks = cv.len;
-    layout.grid_ticks = prefs.snap.ticks();
+    layout.grid_ticks = map.grid;
+    layout.grid_step = step;
+    layout.grid_text = grid_text;
     layout.selected = app.keys.selection.len();
     layout.auditions = app.keys.auditions;
     layout.last_audition = app.keys.last_audition;
@@ -941,6 +1042,34 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     {
         app.step_toggle();
     }
+    // Step velocity: click toggles Played / Fixed; dragging up or right raises the fixed value.
+    let (b, _) = button(ui, 116.0, "step_velocity");
+    let resp = ui.interact(b, ui.id().with(("keys_btn", "step_velocity_drag")), Sense::click_and_drag());
+    let fixed = app.ui.keys.step_fixed;
+    let p = ui.painter();
+    p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() || resp.dragged() { TOKENS.button_hover } else { TOKENS.button });
+    let label = if fixed { format!("Velocity: Fixed {}", app.ui.keys.step_velocity) } else { "Velocity: Played".into() };
+    p.text(b.center(), Align2::CENTER_CENTER, label, small.clone(), if fixed { TOKENS.text } else { TOKENS.text_dim });
+    layout.step_velocity = r4(b);
+    if resp.drag_started() {
+        app.ui.keys.step_fixed = true;
+        app.keys.step_vel_drag = 0.0;
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        app.keys.step_vel_drag += (d.x - d.y) * 0.5;
+        let whole = app.keys.step_vel_drag.trunc();
+        app.keys.step_vel_drag -= whole;
+        app.ui.keys.step_velocity = (i32::from(app.ui.keys.step_velocity) + whole as i32).clamp(1, 127) as u8;
+    }
+    if resp
+        .on_hover_text(
+            "Step entry velocity: Played uses how hard the key was hit; Fixed enters every note at the set value. Click to switch, drag to change.",
+        )
+        .clicked()
+    {
+        app.ui.keys.step_fixed = !fixed;
+    }
     let (b, resp) = button(ui, 72.0, "audition");
     let on = app.ui.keys.audition;
     let p = ui.painter();
@@ -972,10 +1101,14 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     {
         let _ = app.keys_quantize();
     }
-    let (b, resp) = button(ui, 84.0, "snap");
+    let (b, resp) = button(ui, 104.0, "snap");
     let p = ui.painter();
     p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
-    p.text(pos2(b.min.x + 8.0, b.center().y), Align2::LEFT_CENTER, format!("Grid {}", app.ui.keys.snap.label()), small, TOKENS.text);
+    let grid_name = match Snap::of(&app.ui.keys.grid) {
+        Some(snap) => snap.label().to_string(),
+        None => grid::label_at(keys_ppt(&app.ui.keys), grid::bar_ticks(app.engine.session()), &app.ui.keys.grid),
+    };
+    p.text(pos2(b.min.x + 8.0, b.center().y), Align2::LEFT_CENTER, format!("Grid {grid_name}"), small, TOKENS.text);
     let c = pos2(b.max.x - 9.0, b.center().y);
     p.add(egui::Shape::convex_polygon(
         vec![pos2(c.x - 3.0, c.y - 1.5), pos2(c.x + 3.0, c.y - 1.5), pos2(c.x, c.y + 2.0)],
@@ -983,13 +1116,13 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
         Stroke::NONE,
     ));
     layout.snap = r4(b);
-    let current = app.ui.keys.snap;
-    egui::Popup::menu(&resp).width(90.0).show(|ui| {
+    let current = Snap::of(&app.ui.keys.grid);
+    egui::Popup::menu(&resp).width(100.0).show(|ui| {
         for snap in Snap::ALL {
-            let item = crate::menus::check_button(ui, snap == current, snap.label());
+            let item = crate::menus::check_button(ui, Some(snap) == current, snap.label());
             layout.snap_menu.push(MenuItem::at(ui, snap.label().into(), snap.label().into(), item.rect));
             if item.clicked() {
-                app.ui.keys.snap = snap;
+                snap.apply(&mut app.ui.keys.grid);
                 ui.close();
             }
         }
@@ -1099,16 +1232,23 @@ fn paint_grid(ui: &Ui, s: &Session, map: &Map, grid: Rect, ruler: Rect, cv: &Cli
         let b1 = s.tempo.bar_start_tick(bar + 1);
         let m = s.tempo.meter_at_tick(b0);
         let beat = (PPQ * 4 / i64::from(m.denominator.max(1))).max(1);
-        let sub = map.grid.filter(|g| *g as f64 * map.ppt >= 7.0);
-        let step = sub.unwrap_or(beat).min(beat);
-        let mut t = b0 + step;
+        let sub = grid::sub_line_step(map.step, map.ppt, beat);
+        let mut t = b0 + beat;
         while t < b1 {
             let x = map.x(t - map.c0);
-            let color = if (t - b0) % beat == 0 { TOKENS.grid_bar.gamma_multiply(0.75) } else { TOKENS.grid_beat };
-            if (t - b0) % beat == 0 || sub.is_some() {
-                p.line_segment([pos2(x, grid.min.y), pos2(x, grid.max.y)], Stroke::new(1.0, color));
+            p.line_segment([pos2(x, grid.min.y), pos2(x, grid.max.y)], Stroke::new(1.0, TOKENS.grid_bar.gamma_multiply(0.75)));
+            t += beat;
+        }
+        // Sub-beat lines, fainter than the beats (a triplet step does not divide the beat evenly).
+        if let Some(sub) = sub {
+            let mut t = b0 + sub;
+            while t < b1 {
+                if (t - b0) % beat != 0 {
+                    let x = map.x(t - map.c0);
+                    p.line_segment([pos2(x, grid.min.y), pos2(x, grid.max.y)], Stroke::new(1.0, TOKENS.grid_beat.gamma_multiply(0.6)));
+                }
+                t += sub;
             }
-            t += step;
         }
         let x = map.x(b0 - map.c0);
         p.line_segment([pos2(x, grid.min.y), pos2(x, grid.max.y)], Stroke::new(1.0, TOKENS.grid_bar));
@@ -1283,7 +1423,7 @@ fn grid_input(app: &mut StudioApp, ui: &mut Ui, map: &Map, grid: Rect, vel: Rect
                         release_velocity: 64,
                         channel: 0,
                         start,
-                        length: app.ui.keys.snap.step(),
+                        length: map.step,
                     };
                     if let Ok(sel) = app.keys_add(&[n]) {
                         app.keys.selection = sel;
@@ -1594,7 +1734,7 @@ fn clip_end_handle(app: &mut StudioApp, ui: &mut Ui, map: &Map, ruler: Rect, gri
     }
     let resp = ui.interact(h.intersect(ruler), ui.id().with("keys_clip_end"), Sense::click_and_drag());
     let dragging = matches!(app.keys.gesture, Some(KeysGesture::ClipEnd));
-    let step = map.grid.unwrap_or(PPQ / 4).max(1);
+    let step = map.step.max(1);
     let target = ui.input(|i| i.pointer.latest_pos()).map(|p| map.round(map.tick(p.x)).max(step));
     let p = ui.painter().with_clip_rect(Rect::from_min_max(ruler.min, grid.max));
     let ink = if resp.hovered() || dragging { TOKENS.accent } else { TOKENS.text_dim };

@@ -3,7 +3,8 @@
 //! [`MIN_SPACING_PX`] apart) or is pinned (`Fixed`). A triplet toggle scales either by 2/3, and
 //! snapping can be switched off. This is view state, not saved in the session. Snapping
 //! (`automation::snap`, `snap_delta`) and the lines drawn in the arrangement both ask this module,
-//! so they always agree. The piano roll keeps its own fixed `Snap` menu (`keys.rs`).
+//! so they always agree. The piano roll keeps its own [`GridView`] (its zoom differs) and asks the
+//! same functions with its own points per tick.
 
 use soundcraft_model::Session;
 use soundcraft_time::TICKS_PER_QUARTER as PPQ;
@@ -14,7 +15,7 @@ pub const MIN_SPACING_PX: f64 = 12.0;
 pub const MIN_DRAW_PX: f64 = 4.0;
 
 /// Where the division comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum GridMode {
     /// Follows the zoom.
     #[default]
@@ -24,7 +25,8 @@ pub enum GridMode {
 }
 
 /// The arrangement's grid settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GridView {
     pub mode: GridMode,
     pub triplet: bool,
@@ -111,10 +113,14 @@ pub fn name(base: i64, bar_ticks: i64, triplet: bool) -> String {
 
 /// The grid as the ruler corner shows it: "Grid: 1/16", "Grid: 1/8T", "Adaptive 1/32", "Snap off".
 pub fn label(s: &Session, spp: f64, g: &GridView) -> String {
+    label_at(px_per_tick(s, spp), bar_ticks(s), g)
+}
+
+/// [`label`] for a view that already knows its points per tick (the piano roll).
+pub fn label_at(ppt: f64, bar: i64, g: &GridView) -> String {
     if !g.snap_enabled {
         return "Snap off".into();
     }
-    let (ppt, bar) = (px_per_tick(s, spp), bar_ticks(s));
     let n = name(base(ppt, bar, g), bar, g.triplet);
     match g.mode {
         GridMode::Adaptive => format!("Adaptive {n}"),

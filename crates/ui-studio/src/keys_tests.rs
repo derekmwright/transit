@@ -348,11 +348,11 @@ fn new_note_velocity_defaults_bounds_and_control_updates_preserve_other_tool_set
     let mut t = T::open();
     let old: crate::UiState = serde_json::from_value(json!({"keys": {"snap": "1/8"}})).unwrap();
     assert_eq!(old.keys.velocity, 100, "old ui.json without velocity gets the default");
-    t.app.run("ui.set", json!({"keys": {"snap": "1/8", "audition": false}})).unwrap();
+    t.app.run("ui.set", json!({"keys": {"grid": {"mode": {"Fixed": 480}}, "audition": false}})).unwrap();
     for (value, expected) in [(-10, 1), (0, 1), (1, 1), (87, 87), (127, 127), (128, 127), (300, 127)] {
         t.app.run("ui.set", json!({"keys": {"velocity": value}})).unwrap();
         assert_eq!(t.app.ui.keys.velocity, expected);
-        assert_eq!(t.app.ui.keys.snap, Snap::Eighth);
+        assert_eq!(Snap::of(&t.app.ui.keys.grid), Some(Snap::Eighth));
         assert!(!t.app.ui.keys.audition);
         assert!(t.app.keys_shown());
         assert_eq!(t.app.inspect(&t.ctx)["ui"]["keys"]["velocity"], json!(expected));
@@ -440,7 +440,7 @@ fn view_gestures_change_the_ui_state_and_never_the_document() {
     let item = t.app.keys.layout.snap_menu.iter().find(|m| m.label == "1/8").cloned().expect("1/8 listed");
     assert_eq!(t.app.keys.layout.snap_menu.len(), Snap::ALL.len());
     t.click(mid(item.rect));
-    assert_eq!(t.app.ui.keys.snap, Snap::Eighth);
+    assert_eq!(Snap::of(&t.app.ui.keys.grid), Some(Snap::Eighth));
     // Pane height: drag the top edge up.
     let h0 = t.app.ui.keys.height;
     let hd = mid(t.app.keys.layout.handle);
@@ -478,9 +478,9 @@ fn view_gestures_change_the_ui_state_and_never_the_document() {
     assert_eq!(serde_json::to_value(t.app.engine.session()).unwrap(), doc, "the document is untouched");
     // The preferences go out with ui.inspect and come back through ui.set.
     let v = t.app.inspect(&t.ctx);
-    assert_eq!(v["ui"]["keys"]["snap"], json!("1/8"));
-    t.app.run("ui.set", json!({"keys": {"snap": "1/32", "height": 300.0, "audition": false}})).unwrap();
-    assert_eq!((t.app.ui.keys.snap, t.app.ui.keys.audition), (Snap::ThirtySecond, false));
+    assert_eq!(v["ui"]["keys"]["grid"]["mode"], json!({"Fixed": 480}));
+    t.app.run("ui.set", json!({"keys": {"grid": {"mode": {"Fixed": 120}}, "height": 300.0, "audition": false}})).unwrap();
+    assert_eq!((Snap::of(&t.app.ui.keys.grid), t.app.ui.keys.audition), (Some(Snap::ThirtySecond), false));
 }
 
 #[test]
@@ -972,4 +972,219 @@ fn reselecting_a_midi_input_lets_go_of_held_keys() {
     t.app.run("midi.input", json!({"track": t.track.0, "channel": 3})).unwrap();
     t.frames(2);
     assert!(t.app.keys.layout.live.is_empty());
+}
+
+// The piano roll shares the arrangement's grid machinery (`crate::grid`) with a view of its own.
+
+impl T {
+    fn zoom_to(&mut self, px_per_quarter: f32) {
+        self.app.ui.keys.px_per_quarter = px_per_quarter;
+        self.frames(2);
+    }
+}
+
+#[test]
+fn zooming_in_subdivides_the_piano_roll_grid_down_to_a_128th_and_lines_and_snap_agree() {
+    let mut t = T::open();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    // 60 points per quarter: a 1/16 (15 points), as before.
+    assert_eq!(t.app.keys.layout.grid_step, q / 4);
+    for (px, step) in [(12.0, q), (24.0, q / 2), (60.0, q / 4), (100.0, q / 8), (200.0, q / 16), (400.0, q / 32), (800.0, q / 32)] {
+        t.zoom_to(px);
+        let l = &t.app.keys.layout;
+        assert_eq!(l.grid_step, step, "{px} points per quarter");
+        assert_eq!(l.grid_ticks, Some(step), "snap uses the step the lines are drawn at");
+        assert!(step as f64 * l.px_per_tick >= crate::grid::MIN_SPACING_PX - 1e-6, "{px}: spacing");
+    }
+    assert!(t.app.keys.layout.grid_text.contains("1/128"), "{}", t.app.keys.layout.grid_text);
+    // A double-click at the finest zoom adds a note one 128th long.
+    t.zoom_to(400.0);
+    t.click_n(t.at(95.0, 62), 2, json!({}));
+    let n = t.notes();
+    assert_eq!((n[0].start, n[0].length), (90, 30), "{n:?}");
+    // The arrangement's own grid is untouched.
+    assert_eq!(t.app.arrange.grid, crate::grid::GridView::default());
+}
+
+#[test]
+fn ctrl_1_to_4_drive_the_piano_roll_grid() {
+    let mut t = T::open();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    let arrangement = t.app.arrange.grid;
+    t.key("1", json!({"cmd": true}));
+    assert_eq!(t.app.ui.keys.grid.mode, crate::grid::GridMode::Fixed(q / 8), "finer than the 1/16 in force");
+    assert_eq!(t.app.keys.layout.grid_step, q / 8);
+    t.key("2", json!({"cmd": true}));
+    t.key("2", json!({"cmd": true}));
+    assert_eq!(t.app.keys.layout.grid_step, q / 2);
+    t.key("3", json!({"cmd": true}));
+    assert_eq!(t.app.keys.layout.grid_step, q / 3, "a 1/8 triplet");
+    t.key("3", json!({"cmd": true}));
+    t.key("4", json!({"cmd": true}));
+    assert!(!t.app.ui.keys.grid.snap_enabled && t.app.keys.layout.grid_ticks.is_none());
+    assert_eq!(t.app.keys.layout.grid_text, "Snap off");
+    assert_eq!(t.app.arrange.grid, arrangement, "Ctrl+1 to 4 in the piano roll leave the arrangement alone");
+    t.key("4", json!({"cmd": true}));
+    assert!(t.app.ui.keys.grid.snap_enabled);
+    // Step entry's plain digits still set lengths (a different, exact key).
+    t.step_on();
+    t.key("5", json!({}));
+    assert_eq!(t.app.keys.layout.step_ticks, q / 4);
+}
+
+#[test]
+fn ctrl_4_turns_snap_off_so_a_dragged_note_lands_unsnapped() {
+    let mut t = T::open();
+    t.add(60, 0, 480);
+    t.key("4", json!({"cmd": true}));
+    let to = t.at(120.0 + 510.0, 62);
+    t.drag(t.at(120.0, 60), to, json!({}));
+    let n = t.notes();
+    assert_eq!(n.len(), 1);
+    assert_ne!(n[0].start % 240, 0, "unsnapped: {n:?}");
+    assert!((n[0].start - 510).abs() <= 16, "{n:?}");
+    // The edge resizes freely too.
+    let r = t.note_rect(62, n[0].start);
+    let px = 100.0 * t.app.keys.layout.px_per_tick as f32;
+    t.drag((r[2] - 2.0, (r[1] + r[3]) / 2.0), (r[2] - 2.0 + px, (r[1] + r[3]) / 2.0), json!({}));
+    assert_ne!(t.notes()[0].length % 240, 0, "{:?}", t.notes());
+}
+
+#[test]
+fn the_snap_menu_pins_fixed_entries_and_adaptive_follows_the_zoom_again() {
+    let mut t = T::open();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    t.zoom_to(400.0);
+    assert_eq!(t.app.keys.layout.grid_step, q / 32, "adaptive");
+    let pick = |t: &mut T, label: &str| {
+        t.click(mid(t.app.keys.layout.snap));
+        let item = t.app.keys.layout.snap_menu.iter().find(|m| m.label == label).cloned().unwrap_or_else(|| panic!("{label} listed"));
+        t.click(mid(item.rect));
+    };
+    pick(&mut t, "1/16");
+    assert_eq!(t.app.ui.keys.grid.mode, crate::grid::GridMode::Fixed(q / 4));
+    assert_eq!(t.app.keys.layout.grid_step, q / 4, "pinned: the zoom no longer matters");
+    t.zoom_to(12.0);
+    assert_eq!(t.app.keys.layout.grid_step, q / 4);
+    pick(&mut t, "1/8T");
+    assert_eq!(t.app.keys.layout.grid_step, q / 3);
+    pick(&mut t, "Off");
+    assert!(t.app.keys.layout.grid_ticks.is_none());
+    pick(&mut t, "Adaptive");
+    assert_eq!(t.app.ui.keys.grid, crate::grid::GridView::default());
+    assert_eq!(t.app.keys.layout.grid_step, q, "adaptive at 12 points per quarter");
+}
+
+#[test]
+fn step_entry_default_length_follows_the_adaptive_grid() {
+    let mut t = T::open();
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    t.zoom_to(200.0);
+    t.step_on();
+    assert_eq!(t.app.keys.layout.step_ticks, q / 16);
+    t.tap(60, 100);
+    assert_eq!((t.notes()[0].length, t.app.keys.layout.step_cursor), (q / 16, q / 16));
+    // A length key still wins over the grid.
+    t.key("3", json!({}));
+    t.zoom_to(400.0);
+    assert_eq!(t.app.keys.layout.step_ticks, q);
+}
+
+#[test]
+fn left_and_right_move_the_step_cursor_without_editing_and_home_and_end_jump() {
+    let mut t = T::open();
+    t.step_on();
+    t.tap(60, 100);
+    t.tap(62, 100);
+    t.tap(64, 100);
+    assert_eq!(t.app.keys.layout.step_cursor, 3 * SIXTEENTH);
+    let (undo, notes) = (t.undo_len(), t.notes());
+    t.key("ArrowLeft", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 2 * SIXTEENTH);
+    t.key("ArrowLeft", json!({}));
+    t.key("ArrowRight", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 2 * SIXTEENTH);
+    assert_eq!((t.undo_len(), t.notes()), (undo, notes), "moving the cursor edits nothing, and does not nudge notes");
+    t.key("Home", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 0);
+    t.key("ArrowLeft", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 0, "stops at the clip start");
+    t.key("End", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 3 * SIXTEENTH, "the end of the entered material");
+    t.key("ArrowRight", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 4 * SIXTEENTH);
+    // Entering at a moved cursor, then Backspace still takes the last entered step back.
+    t.key("ArrowLeft", json!({}));
+    t.key("ArrowLeft", json!({}));
+    t.tap(65, 100);
+    assert_eq!(t.notes().iter().filter(|n| n.pitch == 65).map(|n| n.start).collect::<Vec<_>>(), vec![2 * SIXTEENTH]);
+    t.key("Backspace", json!({}));
+    assert!(t.notes().iter().all(|n| n.pitch != 65));
+    assert_eq!(t.app.keys.layout.step_cursor, 2 * SIXTEENTH);
+    // A rest counts as material for End.
+    t.key("End", json!({}));
+    t.key("Period", json!({}));
+    t.key("Home", json!({}));
+    t.key("End", json!({}));
+    assert_eq!(t.app.keys.layout.step_cursor, 4 * SIXTEENTH);
+}
+
+#[test]
+fn the_step_cursor_stays_visible_when_it_jumps() {
+    let mut t = T::open();
+    t.step_on();
+    t.zoom_to(400.0);
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    t.key("1", json!({}));
+    for pitch in 60..70 {
+        t.tap(pitch, 100);
+    }
+    t.key("Home", json!({}));
+    t.frames(2);
+    let l = &t.app.keys.layout;
+    assert_eq!((l.step_cursor, l.scroll_ticks), (0, 0.0));
+    t.key("End", json!({}));
+    t.frames(2);
+    let l = &t.app.keys.layout;
+    let visible = f64::from(l.grid[2] - l.grid[0]) / l.px_per_tick;
+    assert_eq!(l.step_cursor, 10 * 4 * q);
+    assert!(l.scroll_ticks <= l.step_cursor as f64 && (l.step_cursor as f64) < l.scroll_ticks + visible, "{} {visible}", l.scroll_ticks);
+}
+
+#[test]
+fn fixed_step_velocity_overrides_the_played_velocity_and_played_follows_the_key() {
+    let mut t = T::open();
+    assert!(!t.app.ui.keys.step_fixed && t.app.ui.keys.step_velocity == 100, "default: Played, 100 when fixed");
+    t.step_on();
+    t.tap(60, 37);
+    assert_eq!(t.notes()[0].velocity, 37, "Played");
+    // Click the toolbar control: Fixed. Drag it to change the value.
+    t.click(mid(t.app.keys.layout.step_velocity));
+    assert!(t.app.ui.keys.step_fixed);
+    let m = mid(t.app.keys.layout.step_velocity);
+    t.drag(m, (m.0 - 40.0, m.1), json!({}));
+    assert!(t.app.ui.keys.step_fixed && t.app.ui.keys.step_velocity < 100, "dragging left lowers it: {}", t.app.ui.keys.step_velocity);
+    t.app.ui.keys.step_velocity = 80;
+    t.tap(62, 127);
+    t.tap(64, 5);
+    let v: Vec<(u8, u8)> = t.notes().iter().map(|n| (n.pitch, n.velocity)).collect();
+    assert_eq!(v, vec![(60, 37), (62, 80), (64, 80)], "Fixed 80 whatever the key did");
+    // A chord is fixed note by note.
+    t.played(65, 20, true);
+    t.played(67, 120, true);
+    t.played(65, 0, false);
+    assert!(t.notes().iter().filter(|n| n.pitch == 65 || n.pitch == 67).all(|n| n.velocity == 80));
+    // Back to Played.
+    t.click(mid(t.app.keys.layout.step_velocity));
+    assert!(!t.app.ui.keys.step_fixed);
+    t.tap(69, 99);
+    assert_eq!(t.notes().iter().find(|n| n.pitch == 69).unwrap().velocity, 99);
+    // Saved with the other piano-roll preferences.
+    t.app.ui.keys.step_fixed = true;
+    t.app.ui.keys.step_velocity = 64;
+    let saved = serde_json::to_vec(&t.app.ui).unwrap();
+    let back: crate::UiState = serde_json::from_slice(&saved).unwrap();
+    assert_eq!((back.keys.step_fixed, back.keys.step_velocity), (true, 64));
+    let old: crate::UiState = serde_json::from_value(json!({"keys": {"snap": "1/8"}})).unwrap();
+    assert_eq!((old.keys.step_fixed, old.keys.step_velocity, old.keys.grid), (false, 100, crate::grid::GridView::default()));
 }

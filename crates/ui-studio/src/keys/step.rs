@@ -10,6 +10,8 @@ use soundcraft_playback::PlayedNote;
 #[derive(Debug, Clone)]
 struct Entered {
     start: i64,
+    /// Where the step ends (a rest has no notes to say so).
+    end: i64,
     notes: Vec<Note>,
 }
 
@@ -53,7 +55,7 @@ impl StudioApp {
     }
 
     pub fn step_len(&self) -> i64 {
-        self.keys.step.len.unwrap_or_else(|| self.ui.keys.snap.step())
+        self.keys.step.len.unwrap_or_else(|| self.keys_step())
     }
 
     /// Turn Step on or off. On: the cursor starts at the selection or the playhead when either is
@@ -146,6 +148,8 @@ impl StudioApp {
             self.status = "Step entry stopped: the next clip starts here.".into();
             return;
         }
+        let fixed = self.ui.keys.step_fixed.then_some(self.ui.keys.step_velocity.clamp(1, 127));
+        let notes: Vec<(u8, u8)> = notes.iter().map(|(pitch, played)| (*pitch, fixed.unwrap_or(*played))).collect();
         let pitches: Vec<u8> = notes.iter().map(|n| n.0).collect();
         let velocities: Vec<u8> = notes.iter().map(|n| n.1).collect();
         let key = self.keys_merge_key();
@@ -163,9 +167,33 @@ impl StudioApp {
             length: len,
         });
         let step = &mut self.keys.step;
-        step.steps.push(Entered { start: at, notes: entered.collect() });
+        step.steps.push(Entered { start: at, end: at + len, notes: entered.collect() });
         step.cursor = at + len;
         step.follow = true;
+    }
+
+    /// Left and Right: move the cursor one step length back (`-1`) or forward (`1`) without
+    /// editing anything; it stops at the clip start.
+    pub fn step_move(&mut self, dir: i64) {
+        let len = self.step_len();
+        let step = &mut self.keys.step;
+        step.cursor = (step.cursor + dir * len).max(0);
+        step.follow = true;
+    }
+
+    /// Home: the cursor to the clip start.
+    pub fn step_home(&mut self) {
+        self.keys.step.cursor = 0;
+        self.keys.step.follow = true;
+    }
+
+    /// End: the cursor to the end of the material: the last step entered this session or the last
+    /// note already in the clip, whichever is later.
+    pub fn step_end(&mut self) {
+        let entered = self.keys.step.steps.iter().map(|e| e.end).max().unwrap_or(0);
+        let existing = self.keys_notes().iter().map(Note::end).max().unwrap_or(0);
+        self.keys.step.cursor = entered.max(existing);
+        self.keys.step.follow = true;
     }
 
     /// Backspace: delete the last entered step's notes and move the cursor back onto it; with no
