@@ -235,6 +235,19 @@ fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
     if w.is_finite() && h.is_finite() && w >= 960.0 && h >= 600.0 { [w.min(16_384.0), h.min(16_384.0)] } else { [1600.0, 1000.0] }
 }
 
+/// The window, Dock, taskbar and Alt-Tab icon. macOS gets Apple's icon grid (transparent margin);
+/// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
+fn app_icon() -> egui::IconData {
+    #[cfg(target_os = "macos")]
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/transit-macos-512.png");
+    #[cfg(not(target_os = "macos"))]
+    let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/transit.png");
+    eframe::icon_data::from_png_bytes(png).unwrap_or_else(|e| {
+        log::warn!("app icon: {e}");
+        egui::IconData::default()
+    })
+}
+
 fn main() -> eframe::Result {
     // A plugin scan's child process: load one file, answer, exit. First, before anything else
     // (E1/E2: otherwise every scan child starts a whole app).
@@ -294,6 +307,7 @@ fn main() -> eframe::Result {
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(app_icon())
             .with_title("transit")
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_min_inner_size([960.0, 600.0])

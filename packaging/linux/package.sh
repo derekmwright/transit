@@ -108,8 +108,8 @@ if has appimage; then
   mv "$APPDIR/usr/share/doc" "$WORK/doc-unused"
   ln -s usr/bin/soundcraft "$APPDIR/AppRun"
   cp "$HERE/$APP_ID.desktop" "$APPDIR/$APP_ID.desktop"
-  cp "$ROOT/assets/app-icon/hicolor/256x256/apps/$APP_ID.png" "$APPDIR/$APP_ID.png"
-  ln -s "$APP_ID.png" "$APPDIR/.DirIcon"
+  cp "$ROOT/assets/app-icon/hicolor/256x256/apps/transit.png" "$APPDIR/transit.png"
+  ln -s transit.png "$APPDIR/.DirIcon"
 
   TOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
   if [ -z "$TOOL" ]; then

@@ -66,6 +66,8 @@ modules:
       # Already has the release's version and date substituted by package.sh.
       - install -Dm644 share/metainfo/ai.storyteller.soundcraft.metainfo.xml /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml
       - mkdir -p /app/share/icons /app/share/doc && cp -R share/icons/hicolor /app/share/icons/ && cp -R share/doc/soundcraft /app/share/doc/
+      # Flatpak exports only icons named after the app ID, so rename the hicolor icons and point the desktop entry at them.
+      - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/ai.storyteller.soundcraft.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=ai.storyteller.soundcraft/' /app/share/applications/ai.storyteller.soundcraft.desktop; sed -i 's#<icon type="stock">transit<#<icon type="stock">ai.storyteller.soundcraft<#' /app/share/metainfo/ai.storyteller.soundcraft.metainfo.xml 2>/dev/null || true
       # Mount point for the plugin extensions (add-extensions).
       - install -d /app/extensions/Plugins
     sources:

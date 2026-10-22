@@ -9,6 +9,7 @@ This is the wordmark only; the app icon is separate (`assets/app-icon/`).
 | `transit-wordmark-graphite.svg` | Same outlines, fill `#1B1C1E`, for light surfaces |
 | `transit-wordmark-white-2172.png` | 2172 x 724 transparent PNG of the white version |
 | `transit-wordmark-graphite-2172.png` | 2172 x 724 transparent PNG of the graphite version |
+| `transit-icon-dark.svg`, `transit-icon-dark-1024.png` | Dark variant of the app icon (pale t `#F6F6F8` on charcoal `#1B1C1E`), kept for dark-theme or monochrome use; the app icon proper is the blue one in `assets/app-icon/` |
 | `../../docs/images/transit-wordmark-dark.png` | White wordmark on charcoal, for the README |
 
 ## Usage

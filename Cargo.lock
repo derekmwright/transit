@@ -4596,6 +4596,7 @@ dependencies = [
  "soundcraft-playback",
  "soundcraft-ui-egui",
  "soundcraft-ui-studio",
+ "winresource",
 ]
 
 [[package]]

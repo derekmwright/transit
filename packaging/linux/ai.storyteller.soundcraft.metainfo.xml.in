@@ -24,7 +24,7 @@
     </ul>
   </description>
   <launchable type="desktop-id">ai.storyteller.soundcraft.desktop</launchable>
-  <icon type="stock">ai.storyteller.soundcraft</icon>
+  <icon type="stock">transit</icon>
   <!-- Only url types known to appstream 0.15 (Ubuntu 22.04, where CI validates): no vcs-browser. -->
   <url type="homepage">https://getartcraft.com/apps/soundcraft</url>
   <url type="bugtracker">https://github.com/storytold/soundcraft/issues</url>

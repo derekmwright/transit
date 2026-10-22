@@ -7,13 +7,13 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../assets/app-icon/soundcraft.ico");
+    println!("cargo:rerun-if-changed=../../assets/app-icon/transit.ico");
     println!("cargo:rerun-if-env-changed=SOUNDCRAFT_REQUIRE_WINRES");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
     let mut res = winresource::WindowsResource::new();
-    res.set_icon("../../assets/app-icon/soundcraft.ico")
+    res.set_icon("../../assets/app-icon/transit.ico")
         .set("ProductName", "SoundCraft")
         .set("FileDescription", "SoundCraft digital audio workstation")
         .set("CompanyName", "Learning Machines LLC")
