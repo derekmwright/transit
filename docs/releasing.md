@@ -15,7 +15,7 @@ Releases are tag-driven. `.github/workflows/release.yml` does the building.
    - Windows x86_64 (one download, a `.msi` installer and a portable `.zip`): `windows-x86_64`
      (native WASAPI and native ASIO; no cpal ASIO, see below). Unsigned unless the
      Windows signing secrets below are set. SmartScreen may ask for "More info", then "Run anyway".
-   - macOS arm64: `transit-<version>-macos-aarch64.dmg` (`transit.app` with a drag-to-Applications
+   - macOS arm64: `transit-v<version>-macos-arm64.dmg` (`transit.app` with a drag-to-Applications
      window, built by `packaging/macos/package.sh`) and a `macos-arm64` tarball with the bare binary
      and `audio-bench`. Ad-hoc signed and not notarized unless the signing secrets below are set.
      If macOS blocks the app, run `xattr -dr com.apple.quarantine /Applications/transit.app` or
@@ -23,6 +23,12 @@ Releases are tag-driven. `.github/workflows/release.yml` does the building.
    - Linux x86_64.
 4. Check the pre-release page and publish it when the archives look right. The workflow body is generic:
    paste or replace it after publication with `gh release edit <tag> --notes-file <file>`.
+
+## Released
+
+- `v0.2.0-alpha.1`, 2026-10-22, commit `995cf66`. The cpal ASIO zip and MSI were removed from this
+  release by hand; the workflow no longer builds them (commits `451bb52`, `f792a0e`, `f751a17`). Its DMG is
+  named `transit-0.2.0-alpha.1-macos-aarch64.dmg`; later tags use the `transit-v<version>-macos-arm64.dmg` form.
 
 ## macOS signing and notarization (optional)
 

@@ -16,13 +16,23 @@ layer and egui UI. transit began in October 2026 as a fork of
 credited in About and in NOTICE.
 
 > [!NOTE]
-> transit is alpha software under active development. The current priority is core engine
+> transit is alpha software under active development; the current pre-release is [v0.2.0-alpha.1](https://github.com/derekmwright/transit/releases/tag/v0.2.0-alpha.1) (see [Downloads](#downloads)). The current priority is core engine
 > correctness, stability and performance, measured on real hardware, ahead of new features.
 > Expect rough edges in the UI and some missing features; the audio engine, recording alignment
 > and device handling get fixed first, following [the engineering principles](docs/principles.md).
 > Releases are frequent, and each lists its
 > [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
 > help right now: see [How to help](#how-to-help).
+
+## Downloads
+
+The current pre-release is [v0.2.0-alpha.1](https://github.com/derekmwright/transit/releases/tag/v0.2.0-alpha.1).
+
+- **Windows (x86_64):** one download, the `.zip` (portable) or the `.msi` (installer; it registers `.transit` and `.transitz`). It has native WASAPI and native ASIO (experimental).
+- **macOS (Apple silicon):** the `.dmg`; open it and drag `transit.app` to Applications.
+- **Linux (x86_64):** the tarball; unpack it and run `transit`.
+
+The builds are unsigned. On Windows, SmartScreen shows "More info", then "Run anyway". On macOS, if the app is blocked, run `xattr -dr com.apple.quarantine /Applications/transit.app` or right-click it and choose Open.
 
 ![Arrangement view](docs/images/transit-arrange.png)
 
