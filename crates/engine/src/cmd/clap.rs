@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::cmd;
-use serde_json::json;
 use soundcraft_dsp::PluginInfo;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -14,24 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
         None,
         "{rescan?: bool} → [{id: \"clap:…\", plugin_id, name, vendor, version, description, features, category, is_instrument, path}]",
         always,
-        |_, p| {
-            // Unit tests never scan the machine's plug-in folders: that loads every installed
-            // plug-in in-process, and some never unload, which hangs the test binary at exit.
-            #[cfg(test)]
-            {
-                let _ = p;
-                Ok(json!([]))
-            }
-            #[cfg(not(test))]
-            {
-            let list = if p.get("rescan").and_then(Value::as_bool).unwrap_or(false) {
-                soundcraft_clap_host::rescan()
-            } else {
-                soundcraft_clap_host::scan()
-            };
-            Ok(json!(list))
-            }
-        }
+        super::plugin_scan::clap
     )]
 }
 

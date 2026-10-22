@@ -3,9 +3,10 @@
 use super::*;
 use crate::{TransportRequest, cmd};
 use serde_json::json;
-use soundcraft_model::{Clip, ClipContent, Session, SourceAudio};
+use soundcraft_model::{Clip, ClipContent, SourceAudio};
 use soundcraft_time::SampleRate;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::cell::RefCell;
+use std::sync::{Arc, Weak};
 
 /// Transients are found in fixed blocks of each clip, so a long clip costs a block per press and
 /// Tab and Alt+Tab always see the same transients.
@@ -13,8 +14,9 @@ const BLOCK_SECS: f64 = 10.0;
 const SCAN_LIMIT: i64 = 64;
 const CACHE_LIMIT: usize = 64;
 
-/// Blocks already analysed, reused while their clips, clip effects and audio stay the same.
-static ANALYSED: Mutex<Vec<Analysed>> = Mutex::new(Vec::new());
+/// Blocks already analyzed by this engine, reused while their inputs stay the same.
+#[derive(Default)]
+pub(crate) struct TransientCache(RefCell<Vec<Analysed>>);
 
 struct Analysed {
     track: TrackId,
@@ -34,7 +36,7 @@ fn tab(e: &mut Engine, p: &Value) -> Result<Value> {
     let (back, extend) = (bool_or(p, "back", false), bool_or(p, "extend", false));
     let s = e.session();
     let sel = s.edit.selection;
-    let to = |from| stop(s, from, back);
+    let to = |from| stop(e, from, back);
     let next = match (extend, back) {
         (false, _) => to(sel.start).map(Range::point),
         (true, false) => to(sel.end).map(|x| Range::new(sel.start, x)),
@@ -59,7 +61,8 @@ fn tab(e: &mut Engine, p: &Value) -> Result<Value> {
 }
 
 /// The nearest stop after `from` (before it when `back`) on the selected tracks.
-fn stop(s: &Session, from: Samples, back: bool) -> Option<Samples> {
+fn stop(e: &Engine, from: Samples, back: bool) -> Option<Samples> {
+    let s = e.session();
     let nearer = |x: Samples, best: Option<Samples>| {
         if back { x < from && best.is_none_or(|b| x > b) } else { x > from && best.is_none_or(|b| x < b) }
     };
@@ -93,7 +96,7 @@ fn stop(s: &Session, from: Samples, back: bool) -> Option<Samples> {
         let apart = |x: Samples| stops.iter().all(|b| b.abs_diff(x) > gap);
         for t in &tracks {
             for c in t.clips().iter().filter(|c| matches!(c.content, ClipContent::Audio { .. })) {
-                if let Some(x) = transient(s, t.id, c.range(), from, back, best, apart) {
+                if let Some(x) = transient(e, t.id, c.range(), from, back, best, apart) {
                     best = Some(x);
                 }
             }
@@ -104,7 +107,7 @@ fn stop(s: &Session, from: Samples, back: bool) -> Option<Samples> {
 
 /// The transient in `clip` nearest to `from` on its side, if it is nearer than `best`.
 fn transient(
-    s: &Session,
+    e: &Engine,
     t: TrackId,
     clip: Range,
     from: Samples,
@@ -112,6 +115,7 @@ fn transient(
     best: Option<Samples>,
     apart: impl Fn(Samples) -> bool,
 ) -> Option<Samples> {
+    let s = e.session();
     let (lo, hi) = if back {
         (best.map_or(clip.start, |b| b.saturating_add(1)).max(clip.start), from.min(clip.end))
     } else {
@@ -129,7 +133,7 @@ fn transient(
         let start = clip.start.saturating_add(k.saturating_mul(block));
         let b = Range::new(start, start.saturating_add(block).min(clip.end));
         let around = Range::new(b.start.saturating_sub(margin), b.end.saturating_add(margin));
-        let hits = analysed(s, t, around).into_iter().filter(|x| b.contains(*x) && (lo..hi).contains(x) && apart(*x));
+        let hits = analysed(e, t, around).into_iter().filter(|x| b.contains(*x) && (lo..hi).contains(x) && apart(*x));
         if let Some(x) = if back { hits.max() } else { hits.min() } {
             return Some(x);
         }
@@ -138,7 +142,8 @@ fn transient(
 }
 
 /// The transients of track `t` in `around`, from the cache when nothing there has changed.
-fn analysed(s: &Session, t: TrackId, around: Range) -> Vec<Samples> {
+fn analysed(e: &Engine, t: TrackId, around: Range) -> Vec<Samples> {
+    let s = e.session();
     let clips: Vec<Clip> = s.track(t).map_or_else(Vec::new, |tr| tr.clips().iter().filter(|c| c.range().overlaps(&around)).cloned().collect());
     let audio: Vec<Weak<SourceAudio>> = clips
         .iter()
@@ -160,11 +165,11 @@ fn analysed(s: &Session, t: TrackId, around: Range) -> Vec<Samples> {
             && a.audio.len() == audio.len()
             && a.audio.iter().zip(&audio).all(|(x, y)| x.ptr_eq(y))
     };
-    if let Some(a) = ANALYSED.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|a| same(a)) {
+    if let Some(a) = e.transient_cache.0.borrow().iter().find(|a| same(a)) {
         return a.hits.clone();
     }
     let hits = crate::io::transients_in(s, t, around, 0.5);
-    let mut kept = ANALYSED.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut kept = e.transient_cache.0.borrow_mut();
     if kept.len() >= CACHE_LIMIT {
         kept.remove(0);
     }
@@ -180,6 +185,17 @@ mod tests {
     use soundcraft_midi::{Note, Sequence};
     use soundcraft_model::{ChannelFormat, Clip, Session, TrackId, TrackKind};
     use soundcraft_time::{SampleRate, TICKS_PER_QUARTER};
+
+    #[test]
+    fn transient_cache_is_owned_and_cleared_by_its_engine_issue_10() {
+        let mut first = Engine::default();
+        let second = Engine::default();
+        super::analysed(&first, TrackId(1), soundcraft_time::Range::new(0, 480));
+        assert_eq!(first.transient_cache.0.borrow().len(), 1);
+        assert_eq!(second.transient_cache.0.borrow().len(), 0);
+        first.replace_session(Session::default());
+        assert_eq!(first.transient_cache.0.borrow().len(), 0);
+    }
 
     const SR: f64 = 48_000.0;
 

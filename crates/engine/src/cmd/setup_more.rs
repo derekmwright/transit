@@ -5,17 +5,14 @@ use super::more_util::{set_text, store_value, text, toggle_flag, values_with_pre
 use super::*;
 use crate::cmd;
 use serde_json::json;
-use soundcraft_model::{BusId, ChannelFormat, ClipContent, OutputPath, Route, Session, SourceId, TrackId, TrackKind};
+use soundcraft_model::{BusId, ChannelFormat, OutputPath, Route, Session, TrackId, TrackKind};
 use soundcraft_time::Timecode;
-use std::path::Path;
 
 macro_rules! option {
     ($id:literal, $label:literal, $flag:literal) => {
         cmd!(noundo $id, $label, ["Options"], None, "{value?: bool} (toggles when omitted)", always, |e, p| toggle_flag(e, p, $flag))
     };
 }
-
-const MIDI_FILTER_KINDS: [&str; 8] = ["notes", "pitch_bend", "mono_aftertouch", "poly_aftertouch", "program", "cc", "sysex", "realtime"];
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -130,8 +127,8 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({"enabled": s.edit.flag("midi.beat_clock"), "offset": s.edit.value("midi.beat_clock.offset", 0.0), "destination": text(&s.edit, "midi.beat_clock.destination")}))
         }),
-        cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — filtered kinds are not recorded", always, midi_filter),
-        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]}", always, midi_inputs),
+        cmd!(noundo "setup.midi_input_filter", "MIDI Input Filter...", ["Setup", "MIDI"], None, "{filter?: [notes|pitch_bend|mono_aftertouch|poly_aftertouch|program|cc|sysex|realtime], allow?: [...]} — unavailable: event-kind filtering is not supported", midi_filter_available, midi_filter),
+        cmd!(noundo "setup.midi_input_devices", "MIDI Input Devices...", ["Setup", "MIDI"], None, "{enable?: [names], disable?: [names]} — unavailable: use track.midi_input", midi_inputs_available, midi_inputs),
         cmd!(noundo "setup.transcription_settings", "Transcription Settings...", ["Setup"], None, "{enabled?: bool, language?: 'en'}", always, |e, p| {
             let s = e.session_mut();
             if let Some(v) = p.get("enabled").and_then(Value::as_bool) {
@@ -485,142 +482,29 @@ fn click_countoff(e: &mut Engine, p: &Value) -> Result<Value> {
     }))
 }
 
-fn kinds(p: &Value, key: &str) -> Vec<&'static str> {
-    p.get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).filter_map(|k| MIDI_FILTER_KINDS.iter().copied().find(|x| *x == k)).collect())
-        .unwrap_or_default()
+fn midi_filter_available(_: &Engine) -> std::result::Result<(), String> {
+    Err("MIDI event-kind filtering is not supported".into())
 }
 
-fn midi_filter(e: &mut Engine, p: &Value) -> Result<Value> {
-    let s = e.session_mut();
-    for k in kinds(p, "filter") {
-        s.edit.set_flag(&format!("midi.filter.{k}"), true);
-    }
-    for k in kinds(p, "allow") {
-        s.edit.set_flag(&format!("midi.filter.{k}"), false);
-    }
-    let filtered: Vec<&str> = MIDI_FILTER_KINDS.iter().copied().filter(|k| s.edit.flag(&format!("midi.filter.{k}"))).collect();
-    Ok(json!({"filtered": filtered}))
+fn midi_inputs_available(_: &Engine) -> std::result::Result<(), String> {
+    Err("use track.midi_input to choose a track's MIDI port and channel".into())
 }
 
-fn device_key(name: &str) -> String {
-    let n: String = name.chars().filter(|c| !c.is_control() && *c != '=').take(64).collect();
-    format!("midi.input.{}", n.trim())
+fn midi_filter(_: &mut Engine, _: &Value) -> Result<Value> {
+    Err(EngineError::Disabled("setup.midi_input_filter".into(), "MIDI event-kind filtering is not supported".into()))
 }
 
-fn midi_inputs(e: &mut Engine, p: &Value) -> Result<Value> {
-    let s = e.session_mut();
-    for (key, on) in [("enable", true), ("disable", false)] {
-        for n in p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).take(64).collect::<Vec<_>>()).unwrap_or_default() {
-            if !n.trim().is_empty() {
-                s.edit.set_flag(&device_key(n), on);
-            }
-        }
-    }
-    let enabled: Vec<&str> = s.edit.flags.iter().filter_map(|f| f.strip_prefix("midi.input.")).collect();
-    Ok(json!({"enabled": enabled}))
+fn midi_inputs(_: &mut Engine, _: &Value) -> Result<Value> {
+    Err(EngineError::Disabled("setup.midi_input_devices".into(), "use track.midi_input to choose a track's MIDI port and channel".into()))
 }
 
 fn import_session_data(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "file.import_session_data";
     let path = str_param(p, "path").filter(|x| !x.trim().is_empty()).ok_or_else(|| bad(id, "`path` required"))?.to_string();
-    let text_v = crate::io::read_text(&path)?;
-    let other = Session::from_json(&text_v).map_err(|err| EngineError::Io(format!("{path}: {err}")))?;
     let names: Option<Vec<String>> =
         p.get("tracks").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
-    let picked: Vec<soundcraft_model::Track> = match &names {
-        Some(ns) => {
-            let mut v = Vec::new();
-            for n in ns {
-                v.push(other.track_by_name(n).cloned().ok_or_else(|| bad(id, format!("`{path}` has no track named `{n}`")))?);
-            }
-            v
-        }
-        None => other.tracks.iter().filter(|t| t.kind != TrackKind::Master).cloned().collect(),
-    };
-    if picked.is_empty() {
-        return Err(bad(id, "nothing to import"));
-    }
-    let mut needed: Vec<SourceId> =
-        picked.iter().flat_map(|t| t.playlists.iter().flat_map(|pl| pl.clips.iter().filter_map(|c| c.source()))).collect();
-    // A Sampler's sample is session audio too.
-    needed.extend(picked.iter().filter_map(|t| t.instrument.as_ref().and_then(|i| i.sample)));
-    needed.sort_by_key(|x| x.0);
-    needed.dedup();
-    let sr = e.session().sample_rate.hz();
-    let s = e.session_mut();
-    let mut files = crate::io::DecodedFiles::new();
-    let mut map: std::collections::BTreeMap<u64, SourceId> = Default::default();
-    let mut missing = Vec::new();
-    for src in needed.iter().filter_map(|sid| other.source(*sid)) {
-        let mut ns = src.clone();
-        ns.id = SourceId(s.alloc());
-        match crate::io::stored_path(&src.path, Path::new(&path)) {
-            Ok(abs) => {
-                ns.path = abs.to_string_lossy().into_owned();
-                match crate::io::decode_file(&mut files, &abs, sr) {
-                    Ok(audio) => {
-                        ns.frames = audio.buffer.frames() as u64;
-                        ns.sample_rate = sr;
-                        ns.unsaved = true;
-                        s.pool.insert(ns.id, audio);
-                    }
-                    Err(_) => {
-                        ns.unsaved = false;
-                        missing.push(ns.path.clone());
-                    }
-                }
-            }
-            Err(why) => {
-                ns.unsaved = false;
-                missing.push(format!("{}: {why}", ns.path));
-            }
-        }
-        map.insert(src.id.0, ns.id);
-        s.sources.push(ns);
-    }
-    let mut out = Vec::new();
-    for mut tr in picked {
-        tr.id = TrackId(s.alloc());
-        tr.name = s.unique_track_name(&tr.name);
-        tr.folder = None;
-        tr.mixer.vca = None;
-        for pl in &mut tr.playlists {
-            for c in &mut pl.clips {
-                c.id = s.new_clip_id();
-                if let ClipContent::Audio { source, .. } = &mut c.content
-                    && let Some(n) = map.get(&source.0)
-                {
-                    *source = *n;
-                }
-            }
-        }
-        // The donor's source ids mean nothing here: remap the sample, or drop it when it didn't come along.
-        if let Some(ins) = tr.instrument.as_mut() {
-            ins.sample = ins.sample.and_then(|sid| map.get(&sid.0).copied());
-        }
-        // Busses are matched by name (created when missing).
-        let remap = |s: &mut Session, r: &Route| -> Route {
-            match r {
-                Route::Bus(b) => other.bus(*b).map_or(Route::None, |ob| Route::Bus(s.add_bus(&ob.name, ob.format))),
-                x => x.clone(),
-            }
-        };
-        tr.mixer.input = remap(s, &tr.mixer.input);
-        tr.mixer.output = remap(s, &tr.mixer.output);
-        for slot in tr.mixer.sends.iter_mut().flatten() {
-            slot.target = remap(s, &slot.target);
-        }
-        let pos = s.tracks.iter().position(|t| t.kind == TrackKind::Master).unwrap_or(s.tracks.len());
-        out.push(tr.id);
-        s.tracks.insert(pos, tr);
-    }
-    s.edit.selected_tracks = out.clone();
-    // An imported hardware insert whose send path is taken here comes in disabled.
-    let disabled = soundcraft_model::disable_hardware_conflicts(s);
-    e.messages.extend(disabled);
-    Ok(json!({"tracks": out, "sources": map.len(), "missing": missing}))
+    let imported = crate::io::import_session_data(e, &path, names)?;
+    Ok(json!({"tracks": imported.tracks, "sources": imported.sources, "missing": imported.missing}))
 }
 
 #[cfg(test)]
@@ -786,15 +670,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_and_midi_settings() {
+    fn engine_and_midi_settings_issue_10() {
         let mut e = Engine::default();
         let r = e.execute("setup.playback_engine", &json!({"buffer_size": 300, "device": "Interface"})).unwrap();
         assert_eq!(r["buffer_size"], 512.0);
         assert_eq!(r["device"], "Interface");
-        let r = e.execute("setup.midi_input_filter", &json!({"filter": ["sysex", "bogus"]})).unwrap();
-        assert_eq!(r["filtered"], json!(["sysex"]));
-        let r = e.execute("setup.midi_input_devices", &json!({"enable": ["Keys"]})).unwrap();
-        assert_eq!(r["enabled"], json!(["Keys"]));
+        let before = e.session_arc();
+        for (id, params) in [("setup.midi_input_filter", json!({"filter": ["sysex"]})), ("setup.midi_input_devices", json!({"enable": ["Keys"]}))] {
+            assert!(!find_command(id).unwrap().info(&e).enabled);
+            assert!(matches!(e.execute(id, &params), Err(EngineError::Disabled(..))));
+            assert_eq!(e.session(), before.as_ref());
+        }
         let r = e.execute("setup.video_sync_offset", &json!({"frames": 2})).unwrap();
         assert_eq!(r["samples"], 3200.0);
     }

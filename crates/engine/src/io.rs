@@ -214,7 +214,7 @@ impl PreparedAudio {
 /// and after each resampled channel; when it returns `false` the work stops with an error.
 pub fn prepare_audio_bytes(name: &str, bytes: &[u8], path: Option<&str>, rate: u32, progress: &mut dyn FnMut(f32) -> bool) -> Result<PreparedAudio> {
     let canceled = || EngineError::Io(format!("{name}: canceled"));
-    let too_large = || EngineError::Io(format!("{name}: file is too large to import"));
+    let too_large = || crate::cmd::bad("file.import_audio", format!("{name}: file is too large to import"));
     let ext = Path::new(name).extension().and_then(|x| x.to_str()).map(str::to_ascii_lowercase);
     let (info, mut buf) = soundcraft_audio_io::decode(bytes, ext.as_deref()).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
     if !progress(0.4) {
@@ -239,7 +239,7 @@ pub fn prepare_audio_bytes(name: &str, bytes: &[u8], path: Option<&str>, rate: u
         buf.sample_rate = rate;
     }
     if buf.frames() == 0 {
-        return Err(EngineError::Io(format!("{name}: no audio")));
+        return Err(crate::cmd::bad("file.import_audio", format!("{name}: no audio")));
     }
     let audio = Arc::new(SourceAudio::new(buf));
     if !progress(1.0) {
@@ -398,265 +398,18 @@ pub fn relink_videos(s: &mut Session, session: &Path) -> Vec<String> {
     missing
 }
 
-/// Most meter changes a MIDI file may bring into the tempo map; scores have a handful.
-const MAX_MIDI_METERS: usize = 10_000;
+mod midi;
+pub use midi::{export_midi, import_midi_bytes};
 
-/// Import a Standard MIDI File as MIDI tracks (one per SMF track).
-pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: bool) -> Result<Vec<TrackId>> {
-    let smf = soundcraft_midi::read_smf(bytes).map_err(|err| EngineError::Io(err.to_string()))?;
-    let s = e.session_mut();
-    if tempo_map {
-        let old = s.tempo.clone();
-        // Each meter is placed by walking the ones before it.
-        if smf.meters.len() > MAX_MIDI_METERS {
-            return Err(EngineError::Io(format!("MIDI file: more than {MAX_MIDI_METERS} meter changes")));
-        }
-        for (tick, bpm) in &smf.tempos {
-            let _ = s.tempo.set_tempo(*tick, *bpm);
-        }
-        for (tick, n, d) in &smf.meters {
-            let _ = s.tempo.set_meter(*tick, u32::from(*n), u32::from(*d));
-        }
-        // The file's tempo map replaces the session's: material already on ticks tracks keeps its bars.
-        crate::retime::retime_to_tempo(s, &old).map_err(|m| EngineError::Io(format!("MIDI file tempo map: {m}")))?;
-    }
-    let base_tick = s.tempo.samples_to_ticks(at, s.sample_rate);
-    let mut out = Vec::new();
-    for (i, tr) in smf.tracks.iter().enumerate() {
-        if tr.sequence.notes.is_empty() {
-            continue;
-        }
-        let mut name = if tr.name.trim().is_empty() { format!("MIDI {}", i + 1) } else { tr.name.clone() };
-        soundcraft_model::truncate_chars(&mut name, soundcraft_model::MAX_NAME_CHARS);
-        let id = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&name));
-        let drums = tr.sequence.notes.iter().all(|n| n.channel == 9);
-        if let Some(t) = s.track_mut(id) {
-            t.instrument = Some(soundcraft_model::Insert::new(if drums { "drum_synth" } else { "subtractive_synth" }));
-        }
-        let end_tick = base_tick.saturating_add(tr.sequence.end_tick().max(1));
-        let len = s.tempo.tick_to_samples(end_tick, s.sample_rate).saturating_sub(at);
-        if len > s.sample_rate.samples(86_400.0) {
-            return Err(EngineError::Io(format!("MIDI track {}: longer than 24 hours", i + 1)));
-        }
-        let cid = s.new_clip_id();
-        crate::edit::place_clip(s, id, Clip::midi(cid, name, at, len.max(1), tr.sequence.clone()));
-        out.push(id);
-    }
-    Ok(out)
-}
-
-/// Export MIDI clips as a format-1 SMF. `only` limits the file to those tracks.
-pub fn export_midi(e: &Engine, only: Option<&[TrackId]>) -> Result<Vec<u8>> {
-    let s = e.session();
-    let mut smf = soundcraft_midi::Smf {
-        format: 1,
-        tracks: Vec::new(),
-        tempos: s.tempo.tempos().iter().map(|t| (t.tick, t.bpm)).collect(),
-        meters: s.tempo.meters().iter().map(|m| (m.tick, u8::try_from(m.numerator).unwrap_or(4), u8::try_from(m.denominator).unwrap_or(4))).collect(),
-        markers: s.markers.iter().map(|m| (s.tempo.samples_to_ticks(m.start, s.sample_rate), m.name.clone())).collect(),
-        key_sigs: Vec::new(),
-    };
-    let chosen: Vec<_> = s.tracks.iter().filter(|t| t.kind.is_midi() && only.is_none_or(|ids| ids.contains(&t.id))).collect();
-    if only.is_some() && chosen.is_empty() {
-        return Err(EngineError::BadParams("file.export_midi".into(), "none of the requested tracks hold MIDI".into()));
-    }
-    for t in chosen {
-        let mut seq = soundcraft_midi::Sequence::default();
-        for c in t.clips() {
-            if let ClipContent::Midi { sequence } = &c.content {
-                let base = s.tempo.samples_to_ticks(c.start, s.sample_rate);
-                for n in &sequence.notes {
-                    let mut n = *n;
-                    n.start = n.start.saturating_add(base);
-                    seq.notes.push(n);
-                }
-                for ev in &sequence.ctrls {
-                    let mut ev = *ev;
-                    ev.tick = ev.tick.saturating_add(base);
-                    seq.ctrls.push(ev);
-                }
-            }
-        }
-        seq.sort();
-        smf.tracks.push(soundcraft_midi::SmfTrack { name: t.name.clone(), sequence: seq });
-    }
-    soundcraft_midi::write_smf(&smf).map_err(|err| EngineError::Io(err.to_string()))
-}
+mod session_data;
+pub(crate) use session_data::import_session_data;
 
 mod paths;
 pub use paths::{PathBounce, PathBounced, PathNormalize, PathStem, bounce_paths, is_routed, routed_paths};
 
-/// A bounce of the main mix, or of one bus, over a range, written to its file block by block so no
-/// bounce has to fit in memory, and rendered a slice at a time ([`Bounce::step`]) so a UI can show
-/// progress. The file appears at its path only once complete; a bounce that fails, or is dropped
-/// unfinished, leaves any older file there alone.
-pub struct Bounce {
-    /// Offline mode for hosted plugins: they sample their parameter curves at creation, since no
-    /// editor `idle` runs during a render.
-    _offline: soundcraft_vst3_host::OfflineScope,
-    session: Arc<Session>,
-    path: PathBuf,
-    part: PathBuf,
-    range: Range,
-    bus: Option<BusId>,
-    fold: Option<ChannelFormat>,
-    normalize: bool,
-    /// Measuring the peak to normalize to, the first of two passes.
-    measuring: bool,
-    render: soundcraft_mix::RangeRender,
-    block: Vec<Vec<f32>>,
-    done: usize,
-    gain: f32,
-    peak: f32,
-    meter: soundcraft_dsp::meter::LoudnessMeter,
-    enc: Option<soundcraft_audio_io::FileEncoder<Out>>,
-}
-
-/// A finished bounce: the size of its file and its levels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bounced {
-    pub bytes: u64,
-    pub peak_db: f32,
-    pub lufs: f32,
-    pub true_peak_db: f32,
-}
-
-impl Bounce {
-    /// Starts a bounce of `s`'s main mix, or of `bus`, over `r` to `path`: every channel (SMPTE/WAV
-    /// order, with the WAV speaker mask of its format), or an ITU stereo fold-down when
-    /// `fold_stereo`, peak-normalized to -0.1 dBFS when `normalize` (which renders twice).
-    pub fn new(
-        s: Arc<Session>,
-        path: &Path,
-        r: Range,
-        opts: &EncodeOptions,
-        bus: Option<BusId>,
-        normalize: bool,
-        fold_stereo: bool,
-    ) -> Result<Bounce> {
-        if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
-            return Err(EngineError::BadParams("file.bounce_mix".into(), "bounces are limited to 4 hours".into()));
-        }
-        let (fmt, channels, fold) = bounce_layout(&s, bus, fold_stereo);
-        let name = path.file_name().map_or_else(|| "bounce".into(), |n| n.to_string_lossy().into_owned());
-        let part = path.with_file_name(format!("{name}.part"));
-        crate::file_access::check_write(path).map_err(EngineError::Io)?;
-        crate::file_access::check_write(&part).map_err(EngineError::Io)?;
-        let enc = (|| -> std::result::Result<_, soundcraft_audio_io::AudioError> {
-            let enc = soundcraft_audio_io::FileEncoder::new(Out::create(&part)?, opts, channels, s.sample_rate.hz(), Some(fmt.channel_mask()))?;
-            enc.check_room(u64::try_from(r.len()).unwrap_or(0))?;
-            Ok(enc)
-        })()
-        .map_err(|err| {
-            let _ = std::fs::remove_file(&part);
-            EngineError::Io(format!("{}: {err}", path.display()))
-        })?;
-        // Hosted plug-ins are created while the render is compiled: offline mode must already be on.
-        let offline = soundcraft_vst3_host::offline_scope();
-        let render = soundcraft_mix::RangeRender::try_new(&s, bus, r, 1024)
-            .map_err(|err| EngineError::Io(format!("{}: the session could not be prepared for rendering: {err:?}", path.display())))?;
-        let meter = soundcraft_dsp::meter::LoudnessMeter::new(s.sample_rate.as_f64() as f32, channels);
-        Ok(Bounce {
-            _offline: offline,
-            session: s,
-            path: path.to_path_buf(),
-            part,
-            range: r,
-            bus,
-            fold,
-            normalize,
-            measuring: normalize,
-            render,
-            block: Vec::new(),
-            done: 0,
-            gain: 1.0,
-            peak: 0.0,
-            meter,
-            enc: Some(enc),
-        })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn range(&self) -> Range {
-        self.range
-    }
-
-    /// How far along the bounce is, from 0 to 1.
-    pub fn progress(&self) -> f32 {
-        let pass = (self.done as f64 / self.range.len().max(1) as f64).min(1.0) as f32;
-        match (self.normalize, self.measuring) {
-            (false, _) => pass,
-            (true, true) => pass / 2.0,
-            (true, false) => 0.5 + pass / 2.0,
-        }
-    }
-
-    /// Renders blocks until `more` returns false (at least one per call). Returns the finished
-    /// bounce once its file is complete.
-    pub fn step(&mut self, mut more: impl FnMut() -> bool) -> Result<Option<Bounced>> {
-        loop {
-            match self.render.next_block() {
-                Some((chunk, n)) => {
-                    fill(&mut self.block, chunk, n, self.fold, self.gain);
-                    self.done += n;
-                    self.peak = self.peak.max(soundcraft_dsp::offline::peak(&self.block));
-                    if !self.measuring {
-                        self.meter.process(&self.block, n);
-                        if let Some(enc) = &mut self.enc {
-                            enc.write(&self.block, n).map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?;
-                        }
-                    }
-                }
-                None if self.measuring => {
-                    self.gain = if self.peak > 0.0 { soundcraft_dsp::db_to_gain(-0.1) / self.peak } else { 1.0 };
-                    self.peak = 0.0;
-                    self.done = 0;
-                    self.measuring = false;
-                    self.render = soundcraft_mix::RangeRender::try_new(&self.session, self.bus, self.range, 1024).map_err(|err| {
-                        EngineError::Io(format!("{}: the session could not be prepared for rendering: {err:?}", self.path.display()))
-                    })?;
-                }
-                None => return self.finish().map(Some),
-            }
-            if !more() {
-                return Ok(None);
-            }
-        }
-    }
-
-    /// Renders the whole bounce (see [`Bounce::step`]).
-    pub fn run(mut self) -> Result<Bounced> {
-        loop {
-            if let Some(done) = self.step(|| true)? {
-                return Ok(done);
-            }
-        }
-    }
-
-    fn finish(&mut self) -> Result<Bounced> {
-        let bytes = match self.enc.take() {
-            Some(enc) => enc.finish().map_err(|err| EngineError::Io(format!("{}: {err}", self.path.display())))?.complete(&self.part, &self.path)?,
-            None => 0,
-        };
-        Ok(Bounced {
-            bytes,
-            peak_db: soundcraft_dsp::gain_to_db(self.peak),
-            lufs: self.meter.integrated_lufs(),
-            true_peak_db: self.meter.true_peak_db(),
-        })
-    }
-}
-
-impl Drop for Bounce {
-    /// Removes the part file unless the bounce completed (which renamed it).
-    fn drop(&mut self) {
-        drop(self.enc.take());
-        let _ = std::fs::remove_file(&self.part);
-    }
-}
+mod bounce;
+pub use bounce::{Bounce, BounceOptions, Bounced, bounce_stems, bounce_stems_with};
+use bounce::{bounce_layout, check_bounce_range};
 
 /// Where a bounce is written: its part file, or memory in the browser, which has no file system.
 enum Out {
@@ -725,69 +478,6 @@ impl std::io::Seek for Out {
     }
 }
 
-const MAX_BOUNCE_SECS: f64 = 4.0 * 3600.0;
-
-/// The format, channel count and fold-down source of a bounce of the main mix or `bus`: every
-/// channel (a mono or stereo main mix as stereo), or an ITU stereo fold-down of a surround source
-/// when `fold_stereo`.
-fn bounce_layout(s: &Session, bus: Option<BusId>, fold_stereo: bool) -> (ChannelFormat, usize, Option<ChannelFormat>) {
-    let nch = soundcraft_mix::source_channels(s, bus);
-    let fmt = match bus {
-        Some(id) => s.bus(id).map_or(ChannelFormat::Stereo, |b| b.format),
-        None if nch <= 2 => ChannelFormat::Stereo,
-        None => s.main_format(),
-    };
-    if fold_stereo && nch > 2 { (ChannelFormat::Stereo, 2, Some(fmt)) } else { (fmt, nch, None) }
-}
-
-/// The first `n` frames of `chunk`, folded down from `fold` when set and scaled by `gain`.
-fn fill(block: &mut Vec<Vec<f32>>, chunk: &[Vec<f32>], n: usize, fold: Option<ChannelFormat>, gain: f32) {
-    let folded = fold.map(|from| soundcraft_mix::fold_down_stereo(from, chunk));
-    let src = folded.as_deref().unwrap_or(chunk);
-    block.resize_with(src.len(), Vec::new);
-    for (d, c) in block.iter_mut().zip(src) {
-        d.clear();
-        d.extend(c.iter().take(n).map(|v| v * gain));
-    }
-}
-
-/// Bounce one file per audio/instrument track (each soloed, so its sends and auxes are included)
-/// into `dir`. Returns the written paths.
-pub fn bounce_stems(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions) -> Result<Vec<String>> {
-    bounce_stems_with(e, dir, r, opts, false)
-}
-
-/// [`bounce_stems`] in the main format, or folded down to stereo when `fold_stereo`.
-pub fn bounce_stems_with(e: &Engine, dir: &str, r: Range, opts: &EncodeOptions, fold_stereo: bool) -> Result<Vec<String>> {
-    let s = e.session();
-    if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
-        return Err(EngineError::BadParams("file.bounce_stems".into(), "bounces are limited to 4 hours".into()));
-    }
-    make_dir(dir)?;
-    let ext = match opts.format {
-        FileFormat::Aiff => "aif",
-        FileFormat::Flac => "flac",
-        _ => "wav",
-    };
-    let mut out = Vec::new();
-    let stems: Vec<(TrackId, String)> = s
-        .tracks
-        .iter()
-        .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi) && !t.inactive && !t.mixer.mute)
-        .map(|t| (t.id, t.name.clone()))
-        .collect();
-    for (id, name) in stems {
-        let mut solo = s.clone();
-        for t in &mut solo.tracks {
-            t.mixer.solo = t.id == id;
-        }
-        let path = Path::new(dir).join(format!("{} - {}.{ext}", sanitize_name(&s.name), sanitize_name(&name)));
-        Bounce::new(Arc::new(solo), &path, r, opts, None, false, fold_stereo)?.run()?;
-        out.push(path.to_string_lossy().into_owned());
-    }
-    Ok(out)
-}
-
 /// Limit a range used for rendering to the track's material (plus a second), so a huge
 /// selection never renders hours of silence.
 pub fn bounded_to_track(s: &Session, t: TrackId, r: Range) -> Range {
@@ -809,7 +499,7 @@ pub fn transients_in(s: &Session, t: TrackId, r: Range, sens: f32) -> Vec<Sample
 /// Strip Silence: keep only the non-silent ranges of clips inside `r`.
 pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> Result<usize> {
     let r = bounded_to_track(s, t, r);
-    let keep = non_silent(s, t, r, thr, min_len, pre, post)?;
+    let keep = non_silent(s, t, r, SilenceOptions { threshold: thr, min_len, pre, post })?;
     let mut cut_points = vec![r.start];
     for (a, b) in &keep {
         cut_points.push(*a);
@@ -840,10 +530,18 @@ pub fn strip_silence(s: &mut Session, t: TrackId, r: Range, thr: f32, min_len: S
 /// Most samples (over all channels) Strip Silence renders at once.
 const STRIP_WINDOW_SAMPLES: usize = 1 << 24;
 
+struct SilenceOptions {
+    threshold: f32,
+    min_len: Samples,
+    pre: Samples,
+    post: Samples,
+}
+
 /// The non-silent ranges of `t`'s clips in `r`. The audio is rendered a window at a time where
 /// audio clips play, so all of `r` is scanned however long it is (one render stops at
 /// `MAX_RENDER_SAMPLES`); at most a day of clips, Pro Tools' longest session.
-fn non_silent(s: &Session, t: TrackId, r: Range, thr: f32, min_len: Samples, pre: Samples, post: Samples) -> Result<Vec<(Samples, Samples)>> {
+fn non_silent(s: &Session, t: TrackId, r: Range, options: SilenceOptions) -> Result<Vec<(Samples, Samples)>> {
+    let SilenceOptions { threshold: thr, min_len, pre, post } = options;
     let Some(tr) = s.track(t) else { return Ok(Vec::new()) };
     let mut clips: Vec<Range> = tr.clips().iter().filter(|c| c.is_audio() && !c.muted).filter_map(|c| c.range().intersect(&r)).collect();
     clips.sort_by_key(|x| x.start);
@@ -1417,10 +1115,7 @@ pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Ve
     let (text, mut files) = if bytes.starts_with(b"PK\x03\x04") {
         read_bundle(bytes)?
     } else {
-        (
-            String::from_utf8(bytes.to_vec()).map_err(|_| EngineError::Io(format!("{name}: not a SoundCraft session")))?,
-            std::collections::HashMap::new(),
-        )
+        (String::from_utf8(bytes.to_vec()).map_err(|_| EngineError::Io(format!("{name}: not a transit session")))?, std::collections::HashMap::new())
     };
     let mut s = Session::from_json(&text).map_err(|err| EngineError::Io(format!("{name}: {err}")))?;
     let mut missing = Vec::new();
@@ -1450,7 +1145,7 @@ fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String
     let zerr = |err: zip::result::ZipError| EngineError::Io(format!("bundle: {err}"));
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(zerr)?;
     if z.len() > MAX_BUNDLE_ENTRIES {
-        return Err(EngineError::Io("bundle: too many files".into()));
+        return Err(crate::cmd::bad("session.open", "bundle: too many files"));
     }
     let (mut text, mut files, mut total) = (None, std::collections::HashMap::new(), 0u64);
     for i in 0..z.len() {
@@ -1462,7 +1157,7 @@ fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String
         let size = f.size();
         total = total.saturating_add(size);
         if total > MAX_BUNDLE_BYTES {
-            return Err(EngineError::Io("bundle: too large".into()));
+            return Err(crate::cmd::bad("session.open", "bundle: too large"));
         }
         let mut data = Vec::new();
         // The declared size is hostile too: never read past it.
@@ -1474,383 +1169,12 @@ fn read_bundle(bytes: &[u8]) -> Result<(String, std::collections::HashMap<String
             files.insert(rel, data);
         }
     }
-    let text = text.ok_or_else(|| EngineError::Io("bundle: no .transit session inside".into()))?;
+    let text = text.ok_or_else(|| crate::cmd::bad("session.open", "bundle: no .transit session inside"))?;
     Ok((text, files))
 }
 
-/// The record-enabled audio tracks, each with the input channels it records (those its input
-/// route names, "In 3" → 2, wrapped to the device's `input_channels`) and a new take file
-/// `<track>_<NN>.wav` in the `Audio Files` of the session's folder (`unsaved_dir` until it is saved).
-pub fn plan_takes(e: &Engine, unsaved_dir: &Path, input_channels: usize) -> Vec<(TrackId, Vec<usize>, PathBuf)> {
-    let dir = e.path.as_deref().and_then(|p| Path::new(p).parent()).unwrap_or(unsaved_dir);
-    let s = e.session();
-    let take_no = s.sources.len() + 1;
-    s.tracks
-        .iter()
-        .filter(|t| t.mixer.record_arm && t.kind == TrackKind::Audio && !t.inactive)
-        .map(|t| {
-            // The same resolution as the mix's input monitoring: a path by its name in this
-            // machine's table, else the number in the label.
-            let inputs = (0..t.channels())
-                .map(|k| {
-                    let channel = match &t.mixer.input {
-                        soundcraft_model::Route::Hardware(h) => soundcraft_model::input_channel(Some(e.io_map()), h, k),
-                        _ => k,
-                    };
-                    channel % input_channels.max(1)
-                })
-                .collect();
-            let file = |n: usize| dir.join("Audio Files").join(format!("{}_{n:02}.wav", sanitize_name(&t.name)));
-            let path = (take_no..take_no + 1_000).map(file).find(|p| !p.exists()).unwrap_or_else(|| file(take_no));
-            (t.id, inputs, path)
-        })
-        .collect()
-}
-
-/// A recording's plan, made when it starts: each record-enabled track's take file, where the
-/// takes start on the timeline, the loop length they split into when loop recording, and the
-/// punch range they're trimmed to.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Recording {
-    pub start: Samples,
-    pub pass: Option<Samples>,
-    pub punch: Option<Range>,
-    /// The input's sample rate, which the take files are written at.
-    pub rate: u32,
-    pub takes: Vec<Take>,
-    /// The MIDI take journal of the pass, if MIDI is being recorded (crash recovery rebuilds the
-    /// clip from it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub midi_journal: Option<PathBuf>,
-    /// The pass's MIDI clips are already in the session this plan was saved with, so recovery
-    /// discards the journal instead of rebuilding them (set once Stop has placed the clips).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub midi_placed: bool,
-}
-
-/// One track's take file.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Take {
-    pub track: TrackId,
-    pub path: PathBuf,
-    pub channels: usize,
-}
-
-/// Place recorded take files as `plan` says, as one undo step ("Record").
-pub fn place_recording(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>) -> Vec<soundcraft_model::ClipId> {
-    let ids = add_recording(e, plan.start, takes, plan.pass);
-    if let Some(p) = plan.punch {
-        let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
-        let _ = e.execute_merged("edit.trim_to_fill_selection", &json!({"clips": clips, "start": p.start, "end": p.end}), "record");
-    }
-    ids
-}
-
-/// `place_recording` that is always exactly one undo step labeled "Record", whatever it does:
-/// with `new_take`, a track that already has clips under the take (within the punch range)
-/// first gets a duplicate of its playlist, so the old clips stay as the previous take; the punch
-/// trim is folded in too. Loop recordings never duplicate.
-pub fn place_recording_take(e: &mut Engine, plan: &Recording, takes: Vec<(TrackId, PathBuf)>, new_take: bool) -> Vec<soundcraft_model::ClipId> {
-    let ids = add_recording_take(e, plan.start, takes, plan.pass, new_take, plan.punch);
-    let n0 = e.undo_pushes();
-    if !ids.is_empty() {
-        if let Some(p) = plan.punch {
-            let clips: Vec<u64> = ids.iter().map(|c| c.0).collect();
-            let _ = e.execute("edit.trim_to_fill_selection", &json!({"clips": clips, "start": p.start, "end": p.end}));
-        }
-        // The add above is already one "Record" step; fold in the trim pushed since.
-        let added = usize::try_from(e.undo_pushes() - n0).unwrap_or(0);
-        if added > 0 {
-            let _ = e.squash_undo(added + 1, "Record");
-        }
-    }
-    ids
-}
-
-/// Turn recorded take files into clips at `start`, as one undo step ("Record"); each file is the
-/// source of its clips. With `pass` (loop recording), a take becomes one clip per pass (at most
-/// 1000), each pass after the first on a new playlist.
-pub fn add_recording(e: &mut Engine, start: Samples, takes: Vec<(TrackId, PathBuf)>, pass: Option<Samples>) -> Vec<soundcraft_model::ClipId> {
-    add_recording_take(e, start, takes, pass, false, None)
-}
-
-/// `add_recording` with `new_take`: a track with clips under the take (clipped to `punch`) gets a
-/// duplicate of its active playlist first, inside the same "Record" step.
-pub fn add_recording_take(
-    e: &mut Engine,
-    start: Samples,
-    takes: Vec<(TrackId, PathBuf)>,
-    pass: Option<Samples>,
-    new_take: bool,
-    punch: Option<Range>,
-) -> Vec<soundcraft_model::ClipId> {
-    let before = e.session_arc();
-    let n0 = e.undo_pushes();
-    let mut out = Vec::new();
-    for (tid, path) in takes {
-        let read =
-            read_file(&path).and_then(|b| soundcraft_audio_io::decode(&b, None).map_err(|err| EngineError::Io(format!("{}: {err}", path.display()))));
-        let Ok((_, buf)) = read.inspect_err(|err| e.message(err.to_string())) else { continue };
-        if new_take && pass.is_none() {
-            let frames = i64::try_from(buf.frames()).unwrap_or(0);
-            let from = punch.map_or(start, |p| p.start.max(start));
-            let to = punch.map_or(start + frames, |p| p.end.min(start + frames));
-            let over = to > from && e.session().track(tid).is_some_and(|t| t.clips().iter().any(|c| c.start < to && c.end() > from));
-            if over {
-                let _ = e.execute("track.playlist_duplicate", &json!({"track": tid.0}));
-            }
-        }
-        let s = e.session_mut();
-        if s.track(tid).is_none() {
-            continue;
-        }
-        let resampled = buf.sample_rate != s.sample_rate.hz();
-        let name = path.file_stem().and_then(|x| x.to_str()).unwrap_or("Take");
-        let src = add_source(s, name, buf, Some(&path.to_string_lossy()), FileFormat::Wav);
-        let Some(x) = s.sources.last_mut() else { continue };
-        x.unsaved = resampled;
-        let len = i64::try_from(x.frames).unwrap_or(0);
-        let pass = pass.unwrap_or(len).max(1);
-        for offset in (0..len).step_by(usize::try_from(pass).unwrap_or(usize::MAX)).take(1_000) {
-            let n = pass.min(len - offset);
-            if offset > 0 && n < pass / 8 {
-                break;
-            }
-            if offset > 0
-                && let Some(t) = s.track_mut(tid)
-            {
-                t.playlists.push(soundcraft_model::Playlist::new(format!("{}.{:02}", t.name, t.playlists.len() + 1)));
-                t.active_playlist = t.playlists.len() - 1;
-            }
-            let cid = s.new_clip_id();
-            crate::edit::place_clip(s, tid, Clip::audio(cid, name, src, offset, start, n));
-            out.push(cid);
-        }
-    }
-    if !out.is_empty() {
-        e.push_undo("Record", before);
-        let added = usize::try_from(e.undo_pushes() - n0).unwrap_or(0);
-        if new_take && added > 1 {
-            let _ = e.squash_undo(added, "Record");
-        }
-    }
-    out
-}
-
-/// Where a take recording from `start` shows while it holds `len` samples, as it will be placed:
-/// just the pass under way when loop recording in passes of `pass`, within the `punch` range.
-/// Returns the timeline position of its first sample and the span it covers.
-pub fn live_span(start: Samples, pass: Option<Samples>, punch: Option<Range>, len: Samples) -> Option<(Samples, Range)> {
-    let origin = start.saturating_sub(pass.filter(|p| *p > 0).map_or(0, |p| len / p * p));
-    let span = Range::new(start, origin.saturating_add(len));
-    Some((origin, span.intersect(&punch.unwrap_or(span))?))
-}
-
-#[cfg(test)]
-mod record_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn armed(e: &mut Engine, name: &str, format: &str, input: &str) -> TrackId {
-        let id = e.execute("track.new", &json!({"name": name, "format": format})).unwrap()["tracks"][0].as_u64().unwrap();
-        e.execute("track.input", &json!({"tracks": [id], "input": input})).unwrap();
-        e.execute("mix.record_arm", &json!({"tracks": [id], "value": true})).unwrap();
-        TrackId(id)
-    }
-
-    fn write_take(path: &Path, frames: usize) {
-        let mut bytes = soundcraft_audio_io::wav_float_header(1, 48_000, frames as u64).unwrap();
-        bytes.extend((0..frames).flat_map(|i| (i as f32 / frames as f32 - 0.5).to_le_bytes()));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    #[test]
-    fn an_input_path_by_name_records_its_channel_and_old_labels_keep_their_meaning() {
-        use soundcraft_model::{ChannelFormat, IoDirection, IoMap, IoPath};
-        let dir = std::env::temp_dir().join(format!("soundcraft-takes-path-{}", std::process::id()));
-        let mut e = Engine::default();
-        let mut io = IoMap::for_device("ASIO", "x", 8, 2);
-        io.add_path(IoPath { name: "Guitar".into(), direction: IoDirection::Input, channels: vec![4], format: ChannelFormat::Mono }).unwrap();
-        io.add_path(IoPath { name: "Drum pair".into(), direction: IoDirection::Input, channels: vec![6, 7], format: ChannelFormat::Stereo }).unwrap();
-        e.set_io_map(io);
-        let gtr = armed(&mut e, "Gtr", "mono", "Guitar");
-        let drums = armed(&mut e, "Drums", "stereo", "Drum pair");
-        let old = armed(&mut e, "Old", "stereo", "In 3-4");
-        let plan = plan_takes(&e, &dir, 8);
-        let channels = |t: TrackId| plan.iter().find(|p| p.0 == t).map(|p| p.1.clone()).unwrap();
-        assert_eq!(channels(gtr), [4], "Guitar is input channel 5");
-        assert_eq!(channels(drums), [6, 7]);
-        assert_eq!(channels(old), [2, 3]);
-        // The same names, resolved by the mix: one function (`soundcraft_model::input_channel`).
-        assert_eq!(soundcraft_model::input_channel(Some(e.io_map()), "Guitar", 0), 4);
-    }
-
-    #[test]
-    fn armed_tracks_get_new_take_files_used_in_place() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-takes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut e = Engine::default();
-        let vox = armed(&mut e, "Vox", "mono", "In 2");
-        let gtr = armed(&mut e, "Gtr", "stereo", "In 3-4");
-        write_take(&dir.join("Audio Files/Vox_01.wav"), 10);
-        let plan = plan_takes(&e, &dir, 4);
-        assert_eq!(plan, vec![(vox, vec![1], dir.join("Audio Files/Vox_02.wav")), (gtr, vec![2, 3], dir.join("Audio Files/Gtr_01.wav"))]);
-        assert_eq!(plan_takes(&e, &dir, 2)[1].1, vec![0, 1]);
-
-        let session = dir.join("Song.transit").to_string_lossy().into_owned();
-        e.execute("session.save_as", &json!({"path": session})).unwrap();
-        write_take(&plan[0].2, 4_800);
-        let clips = add_recording(&mut e, 96_000, vec![(vox, plan[0].2.clone())], None);
-        let clip = e.session().find_clip(clips[0]).unwrap().1.clone();
-        assert_eq!((clip.start, clip.length), (96_000, 4_800));
-        assert_eq!(save_session(&mut e, &session).unwrap(), 0);
-        let src = e.session().sources.last().unwrap().clone();
-        assert_eq!((src.name.as_str(), src.path.as_str(), src.unsaved, src.frames), ("Vox_02", "Audio Files/Vox_02.wav", false, 4_800));
-        e.execute("edit.undo", &json!({})).unwrap();
-        assert!(e.session().find_clip(clips[0]).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_loop_take_becomes_one_clip_per_pass_and_autosaves_in_place() {
-        let dir = std::env::temp_dir().join(format!("soundcraft-loop-take-{}", std::process::id()));
-        let path = dir.join("Audio Files/Vox_01.wav");
-        write_take(&path, 1_050);
-        let mut e = Engine::default();
-        let vox = armed(&mut e, "Vox", "mono", "In 1");
-        assert_eq!(add_recording(&mut e, 1_000, vec![(vox, path.clone())], Some(400)).len(), 3);
-        assert_eq!(save_copy(&e, &dir.join("Untitled.transit").to_string_lossy()).unwrap(), 0);
-        let t = e.session().track(vox).unwrap();
-        let passes: Vec<_> = t.playlists.iter().flat_map(|p| p.clips.iter().map(|c| (c.source_offset(), c.start, c.length))).collect();
-        assert_eq!(passes, vec![(0, 1_000, 400), (400, 1_000, 400), (800, 1_000, 250)]);
-        assert_eq!((t.active_playlist, t.playlists[2].name.as_str()), (2, "Vox.03"));
-        e.execute("edit.undo", &json!({})).unwrap();
-        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn over_a_clip(tag: &str) -> (Engine, TrackId, PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("soundcraft-newtake-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (first, second) = (dir.join("Audio Files/Vox_01.wav"), dir.join("Audio Files/Vox_02.wav"));
-        write_take(&first, 4_800);
-        write_take(&second, 4_800);
-        let mut e = Engine::default();
-        let vox = armed(&mut e, "Vox", "mono", "In 1");
-        add_recording(&mut e, 1_000, vec![(vox, first.clone())], None);
-        (e, vox, first, second)
-    }
-
-    #[test]
-    fn new_take_recording_over_a_clip_is_one_record_step() {
-        let (mut e, vox, _, second) = over_a_clip("one");
-        let before = e.undo_history();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
-        let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
-        assert_eq!(ids.len(), 1);
-        let h = e.undo_history();
-        assert_eq!((h.len(), h.last().map(String::as_str)), (before.len() + 1, Some("Record")));
-        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 2);
-        e.execute("edit.undo", &json!({})).unwrap();
-        let t = e.session().track(vox).unwrap();
-        assert_eq!((t.playlists.len(), t.clips().len(), t.clips()[0].start), (1, 1, 1_000));
-        e.execute("edit.redo", &json!({})).unwrap();
-        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 2);
-    }
-
-    #[test]
-    fn new_take_with_punch_folds_the_trim_into_the_record_step() {
-        let (mut e, vox, _, second) = over_a_clip("punch");
-        let n = e.undo_history().len();
-        let plan = Recording {
-            start: 1_000,
-            pass: None,
-            punch: Some(Range::new(2_000, 3_000)),
-            rate: 48_000,
-            takes: Vec::new(),
-            midi_journal: None,
-            midi_placed: false,
-        };
-        let ids = place_recording_take(&mut e, &plan, vec![(vox, second)], true);
-        let h = e.undo_history();
-        assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
-        let c = e.session().find_clip(ids[0]).unwrap().1.clone();
-        assert_eq!((c.start, c.length), (2_000, 1_000));
-        e.execute("edit.undo", &json!({})).unwrap();
-        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
-    }
-
-    #[test]
-    fn new_take_fold_still_works_when_the_history_is_full() {
-        let (mut e, vox, _, second) = over_a_clip("full");
-        e.history_limit = e.undo_history().len();
-        let last = e.undo_history().pop();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
-        place_recording_take(&mut e, &plan, vec![(vox, second)], true);
-        let h = e.undo_history();
-        // One new entry on top of the previous newest; the duplicate step is folded, not left behind.
-        assert_eq!(h[h.len() - 2..], [last.unwrap(), "Record".to_string()]);
-        assert!(!h.iter().any(|l| l == "Duplicate Playlist"));
-        e.execute("edit.undo", &json!({})).unwrap();
-        let t = e.session().track(vox).unwrap();
-        assert_eq!((t.playlists.len(), t.clips().len(), t.clips()[0].start), (1, 1, 1_000));
-    }
-
-    #[test]
-    fn new_take_across_two_tracks_with_clips_is_one_step() {
-        let (mut e, vox, _, second) = over_a_clip("two");
-        let gtr = armed(&mut e, "Gtr", "mono", "In 2");
-        add_recording(&mut e, 1_000, vec![(gtr, second.clone())], None);
-        let n = e.undo_history().len();
-        let plan = Recording { start: 2_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
-        place_recording_take(&mut e, &plan, vec![(vox, second.clone()), (gtr, second)], true);
-        let h = e.undo_history();
-        assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
-        assert_eq!([vox, gtr].map(|t| e.session().track(t).unwrap().playlists.len()), [2, 2]);
-        e.execute("edit.undo", &json!({})).unwrap();
-        assert_eq!([vox, gtr].map(|t| e.session().track(t).unwrap().playlists.len()), [1, 1]);
-    }
-
-    #[test]
-    fn new_take_into_empty_space_does_not_duplicate_and_is_one_step() {
-        let (mut e, vox, _, second) = over_a_clip("empty");
-        let n = e.undo_history().len();
-        let plan = Recording { start: 20_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None, midi_placed: false };
-        place_recording_take(&mut e, &plan, vec![(vox, second)], true);
-        let h = e.undo_history();
-        assert_eq!((h.len(), h.last().map(String::as_str)), (n + 1, Some("Record")));
-        assert_eq!(e.session().track(vox).unwrap().playlists.len(), 1);
-    }
-
-    #[test]
-    fn recording_without_new_take_keeps_the_old_steps() {
-        let (mut e, vox, _, second) = over_a_clip("old");
-        let n = e.undo_history().len();
-        let plan = Recording {
-            start: 1_000,
-            pass: None,
-            punch: Some(Range::new(2_000, 3_000)),
-            rate: 48_000,
-            takes: Vec::new(),
-            midi_journal: None,
-            midi_placed: false,
-        };
-        place_recording(&mut e, &plan, vec![(vox, second)]);
-        assert_eq!(e.undo_history().len(), n + 2);
-    }
-
-    #[test]
-    fn a_take_shows_the_pass_under_way_within_the_punch_while_it_records() {
-        assert_eq!(live_span(1_000, None, None, 0), None);
-        assert_eq!(live_span(1_000, None, None, 500), Some((1_000, Range::new(1_000, 1_500))));
-        assert_eq!(live_span(1_000, Some(400), None, 900), Some((200, Range::new(1_000, 1_100))));
-        assert_eq!(live_span(1_000, Some(400), None, 800), None);
-        let punch = Some(Range::new(1_200, 1_400));
-        assert_eq!(live_span(1_000, None, punch, 150), None);
-        assert_eq!(live_span(1_000, None, punch, 500), Some((1_000, Range::new(1_200, 1_400))));
-    }
-}
+mod recording;
+pub use recording::{Recording, Take, add_recording, add_recording_take, live_span, place_recording, place_recording_take, plan_takes};
 
 #[cfg(test)]
 mod save_tests {
@@ -2182,10 +1506,11 @@ mod name_tests {
     fn midi_with_more_meter_changes_than_scores_have_is_refused() {
         let note = soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 960 };
         let sequence = soundcraft_midi::Sequence { notes: vec![note], ..Default::default() };
-        let meters = (0..=MAX_MIDI_METERS as i64).map(|bar| (bar * 3840, 4, 4)).collect();
+        let meters = (0..=midi::MAX_MIDI_METERS as i64).map(|bar| (bar * 3840, 4, 4)).collect();
         let smf = soundcraft_midi::Smf { tracks: vec![soundcraft_midi::SmfTrack { name: String::new(), sequence }], meters, ..Default::default() };
         let err = import_midi_bytes(&mut Engine::default(), &soundcraft_midi::write_smf(&smf).unwrap(), 0, true).unwrap_err();
         assert!(err.to_string().contains("meter changes"), "{err}");
+        assert!(matches!(&err, EngineError::BadParams(command, _) if command == "file.import_midi"));
     }
 
     #[test]

@@ -397,7 +397,13 @@ pub fn bounce_job(e: &Engine, p: &Value) -> Result<crate::io::Bounce> {
     let normalize = bool_or(p, "normalize", false);
     let fold = fold_down_param(p, "file.bounce_mix")?;
     let bus = bounce_bus(e, p)?;
-    crate::io::Bounce::new(e.session_arc(), std::path::Path::new(&path), r, &opts, bus, normalize, fold)
+    crate::io::Bounce::with_options(
+        e.session_arc(),
+        std::path::Path::new(&path),
+        r,
+        &opts,
+        crate::io::BounceOptions { bus, normalize, fold_stereo: fold },
+    )
 }
 
 /// `file.bounce_paths`: one file per output path, in one pass.

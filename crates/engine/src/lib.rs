@@ -165,6 +165,9 @@ pub struct Engine {
     /// the document: editing it neither dirties the session nor makes an undo step.
     io: soundcraft_model::IoMap,
     io_revision: u64,
+    command_targets: cmd::CommandTargets,
+    transient_cache: cmd::TransientCache,
+    plugin_discovery: cmd::PluginDiscovery,
 }
 
 /// Logs the routing loops a document holds as it is opened (an older file: the mix renders it
@@ -212,6 +215,9 @@ impl Engine {
             imports: import::Imports::default(),
             io: soundcraft_model::IoMap::default(),
             io_revision: 0,
+            command_targets: cmd::CommandTargets::default(),
+            transient_cache: cmd::TransientCache::default(),
+            plugin_discovery: cmd::PluginDiscovery::default(),
         }
     }
 
@@ -300,6 +306,7 @@ impl Engine {
 
     /// Replace the whole document (open / new); clears history.
     pub fn replace_session(&mut self, s: Session) {
+        self.transient_cache = cmd::TransientCache::default();
         log_route_loops(&s);
         self.transport = TransportStatus { position: s.edit.selection.start.max(0), ..TransportStatus::default() };
         self.transport_requests.clear();
@@ -453,17 +460,7 @@ impl Engine {
     /// document is restored.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        if self.blocked_while_recording(id) {
-            return Err(EngineError::Disabled(id.to_string(), "stop recording first".into()));
-        }
-        if let Err(reason) = (spec.enabled)(self) {
-            // A call that names its targets (tracks, clips, a range) does not need a selection;
-            // the command itself validates them.
-            let names_targets = ["track", "tracks", "clip", "clips", "sources", "start", "end", "at"].iter().any(|k| params.get(k).is_some());
-            if !names_targets {
-                return Err(EngineError::Disabled(id.to_string(), reason));
-            }
-        }
+        self.check_enabled(spec, params)?;
         if spec.view {
             return self.execute_view(spec, params);
         }
@@ -472,33 +469,12 @@ impl Engine {
         let rev = self.revision;
         let dirty = self.dirty;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, params)));
-        // L22: no edit may close a routing loop, whichever command makes it (folder moves, track
-        // deletes that promote members, presets, imported session data, ...). Opening a document
-        // (it replaces the saved one too) may hold one: the mix breaks it and it was logged.
-        let result = match result {
-            Ok(Ok(v)) if !Arc::ptr_eq(&before, &self.doc) && Arc::ptr_eq(&saved, &self.saved) => {
-                match soundcraft_model::new_cycle(&before, &self.doc) {
-                    Some(path) => Ok(Err(cmd::bad(
-                        id,
-                        format!("that route would create a routing loop: {}", soundcraft_model::describe_cycle(&self.doc, &path)),
-                    ))),
-                    // A hardware insert (ADR 0015 section 5): a send path serves one insert, and the
-                    // return may not feed its own send.
-                    None => match soundcraft_model::new_hardware_problem(&before, &self.doc) {
-                        Some(why) => Ok(Err(cmd::bad(id, why))),
-                        None => Ok(Ok(v)),
-                    },
-                }
-            }
-            other => other,
-        };
-        // A frozen track plays its render: no command may change what was rendered.
-        let result = match result {
-            Ok(Ok(_)) if !Arc::ptr_eq(&before, &self.doc) && Arc::ptr_eq(&saved, &self.saved) && cmd::edits_frozen(&before, &self.doc) => {
-                Ok(Err(EngineError::TrackFrozen))
-            }
-            other => other,
-        };
+        let result = result.map(|result| {
+            result.and_then(|value| {
+                self.validate_edit(id, &before, &saved)?;
+                Ok(value)
+            })
+        });
         let result = match result {
             Ok(r) => r,
             Err(p) => {
@@ -535,6 +511,36 @@ impl Engine {
                 Err(e)
             }
         }
+    }
+
+    fn validate_edit(&self, id: &str, before: &Arc<Session>, saved: &Arc<Session>) -> Result<()> {
+        // Opening a document replaces the saved snapshot too; existing route problems are
+        // reported on open. Ordinary edits may introduce neither loops nor insert conflicts.
+        if Arc::ptr_eq(before, &self.doc) || !Arc::ptr_eq(saved, &self.saved) {
+            return Ok(());
+        }
+        if let Some(path) = soundcraft_model::new_cycle(before, &self.doc) {
+            return Err(cmd::bad(id, format!("that route would create a routing loop: {}", soundcraft_model::describe_cycle(&self.doc, &path))));
+        }
+        if let Some(why) = soundcraft_model::new_hardware_problem(before, &self.doc) {
+            return Err(cmd::bad(id, why));
+        }
+        if cmd::edits_frozen(before, &self.doc) {
+            return Err(EngineError::TrackFrozen);
+        }
+        Ok(())
+    }
+
+    fn check_enabled(&mut self, spec: &CommandSpec, params: &Value) -> Result<()> {
+        if self.blocked_while_recording(spec.id) {
+            return Err(EngineError::Disabled(spec.id.to_string(), "stop recording first".into()));
+        }
+        // Only selection predicates consume explicit targets. Clipboard, history and other
+        // prerequisites still run, regardless of the parameter names supplied by the caller.
+        self.command_targets = cmd::CommandTargets::from_params(params);
+        let enabled = (spec.enabled)(self);
+        self.command_targets = cmd::CommandTargets::default();
+        enabled.map_err(|reason| EngineError::Disabled(spec.id.to_string(), reason))
     }
 
     fn execute_view(&mut self, spec: &CommandSpec, params: &Value) -> Result<Value> {

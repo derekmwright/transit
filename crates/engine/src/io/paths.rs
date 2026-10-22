@@ -7,7 +7,7 @@
 //! Every file therefore starts at the range start, sample-aligned with the others and with a
 //! plain main bounce of the same session.
 
-use super::{MAX_BOUNCE_SECS, Out, bounce_layout, make_dir, sanitize_name};
+use super::{Out, bounce_layout, check_bounce_range, make_dir, sanitize_name};
 use crate::{EngineError, Result};
 use soundcraft_audio_io::{EncodeOptions, FileEncoder, FileFormat};
 use soundcraft_model::{ChannelFormat, IoDirection, IoMap, Route, Session, TrackKind};
@@ -116,9 +116,7 @@ impl PathBounce {
         normalize: PathNormalize,
     ) -> Result<PathBounce> {
         const CMD: &str = "file.bounce_paths";
-        if r.len() > s.sample_rate.samples(MAX_BOUNCE_SECS) {
-            return Err(EngineError::BadParams(CMD.into(), "bounces are limited to 4 hours".into()));
-        }
+        check_bounce_range(&s, r, CMD)?;
         let mut names: Vec<String> = if paths.is_empty() { routed_paths(&s, io) } else { Vec::new() };
         for want in paths {
             let want = want.trim();

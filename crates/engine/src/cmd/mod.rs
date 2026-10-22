@@ -25,6 +25,7 @@ mod midi_input;
 mod mix;
 mod more_util;
 mod options;
+mod plugin_scan;
 mod plugin_state;
 mod query;
 pub(crate) mod sampler;
@@ -43,6 +44,26 @@ mod zoom_toggle;
 pub use file::{bounce_job, bounce_paths_job};
 
 pub(crate) use edit::remember_selection;
+pub(crate) use plugin_scan::PluginDiscovery;
+pub(crate) use tab::TransientCache;
+
+/// Explicit targets satisfy selection predicates only; command handlers validate their values.
+#[derive(Default)]
+pub(crate) struct CommandTargets {
+    selection: bool,
+    range: bool,
+    sources: bool,
+}
+
+impl CommandTargets {
+    pub(crate) fn from_params(p: &Value) -> Self {
+        Self {
+            selection: ["track", "tracks", "clip", "clips"].iter().any(|key| p.get(key).is_some()),
+            range: p.get("start").is_some() && (p.get("end").is_some() || p.get("length").is_some()),
+            sources: p.get("sources").is_some(),
+        }
+    }
+}
 
 pub type Run = fn(&mut Engine, &Value) -> Result<Value>;
 /// `Err(reason)` = disabled.
@@ -147,7 +168,8 @@ pub fn command_specs() -> &'static [CommandSpec] {
 }
 
 pub fn find_command(id: &str) -> Option<&'static CommandSpec> {
-    command_specs().iter().find(|c| c.id == id)
+    static BY_ID: OnceLock<std::collections::HashMap<&'static str, &'static CommandSpec>> = OnceLock::new();
+    BY_ID.get_or_init(|| command_specs().iter().map(|c| (c.id, c)).collect()).get(id).copied()
 }
 
 // ---- enablement --------------------------------------------------------------------------
@@ -162,12 +184,20 @@ pub fn has_tracks(e: &Engine) -> std::result::Result<(), String> {
 
 pub fn has_selection(e: &Engine) -> std::result::Result<(), String> {
     let s = e.session();
-    if s.edit.selected_tracks.is_empty() && s.edit.selected_clips.is_empty() { Err("nothing is selected".into()) } else { Ok(()) }
+    if !e.command_targets.selection && s.edit.selected_tracks.is_empty() && s.edit.selected_clips.is_empty() {
+        Err("nothing is selected".into())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn has_range(e: &Engine) -> std::result::Result<(), String> {
     let s = e.session();
-    if (s.edit.selected_tracks.is_empty() || s.edit.selection.is_empty()) && s.edit.selected_clips.is_empty() {
+    if !e.command_targets.selection
+        && !e.command_targets.range
+        && (s.edit.selected_tracks.is_empty() || s.edit.selection.is_empty())
+        && s.edit.selected_clips.is_empty()
+    {
         Err("make an edit selection first".into())
     } else {
         Ok(())
@@ -349,6 +379,20 @@ pub fn clip_ids_param(e: &Engine, p: &Value) -> Vec<ClipId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_parameters_do_not_bypass_non_selection_prerequisites_issue_10() {
+        let mut e = Engine::default();
+        for id in ["edit.undo", "edit.redo", "edit.paste"] {
+            for params in [serde_json::json!({"at": 0}), serde_json::json!({"start": 0}), serde_json::json!({"track": 1})] {
+                assert!(matches!(e.execute(id, &params), Err(EngineError::Disabled(..))), "{id}: {params}");
+            }
+        }
+        let t = e.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Mono, None);
+        e.execute("mix.volume", &serde_json::json!({"track": t.0, "db": -6.0})).unwrap();
+        assert_eq!(e.session().track(t).unwrap().mixer.volume_db, -6.0);
+        assert!(matches!(e.execute("mix.volume", &serde_json::json!({"at": 0, "db": 1.0})), Err(EngineError::Disabled(..))));
+    }
 
     #[test]
     fn ids_are_unique_and_documented() {

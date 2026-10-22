@@ -22,7 +22,11 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn has_list_selection(e: &Engine) -> std::result::Result<(), String> {
     let ed = &e.session().edit;
-    if ed.selected_clips.is_empty() && ed.selected_sources.is_empty() { Err("select clips or files in the Clip List".into()) } else { Ok(()) }
+    if !e.command_targets.selection && !e.command_targets.sources && ed.selected_clips.is_empty() && ed.selected_sources.is_empty() {
+        Err("select clips or files in the Clip List".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn ids<'a, T: serde::Deserialize<'a>>(p: &'a Value, key: &str) -> Result<Option<T>> {
