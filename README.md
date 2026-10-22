@@ -25,7 +25,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Tempo and meter changes along the timeline, edited by dragging or typing in the transport.
 - Transport metronome button: right-click for click level and count-in bars. Count-in works at bar 1, and recording starts sample-exact at the end of it.
 - Transport load readout (for example "30%  128 @ 48 kHz  ASIO") with an overload warning.
-- Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor. Keys you play live are accented on the piano roll's keyboard.
+- Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor. Keys you play live are accented on the piano roll's keyboard. It shares the adaptive grid (Ctrl+1-4), with step-cursor keys and a fixed-velocity setting.
 - Freeze, Unfreeze and Flatten a track (the snowflake on the track header); a frozen track plays its rendered audio, with its key sources running.
 
 ### Mixer and routing
@@ -43,6 +43,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - The device card shows Loading while a heavy plug-in instantiates.
 - Plug-in browser with a background scan and your own search folders.
 - Built-in instruments: Subtractive Synth, Drum Synth, Sampler. All built-ins open an editor window: parameter rows, Sampler load or drop, Drum Synth by pad.
+- Built-in panels with knobs, and bespoke layouts for Compressor, Gate, EQ, Synth and Plate; factory and user presets; a scope and a gain-reduction display on the dynamics panels. Moving a plug-in knob while a lane is armed (Write, Latch, Touch) records into it.
 - Built-in dynamics and EQ: Compressor/Limiter, Expander/Gate, De-Esser, Maximizer, Channel Strip, EQ 7-Band, EQ 1-Band.
 - Built-in effects: Room and Plate Reverb, Mod Delay, Chorus, Flanger, Phaser, Saturator, Lo-Fi, Rectifier, Pitch Shifter.
 - Utilities: Gain, Trim, Invert, Time Shift, DC Offset Removal, Signal Generator, Dither.
@@ -52,19 +53,23 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
 - MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass; each loop pass becomes a take; the lane shows the growing clip while you play.
+- A MIDI take journal is written during the pass; after a crash, the next launch offers to recover it as a `<Track>_recovered` clip. Record works without a calibrated device clock: alignment is approximate, and when it cannot start you get a plain-English reason.
 
 ### Audio devices
 
 - Audio Devices window to pick the driver (WASAPI, or ASIO in builds you make yourself), device and buffer size.
 - Named input and output paths, saved per machine.
+- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. `audio-bench --backend wasapi` measures it.
 - Tracks, buses and sends route to any output path, with latency aligned across them.
 
 ### Sessions and rendering
 
 - Bounce the main mix or any bus over the selection or loop range to WAV, AIFF or FLAC at 16-bit, 24-bit or 32-bit float.
+- Stems by output path from the Bounce dialog.
 - Bounce in Place turns a track's clips into audio.
 - Full undo history; every edit is a command.
 - Autosave, and sessions saved as versioned, human-readable JSON.
+- A launch splash with plug-in scan progress, and Help > About with version info.
 - Import audio and MIDI files; export MIDI. File > Open Recent lists your last ten sessions (Ctrl+Shift+O).
 
 ### Under the hood
@@ -118,7 +123,7 @@ disables saving settings.
 
 - Pre-alpha; the session format and UI change freely.
 - A heavy plug-in can still block the UI for the duration of its single create call.
-- MIDI recording has no take file yet (a crash mid-pass loses that pass's MIDI), and Freeze renders a fixed 2 second tail.
+- A crash between Stop and the next autosave can still lose a MIDI pass (K13); approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
 - Windows releases are unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft

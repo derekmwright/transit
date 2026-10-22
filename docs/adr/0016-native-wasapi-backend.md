@@ -2,7 +2,7 @@
 
 - **Status:** accepted 2026-10-21 (direction from the project owner; refutation review round 1 resolved); implementation after ADR 0015 slice (c)
 - **Date:** 2026-10-21
-- **Implementation:** slice (a) landed 0ef51ae. None yet for the rest. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
+- **Implementation:** slices (a) 0ef51ae, (b) 51e79d6, (c) 799049d+3c3257f landed; (d) capture next. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
 - **Reopen when:** the benchmark harness (slice b) shows CPAL-shared already within the gate margin of ASIO on both reference interfaces (measured by the method in section 5, so this cannot fire before slice b); or the native shared low-latency path cannot beat CPAL-shared on the Scarlett 2i2 and the TASCAM Model 12 after slice (c); or `IAudioClock2` device positions prove no better a clock than QPC arrival on the reference drivers (slice d gate fails); or upstream CPAL gains exclusive mode, `IAudioClient3` and device-position timestamps.
 
 ## Context

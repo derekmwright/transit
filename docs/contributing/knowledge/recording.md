@@ -9,6 +9,8 @@ A lost take is a merge-blocking defect. Treat every change here as high risk.
   the applied action runs, not when the UI asks, so the take's start frame is the real one. A
   delayed or cancelled ticket can never start a later take. `start/mapping.rs` maps the start to
   the session position.
+- **No-clock latch:** a record pass does not need a validated output clock map. MIDI-only passes latch on the output frame; duplex audio aligns by input frame ordinal within one block.
+  With no validated clock after 1 s the start fails with a plain-English message, never raw Debug text.
 - **Placement:** takes are placed from the latched device frame and the clock fit, not from the
   time the user pressed the key (`clocks.md`).
 - **Input selection:** monitoring and recording must resolve an input path the same way
