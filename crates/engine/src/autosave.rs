@@ -294,7 +294,8 @@ pub struct Leftover {
 }
 
 /// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
-/// session file they came from or holding a recording. Empty and outdated ones are deleted.
+/// session file they came from (or in the same timestamp tick: Linux file times are only as fine as the
+/// kernel tick, and a change autosaved right after a save must not be taken for older) or holding a recording. Empty and outdated ones are deleted.
 pub fn leftovers(root: &Path) -> Vec<Leftover> {
     let mut out = Vec::new();
     for dir in std::fs::read_dir(root).into_iter().flatten().flatten().map(|d| d.path()) {
@@ -309,7 +310,7 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         let recording = dir.join(RECORDING).is_file();
         drop(lock);
         match saved {
-            Ok(saved) if recording || origin_saved.is_none_or(|o| saved > o) => {
+            Ok(saved) if recording || origin_saved.is_none_or(|o| saved >= o) => {
                 let text = std::fs::read_to_string(&session_file).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
@@ -845,6 +846,25 @@ mod tests {
         assert_eq!(levels(&reopened), [0.5]);
         Autosave::create(&root, "Song").unwrap().discard();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_autosaved_within_the_saves_timestamp_tick_is_still_offered() {
+        let dir = folder("autosave-same-tick");
+        let path = dir.join("Song.transit");
+        let root = dir.join("Autosave");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = Engine::default();
+        crate::io::save_session(&mut e, &path.to_string_lossy()).unwrap();
+        record(&mut e, 0.5);
+        let mut a = Autosave::create(&root, "Song").unwrap();
+        a.write(e.session(), e.path.as_deref(), None).unwrap();
+        // Coarse file times: the save and the autosave carry the very same modification time.
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options().write(true).open(a.dir.join(SESSION)).unwrap().set_modified(time).unwrap();
+        drop(a);
+        assert_eq!(leftovers(&root).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
