@@ -130,7 +130,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 - Stems by output path from the Bounce dialog.
 - Bounce in Place turns a track's clips into audio.
 - Full undo history; every edit is a command.
-- Autosave, and sessions saved as versioned, human-readable JSON.
+- Autosave, and sessions saved as versioned, human-readable JSON in `.transit` files (older `.scraft` sessions still open).
 - A launch splash that reports the audio device opening first, then plug-in scan progress, and Help > About with version info.
 - Import audio and MIDI files; export MIDI. File > Open Recent lists your last ten sessions (Ctrl+Shift+O).
 

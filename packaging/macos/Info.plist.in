@@ -66,7 +66,7 @@
       <key>UTTypeTagSpecification</key>
       <dict>
         <key>public.filename-extension</key>
-        <array><string>scraft</string></array>
+        <array><string>transit</string><string>scraft</string></array>
         <key>public.mime-type</key>
         <array><string>application/x-soundcraft-session</string></array>
       </dict>

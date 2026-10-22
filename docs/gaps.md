@@ -71,7 +71,7 @@ When you close a gap, delete its entry (or shrink it) in the same PR, and bump t
 ### G-03. Session interchange with Pro Tools
 
 - **Missing:** opening or saving `.ptx`/`.ptf`, AAF and OMF import and export (#40), Media
-  Composer–compatible sessions. Our session format is `.scraft` JSON.
+  Composer–compatible sessions. Our session format is `.transit` JSON.
 - **Impact:** the standard's main-format bar for beta. A Pro Tools user cannot bring a project in
   or hand one back; post-production (picture editors deliver AAF) is blocked.
 - **Estimate:** AAF/OMF import + export ≈ 50–90 h (FilmCraft already writes AAF/OMF; we can learn

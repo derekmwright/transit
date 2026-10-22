@@ -1,7 +1,9 @@
 # Session format
 
-A session is `crates/model` data (`Session` in `crates/model/src/session.rs`), saved as `.scraft`
-JSON plus an `Audio Files/` folder. Users' work lives in these files.
+A session is `crates/model` data (`Session` in `crates/model/src/session.rs`), saved as `.transit`
+JSON plus an `Audio Files/` folder. Users' work lives in these files. Sessions saved before the
+rename have the extension `.scraft` and still open; Save on one writes a `.transit` file beside it
+and leaves the `.scraft` alone. The format inside is the same.
 
 ## Rules
 

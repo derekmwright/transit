@@ -15,7 +15,7 @@ the ADRs. A new topic gets a new file and a row here.
 | [`sidechain.md`](sidechain.md) | Insert keys and key taps. |
 | [`midi.md`](midi.md) | Live MIDI input, step entry, note delivery. |
 | [`recording.md`](recording.md) | Record start, takes, input capture. |
-| [`session-format.md`](session-format.md) | Anything saved in a `.scraft` file. |
+| [`session-format.md`](session-format.md) | Anything saved in a `.transit` file. |
 | [`commands.md`](commands.md) | User actions, undo, the control channel. |
 | [`ui.md`](ui.md) | `crates/ui-studio`: shortcuts, icons, theme, tests. |
 | [`unsafe.md`](unsafe.md) | Any `unsafe`, FFI or OS call. |

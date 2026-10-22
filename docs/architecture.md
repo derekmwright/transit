@@ -21,7 +21,7 @@ Layer rules: [`layering.md`](contributing/knowledge/layering.md).
 
 `model::Session` is plain serde data: tracks with playlists of clips, mixer state, tempo and meter
 maps, memory locations, groups, buses, and edit state. Decoded audio lives in a `SourcePool` of
-`Arc`s that is not serialized. Sessions save as `.scraft` JSON plus an `Audio Files/` folder. Format
+`Arc`s that is not serialized. Sessions save as `.transit` JSON plus an `Audio Files/` folder. Format
 rules: [`session-format.md`](contributing/knowledge/session-format.md).
 
 ## Commands and undo

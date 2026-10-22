@@ -4,7 +4,7 @@
 
     wix build transit.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
 
-  Per-machine install into Program Files, a Start Menu shortcut, `.scraft` sessions owned by
+  Per-machine install into Program Files, a Start Menu shortcut, `.transit` sessions owned by
   transit, and transit offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
 -->
@@ -49,8 +49,12 @@
               Icon="TransitIcon.ico" IconIndex="0" />
         </File>
 
-        <!-- .scraft: transit's session format (extension and MIME type unchanged); transit is its default app. -->
+        <!-- .transit: transit's session format (MIME type unchanged); transit is its default app.
+             .scraft is the extension sessions had before; those files still open, so it stays registered. -->
         <ProgId Id="transit.Session" Description="transit Session" Icon="TransitExe" IconIndex="0">
+          <Extension Id="transit" ContentType="application/x-soundcraft-session">
+            <Verb Id="open" Command="Open" TargetFile="TransitExe" Argument="&quot;%1&quot;" />
+          </Extension>
           <Extension Id="scraft" ContentType="application/x-soundcraft-session">
             <Verb Id="open" Command="Open" TargetFile="TransitExe" Argument="&quot;%1&quot;" />
           </Extension>
@@ -72,6 +76,7 @@
         <!-- "Open with" app list and the Run dialog (Win+R "transit"). -->
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe" Name="FriendlyAppName" Value="transit" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\shell\open\command" Value="&quot;[#TransitExe]&quot; &quot;%1&quot;" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".transit" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".scraft" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
