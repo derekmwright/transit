@@ -64,11 +64,12 @@ impl CaptureStamper {
 
     /// The callback instant is the position read after `GetBuffer`; the frame time is the QPC of the
     /// packet's first frame, moved earlier by the calibrated round trip when there is one. A
-    /// discontinuity, a timestamp error or an unreadable clock gives an invalid stamp (the clock fit
-    /// restarts) and forgets the history.
-    pub(crate) fn stamp(&mut self, packet: &Packet, host_ns: Option<u64>) -> Stamp {
+    /// real discontinuity (discontinuity, which the caller has already cleared for the stream's first
+    /// packet, whose flag is expected and means no loss), a timestamp error or an unreadable clock gives
+    /// an invalid stamp (the clock fit restarts) and forgets the history.
+    pub(crate) fn stamp(&mut self, packet: &Packet, discontinuity: bool, host_ns: Option<u64>) -> Stamp {
         let (Some(clock), Some(host_ns)) = (packet.clock, host_ns) else { return self.invalid() };
-        if packet.timestamp_error || packet.discontinuity || packet.frames == 0 {
+        if packet.timestamp_error || discontinuity || packet.frames == 0 {
             return self.invalid();
         }
         let callback = relative_ns(clock.qpc_100ns, self.origin_qpc, self.origin_ns);
@@ -168,17 +169,18 @@ pub(crate) fn run(
                 stats.packets += 1;
                 stats.frames += u64::from(packet.frames);
                 stats.silent += u64::from(packet.silent);
-                stats.discontinuities += u64::from(packet.discontinuity);
+                // WASAPI flags the first packet after Start as a discontinuity: there is no earlier data,
+                // so it is not a loss and is neither counted, filled nor given an invalid stamp.
+                let discontinuity = packet.discontinuity && previous.is_some();
+                stats.discontinuities += u64::from(discontinuity);
                 stats.timestamp_errors += u64::from(packet.timestamp_error);
-                if packet.discontinuity
-                    && let Some(previous) = previous.as_ref()
-                {
+                if discontinuity && let Some(previous) = previous.as_ref() {
                     let gap = gap_frames(previous, packet, config.format.rate);
                     fill_gap(capture, scratch, channels, config, &mut stamper, packet, gap);
                 }
                 let end_position = (!packet.timestamp_error).then(|| packet.device_position.saturating_add(u64::from(packet.frames)));
                 previous = Some(Previous { frames: packet.frames, qpc_100ns: packet.qpc_100ns, end_position });
-                let stamp = stamper.stamp(packet, config.origin.now_ns());
+                let stamp = stamper.stamp(packet, discontinuity, config.origin.now_ns());
                 let bytes = if packet.silent { None } else { bytes };
                 let mut source = ConvertSource { scratch: &mut *scratch, channels, frames: packet.frames as usize, bytes, wire: config.wire };
                 let mut block = CaptureBlock::new(packet.frames as usize, stamp, config.format, &mut source);
@@ -557,6 +559,19 @@ mod tests {
             let config = config(None);
             let run = drive(&mut device, &config);
             assert_eq!((run.seen.len(), config.filled.load(Ordering::Relaxed)), (steps.len(), 0));
+        }
+    }
+
+    #[test]
+    fn the_first_packets_discontinuity_flag_is_not_a_loss() {
+        for first in [lost(0), lost(700)] {
+            let mut device = Fake::new([Step::Wake(vec![first, normal(), normal()])]);
+            let config = config(None);
+            let run = drive(&mut device, &config);
+            assert_eq!(run.stats.discontinuities, 0);
+            assert_eq!(config.filled.load(Ordering::Relaxed), 0);
+            assert_eq!(run.seen.len(), 3);
+            assert!(run.seen.iter().all(|s| s.stamp.quality != Quality::Invalid));
         }
     }
 
