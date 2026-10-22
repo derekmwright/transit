@@ -120,3 +120,29 @@ open item: the Focusrite driver's `getLatencies` figures (input plus output: 24.
 frame times put the captured click before the played one and no loopback calibration can be formed
 (the calibration's round trip is unsigned). Either the driver counts a buffer it should not, or the
 stamp model's "latency includes the buffer" reading is wrong for this driver; ASIO slice d decides.
+
+## Native ASIO re-run after ASIO slice c
+
+After the slice (c) changes to `transit-audio-asio` (stop waiting for an in-flight callback, the
+orphaned-session sweep, invalid stamps after a discontinuity), the same command at 64 frames, transit
+closed, three runs, alternated with the bench built from the slice (b) head (d9dcf67):
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.668 / 1.327 / 1.328 | 0/0 | 0.00 | 0.8 / 1.0 | 6.227 / 6.248 / 6.256 (20 of 20) | 299 / 300 / 300 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c; stamp pairing 4 frames |
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.669 / 1.328 / 1.328 | 0/0 | 0.00 | 0.8 / 1.0 | 6.086 / 6.121 / 6.133 (20 of 20) | 292 / 294 / 294 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c; no stamp pairing |
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.668 / 1.327 / 1.328 | 0/0 | 0.00 | 0.9 / 1.0 | 6.245 / 6.255 / 6.268 (20 of 20) | 300 / 300 / 301 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c; stamp pairing 4 frames |
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.668 / 1.328 / 1.328 | 0/0 | 0.00 | 0.8 / 1.0 | 6.105 / 6.118 / 6.129 (20 of 20) | 293 / 294 / 294 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice b binary; no stamp pairing |
+| asio | ASIO | Focusrite USB ASIO | 64 | 64 fr / 1.333 ms | 48000 | 0.669 / 1.328 / 1.328 | 0/0 | 0.00 | 0.8 / 1.0 | 6.117 / 6.133 / 6.157 (20 of 20) | 294 / 294 / 296 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice b binary; no stamp pairing |
+
+Backend lines of the first run (the others differ only in the late and service maxima):
+
+- "render backend: wakes 7492, late p95 1021 µs, max 1021 µs; service p95 16 µs, max 78 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 64 fr; latency 2.9 ms; fmt i32 48000 Hz"
+- "capture backend: wakes 7492, late p95 1021 µs, max 1021 µs; service p95 16 µs, max 78 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 64 fr; latency 3.9 ms; fmt i32 48000 Hz"
+
+Reading: the loop is 294 or 300 frames (6.12 or 6.25 ms) from one start to the next, against 6.13 ms in
+the slice (b) section; both binaries give 294 frames, so slice (c) changed nothing in the audio path.
+When a start lands on the 300-frame loop the stamp-time calibration pairs every click at +4 frames
+(+-1), when it lands on 294 it pairs none: the stamp-time difference moves by about 30 frames for a
+6-frame change of the loop, which is part of the open stamp question (known issue K31), and the 4 frames
+are not a usable calibration.

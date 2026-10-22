@@ -94,3 +94,27 @@ Against the Scarlett 2i2 on the same machine (shared 248 ms, exclusive 223 ms, A
 frames): the Scarlett's shared path is the slow one and exclusive helps only a little, while the Model 12's
 shared path is fast and exclusive makes it much slower. Exclusive-mode latency is a property of the
 driver, not of WASAPI. The Model 12's ASIO latency is not measured yet.
+
+## Native ASIO re-run after ASIO slice c
+
+The same command as above (`--rate 44100 --loopback --out-ch 2 --in-ch 1 --seconds 10`), transit
+closed, after the slice (c) changes to `transit-audio-asio`, three runs, then once with the bench
+built from the slice (b) head (d9dcf67) for comparison:
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| asio | ASIO | Model Mixer ASIO Driver | default | 256 fr / 5.805 ms | 44100 | 0.196 / 0.807 / 0.903 | 0/0 | 0.00 | 8.8 / 10.0 | 21.878 / 22.072 / 23.072 (19 of 19) | 965 / 973 / 1017 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c |
+| asio | ASIO | Model Mixer ASIO Driver | default | 256 fr / 5.805 ms | 44100 | 0.197 / 0.808 / 1.041 | 0/0 | 0.00 | 8.9 / 10.0 | 21.876 / 22.075 / 23.064 (19 of 19) | 965 / 974 / 1017 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c |
+| asio | ASIO | Model Mixer ASIO Driver | default | 256 fr / 5.805 ms | 44100 | 0.197 / 0.808 / 0.860 | 0/0 | 0.00 | 9.0 / 17.8 | 21.904 / 22.088 / 23.112 (19 of 19) | 966 / 974 / 1019 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice c |
+| asio | ASIO | Model Mixer ASIO Driver | default | 256 fr / 5.805 ms | 44100 | 0.197 / 0.809 / 1.326 | 0/0 | 0.00 | 8.2 / 16.5 | 21.905 / 22.101 / 23.092 (19 of 19) | 966 / 975 / 1018 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | slice b binary (d9dcf67) |
+
+- "render backend: wakes 1675, late p95 256 µs, max 295 µs; service p95 32 µs, max 53 µs; skipped 0, timeouts 0; min padding 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 15.8 ms; fmt i24 44100 Hz"
+- "capture backend: wakes 1675, late p95 256 µs, max 295 µs; service p95 32 µs, max 53 µs; skipped 0, timeouts 0; max packets 0; overloads 0, position jumps 0, resets 0; buffer 256 fr; latency 6.8 ms; fmt i24 44100 Hz"
+- "calibration: none (only 0 of 19 clicks were detected on the loopback (input peaks: ch1 -12.8 dBFS, ch2 -6.0 dBFS, ..., ch11 -14.0 dBFS, ch12 -14.0 dBFS ...)"
+
+Reading: the loop now measures 22.1 ms (974 frames), not the 28.1 ms (1239 frames) of the morning run,
+about one 256-frame buffer less, and the slice (b) binary measures the same 22.1 ms, so the change is the
+interface's, not the code's: like its WASAPI shared path (60 to 62 or 71 to 73 ms by start phase), the
+Model 12's ASIO loop moves by about a buffer between sessions (the unit's state also differs from the
+morning run: input 2 now carries the click at -6 dBFS and inputs 11 and 12 at -14 dBFS). In this phase the driver's figures (300 + 695 = 995 frames) exceed the loop, so the
+stamp-time calibration pairs no click (known issue K31).
