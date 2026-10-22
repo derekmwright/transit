@@ -312,7 +312,7 @@ impl History {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
-    use soundcraft_rt::testing::measure;
+    use transit_rt::testing::measure;
 
     fn point(n: u64) -> Point {
         Point { host_ns: n * 1000, output_frame: n, position: Position { sample: -(n as i64), fraction: n, denominator: n + 1 } }

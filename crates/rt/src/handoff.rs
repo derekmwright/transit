@@ -19,7 +19,7 @@
 //! or while holding a resource that the callback needs to finish.
 //!
 //! ```
-//! use soundcraft_rt::handoff::Anchor;
+//! use transit_rt::handoff::Anchor;
 //! let (anchor, mut audio) = Anchor::new(0_u64);
 //! if let Some(mut guard) = audio.enter() { *guard += 1; }
 //! anchor.close();
@@ -83,12 +83,12 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 /// Main's owner; neither `Send` nor `Sync`. Dropping it closes, waits, and drops `T`.
 ///
 /// ```compile_fail
-/// use soundcraft_rt::handoff::Anchor;
+/// use transit_rt::handoff::Anchor;
 /// fn send<T: Send>() {}
 /// send::<Anchor<u32>>();
 /// ```
 /// ```compile_fail
-/// use soundcraft_rt::handoff::Anchor;
+/// use transit_rt::handoff::Anchor;
 /// fn sync<T: Sync>() {}
 /// sync::<Anchor<u32>>();
 /// ```
@@ -102,7 +102,7 @@ impl<T: Send> Anchor<T> {
     /// Allocate the value on Main and create its sole audio endpoint.
     ///
     /// ```compile_fail
-    /// use soundcraft_rt::handoff::Anchor;
+    /// use transit_rt::handoff::Anchor;
     /// let _ = Anchor::new(std::rc::Rc::new(1)); // not transferable to audio
     /// ```
     #[must_use]
@@ -153,7 +153,7 @@ impl<T> Drop for Anchor<T> {
 /// The single, non-clone endpoint. `Send` when `T: Send`; never owns `T`'s destruction.
 ///
 /// ```compile_fail
-/// use soundcraft_rt::handoff::Anchor;
+/// use transit_rt::handoff::Anchor;
 /// let (_, audio) = Anchor::new(1);
 /// let _ = audio.clone();
 /// ```
@@ -182,12 +182,12 @@ impl<T> AudioAccess<T> {
 /// Forgetting it prevents reclamation forever, preserving memory safety.
 ///
 /// ```compile_fail
-/// use soundcraft_rt::handoff::Guard;
+/// use transit_rt::handoff::Guard;
 /// fn send<T: Send>() {}
 /// send::<Guard<'static, u32>>();
 /// ```
 /// ```compile_fail
-/// use soundcraft_rt::handoff::Anchor;
+/// use transit_rt::handoff::Anchor;
 /// let (_, mut audio) = Anchor::new(1);
 /// let mut first = audio.enter().unwrap();
 /// let _second = audio.enter();

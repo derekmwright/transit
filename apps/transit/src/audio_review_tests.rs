@@ -31,7 +31,7 @@ fn review_quit_before_verification_keeps_previous_good_audio() {
     studio.ui.audio.output = Some("previous verified output".into());
     config::save_ui(&path, &studio.ui).unwrap();
     let previous = studio.ui.audio.clone();
-    studio.audio_devices.fake = soundcraft_ui_studio::audio_devices::fake_from_json(&serde_json::json!({
+    studio.audio_devices.fake = transit_ui_studio::audio_devices::fake_from_json(&serde_json::json!({
         "systems": [{"name": "WASAPI", "is_default": true, "outputs": [{"name": "untested output", "is_default": true}]}]
     }))
     .unwrap();

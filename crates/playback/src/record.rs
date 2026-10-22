@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use soundcraft_audio_backend as ab;
 use soundcraft_model::TrackId;
+use transit_audio_backend as ab;
 
 /// What [`Recorder::finish`] returns: the takes that hold audio and the first problem met.
 pub type Takes = (Vec<(TrackId, PathBuf)>, Option<String>);
@@ -212,7 +212,7 @@ pub struct Recorder {
     shared: Arc<Shared>,
     /// Live input for monitoring (always fed while the input stream runs).
     pub monitor: Arc<InputRing>,
-    _stream: Option<Box<dyn soundcraft_audio_backend::Stream>>,
+    _stream: Option<Box<dyn transit_audio_backend::Stream>>,
     clock: Option<crate::device_clock::MaintainedClock>,
     record_start: Option<start::Reader>,
     pub device_name: String,
@@ -832,7 +832,7 @@ mod tests {
             let data: Vec<f32> = (0..12).map(|n| n as f32 / 20.0).collect();
             let mut offset = 0;
             for frames in parts {
-                let (_, heap) = soundcraft_rt::testing::measure(|| {
+                let (_, heap) = transit_rt::testing::measure(|| {
                     let _lease = shared.begin_capture().unwrap();
                     shared.capture_at(100 + offset as u64, &data[offset..offset + frames]);
                 });

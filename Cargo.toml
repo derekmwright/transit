@@ -13,11 +13,11 @@ repository = "https://github.com/storytold/soundcraft"
 [workspace.dependencies]
 # internal
 soundcraft-time = { path = "crates/time" }
-soundcraft-rt = { path = "crates/rt" }
+transit-rt = { path = "crates/rt" }
 soundcraft-audio-io = { path = "crates/audio-io" }
-soundcraft-audio-backend = { path = "crates/audio-backend" }
-soundcraft-audio-wasapi = { path = "crates/audio-wasapi" }
-soundcraft-midi-io = { path = "crates/midi-io" }
+transit-audio-backend = { path = "crates/audio-backend" }
+transit-audio-wasapi = { path = "crates/audio-wasapi" }
+transit-midi-io = { path = "crates/midi-io" }
 soundcraft-midi = { path = "crates/midi" }
 soundcraft-video = { path = "crates/video" }
 soundcraft-dsp = { path = "crates/dsp" }
@@ -31,7 +31,7 @@ soundcraft-engine = { path = "crates/engine" }
 soundcraft-playback = { path = "crates/playback" }
 soundcraft-automation = { path = "crates/automation" }
 soundcraft-ui-egui = { path = "crates/ui-egui" }
-soundcraft-ui-studio = { path = "crates/ui-studio" }
+transit-ui-studio = { path = "crates/ui-studio" }
 
 # foundation
 thiserror = "2"
@@ -51,7 +51,7 @@ cpal = "=0.16.0"
 rtrb = "=0.4.0"
 # Latest clock-state publication uses a bounded swap, never a retry loop; review every bump.
 triple_buffer = "=9.0.0"
-# MIDI device transport (soundcraft-midi-io). Pinned: the input callback contract is reviewed per bump.
+# MIDI device transport (transit-midi-io). Pinned: the input callback contract is reviewed per bump.
 midir = "=0.10.4"
 
 # Which file paths stored in a session may be opened.

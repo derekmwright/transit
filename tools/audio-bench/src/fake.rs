@@ -3,9 +3,9 @@
 //! software loopback with a known delay. It proves the harness logic, not any hardware.
 
 use crate::session::Request;
-use soundcraft_audio_backend as ab;
-use soundcraft_audio_backend::fake::{FakeBackend, SliceSink, SliceSource};
 use std::collections::VecDeque;
+use transit_audio_backend as ab;
+use transit_audio_backend::fake::{FakeBackend, SliceSink, SliceSource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Script {

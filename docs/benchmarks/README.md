@@ -2,7 +2,7 @@
 
 The harness behind the gate of [ADR 0016](../adr/0016-native-wasapi-backend.md) (section 5). It lives in
 `tools/audio-bench` and runs through `cargo xtask audio-bench`. It drives a backend through the
-`soundcraft-audio-backend` trait only, so cpal-shared, cpal-ASIO and the future native backend are
+`transit-audio-backend` trait only, so cpal-shared, cpal-ASIO and the future native backend are
 measured by identical code, and by host time only.
 
 Hardware numbers are notes, never CI gates. Fake-device results prove the harness logic, not any

@@ -7,10 +7,10 @@ use soundcraft_mix::{
     create_instance,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

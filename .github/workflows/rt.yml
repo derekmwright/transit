@@ -1,4 +1,4 @@
-# ADR 0013, 5: soundcraft-rt (the one crate with unsafe) and the mix crate that calls it are
+# ADR 0013, 5: transit-rt (the one crate with unsafe) and the mix crate that calls it are
 # linted and tested on every platform it has code for, with and without the portable fallback.
 name: Realtime (rt)
 
@@ -41,19 +41,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: clippy (rt)
-        run: cargo clippy -p soundcraft-rt --all-targets -- -D warnings
+        run: cargo clippy -p transit-rt --all-targets -- -D warnings
       - name: clippy (rt, force-fallback)
-        run: cargo clippy -p soundcraft-rt --all-targets --features force-fallback -- -D warnings
+        run: cargo clippy -p transit-rt --all-targets --features force-fallback -- -D warnings
       - name: clippy (mix)
         run: cargo clippy -p soundcraft-mix --all-targets -- -D warnings
       - name: test
-        run: cargo test -p soundcraft-rt -p soundcraft-mix
+        run: cargo test -p transit-rt -p soundcraft-mix
       - name: test (rt, force-fallback)
-        run: cargo test -p soundcraft-rt --features force-fallback
+        run: cargo test -p transit-rt --features force-fallback
       # Without privileges SCHED_FIFO is refused: the rt tests accept Denied(EPERM) there. Under
       # sudo the same tests must get SCHED_FIFO (SOUNDCRAFT_RT_EXPECT_PROMOTED=1).
       - name: test (rt, Linux, SCHED_FIFO under sudo)
         if: runner.os == 'Linux'
         run: |
-          cargo test -p soundcraft-rt --no-run
-          sudo -E env "PATH=$PATH" SOUNDCRAFT_RT_EXPECT_PROMOTED=1 cargo test -p soundcraft-rt
+          cargo test -p transit-rt --no-run
+          sudo -E env "PATH=$PATH" SOUNDCRAFT_RT_EXPECT_PROMOTED=1 cargo test -p transit-rt

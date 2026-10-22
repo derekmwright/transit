@@ -14,11 +14,11 @@ use std::thread::ThreadId;
 
 /// Counts heap operations on threads a test measures (all other threads are only forwarded).
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 /// Adopts on this thread, measured: the audio side allocates and frees nothing.
 fn adopt_measured(eng: &mut MixEngine, env: &mut PlanEnvelope) -> Adoption {
-    let (a, stats) = soundcraft_rt::testing::measure(|| eng.adopt_plan(env));
+    let (a, stats) = transit_rt::testing::measure(|| eng.adopt_plan(env));
     assert!(stats.is_zero(), "adopt_plan allocated or freed: {stats:?}");
     a
 }
@@ -562,7 +562,7 @@ fn limits_are_checked_before_anything_is_allocated() {
         let mut comp = PlanCompiler::new(target(), limits);
         let mut make = factory(&log);
         let (r, stats) =
-            soundcraft_rt::testing::measure(|| comp.compile(Arc::clone(&ses), PlanGeneration::EMPTY, PlanGeneration::from_raw(1), &mut make));
+            transit_rt::testing::measure(|| comp.compile(Arc::clone(&ses), PlanGeneration::EMPTY, PlanGeneration::from_raw(1), &mut make));
         match r {
             Err(CompileError::ResourceLimit { what: w, need, limit }) => {
                 assert_eq!(w, what);

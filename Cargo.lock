@@ -450,10 +450,10 @@ dependencies = [
 name = "audio-bench"
 version = "0.8.0"
 dependencies = [
- "soundcraft-audio-backend",
- "soundcraft-audio-wasapi",
  "soundcraft-playback",
- "soundcraft-rt",
+ "transit-audio-backend",
+ "transit-audio-wasapi",
+ "transit-rt",
 ]
 
 [[package]]
@@ -3845,10 +3845,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "soundcraft-audio-backend"
-version = "0.8.0"
-
-[[package]]
 name = "soundcraft-audio-io"
 version = "0.8.0"
 dependencies = [
@@ -3858,18 +3854,6 @@ dependencies = [
  "serde_json",
  "symphonia",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "soundcraft-audio-wasapi"
-version = "0.8.0"
-dependencies = [
- "cpal",
- "log",
- "soundcraft-audio-backend",
- "soundcraft-rt",
- "windows 0.62.2",
- "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -3935,11 +3919,11 @@ dependencies = [
  "soundcraft-midi",
  "soundcraft-mix",
  "soundcraft-model",
- "soundcraft-rt",
  "soundcraft-time",
  "soundcraft-video",
  "soundcraft-vst3-host",
  "thiserror 2.0.21",
+ "transit-rt",
  "zip",
 ]
 
@@ -3950,16 +3934,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "soundcraft-midi-io"
-version = "0.8.0"
-dependencies = [
- "midir",
- "rtrb",
- "soundcraft-rt",
  "thiserror 2.0.21",
 ]
 
@@ -3975,9 +3949,9 @@ dependencies = [
  "soundcraft-dsp",
  "soundcraft-midi",
  "soundcraft-model",
- "soundcraft-rt",
  "soundcraft-time",
  "soundcraft-vst3-host",
+ "transit-rt",
 ]
 
 [[package]]
@@ -4003,28 +3977,19 @@ dependencies = [
  "serde",
  "serde_json",
  "soundcraft-asio-panel",
- "soundcraft-audio-backend",
  "soundcraft-audio-io",
- "soundcraft-audio-wasapi",
  "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",
- "soundcraft-midi-io",
  "soundcraft-mix",
  "soundcraft-model",
- "soundcraft-rt",
  "soundcraft-time",
  "soundcraft-vst3-host",
+ "transit-audio-backend",
+ "transit-audio-wasapi",
+ "transit-midi-io",
+ "transit-rt",
  "triple_buffer",
-]
-
-[[package]]
-name = "soundcraft-rt"
-version = "0.8.0"
-dependencies = [
- "libc",
- "log",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4061,28 +4026,6 @@ dependencies = [
  "soundcraft-video",
  "soundcraft-vst3-host",
  "toml",
-]
-
-[[package]]
-name = "soundcraft-ui-studio"
-version = "0.8.0"
-dependencies = [
- "egui",
- "egui_extras",
- "image",
- "log",
- "resvg",
- "serde",
- "serde_json",
- "soundcraft-clap-host",
- "soundcraft-dsp",
- "soundcraft-engine",
- "soundcraft-midi",
- "soundcraft-mix",
- "soundcraft-model",
- "soundcraft-playback",
- "soundcraft-time",
- "soundcraft-vst3-host",
 ]
 
 [[package]]
@@ -4623,8 +4566,65 @@ dependencies = [
  "soundcraft-engine",
  "soundcraft-playback",
  "soundcraft-ui-egui",
- "soundcraft-ui-studio",
+ "transit-ui-studio",
  "winresource",
+]
+
+[[package]]
+name = "transit-audio-backend"
+version = "0.8.0"
+
+[[package]]
+name = "transit-audio-wasapi"
+version = "0.8.0"
+dependencies = [
+ "cpal",
+ "log",
+ "transit-audio-backend",
+ "transit-rt",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "transit-midi-io"
+version = "0.8.0"
+dependencies = [
+ "midir",
+ "rtrb",
+ "thiserror 2.0.21",
+ "transit-rt",
+]
+
+[[package]]
+name = "transit-rt"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "log",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "transit-ui-studio"
+version = "0.8.0"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "image",
+ "log",
+ "resvg",
+ "serde",
+ "serde_json",
+ "soundcraft-clap-host",
+ "soundcraft-dsp",
+ "soundcraft-engine",
+ "soundcraft-midi",
+ "soundcraft-mix",
+ "soundcraft-model",
+ "soundcraft-playback",
+ "soundcraft-time",
+ "soundcraft-vst3-host",
 ]
 
 [[package]]

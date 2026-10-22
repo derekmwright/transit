@@ -8,9 +8,9 @@ use soundcraft_mix::{
     render_clips,
 };
 use soundcraft_model::{ChannelFormat, Clip, ClipId, Session, SourceAudio, SourceId, TrackId, TrackKind};
-use soundcraft_rt::testing::{CountingAlloc, measure};
 use soundcraft_time::Range;
 use std::sync::Arc;
+use transit_rt::testing::{CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

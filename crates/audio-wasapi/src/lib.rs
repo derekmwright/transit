@@ -2,7 +2,7 @@
 //! `IAudioClient3` at the smallest engine period the endpoint allows, with the device position of
 //! `IAudioClock2` as the stamp source. Windows only: on every other platform the crate is empty.
 //!
-//! This is the one crate besides `soundcraft-rt` that contains `unsafe` (ADR 0013, second
+//! This is the one crate besides `transit-rt` that contains `unsafe` (ADR 0013, second
 //! amendment), for COM and WASAPI through the `windows` crate only. Each stream is owned by one
 //! MTA thread; see [`com`] for the threading rules and [`render_loop`] for the audio-thread loop.
 //! Capture arrives with slice (d); exclusive mode with slice (e).
@@ -17,8 +17,8 @@ mod lifecycle;
 mod render_loop;
 
 use com::{EndpointInfo, OpenParams, RenderStream, Watcher};
-use soundcraft_audio_backend as ab;
 use std::sync::{Mutex, PoisonError};
+use transit_audio_backend as ab;
 
 /// The system name every endpoint of this backend carries.
 pub const SYSTEM: &str = "WASAPI";
@@ -152,7 +152,7 @@ const NO_CAPTURE: &str = "capture arrives with slice (d)";
 #[cfg(test)]
 mod hardware {
     //! Tests that open the owner's real default endpoint. They are `#[ignore]`d: the owner runs
-    //! them with `cargo test -p soundcraft-audio-wasapi -- --ignored hardware_ --nocapture`.
+    //! them with `cargo test -p transit-audio-wasapi -- --ignored hardware_ --nocapture`.
     use super::*;
     use ab::Backend;
     use std::sync::Arc;

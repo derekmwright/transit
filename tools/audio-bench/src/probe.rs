@@ -1,11 +1,11 @@
 //! The callbacks of the harness: they only stamp and count. Every buffer is allocated before a
 //! stream starts, logs are fixed-size and single-writer, and nothing locks or allocates.
 
-use soundcraft_audio_backend as ab;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+use transit_audio_backend as ab;
 
 /// Arrival value of a callback whose stamp was invalid.
 pub const INVALID_ARRIVAL: u64 = u64::MAX;

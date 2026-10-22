@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use crate::action_lane::{self, CALLBACK_ACTIONS, CAPACITY, Class, Event, Outcome, SendError};
 use soundcraft_mix::PlanGeneration;
-use soundcraft_rt::testing::measure;
+use transit_rt::testing::measure;
 
 // CountingAlloc is installed once by the playback plan-bridge unit-test module.
 

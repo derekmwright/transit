@@ -7,12 +7,12 @@ use soundcraft_mix::{
     mark_audio_thread,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
-use soundcraft_rt::testing::{CountingAlloc, measure};
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::thread::ThreadId;
+use transit_rt::testing::{CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

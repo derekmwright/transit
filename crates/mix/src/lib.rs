@@ -1664,7 +1664,7 @@ pub const MAX_RENDER_WORKERS: usize = 8;
 pub const RENDER_POOL_ENV: &str = "SOUNDCRAFT_RENDER_POOL";
 
 /// Environment variable: `1` leaves the render pool's workers at the OS default priority instead
-/// of promoting them with [`soundcraft_rt::promote_audio_thread`]. Read once, when the render
+/// of promoting them with [`transit_rt::promote_audio_thread`]. Read once, when the render
 /// pool is built. It does not affect the audio callback thread: this crate never promotes that.
 pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
 
@@ -1672,10 +1672,10 @@ pub const RENDER_NO_PRIORITY_ENV: &str = "SOUNDCRAFT_RENDER_NO_PRIORITY";
 /// [`RENDER_POOL_ENV`] clears it at startup.
 static FORCE_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// What each render pool worker's [`soundcraft_rt::promote_audio_thread`] achieved, by worker
+/// What each render pool worker's [`transit_rt::promote_audio_thread`] achieved, by worker
 /// index; written once by the worker's start handler, never on the render path.
 #[cfg(not(target_arch = "wasm32"))]
-static WORKER_PROMOTION: [std::sync::OnceLock<soundcraft_rt::Promotion>; MAX_RENDER_WORKERS] =
+static WORKER_PROMOTION: [std::sync::OnceLock<transit_rt::Promotion>; MAX_RENDER_WORKERS] =
     [const { std::sync::OnceLock::new() }; MAX_RENDER_WORKERS];
 
 /// True when `name` is set to `1` (or `true`/`yes`, any case).
@@ -1688,7 +1688,7 @@ fn env_flag(name: &str) -> bool {
 /// does not exist or has not started yet; `Unsupported("disabled")` under
 /// [`RENDER_NO_PRIORITY_ENV`]). For diagnostics and tests.
 #[must_use]
-pub fn render_worker_promotions() -> [Option<soundcraft_rt::Promotion>; MAX_RENDER_WORKERS] {
+pub fn render_worker_promotions() -> [Option<transit_rt::Promotion>; MAX_RENDER_WORKERS] {
     #[cfg(not(target_arch = "wasm32"))]
     return std::array::from_fn(|i| WORKER_PROMOTION.get(i).and_then(|slot| slot.get().copied()));
     #[cfg(target_arch = "wasm32")]
@@ -1737,7 +1737,7 @@ fn init_render_pool() {}
 /// Fewer than two workers is no pool: one worker plus a waiting callback is slower than the
 /// callback alone.
 ///
-/// Priority: each worker promotes itself at start with [`soundcraft_rt::promote_audio_thread`]
+/// Priority: each worker promotes itself at start with [`transit_rt::promote_audio_thread`]
 /// (MMCSS "Pro Audio" on Windows, `SCHED_FIFO` on Linux, the Mach time-constraint policy on
 /// macOS; ADR 0013 keeps that `unsafe` out of this crate), unless `promote` is false. The result
 /// lands in [`render_worker_promotions`] and is logged once per worker at debug level. A refused
@@ -1754,7 +1754,7 @@ fn build_render_pool(promote: bool) -> Option<rayon::ThreadPool> {
         .num_threads(workers)
         .thread_name(|i| format!("mix-render-{i}"))
         .start_handler(move |i| {
-            let p = if promote { soundcraft_rt::promote_audio_thread() } else { soundcraft_rt::Promotion::Unsupported("disabled") };
+            let p = if promote { transit_rt::promote_audio_thread() } else { transit_rt::Promotion::Unsupported("disabled") };
             if let Some(slot) = WORKER_PROMOTION.get(i) {
                 let _ = slot.set(p);
             }

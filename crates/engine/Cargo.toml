@@ -27,7 +27,7 @@ craft-docpath.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-soundcraft-rt = { workspace = true, features = ["testing"] }
+transit-rt = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -3,7 +3,7 @@
 use super::*;
 use soundcraft_mix::DeviceGeneration;
 use soundcraft_model::{ChannelFormat, Insert, TrackKind};
-use soundcraft_rt::testing::measure;
+use transit_rt::testing::measure;
 
 fn target() -> RenderTarget {
     RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 }

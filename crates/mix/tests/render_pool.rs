@@ -110,7 +110,7 @@ fn audio_thread_render_does_not_wait_for_a_saturated_global_pool() {
     eprintln!("worst block with the global pool saturated: {worst:?}");
 }
 
-/// Each render pool worker promotes itself at start through `soundcraft-rt` (ADR 0013), and the
+/// Each render pool worker promotes itself at start through `transit-rt` (ADR 0013), and the
 /// result is kept per worker. Windows grants MMCSS or time-critical priority to any user, so
 /// there every worker must be promoted.
 #[test]
@@ -141,7 +141,7 @@ fn render_pool_workers_promote_themselves_at_start() {
     let disabled = std::env::var(soundcraft_mix::RENDER_NO_PRIORITY_ENV).is_ok_and(|v| v.trim() == "1");
     for p in seen.iter().flatten() {
         if disabled {
-            assert_eq!(*p, soundcraft_rt::Promotion::Unsupported("disabled"));
+            assert_eq!(*p, transit_rt::Promotion::Unsupported("disabled"));
         } else if cfg!(windows) {
             assert!(p.is_promoted(), "{seen:?}");
         }

@@ -2,10 +2,10 @@
 #![forbid(unsafe_code)]
 
 use soundcraft_playback::record::{InputRing, MonitorTelemetry};
-use soundcraft_rt::testing::measure;
+use transit_rt::testing::measure;
 
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 #[test]
 fn uneven_equal_rate_partitions_preserve_every_channel_through_wraparound() {

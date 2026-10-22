@@ -118,7 +118,7 @@ pub fn soundcraft_dir() -> Option<PathBuf> {
 const MAX_UI_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Read bounded settings; `Ok(None)` when there are none yet.
-pub fn load_ui(path: &Path) -> Result<Option<soundcraft_ui_studio::UiState>, String> {
+pub fn load_ui(path: &Path) -> Result<Option<transit_ui_studio::UiState>, String> {
     use std::io::Read as _;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -134,7 +134,7 @@ pub fn load_ui(path: &Path) -> Result<Option<soundcraft_ui_studio::UiState>, Str
 }
 
 /// Write settings atomically (temporary file, then rename).
-pub fn save_ui(path: &Path, ui: &soundcraft_ui_studio::UiState) -> Result<(), String> {
+pub fn save_ui(path: &Path, ui: &transit_ui_studio::UiState) -> Result<(), String> {
     use std::io::Write as _;
     let mut saved = ui.clone();
     saved.plugin_windows.clear();
@@ -250,7 +250,7 @@ mod tests {
     fn the_io_map_round_trips_through_ui_json_and_old_files_load_without_it() {
         let dir = std::env::temp_dir().join(format!("transit-io-map-{}", std::process::id()));
         let path = dir.join("ui.json");
-        let mut ui = soundcraft_ui_studio::UiState::default();
+        let mut ui = transit_ui_studio::UiState::default();
         let mut map = soundcraft_engine::model::IoMap::for_device("ASIO", "TASCAM Model 12", 12, 10);
         map.rename_path("Out 3-4", "Cue").unwrap();
         ui.io_maps.push(map.clone());
@@ -270,7 +270,7 @@ mod tests {
     fn recent_files_round_trip_through_ui_json_and_old_files_load_without_them() {
         let dir = std::env::temp_dir().join(format!("transit-recent-files-{}", std::process::id()));
         let path = dir.join("ui.json");
-        let mut ui = soundcraft_ui_studio::UiState::default();
+        let mut ui = transit_ui_studio::UiState::default();
         ui.remember_recent(Path::new("/music/a.scraft"), 100);
         ui.remember_recent(Path::new("/music/b.scraft"), 200);
         save_ui(&path, &ui).unwrap();
@@ -286,7 +286,7 @@ mod tests {
     fn settings_round_trip() {
         let dir = std::env::temp_dir().join(format!("transit-ui-prefs-{}", std::process::id()));
         let path = dir.join("ui.json");
-        let mut ui = soundcraft_ui_studio::UiState { track_height: 60.0, ..Default::default() };
+        let mut ui = transit_ui_studio::UiState { track_height: 60.0, ..Default::default() };
         ui.keys.velocity = 87;
         ui.plugin_windows.push((soundcraft_engine::model::TrackId(1), 0));
         save_ui(&path, &ui).unwrap();

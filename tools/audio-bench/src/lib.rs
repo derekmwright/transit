@@ -13,7 +13,7 @@ pub mod probe;
 pub mod report;
 pub mod session;
 
-use soundcraft_audio_backend as ab;
+use transit_audio_backend as ab;
 
 /// Which backend a run measures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub fn cpal_backend(system: Option<&str>) -> Result<Box<dyn ab::Backend>, String
 #[cfg(all(windows, feature = "native-wasapi"))]
 pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
     use ab::BackendFactory;
-    soundcraft_audio_wasapi::WasapiFactory.backend(None).ok_or_else(|| "the native WASAPI backend is not available".to_string())
+    transit_audio_wasapi::WasapiFactory.backend(None).ok_or_else(|| "the native WASAPI backend is not available".to_string())
 }
 
 /// Without the feature (or off Windows) there is no native backend to measure.

@@ -6,14 +6,14 @@
 //!
 //! CPAL owns Windows device-worker promotion before the first data callback and releases the
 //! registration on the same worker at exit. The pinned fork exposes its actual helper result.
-//! No soundcraft-rt promotion is called on that worker. Render-pool workers have a separate
+//! No transit-rt promotion is called on that worker. Render-pool workers have a separate
 //! policy; their Pro Audio benchmark results do not describe this MMCSS Audio registration.
 
 use crate::{devices, telemetry};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use soundcraft_audio_backend as ab;
 use soundcraft_model::MAX_DEVICE_CHANNELS;
 use std::sync::{Arc, Mutex, PoisonError};
+use transit_audio_backend as ab;
 
 /// Sample types the adapter converts to and from `f32`.
 pub(crate) trait Sample: cpal::SizedSample + cpal::FromSample<f32> {}

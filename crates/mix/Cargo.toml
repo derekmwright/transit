@@ -16,14 +16,14 @@ soundcraft-clap-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-au-host.workspace = true
 soundcraft-model.workspace = true
-soundcraft-rt.workspace = true
+transit-rt.workspace = true
 log.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon.workspace = true
 
 [dev-dependencies]
-soundcraft-rt = { workspace = true, features = ["testing"] }
+transit-rt = { workspace = true, features = ["testing"] }
 soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
 
 [lints]

@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::device_clock::{ClockFitter, ClockKey, Direction, Observer, Quality, Reader, Stamp, observation_lane};
-use soundcraft_rt::testing::measure;
 use std::sync::mpsc;
+use transit_rt::testing::measure;
 
 fn fixture() -> (Observer, Pump, SnapshotReader, SnapshotReader) {
     let (observer, reader) = raw_fixture();

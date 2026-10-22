@@ -2,16 +2,16 @@
 //! event with its backend time, host arrival time and the gaps between successive events.
 //!
 //! ```text
-//! cargo run -p soundcraft-midi-io --example midi_monitor -- KeyStep [seconds]
+//! cargo run -p transit-midi-io --example midi_monitor -- KeyStep [seconds]
 //! ```
 //!
 //! Runs until Enter is pressed, or for `seconds` if given, then prints the port's counters.
 //! It never sends anything to an output.
 
-use soundcraft_midi_io::{InputConfig, MidiIo};
 use std::io::BufRead;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use transit_midi_io::{InputConfig, MidiIo};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")

@@ -6,9 +6,9 @@
 //!
 //! ```ignore
 //! #[global_allocator]
-//! static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+//! static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 //!
-//! let ((), stats) = soundcraft_rt::testing::measure(|| render_one_block());
+//! let ((), stats) = transit_rt::testing::measure(|| render_one_block());
 //! assert!(stats.is_zero());
 //! ```
 

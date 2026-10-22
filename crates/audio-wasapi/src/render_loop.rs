@@ -5,8 +5,8 @@
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use crate::convert::{ConvertSink, Wire};
-use soundcraft_audio_backend::{ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use transit_audio_backend::{ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
 
 /// `AUDCLNT_E_DEVICE_INVALIDATED`: the endpoint was removed, disabled or its format changed.
 const E_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
@@ -226,10 +226,10 @@ fn fail(error: &mut ErrorCallback, fault: Fault) -> Exit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_audio_backend::SampleFormat;
-    use soundcraft_rt::testing::{CountingAlloc, measure};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+    use transit_audio_backend::SampleFormat;
+    use transit_rt::testing::{CountingAlloc, measure};
 
     #[global_allocator]
     static ALLOC: CountingAlloc = CountingAlloc;

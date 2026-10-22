@@ -1,10 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::plan_bridge;
-use soundcraft_midi_io::{InputConfig, fake::Fake};
 use soundcraft_mix::{DeviceGeneration, PlanLimits, RenderTarget, SlotGen};
 use soundcraft_model::TrackId;
-use soundcraft_rt::testing::measure;
+use transit_midi_io::{InputConfig, fake::Fake};
+use transit_rt::testing::measure;
 
 fn route() -> Route {
     Route { engine: EngineEpoch(1), target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: u16::MAX, lookahead: 128 }

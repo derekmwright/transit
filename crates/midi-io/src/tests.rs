@@ -6,11 +6,11 @@ mod refutation;
 use crate::fake::Fake;
 use crate::ring::InputSink;
 use crate::*;
-use soundcraft_rt::testing::measure;
 use std::time::Duration;
+use transit_rt::testing::measure;
 
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 fn config(capacity: usize, reserve: usize) -> InputConfig {
     InputConfig { release_reserve: reserve, ..InputConfig::new(capacity) }

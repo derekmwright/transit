@@ -102,7 +102,7 @@ fn run(s: &Session, serial: bool, promote: bool) -> Stats {
     let s = s.clone();
     let mut eng = planned_engine(&s);
     let mut times = std::thread::spawn(move || {
-        let p = if promote { soundcraft_rt::promote_audio_thread() } else { soundcraft_rt::Promotion::Unsupported("disabled") };
+        let p = if promote { transit_rt::promote_audio_thread() } else { transit_rt::Promotion::Unsupported("disabled") };
         mark_audio_thread();
         let mut out = vec![vec![0.0f32; FRAMES]; 2];
         for b in 0..64 {
@@ -120,7 +120,7 @@ fn run(s: &Session, serial: bool, promote: bool) -> Stats {
             eng.render_active(b as i64 * FRAMES as i64, FRAMES, &mut out);
             times.push(t.elapsed());
         }
-        soundcraft_rt::demote(p);
+        transit_rt::demote(p);
         times
     })
     .join()

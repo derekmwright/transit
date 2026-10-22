@@ -10,11 +10,11 @@ repository.workspace = true
 [dependencies]
 soundcraft-time.workspace = true
 soundcraft-audio-io.workspace = true
-soundcraft-audio-backend.workspace = true
+transit-audio-backend.workspace = true
 soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
 soundcraft-dsp.workspace = true
-soundcraft-rt.workspace = true
+transit-rt.workspace = true
 soundcraft-clap-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-asio-panel.workspace = true
@@ -25,7 +25,7 @@ rtrb.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal.workspace = true
 triple_buffer.workspace = true
-soundcraft-midi-io.workspace = true
+transit-midi-io.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Backend startup owns registration and release; never promote from the data callback.
@@ -33,7 +33,7 @@ cpal = { workspace = true, features = ["audio_thread_priority"] }
 
 [target.'cfg(windows)'.dependencies]
 # The native WASAPI backend (ADR 0016), behind the `native-wasapi` feature.
-soundcraft-audio-wasapi = { workspace = true, optional = true }
+transit-audio-wasapi = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 cpal = { workspace = true, features = ["wasm-bindgen"] }
@@ -43,18 +43,18 @@ cpal = { workspace = true, features = ["wasm-bindgen"] }
 test-hooks = []
 # The native WASAPI render backend (ADR 0016 slice c): the "Native WASAPI (experimental)" choice in
 # Audio Devices. Off by default; without it the choice is not offered and `Backend::NativeWasapi` opens cpal.
-native-wasapi = ["dep:soundcraft-audio-wasapi"]
+native-wasapi = ["dep:transit-audio-wasapi"]
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
 # (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p soundcraft --features asio`.
 asio = ["cpal/asio", "soundcraft-asio-panel/asio"]
 
 [dev-dependencies]
-soundcraft-rt = { workspace = true, features = ["testing"] }
+transit-rt = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
 soundcraft-midi.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-soundcraft-midi-io = { workspace = true, features = ["fake"] }
+transit-midi-io = { workspace = true, features = ["fake"] }
 
 [lints]
 workspace = true

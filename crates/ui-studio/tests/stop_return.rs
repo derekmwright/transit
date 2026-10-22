@@ -1,7 +1,7 @@
 //! Transport commands use the same cursor as timeline/ruler clicks, without audio hardware.
 
 use serde_json::json;
-use soundcraft_ui_studio::{Services, StudioApp};
+use transit_ui_studio::{Services, StudioApp};
 
 fn command(app: &mut StudioApp, ctx: &egui::Context, id: &str, params: serde_json::Value) {
     app.run(id, params).unwrap();

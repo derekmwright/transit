@@ -25,5 +25,5 @@ Crates form layers; a crate may depend only on its own layer or lower. The table
 ## Notes
 
 - `crates/mix` forbids `unsafe` (`unsafe_code = "forbid"`). See `unsafe.md`.
-- The `soundcraft-*` package names stay; the short names above drop that prefix.
+- Package prefixes: crates transit created (`rt`, `midi-io`, `audio-backend`, `audio-wasapi`, `ui-studio`) are `transit-*`; inherited crates keep `soundcraft-*` until the planned sweep (ADR 0014 amendment, trademark risk). The short names above drop either prefix.
 - `ui-studio` is transit's UI. Do not add new features to `ui-egui`.

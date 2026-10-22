@@ -8,13 +8,13 @@
 use crate::convert::Wire;
 use crate::lifecycle::Lifecycle;
 use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
-use soundcraft_audio_backend as ab;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use transit_audio_backend as ab;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY};
 use windows::Win32::Media::Audio::{
@@ -692,20 +692,20 @@ fn stream_thread(
             return;
         }
     };
-    // MMCSS "Pro Audio" on this thread (soundcraft-rt), reverted on this thread at exit.
-    let promotion = soundcraft_rt::promote_audio_thread();
+    // MMCSS "Pro Audio" on this thread (transit-rt), reverted on this thread at exit.
+    let promotion = transit_rt::promote_audio_thread();
     priority.store(
         match promotion {
-            soundcraft_rt::Promotion::Mmcss { .. } => PRIO_PRO_AUDIO,
-            soundcraft_rt::Promotion::Priority(_) => PRIO_RAISED,
-            soundcraft_rt::Promotion::Denied(_) => PRIO_FAILED,
+            transit_rt::Promotion::Mmcss { .. } => PRIO_PRO_AUDIO,
+            transit_rt::Promotion::Priority(_) => PRIO_RAISED,
+            transit_rt::Promotion::Denied(_) => PRIO_FAILED,
             _ => PRIO_UNOBSERVED,
         },
         Ordering::Release,
     );
     let origin = params.request.origin;
     let finish = |priority: &AtomicU8| {
-        soundcraft_rt::demote(promotion);
+        transit_rt::demote(promotion);
         if promotion.is_promoted() {
             priority.store(PRIO_RELEASED, Ordering::Release);
         }

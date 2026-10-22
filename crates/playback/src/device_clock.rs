@@ -18,7 +18,7 @@ const MAX_RESIDUAL_NS: f64 = 2_000_000.0;
 // bounded by the existing fit residual policy, not permission to relax that fit.
 const MAX_ESTIMATE_BACKSTEP_NS: i128 = 2_000_000;
 
-pub use soundcraft_audio_backend::{Direction, HostOrigin, Quality, Stamp};
+pub use transit_audio_backend::{Direction, HostOrigin, Quality, Stamp};
 
 /// A stream incarnation and a backend clock domain. Reopening A after B uses a new key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

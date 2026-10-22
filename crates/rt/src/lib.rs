@@ -95,7 +95,7 @@ impl Promotion {
     /// True when the thread now runs in a raised or realtime scheduling class.
     ///
     /// ```
-    /// use soundcraft_rt::Promotion;
+    /// use transit_rt::Promotion;
     /// assert!(Promotion::Priority(15).is_promoted());
     /// assert!(!Promotion::Unsupported("platform").is_promoted());
     /// assert!(!Promotion::Denied(1).is_promoted());
@@ -125,10 +125,10 @@ pub struct Level {
 /// crate docs), so never call it from inside a render or an audio callback.
 ///
 /// ```
-/// let p = soundcraft_rt::promote_audio_thread();
+/// let p = transit_rt::promote_audio_thread();
 /// // On a supported platform with the rights to do it, `p.is_promoted()`; otherwise the thread
 /// // is unchanged and `p` says why.
-/// soundcraft_rt::demote(p);
+/// transit_rt::demote(p);
 /// ```
 #[must_use = "the result says whether the thread is realtime; pass it to `demote` to undo"]
 pub fn promote_audio_thread() -> Promotion {
@@ -144,9 +144,9 @@ pub fn promote_audio_thread() -> Promotion {
 /// promotion, or a call on a thread this crate did not promote, does nothing. Never panics.
 ///
 /// ```
-/// let p = soundcraft_rt::promote_audio_thread();
-/// soundcraft_rt::demote(p);
-/// soundcraft_rt::demote(p); // the second call does nothing
+/// let p = transit_rt::promote_audio_thread();
+/// transit_rt::demote(p);
+/// transit_rt::demote(p); // the second call does nothing
 /// ```
 pub fn demote(p: Promotion) {
     if p.is_promoted() {
@@ -158,7 +158,7 @@ pub fn demote(p: Promotion) {
 /// no way to ask (the fallback) or the query failed.
 ///
 /// ```
-/// if let Some(level) = soundcraft_rt::current_level() {
+/// if let Some(level) = transit_rt::current_level() {
 ///     println!("priority {} realtime {}", level.priority, level.realtime);
 /// }
 /// ```

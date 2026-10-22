@@ -2,15 +2,15 @@
 #![forbid(unsafe_code)]
 
 use soundcraft_playback::publication::{Service, channel};
-use soundcraft_rt::testing::measure;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
+use transit_rt::testing::measure;
 
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 const WATCHDOG: Duration = Duration::from_secs(5);
 

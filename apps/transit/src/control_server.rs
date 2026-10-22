@@ -7,13 +7,13 @@
 //! buffering the rest. So is the number of connections served at once ([`MAX_CONNECTIONS`]).
 
 use serde_json::{Value, json};
-use soundcraft_ui_studio::ControlRequest;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
+use transit_ui_studio::ControlRequest;
 
 /// Longest accepted request line (bytes, without the newline). The largest payload a request
 /// carries is a plugin state for `mix.insert_state`: base64 of at most `b64::MAX_DECODED_BYTES`

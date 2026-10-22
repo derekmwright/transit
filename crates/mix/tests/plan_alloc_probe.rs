@@ -8,7 +8,7 @@
 //! consecutive removals, track delete, a 70-entry map, 40 clip-effect chains, drop thread),
 //! now on the plan API.
 //!
-//! The binary installs `soundcraft_rt::testing::CountingAlloc` and counts the test thread only.
+//! The binary installs `transit_rt::testing::CountingAlloc` and counts the test thread only.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_audio_io::AudioBuffer;
@@ -18,9 +18,9 @@ use soundcraft_mix::{
     RenderTarget, mark_audio_thread,
 };
 use soundcraft_model::{Bus, BusId, ChannelFormat, Clip, ClipId, Insert, OutputPath, Route, Session, SourceAudio, SourceId, TrackId, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

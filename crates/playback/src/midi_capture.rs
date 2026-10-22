@@ -145,7 +145,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use soundcraft_mix::NoteId;
-    use soundcraft_rt::testing::measure;
+    use transit_rt::testing::measure;
 
     fn on(frame: u64) -> CapturedEvent {
         CapturedEvent {

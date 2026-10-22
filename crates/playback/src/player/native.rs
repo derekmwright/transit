@@ -2,13 +2,13 @@
 //! independent ingress worker handles timestamped input even while UI is busy.
 use super::{ActionResult, RuntimeControl, ingress, sources};
 use crate::{device_clock::HostOrigin, player::audio::Command};
-use soundcraft_midi_io::{Direction, InputBoundary, InputConfig, InputConsumer, InputHandle, MidiIo, PortInfo, PortKey};
 use soundcraft_mix::{EngineEpoch, INSTRUMENT_SLOT};
 use soundcraft_model::{MidiInput, MidiPort};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
+use transit_midi_io::{Direction, InputBoundary, InputConfig, InputConsumer, InputHandle, MidiIo, PortInfo, PortKey};
 
 type Owner = RuntimeControl<Command, ActionResult>;
 const POLL: Duration = Duration::from_millis(100);

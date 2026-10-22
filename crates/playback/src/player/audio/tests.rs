@@ -7,11 +7,11 @@ use crate::{
 };
 use soundcraft_mix::{DeviceGeneration, InstanceSpec, NewInstance, SlotGen};
 use soundcraft_model::Session;
-use soundcraft_rt::testing::measure;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU32},
 };
+use transit_rt::testing::measure;
 
 fn fixture(device_rate: u32) -> (Control<Command, ActionResult>, Audio, Arc<Shared>) {
     fixture_session(device_rate, Arc::new(Session::default()))

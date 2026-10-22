@@ -1,7 +1,7 @@
 //! Promotion on real threads. Each test promotes a thread it spawned, so the test harness's own
 //! threads are never left raised.
 
-use soundcraft_rt::{Promotion, current_level, demote, promote_audio_thread};
+use transit_rt::{Promotion, current_level, demote, promote_audio_thread};
 
 fn on_new_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::spawn(f).join().expect("test thread panicked")

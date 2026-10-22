@@ -5,14 +5,14 @@ use super::{Notice, PlayerError, RuntimeControl, ServiceReport, SessionRequestId
 use crate::record::start::Status;
 use crate::{AudioConfig, EditorEdit, Fault, HeldInput, MeterSnapshot, OutputTrouble, PluginStates, Shared};
 use crate::{action_lane, device_clock, devices, plan_bridge, record, scheduling, telemetry};
-use soundcraft_audio_backend as ab;
 use soundcraft_mix::{Arrival, DeviceGeneration, Due, EngineEpoch, InstrumentEvent, Message, NoteId, PlanLimits, RenderTarget, Source};
 use soundcraft_model::{IoMap, Session, TrackId};
-use soundcraft_rt::handoff::{Anchor, AudioAccess};
 use soundcraft_time::{Range, Samples};
 use std::cell::{Cell, RefCell, RefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use transit_audio_backend as ab;
+use transit_rt::handoff::{Anchor, AudioAccess};
 
 type Owner = RuntimeControl<Command, ActionResult>;
 pub type PlayerNotice = Notice<Command, ActionResult>;
@@ -266,7 +266,7 @@ impl Player {
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
         #[cfg(all(windows, feature = "native-wasapi"))]
         if cfg.backend == crate::Backend::NativeWasapi && crate::devices::is_wasapi_system(cfg.system.as_deref()) {
-            return Self::open_native_or_cpal(session, cfg, &soundcraft_audio_wasapi::WasapiFactory, &crate::backend::cpal::CpalFactory);
+            return Self::open_native_or_cpal(session, cfg, &transit_audio_wasapi::WasapiFactory, &crate::backend::cpal::CpalFactory);
         }
         Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
     }
@@ -274,7 +274,7 @@ impl Player {
     /// The native WASAPI backend; when it cannot open (before `start()` succeeded) the cpal backend
     /// opens the same choices and the Player says why. The failed attempt's streams are dropped
     /// here, on the control thread: dropping a native stream joins its thread (see
-    /// `soundcraft-audio-wasapi`'s `RenderStream`) and must never happen on a callback thread.
+    /// `transit-audio-wasapi`'s `RenderStream`) and must never happen on a callback thread.
     #[cfg(any(test, all(windows, feature = "native-wasapi")))]
     fn open_native_or_cpal(
         session: Arc<Session>,
@@ -362,7 +362,7 @@ impl Player {
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {
-                midi.enable(soundcraft_midi_io::MidiIo::new("transit"));
+                midi.enable(transit_midi_io::MidiIo::new("transit"));
             }
             return Ok(player);
         }

@@ -9,9 +9,9 @@ use soundcraft_mix::{
     mark_audio_thread,
 };
 use soundcraft_model::{ChannelFormat, Clip, Session, SourceAudio, SourceId, TrackKind};
-use soundcraft_rt::testing::promotion_calls;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use transit_rt::testing::promotion_calls;
 
 const FRAMES: usize = 256;
 

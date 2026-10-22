@@ -3,13 +3,13 @@
 #![forbid(unsafe_code)]
 
 use audio_bench::probe::{ClickTemplate, Shared, capture_callback, render_callback};
-use soundcraft_audio_backend as ab;
-use soundcraft_audio_backend::Backend as _;
-use soundcraft_audio_backend::fake::{FakeBackend, SliceSink, SliceSource};
-use soundcraft_rt::testing::measure;
+use transit_audio_backend as ab;
+use transit_audio_backend::Backend as _;
+use transit_audio_backend::fake::{FakeBackend, SliceSink, SliceSource};
+use transit_rt::testing::measure;
 
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 const RATE: u32 = 48_000;
 const PERIOD: usize = 64;

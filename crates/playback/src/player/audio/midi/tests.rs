@@ -8,8 +8,8 @@ use crate::player::Control;
 use crate::record::start;
 use soundcraft_mix::{EngineEpoch, Message, NoteId, SlotBinding, Source};
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
-use soundcraft_rt::testing::measure;
 use std::sync::{Arc, atomic::Ordering};
+use transit_rt::testing::measure;
 
 struct Rig {
     control: Control<Command, ActionResult>,
@@ -53,7 +53,7 @@ impl Rig {
             } else {
                 Message::NoteOn { key: 60, velocity: 100, id: NoteId::NONE }
             },
-            raw: soundcraft_midi_io::InputEvent {
+            raw: transit_midi_io::InputEvent {
                 host_arrival_ns: host,
                 backend_time_us: 987,
                 seq: sequence,

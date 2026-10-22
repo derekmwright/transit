@@ -8,7 +8,7 @@
 //! render adds none to what the panics themselves cost (each panic's payload box and the unwind's
 //! own exception box, plus one more exception box for the re-raise).
 //!
-//! The binary installs `soundcraft_rt::testing::CountingAlloc` and a panic hook silent for the
+//! The binary installs `transit_rt::testing::CountingAlloc` and a panic hook silent for the
 //! instruments' panics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -18,11 +18,11 @@ use soundcraft_mix::{
     mark_audio_thread,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

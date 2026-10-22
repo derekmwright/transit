@@ -10,9 +10,9 @@ use soundcraft_mix::{
     Shed, SlotBinding, SlotGen, Source, TransportEpoch,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackId, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

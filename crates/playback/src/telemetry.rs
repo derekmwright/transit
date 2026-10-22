@@ -376,7 +376,7 @@ mod recent_tests {
 
     #[test]
     fn recording_a_callback_does_not_allocate() {
-        use soundcraft_rt::testing::measure;
+        use transit_rt::testing::measure;
         let counters = Counters::default();
         let mut accumulate = Accumulator::default();
         let (_, stats) = measure(|| {

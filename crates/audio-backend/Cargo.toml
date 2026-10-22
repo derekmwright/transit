@@ -1,5 +1,5 @@
 [package]
-name = "soundcraft-audio-backend"
+name = "transit-audio-backend"
 description = "SoundCraft audio backend trait: endpoints, render and capture streams, host-time stamps"
 version.workspace = true
 edition.workspace = true

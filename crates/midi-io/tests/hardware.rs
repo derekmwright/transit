@@ -2,13 +2,13 @@
 //!
 //! ```text
 //! $env:MIDI_IO_TEST_PORT = "KeyStep Pro MIDI IN"
-//! cargo test -p soundcraft-midi-io --test hardware -- --ignored --nocapture
+//! cargo test -p transit-midi-io --test hardware -- --ignored --nocapture
 //! ```
 //!
 //! Play at least 20 notes within 30 seconds of the prompt.
 
-use soundcraft_midi_io::{InputConfig, MidiIo};
 use std::time::{Duration, Instant};
+use transit_midi_io::{InputConfig, MidiIo};
 
 #[test]
 #[ignore = "needs a MIDI controller named by MIDI_IO_TEST_PORT and someone playing it"]
@@ -22,7 +22,7 @@ fn played_events_arrive_in_order_with_monotonic_host_time() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut events = Vec::new();
-    while Instant::now() < deadline && events.iter().filter(|e: &&soundcraft_midi_io::InputEvent| e.bytes[0] & 0xF0 == 0x90).count() < 20 {
+    while Instant::now() < deadline && events.iter().filter(|e: &&transit_midi_io::InputEvent| e.bytes[0] & 0xF0 == 0x90).count() < 20 {
         while let Some(e) = consumer.pop() {
             events.push(e);
         }

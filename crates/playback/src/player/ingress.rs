@@ -3,13 +3,13 @@
 //! Main retains the input handles; closing one invalidates its source first.
 use super::{ActionResult, PlayedNote, RuntimeControl, sources};
 use crate::action_lane::{self, NoteKind, Outcome};
-use soundcraft_midi_io::{InputBoundary, InputConsumer, InputEvent};
 use soundcraft_mix::{EngineEpoch, EventOutcome, Message, NoteId, SlotBinding, Source};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use transit_midi_io::{InputBoundary, InputConsumer, InputEvent};
 
 const BATCH: usize = 256;
 const RELEASE_RESERVE: usize = 32;

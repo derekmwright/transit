@@ -1,8 +1,8 @@
 //! Opening the streams through the backend trait only, and running one measurement.
 
 use crate::probe::{ClickTemplate, Shared, capture_callback, render_callback};
-use soundcraft_audio_backend as ab;
 use std::sync::Arc;
+use transit_audio_backend as ab;
 
 /// What a run asks of the backend.
 #[derive(Debug, Clone)]

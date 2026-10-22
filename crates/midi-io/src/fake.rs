@@ -3,8 +3,8 @@
 //!
 //! ```
 //! # #[cfg(feature = "fake")] {
-//! use soundcraft_midi_io::InputConfig;
-//! use soundcraft_midi_io::fake::Fake;
+//! use transit_midi_io::InputConfig;
+//! use transit_midi_io::fake::Fake;
 //!
 //! let fake = Fake::default();
 //! let key = fake.add_input("Keys"); // a key with a backend id, as on WinMM

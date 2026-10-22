@@ -1,5 +1,5 @@
 [package]
-name = "soundcraft-rt"
+name = "transit-rt"
 description = "SoundCraft realtime OS support: promotes audio worker threads (MMCSS, SCHED_FIFO, Mach time constraint) behind a safe API (ADR 0013: the only home for new unsafe)"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 # Use the portable fallback on every platform (tests and builds that must never touch thread
 # scheduling). `promote_audio_thread` then always returns `Promotion::Unsupported`.
 force-fallback = []
-# Test support: `soundcraft_rt::testing::promotion_calls()`. Off in release builds.
+# Test support: `transit_rt::testing::promotion_calls()`. Off in release builds.
 testing = []
 
 [dependencies]

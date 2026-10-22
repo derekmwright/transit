@@ -1,5 +1,5 @@
 [package]
-name = "soundcraft-audio-wasapi"
+name = "transit-audio-wasapi"
 description = "SoundCraft native WASAPI backend: shared low-latency render through IAudioClient3 (ADR 0016); empty on other platforms"
 version.workspace = true
 edition.workspace = true
@@ -8,8 +8,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-soundcraft-audio-backend.workspace = true
-soundcraft-rt.workspace = true
+transit-audio-backend.workspace = true
+transit-rt.workspace = true
 log.workspace = true
 windows-core = "0.62"
 windows = { version = "0.62", features = [
@@ -26,7 +26,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
-soundcraft-rt = { workspace = true, features = ["testing"] }
+transit-rt = { workspace = true, features = ["testing"] }
 cpal.workspace = true
 
 # ADR 0013, second amendment: this crate may contain `unsafe` for COM and WASAPI through the

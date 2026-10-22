@@ -8,10 +8,10 @@ use soundcraft_mix::{
     Adoption, DeviceGeneration, InstanceSpec, MixEngine, NewInstance, PlanCompiler, PlanGeneration, PlanLimits, RenderTarget, create_instance,
 };
 use soundcraft_model::{ChannelFormat, Clip, Insert, KeyFrom, KeySource, Route, Session, SourceAudio, SourceId, Tap, TrackId, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

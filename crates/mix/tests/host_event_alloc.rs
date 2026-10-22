@@ -3,14 +3,14 @@
 //! controller queues and the timed parameter points, then processing the block (the VST3
 //! parameter point slab included), allocates and frees nothing on the calling thread.
 //!
-//! The binary installs `soundcraft_rt::testing::CountingAlloc` and counts the test thread only.
+//! The binary installs `transit_rt::testing::CountingAlloc` and counts the test thread only.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_dsp::Plugin;
 use soundcraft_dsp::event::{Message, NoteId, PluginEvent};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

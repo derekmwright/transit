@@ -2,10 +2,10 @@
 //! One test in its own binary owns the process-wide hook and logger.
 
 use soundcraft_engine::{Engine, audio_thread_panics};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;

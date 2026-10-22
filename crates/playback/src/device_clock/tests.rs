@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::timeline_map::{self, Admission, History, MapError, PlacementError, Rate, Timeline};
-use soundcraft_rt::testing::measure;
+use transit_rt::testing::measure;
 
 #[test]
 fn saved_asio_estimates_keep_a_usable_map_without_claiming_hardware_calibration() {

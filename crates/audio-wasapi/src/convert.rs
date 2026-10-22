@@ -3,7 +3,7 @@
 //! byte-identical to the cpal adapter's conversion for samples in `[-1.0, 1.0)`.
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
-use soundcraft_audio_backend::RenderSink;
+use transit_audio_backend::RenderSink;
 
 /// The sample formats a shared-mode endpoint mixes in: 32-bit float, and PCM of 16, 24 (packed
 /// in three bytes) and 32 (container) bits. 24 valid bits in a 32-bit container is `I32`: the

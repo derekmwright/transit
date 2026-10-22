@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
-use soundcraft_rt::testing::measure;
 use std::sync::atomic::AtomicUsize;
+use transit_rt::testing::measure;
 
 fn prepared() -> (Player, DeviceOutput) {
     // Allocates clocks/queues only. No device discovery, stream or fallback worker.

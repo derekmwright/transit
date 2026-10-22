@@ -3,7 +3,7 @@
 //! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.scraft]`
 //!
 //! `--control <port>` (or `TRANSIT_CONTROL_PORT`) starts a localhost JSON-lines control server
-//! (`0` picks a free port and prints it). See `soundcraft_ui_studio::control` for the methods.
+//! (`0` picks a free port and prints it). See `transit_ui_studio::control` for the methods.
 //!
 //! Structure copied from `apps/soundcraft/src/main.rs` at `transit` 2af868e (file last changed
 //! 04e1fe8): the scan child answered first in `main`, the logger, prefs, `--control`, `--no-audio`,
@@ -21,8 +21,8 @@ mod logging;
 mod audio_review_tests;
 
 use soundcraft_engine::Engine;
-use soundcraft_ui_studio::{Services, StudioApp, UiState};
 use std::sync::Arc;
+use transit_ui_studio::{Services, StudioApp, UiState};
 
 struct App(StudioApp, Option<&'static logging::AppLogger>);
 
@@ -253,7 +253,7 @@ fn main() -> eframe::Result {
     // A plugin scan's child process: load one file, answer, exit. First, before anything else
     // (E1/E2: otherwise every scan child starts a whole app).
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(reply) = soundcraft_ui_studio::plugin_scan::scan_child(&args) {
+    if let Some(reply) = transit_ui_studio::plugin_scan::scan_child(&args) {
         use std::io::Write as _;
         let _ = writeln!(std::io::stdout(), "{reply}");
         let _ = std::io::stdout().flush();
@@ -338,7 +338,7 @@ fn main() -> eframe::Result {
             app.ui = prefs;
             // The plug-in scan cache is SoundCraft's, shared; runs without preferences keep none.
             let cache = config::soundcraft_dir().filter(|_| prefs_enabled());
-            soundcraft_ui_studio::plugin_scan::start(&app.ui.plugin_dirs, cache.as_deref(), std::env::current_exe().ok());
+            transit_ui_studio::plugin_scan::start(&app.ui.plugin_dirs, cache.as_deref(), std::env::current_exe().ok());
             app.splash.arm();
             app.about.app_version = env!("CARGO_PKG_VERSION").to_string();
             if let Some(port) = control_port {

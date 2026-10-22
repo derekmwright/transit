@@ -14,7 +14,7 @@ static LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn promote() -> Promotion {
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        log::info!("soundcraft-rt: no realtime thread promotion on this platform; audio workers keep the default priority");
+        log::info!("transit-rt: no realtime thread promotion on this platform; audio workers keep the default priority");
     }
     Promotion::Unsupported(REASON)
 }

@@ -1,5 +1,5 @@
 [package]
-name = "soundcraft-midi-io"
+name = "transit-midi-io"
 description = "SoundCraft MIDI device transport: midir-backed port enumeration, hot-plug polling, and a preallocated lock-free input ring with arrival timestamps"
 version.workspace = true
 edition.workspace = true
@@ -13,12 +13,12 @@ rtrb.workspace = true
 thiserror.workspace = true
 
 [features]
-# Exposes the in-process fake backend (`soundcraft_midi_io::fake`) so other crates' tests can drive ports without hardware.
+# Exposes the in-process fake backend (`transit_midi_io::fake`) so other crates' tests can drive ports without hardware.
 fake = []
 
 [dev-dependencies]
 # Dev-only: the counting global allocator for the push-path allocation test (xtask allows dev edges).
-soundcraft-rt = { workspace = true, features = ["testing"] }
+transit-rt = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

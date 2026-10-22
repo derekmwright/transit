@@ -6,11 +6,11 @@ use crate::{MeterSnapshot, plan_bridge, publication::Service, record::InputRing}
 use soundcraft_audio_io::AudioBuffer;
 use soundcraft_mix::{CompileError, DeviceGeneration, EnvelopeState, InstanceSpec, NewInstance, PlanGeneration, PlanLimits, RenderTarget, SlotGen};
 use soundcraft_model::{ChannelFormat, Clip, Insert, Session, SourceAudio, SourceId, TrackKind};
-use soundcraft_rt::testing::measure;
 use std::sync::{Arc, Mutex};
+use transit_rt::testing::measure;
 
 #[global_allocator]
-static ALLOC: soundcraft_rt::testing::CountingAlloc = soundcraft_rt::testing::CountingAlloc;
+static ALLOC: transit_rt::testing::CountingAlloc = transit_rt::testing::CountingAlloc;
 
 fn target() -> RenderTarget {
     RenderTarget { device: DeviceGeneration(1), sample_rate: 48_000, max_block: 512, out_channels: 0, in_channels: 0 }

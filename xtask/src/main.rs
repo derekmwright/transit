@@ -16,7 +16,7 @@ fn cargo(args: &[&str]) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
 }
 
-/// Layer table: crate name (minus `soundcraft-`) → layer. Apps and xtask are exempt.
+/// Layer table: crate name (minus `soundcraft-` or `transit-`) → layer. Apps and xtask are exempt.
 const LAYERS: &[(&str, u8)] = &[
     ("time", 0),
     ("rt", 0),
@@ -64,7 +64,7 @@ fn layers() -> Result<(), String> {
     let mut problems = Vec::new();
     for p in v["packages"].as_array().cloned().unwrap_or_default() {
         let name = p["name"].as_str().unwrap_or("").to_string();
-        let short = name.trim_start_matches("soundcraft-");
+        let short = name.strip_prefix("transit-").or_else(|| name.strip_prefix("soundcraft-")).unwrap_or(&name);
         let manifest = p["manifest_path"].as_str().and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
         // Exempt crates are exempt from layering, not from the unsafe policy.
         if opts_out_of_forbid(&manifest) && !UNSAFE_ALLOWED.contains(&short) {
@@ -83,7 +83,7 @@ fn layers() -> Result<(), String> {
             if UI_CRATES.contains(&dn) && layer < 6 && kind != "dev" {
                 problems.push(format!("{name} (L{layer}) depends on UI crate {dn}"));
             }
-            if let Some(ds) = dn.strip_prefix("soundcraft-") {
+            if let Some(ds) = dn.strip_prefix("soundcraft-").or_else(|| dn.strip_prefix("transit-")) {
                 if STANDALONE.contains(&short) && kind != "dev" {
                     problems.push(format!("{name} is standalone but depends on {dn}"));
                 }
@@ -144,7 +144,7 @@ fn parity() -> Result<(), String> {
 const WASM: &[&str] = &[
     "soundcraft-time",
     "soundcraft-audio-io",
-    "soundcraft-audio-backend",
+    "transit-audio-backend",
     "soundcraft-midi",
     "soundcraft-video",
     "soundcraft-dsp",
@@ -169,14 +169,14 @@ fn wasm() -> Result<(), String> {
     cargo(&args)
 }
 
-/// `soundcraft-rt` type-checks and lints clean on every platform it has code for (ADR 0013, 5),
+/// `transit-rt` type-checks and lints clean on every platform it has code for (ADR 0013, 5),
 /// with and without the portable fallback. Needs `rustup target add` for each; no linker needed.
 const RT_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin"];
 
 fn rt_targets() -> Result<(), String> {
     for t in RT_TARGETS {
         for features in [None, Some("force-fallback")] {
-            let mut args = vec!["clippy", "--target", t, "-p", "soundcraft-rt", "--all-targets"];
+            let mut args = vec!["clippy", "--target", t, "-p", "transit-rt", "--all-targets"];
             if let Some(f) = features {
                 args.extend(["--features", f]);
             }

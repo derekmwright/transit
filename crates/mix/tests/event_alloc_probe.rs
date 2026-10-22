@@ -3,7 +3,7 @@
 //! delivering them (`render_active`), a transport change, a source revocation and a panic
 //! allocate and free nothing on the audio thread.
 //!
-//! The binary installs `soundcraft_rt::testing::CountingAlloc` and counts the test thread only.
+//! The binary installs `transit_rt::testing::CountingAlloc` and counts the test thread only.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use soundcraft_mix::{
@@ -11,8 +11,8 @@ use soundcraft_mix::{
     MixEngine, NoteId, PlanCompiler, PlanGeneration, PlanLimits, RenderFrame, RenderTarget, SlotGen, Source, TransportEpoch, mark_audio_thread,
 };
 use soundcraft_model::{ChannelFormat, Insert, Session, TrackKind};
-use soundcraft_rt::testing::{AllocStats, CountingAlloc, measure};
 use std::sync::Arc;
+use transit_rt::testing::{AllocStats, CountingAlloc, measure};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
