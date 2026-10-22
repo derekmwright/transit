@@ -7,7 +7,7 @@
 #   $DIST/transit-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
 #   $DIST/transit-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
 #
-# <version> is the [package] version in apps/transit/Cargo.toml.
+# <version> is the [workspace.package] version in Cargo.toml.
 #
 # Usage: packaging/linux/package.sh [--skip-build] [--formats "appimage deb rpm tar"]
 #

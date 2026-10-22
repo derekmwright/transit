@@ -14,7 +14,7 @@ asio = ["dep:asio-sys"]
 
 [target.'cfg(windows)'.dependencies]
 # Must resolve to the asio-sys cpal uses: the panel acts on that copy's loaded driver.
-asio-sys = { version = "0.2", optional = true }
+asio-sys = { workspace = true, optional = true }
 
 # The isolated unsafe helper crate (craftrules never-crash): this crate opts out of the workspace
 # `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and allows it solely on the

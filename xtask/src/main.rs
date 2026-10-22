@@ -1,107 +1,172 @@
-//! `cargo xtask <ci|layers|assets|parity|wasm|rt-targets>` — repository gates.
+//! `cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|ico>` — repository gates.
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod ico;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Output};
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn cargo_command() -> Command {
+    let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.current_dir(root());
+    command
+}
+
 fn cargo(args: &[&str]) -> Result<(), String> {
-    let st =
-        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into())).args(args).current_dir(root()).status().map_err(|e| e.to_string())?;
-    if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
+    let st = cargo_command().args(args).status().map_err(|e| e.to_string())?;
+    if st.success() { Ok(()) } else { Err(format!("cargo {} failed ({st})", args.join(" "))) }
 }
 
-/// Layer table: crate name (minus `soundcraft-` or `transit-`) → layer. Apps and xtask are exempt.
+/// Full package names avoid treating a new transit crate as an inherited SoundCraft crate.
+/// Same-layer edges are permitted (docs/contributing/knowledge/layering.md).
 const LAYERS: &[(&str, u8)] = &[
-    ("time", 0),
-    ("rt", 0),
-    ("audio-io", 0),
-    ("audio-backend", 0),
-    ("audio-wasapi", 0),
-    ("audio-asio", 0),
-    ("midi-io", 0),
-    ("midi", 0),
-    ("video", 0),
-    ("dsp", 1),
-    ("clap-host", 1),
-    ("vst3-host", 1),
-    ("au-host", 1),
-    ("asio-panel", 1),
-    ("model", 2),
-    ("mix", 3),
-    ("engine", 4),
-    ("playback", 4),
-    ("automation", 5),
-    ("ui-egui", 6),
-    ("ui-studio", 6),
+    ("soundcraft-time", 0),
+    ("transit-rt", 0),
+    ("soundcraft-audio-io", 0),
+    ("transit-audio-backend", 0),
+    ("transit-audio-wasapi", 0),
+    ("transit-audio-asio", 0),
+    ("transit-midi-io", 0),
+    ("soundcraft-midi", 0),
+    ("soundcraft-video", 0),
+    ("soundcraft-dsp", 1),
+    ("soundcraft-clap-host", 1),
+    ("soundcraft-vst3-host", 1),
+    ("soundcraft-au-host", 1),
+    ("soundcraft-asio-panel", 1),
+    ("soundcraft-model", 2),
+    ("soundcraft-mix", 3),
+    ("soundcraft-engine", 4),
+    ("soundcraft-playback", 4),
+    ("soundcraft-automation", 5),
+    ("soundcraft-ui-egui", 6),
+    ("transit-ui-studio", 6),
 ];
-/// Standalone format crates: no workspace dependencies at all (publishable on their own).
-const STANDALONE: &[&str] = &["time", "audio-io", "midi-io", "midi", "video", "dsp"];
-const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
+/// Standalone crates have no workspace dependencies (dev-dependencies excepted).
+const STANDALONE: &[&str] = &[
+    "soundcraft-time",
+    "soundcraft-audio-io",
+    "transit-audio-backend",
+    "transit-midi-io",
+    "soundcraft-midi",
+    "soundcraft-video",
+    "soundcraft-dsp",
+    "soundcraft-asio-panel",
+];
+// The image crate also decodes video frames in L0; it is not a UI-only dependency.
+const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow", "egui_extras", "resvg", "wgpu"];
+// audio-bench is an app over playback and the native backends, not an engine layer.
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask", "audio-bench"];
-/// The only crates whose manifest may opt out of the workspace `unsafe_code = "forbid"` (ADR 0013
-/// and its amendments): `rt`, `audio-wasapi` and `audio-asio` set `allow`; the SDK and FFI crates set `deny`
-/// and allow `unsafe` only on their FFI module. `au-host` and `asio-panel` are the two isolated
-/// FFI helpers that predate the amendments and follow the same `deny` pattern.
-const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi", "audio-asio", "clap-host", "vst3-host", "au-host", "asio-panel"];
+/// Manifest exceptions to the workspace unsafe forbid (ADR 0013 and its amendments).
+const UNSAFE_ALLOWED: &[&str] = &[
+    "transit-rt",
+    "transit-audio-wasapi",
+    "transit-audio-asio",
+    "soundcraft-clap-host",
+    "soundcraft-vst3-host",
+    "soundcraft-au-host",
+    "soundcraft-asio-panel",
+];
 
-/// True when the manifest sets `unsafe_code` to anything but `forbid` (any spacing or quoting).
-fn opts_out_of_forbid(manifest: &str) -> bool {
-    manifest.lines().any(|line| {
-        let line: String = line.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
-        line.strip_prefix("unsafe_code=").is_some_and(|level| !level.starts_with("forbid") && !level.starts_with('#'))
-    })
+/// Parse Cargo's string and table lint forms, including workspace inheritance.
+fn opts_out_of_forbid(manifest: &str) -> Result<bool, String> {
+    let manifest: toml::Value = toml::from_str(manifest).map_err(|e| format!("invalid manifest: {e}"))?;
+    let lints = manifest.get("lints");
+    if lints.and_then(|v| v.get("workspace")).and_then(toml::Value::as_bool) == Some(true) {
+        return Ok(false);
+    }
+    let lint = lints.and_then(|v| v.get("rust")).and_then(|v| v.get("unsafe_code"));
+    let level = lint.and_then(|v| v.as_str().or_else(|| v.get("level").and_then(toml::Value::as_str)));
+    Ok(level != Some("forbid"))
 }
 
-fn layers() -> Result<(), String> {
-    let out =
-        Command::new("cargo").args(["metadata", "--format-version", "1", "--no-deps"]).current_dir(root()).output().map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+#[derive(serde::Deserialize)]
+struct Metadata {
+    packages: Vec<Package>,
+}
+
+#[derive(serde::Deserialize)]
+struct Package {
+    name: String,
+    manifest_path: PathBuf,
+    dependencies: Vec<Dependency>,
+}
+
+#[derive(serde::Deserialize)]
+struct Dependency {
+    name: String,
+    kind: Option<String>,
+}
+
+fn metadata_output(out: Output) -> Result<Metadata, String> {
+    if !out.status.success() {
+        return Err(format!("cargo metadata failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let metadata: Metadata = serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    if metadata.packages.is_empty() {
+        return Err("cargo metadata returned no packages".into());
+    }
+    Ok(metadata)
+}
+
+fn check_layers(metadata: &Metadata, read_manifest: impl Fn(&Path) -> Result<String, String>) -> Result<(), String> {
     let mut problems = Vec::new();
-    for p in v["packages"].as_array().cloned().unwrap_or_default() {
-        let name = p["name"].as_str().unwrap_or("").to_string();
-        let short = name.strip_prefix("transit-").or_else(|| name.strip_prefix("soundcraft-")).unwrap_or(&name);
-        let manifest = p["manifest_path"].as_str().and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
+    for p in &metadata.packages {
+        let name = p.name.as_str();
+        if name.is_empty() || p.manifest_path.as_os_str().is_empty() {
+            return Err("cargo metadata: empty package name or manifest path".into());
+        }
+        let manifest = read_manifest(&p.manifest_path).map_err(|e| format!("{}: {e}", p.manifest_path.display()))?;
         // Exempt crates are exempt from layering, not from the unsafe policy.
-        if opts_out_of_forbid(&manifest) && !UNSAFE_ALLOWED.contains(&short) {
+        if opts_out_of_forbid(&manifest).map_err(|e| format!("{name}: {e}"))? && !UNSAFE_ALLOWED.contains(&name) {
             problems.push(format!("{name}: opts out of unsafe_code = forbid but is not in the xtask unsafe allowlist"));
         }
-        if EXEMPT.contains(&name.as_str()) {
+        if EXEMPT.contains(&name) {
             continue;
         }
-        let Some(&(_, layer)) = LAYERS.iter().find(|(n, _)| *n == short) else {
+        let Some(&(_, layer)) = LAYERS.iter().find(|(n, _)| *n == name) else {
             problems.push(format!("{name}: not registered in xtask LAYERS"));
             continue;
         };
-        for d in p["dependencies"].as_array().cloned().unwrap_or_default() {
-            let dn = d["name"].as_str().unwrap_or("");
-            let kind = d["kind"].as_str().unwrap_or("normal");
-            if UI_CRATES.contains(&dn) && layer < 6 && kind != "dev" {
+        for d in &p.dependencies {
+            let dn = d.name.as_str();
+            if dn.is_empty() || !matches!(d.kind.as_deref(), None | Some("normal" | "build" | "dev")) {
+                return Err(format!("{name}: invalid dependency name or kind"));
+            }
+            if d.kind.as_deref() == Some("dev") {
+                continue;
+            }
+            if UI_CRATES.contains(&dn) && layer < 6 {
                 problems.push(format!("{name} (L{layer}) depends on UI crate {dn}"));
             }
-            if let Some(ds) = dn.strip_prefix("soundcraft-").or_else(|| dn.strip_prefix("transit-")) {
-                if STANDALONE.contains(&short) && kind != "dev" {
+            if metadata.packages.iter().any(|p| p.name == dn) {
+                if STANDALONE.contains(&name) {
                     problems.push(format!("{name} is standalone but depends on {dn}"));
                 }
-                if let Some(&(_, dl)) = LAYERS.iter().find(|(n, _)| *n == ds)
-                    && dl > layer
-                    && kind != "dev"
-                {
-                    problems.push(format!("{name} (L{layer}) depends upward on {dn} (L{dl})"));
+                if let Some(&(_, dl)) = LAYERS.iter().find(|(n, _)| *n == dn) {
+                    if dl > layer {
+                        problems.push(format!("{name} (L{layer}) depends upward on {dn} (L{dl})"));
+                    }
+                } else {
+                    problems.push(format!("{name} depends on workspace app or unregistered crate {dn}"));
                 }
             }
         }
     }
-    if problems.is_empty() {
-        println!("layers: ok");
-        Ok(())
-    } else {
-        Err(problems.join("\n"))
-    }
+    if problems.is_empty() { Ok(()) } else { Err(problems.join("\n")) }
+}
+
+fn layers() -> Result<(), String> {
+    let out = cargo_command().args(["metadata", "--locked", "--format-version", "1", "--no-deps"]).output().map_err(|e| e.to_string())?;
+    let metadata = metadata_output(out)?;
+    check_layers(&metadata, |path| std::fs::read_to_string(path).map_err(|e| e.to_string()))?;
+    println!("layers: ok");
+    Ok(())
 }
 
 const ASSET_EXT: &[&str] =
@@ -154,6 +219,7 @@ const WASM: &[&str] = &[
     "soundcraft-playback",
     "soundcraft-automation",
     "soundcraft-ui-egui",
+    "soundcraft-web",
 ];
 
 fn wasm() -> Result<(), String> {
@@ -161,10 +227,6 @@ fn wasm() -> Result<(), String> {
     for c in WASM {
         args.push("-p");
         args.push(c);
-    }
-    if root().join("apps/soundcraft-web/Cargo.toml").exists() {
-        args.push("-p");
-        args.push("soundcraft-web");
     }
     cargo(&args)
 }
@@ -238,7 +300,7 @@ fn main() -> ExitCode {
         Some("rt-targets") => rt_targets(),
         Some("audio-bench") => audio_bench(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench>".into()),
+        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|ico>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
@@ -250,27 +312,4 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::opts_out_of_forbid;
-
-    #[test]
-    fn the_unsafe_check_sees_any_spelling_of_an_opt_out() {
-        assert!(opts_out_of_forbid(
-            "[lints.rust]
-unsafe_code = \"allow\"
-"
-        ));
-        assert!(opts_out_of_forbid("unsafe_code=\"allow\""));
-        assert!(opts_out_of_forbid("unsafe_code = 'deny'"));
-        assert!(!opts_out_of_forbid(
-            "unsafe_code = \"forbid\"
-"
-        ));
-        assert!(!opts_out_of_forbid(
-            "# opts out of `unsafe_code = \"allow\"` for itself
-[lints]
-workspace = true
-"
-        ));
-    }
-}
+mod tests;

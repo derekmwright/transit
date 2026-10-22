@@ -38,12 +38,14 @@ jobs:
           - { name: macos-arm64, os: macos-14 }
           - { name: linux-x86_64, os: ubuntu-22.04 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+        shell: bash
       - name: Linux system libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.name }}
       # asio-sys needs libclang for bindgen. windows-latest has LLVM in C:\Program Files\LLVM. Pin the
@@ -56,22 +58,7 @@ jobs:
           # let asio-sys download the SDK itself (https://www.steinberg.net/asiosdk).
           ASIO_SDK_URL: ${{ secrets.ASIO_SDK_URL }}
         run: |
-          $llvm = 'C:\Program Files\LLVM\bin'
-          if (-not (Test-Path "$llvm\clang.exe")) { throw "LLVM not found at $llvm" }
-          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
-          "CLANG_PATH=$llvm\clang.exe" >> $env:GITHUB_ENV
-          "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-msvc" >> $env:GITHUB_ENV
-          $llvm >> $env:GITHUB_PATH
-          if ($env:ASIO_SDK_URL) {
-            $zip = Join-Path $env:RUNNER_TEMP 'asio_sdk.zip'
-            $dst = Join-Path $env:RUNNER_TEMP 'asio_sdk_unpacked'
-            Invoke-WebRequest -Uri $env:ASIO_SDK_URL -OutFile $zip
-            Expand-Archive -Path $zip -DestinationPath $dst -Force
-            # The Steinberg zip holds one top-level folder (asiosdk_*); CPAL_ASIO_DIR is that folder.
-            $sdk = Get-ChildItem $dst -Directory | Select-Object -First 1
-            if (-not (Test-Path (Join-Path $sdk.FullName 'common'))) { throw "ASIO SDK layout unexpected in $dst" }
-            "CPAL_ASIO_DIR=$($sdk.FullName)" >> $env:GITHUB_ENV
-          }
+          ./tools/build-asio.ps1 -SetupOnly -GitHubEnvironment
       # One invocation builds the app and the audio-bench harness (shipped in every archive) so the
       # shared crates compile once with one feature set.
       - name: Build
@@ -101,8 +88,8 @@ jobs:
           } else {
             $full = $null
             $inPkg = $false
-            foreach ($line in Get-Content apps/transit/Cargo.toml) {
-              if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[package]'); continue }
+            foreach ($line in Get-Content Cargo.toml) {
+              if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[workspace.package]'); continue }
               if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $full = $Matches[1]; break }
             }
           }

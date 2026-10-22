@@ -77,7 +77,7 @@ modules:
       # Flatpak exports only icons named after the app ID, so rename the hicolor icons and point the desktop entry at them.
       - for f in /app/share/icons/hicolor/*/apps/transit.*; do mv "$f" "${f%/transit.*}/dev.derekmwright.transit.${f##*.}"; done; sed -i 's/^Icon=transit$/Icon=dev.derekmwright.transit/' /app/share/applications/dev.derekmwright.transit.desktop
       - >-
-        version=$(awk '/^\[/{p=($0=="[package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' apps/transit/Cargo.toml);
+        version=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml);
         install -d /app/share/metainfo;
         sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$(date -u +%Y-%m-%d)/" -e "s#>transit</icon>#>dev.derekmwright.transit</icon>#"
         packaging/linux/transit.metainfo.xml.in > /app/share/metainfo/dev.derekmwright.transit.metainfo.xml

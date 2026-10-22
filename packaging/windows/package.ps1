@@ -32,16 +32,16 @@ function Invoke-Native([string] $What, [scriptblock] $Block) {
   if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
-# The version lives in one place: [package] version in apps/transit/Cargo.toml.
+# The version lives in one place: [workspace.package] version in Cargo.toml.
 $Version = $env:TRANSIT_VERSION
 if (-not $Version) {
   $inPkg = $false
-  foreach ($line in Get-Content (Join-Path $Root 'apps\transit\Cargo.toml')) {
-    if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[package]'); continue }
+  foreach ($line in Get-Content (Join-Path $Root 'Cargo.toml')) {
+    if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[workspace.package]'); continue }
     if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $Version = $Matches[1]; break }
   }
 }
-if (-not $Version) { throw 'could not read [package] version from apps/transit/Cargo.toml' }
+if (-not $Version) { throw 'could not read [workspace.package] version from Cargo.toml' }
 # MSI ProductVersion is numeric (major.minor.build); pre-release tags are dropped there. The full
 # version stays in the MSI's ARP comments and in HKLM\Software\transit (FullVersion).
 $MsiVersion = ($Version -split '-')[0]

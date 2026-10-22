@@ -3,7 +3,7 @@
 #
 # Exports:
 #   ROOT                    workspace root
-#   VERSION                 [package] version from apps/transit/Cargo.toml (override: TRANSIT_VERSION)
+#   VERSION                 [workspace.package] version from Cargo.toml (override: TRANSIT_VERSION)
 #   DIST                    output directory for release artifacts (default: $ROOT/dist/release)
 #   TRANSIT_BUILD_SHA       git commit (recorded in the macOS Info.plist and the job summary)
 #   TRANSIT_BUILD_DATE      UTC build date, YYYY-MM-DD (AppStream release date)
@@ -12,18 +12,19 @@
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export ROOT
 
-# The version lives in exactly one place for the app we ship: `[package] version` in
-# apps/transit/Cargo.toml. (awk avoids compiling anything here.)
+# The version lives in exactly one place for the app we ship: `[workspace.package] version` in
+# Cargo.toml. (awk avoids compiling anything here.)
 app_version() {
   awk '
-    /^\[/ { in_pkg = ($0 == "[package]") ; next }
+    { sub(/\r$/, "") }
+    /^\[/ { in_pkg = ($0 == "[workspace.package]") ; next }
     in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }
-  ' "$ROOT/apps/transit/Cargo.toml"
+  ' "$ROOT/Cargo.toml"
 }
 
 VERSION="${TRANSIT_VERSION:-$(app_version)}"
 if [ -z "$VERSION" ]; then
-  echo "error: could not read [package] version from $ROOT/apps/transit/Cargo.toml" >&2
+  echo "error: could not read [workspace.package] version from $ROOT/Cargo.toml" >&2
   exit 1
 fi
 export VERSION
