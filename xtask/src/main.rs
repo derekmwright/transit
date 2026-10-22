@@ -1,7 +1,6 @@
 //! `cargo xtask <ci|layers|assets|parity|wasm|rt-targets>` — repository gates.
 
 mod ico;
-mod version;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -238,9 +237,8 @@ fn main() -> ExitCode {
         Some("wasm") => wasm(),
         Some("rt-targets") => rt_targets(),
         Some("audio-bench") => audio_bench(args.get(1..).unwrap_or(&[])),
-        Some("version") => version::run(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|version>".into()),
+        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
