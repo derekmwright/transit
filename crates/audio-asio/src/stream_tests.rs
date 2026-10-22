@@ -563,6 +563,55 @@ fn a_driver_that_does_not_call_at_the_stop_is_reverted_from_the_host_and_a_resta
 }
 
 #[test]
+fn a_buffer_switch_that_finds_the_last_one_still_running_is_skipped_and_counted() {
+    use std::sync::atomic::AtomicBool;
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (inside, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (i, r) = (Arc::clone(&inside), Arc::clone(&release));
+    let calls = AtomicUsize::new(0);
+    let held: ab::CaptureCallback = Box::new(move |block| {
+        block.chunks(&mut |_, _| {});
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            i.store(true, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    });
+    let (capture, _) = rig
+        .backend
+        .open_capture(&rig.endpoint, &request(&rig, ab::Direction::Input, 48_000, Some(64)), held, error_cb(&seen, ab::Direction::Input))
+        .expect("in");
+    let (render, _) = rig
+        .backend
+        .open_render(
+            &rig.endpoint,
+            &request(&rig, ab::Direction::Output, 48_000, Some(64)),
+            render_cb(&seen, vec![0.0; 2]),
+            error_cb(&seen, ab::Direction::Output),
+        )
+        .expect("out");
+    capture.start().expect("start");
+    render.start().expect("start");
+    std::thread::scope(|s| {
+        let first = s.spawn(|| drive(&rig, 64, 0, 1, &[]));
+        while !inside.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        drive(&rig, 64, 64, 1, &[]);
+        release.store(true, Ordering::SeqCst);
+        first.join().unwrap();
+    });
+    let stats = render.stats().expect("stats");
+    assert_eq!((stats.busy_skips, capture.stats().expect("stats").busy_skips), (1, 1), "the driver's count, both directions");
+    assert_eq!(seen.render.lock().unwrap().len(), 1, "the skipped switch did nothing");
+    assert!(stats.line(false).ends_with("; overloads 0, busy skips 1, position jumps 0, resets 0"), "{}", stats.line(false));
+    drop((capture, render));
+}
+
+#[test]
 fn overloads_resyncs_and_position_jumps_are_counted() {
     let _guard = lock();
     let rig = rig(scarlett());
@@ -585,7 +634,7 @@ fn overloads_resyncs_and_position_jumps_are_counted() {
     assert_eq!(qualities, [estimate, estimate, estimate, invalid, estimate, invalid, estimate], "the block after the lost one and after the resync");
     let captures: Vec<ab::Quality> = seen.capture.lock().unwrap().iter().map(|(s, _, _)| s.quality).collect();
     assert_eq!(captures, qualities, "both directions restart their fit");
-    assert!(stats.line(false).contains("overloads 2, position jumps 1, resets 1"), "{}", stats.line(false));
+    assert!(stats.line(false).contains("overloads 2, busy skips 0, position jumps 1, resets 1"), "{}", stats.line(false));
     drop((capture, render));
 }
 

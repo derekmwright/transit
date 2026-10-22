@@ -319,8 +319,8 @@ mod tests {
         r.render_stats = Some(ab::StreamStats { wakes: 10, ..Default::default() });
         r.capture_stats = Some(ab::StreamStats { wakes: 10, overloads: 1, ..Default::default() });
         let lines = r.stats_lines();
-        assert!(lines[0].ends_with("min padding 0; overloads 0, position jumps 0, resets 0"), "{}", lines[0]);
-        assert!(lines[1].ends_with("max packets 0; overloads 1, position jumps 0, resets 0"), "{}", lines[1]);
+        assert!(lines[0].ends_with("min padding 0; overloads 0, busy skips 0, position jumps 0, resets 0"), "{}", lines[0]);
+        assert!(lines[1].ends_with("max packets 0; overloads 1, busy skips 0, position jumps 0, resets 0"), "{}", lines[1]);
     }
 
     #[test]

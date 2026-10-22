@@ -361,6 +361,10 @@ pub struct StreamStats {
     pub max_packets_per_wake: u32,
     /// Overloads the driver reported (ASIO `kAsioOverload`; 0 where the backend has no such report).
     pub overloads: u64,
+    /// Callbacks that found the engine still busy, from the previous callback or an error being
+    /// delivered, and did nothing (ASIO: the driver called again before the last switch was done);
+    /// that buffer kept what it held.
+    pub busy_skips: u64,
     /// Callbacks whose device sample position did not advance by exactly one buffer from the
     /// previous one (ASIO); not proof of an audible glitch.
     pub position_jumps: u64,
@@ -406,7 +410,7 @@ impl StreamStats {
     pub fn line_with_wakes(&self, capture: bool, wakes: &str) -> String {
         let tail = if capture { format!("max packets {}", self.max_packets_per_wake) } else { format!("min padding {}", self.min_padding_frames) };
         let faults = if self.faults > 0 { format!("; faults {}", self.faults) } else { String::new() };
-        let events = if self.overloads + self.position_jumps + self.resets > 0 { self.events_tail() } else { String::new() };
+        let events = if self.overloads + self.busy_skips + self.position_jumps + self.resets > 0 { self.events_tail() } else { String::new() };
         format!(
             "wakes {}, late p95 {} µs, max {} µs; service p95 {} µs, max {} µs; skipped {}, timeouts {}; {tail}{faults}{events}",
             wakes,
@@ -419,10 +423,10 @@ impl StreamStats {
         )
     }
 
-    /// "; overloads 0, position jumps 0, resets 0": the driver-event counters, which [`Self::line`]
-    /// appends only when one is not zero.
+    /// "; overloads 0, busy skips 0, position jumps 0, resets 0": the driver-event counters, which
+    /// [`Self::line`] appends only when one is not zero.
     pub fn events_tail(&self) -> String {
-        format!("; overloads {}, position jumps {}, resets {}", self.overloads, self.position_jumps, self.resets)
+        format!("; overloads {}, busy skips {}, position jumps {}, resets {}", self.overloads, self.busy_skips, self.position_jumps, self.resets)
     }
 
     pub fn wake_late_p95_us(&self) -> u64 {
@@ -631,9 +635,11 @@ mod tests {
     fn the_driver_events_join_the_line_only_when_one_happened() {
         let quiet = StreamStats { wakes: 5, ..Default::default() };
         assert!(!quiet.line(false).contains("overloads"));
-        assert_eq!(quiet.events_tail(), "; overloads 0, position jumps 0, resets 0");
+        assert_eq!(quiet.events_tail(), "; overloads 0, busy skips 0, position jumps 0, resets 0");
         let busy = StreamStats { wakes: 5, overloads: 2, position_jumps: 1, ..Default::default() };
-        assert!(busy.line(true).ends_with("max packets 0; overloads 2, position jumps 1, resets 0"), "{}", busy.line(true));
+        assert!(busy.line(true).ends_with("max packets 0; overloads 2, busy skips 0, position jumps 1, resets 0"), "{}", busy.line(true));
+        let skipped = StreamStats { wakes: 5, busy_skips: 3, ..Default::default() };
+        assert!(skipped.line(false).ends_with("min padding 0; overloads 0, busy skips 3, position jumps 0, resets 0"), "{}", skipped.line(false));
     }
 
     #[test]

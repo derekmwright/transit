@@ -1348,6 +1348,13 @@ fn the_window_shows_the_backend_loop_lines_under_the_open_lines_from_a_scripted_
     assert!(lines[1].contains("wakes 6") || lines[1].contains("wakes 7") || lines[1].contains("wakes 8"), "{lines:?}");
     assert!(lines[1].starts_with("Backend: wakes ") && lines[1].contains("/s, late p95"), "a rate, not a counter: {lines:?}");
     assert!(lines[3].starts_with("Backend: wakes ") && lines[3].contains("/s, late p95"), "{lines:?}");
+    // A native ASIO driver's events, busy skips with the overloads, join the line once one happened.
+    output.overloads = 1;
+    output.busy_skips = 2;
+    t.app.audio_devices.injected_backend = Some((Some(output), Some(input)));
+    t.frames(1);
+    let lines: Vec<String> = t.layout()["opened"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect();
+    assert!(lines[1].ends_with("min padding 96; overloads 1, busy skips 2, position jumps 0, resets 0"), "{lines:?}");
     t.app.audio_devices.injected_backend = None;
     t.frames(3);
     let plain = t.layout()["opened"].as_array().unwrap().len();

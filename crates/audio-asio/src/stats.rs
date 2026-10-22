@@ -5,9 +5,9 @@
 //!
 //! ASIO has no wait and no padding: `skipped_wakes`, `min_padding_frames` and
 //! `max_packets_per_wake` stay 0, and `timeouts` counts the watchdog's stalls (the driver stopped
-//! calling back, [`crate::watchdog`]). The driver-event counters (`overloads`, `position_jumps`,
-//! `resets`, `timeouts`) belong to the driver, so both directions of one driver share them
-//! ([`DriverEvents`]).
+//! calling back, [`crate::watchdog`]). The driver-event counters (`overloads`, `busy_skips`,
+//! `position_jumps`, `resets`, `timeouts`) belong to the driver, so both directions of one driver
+//! share them ([`DriverEvents`]).
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use std::sync::Arc;
@@ -18,6 +18,9 @@ use transit_audio_backend::{STATS_BINS, StreamStats};
 #[derive(Default)]
 pub(crate) struct DriverEvents {
     pub(crate) overloads: AtomicU64,
+    /// Buffer switches that found the callback state still busy (the previous switch, or an error
+    /// being delivered) and did nothing.
+    pub(crate) busy_skips: AtomicU64,
     pub(crate) position_jumps: AtomicU64,
     pub(crate) resets: AtomicU64,
     /// Stalls the watchdog found: the driver stopped calling back while a stream should run.
@@ -75,6 +78,7 @@ impl LoopStats {
             service_us: load(&self.service),
             max_service_us: self.max_service_us.load(Relaxed),
             overloads: self.events.overloads.load(Relaxed),
+            busy_skips: self.events.busy_skips.load(Relaxed),
             position_jumps: self.events.position_jumps.load(Relaxed),
             resets: self.events.resets.load(Relaxed),
             timeouts: self.events.timeouts.load(Relaxed),
@@ -111,12 +115,13 @@ mod tests {
         render.service(3_000);
         render.wake();
         events.overloads.fetch_add(2, Relaxed);
+        events.busy_skips.fetch_add(4, Relaxed);
         events.resets.fetch_add(1, Relaxed);
         events.timeouts.fetch_add(1, Relaxed);
         let s = render.snapshot();
         assert_eq!((s.wakes, s.wake_late_us[0], s.wake_late_us[15], s.max_wake_late_us), (1, 1, 1, 500_000));
         assert_eq!((s.service_us[5], s.max_service_us), (1, 300));
-        assert_eq!((s.overloads, s.position_jumps, s.resets, s.timeouts), (2, 0, 1, 1));
+        assert_eq!((s.overloads, s.busy_skips, s.position_jumps, s.resets, s.timeouts), (2, 4, 0, 1, 1));
         assert_eq!((capture.snapshot().overloads, capture.snapshot().wakes), (2, 0), "one driver, one set of events");
         assert_eq!((s.skipped_wakes, s.min_padding_frames, s.max_packets_per_wake), (0, 0, 0));
     }

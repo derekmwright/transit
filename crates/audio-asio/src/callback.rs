@@ -11,7 +11,7 @@
 //! sometimes the host thread from inside a call it made. Nothing here blocks, allocates or takes a
 //! lock: the [`Engine`] and the buffer addresses sit in `UnsafeCell`s guarded by one `busy` flag
 //! that the callbacks only ever *try* to take (a callback that finds it taken does nothing and is
-//! counted); the control side takes it, spinning, only while the driver is stopped or before it
+//! counted in `busy_skips`); the control side takes it, spinning, only while the driver is stopped or before it
 //! starts (attach, restart), when no buffer switch runs. Driver messages that must reach the
 //! owner's error callback set a pending bit and deliver it under the same flag, from whichever
 //! thread gets it next; the holder rechecks the bit after releasing, so none is lost.
@@ -172,8 +172,6 @@ pub(crate) struct CallbackState {
     /// Set by `kAsioLatenciesChanged`; the host thread refetches `getLatencies`.
     pub(crate) latencies_dirty: AtomicBool,
     wake: Arc<Event>,
-    /// Buffer switches that found the state busy and did nothing (a driver calling twice at once).
-    pub(crate) busy_skips: AtomicU64,
     /// The QPC (100 ns) of the last buffer switch's entry, 0 before the first since the driver
     /// started: what the host thread's watchdog reads.
     last_switch: AtomicU64,
@@ -202,7 +200,6 @@ impl CallbackState {
             events,
             latencies_dirty: AtomicBool::new(false),
             wake,
-            busy_skips: AtomicU64::new(0),
             last_switch: AtomicU64::new(0),
             mmcss,
         })
@@ -240,7 +237,7 @@ impl CallbackState {
         self.last_switch.store(arrival_100ns, Ordering::Relaxed);
         self.mmcss.tend();
         if !self.try_take() {
-            self.busy_skips.fetch_add(1, Ordering::Relaxed);
+            self.events.busy_skips.fetch_add(1, Ordering::Relaxed);
             return;
         }
         // SAFETY: `busy` is held (taken above): the only access to the cells until `give_back`.
