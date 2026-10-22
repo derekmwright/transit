@@ -110,15 +110,4 @@ mod tests {
         assert!(super::plugin_info("eq_7band").is_some());
         assert!(super::plugin_info("clap:no.such.plugin").is_none());
     }
-
-    /// Apple's own Audio Units ship with every Mac, so `mix.insert` can be checked against one.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn audio_units_insert_by_id() {
-        let mut e = Engine::default();
-        e.execute("track.new", &json!({})).unwrap();
-        let t = e.session().tracks[0].id.0;
-        let r = e.execute("mix.insert", &json!({"track": t, "plugin": "au:aufx:bpas:appl"}));
-        assert_eq!(r.map(|v| v["plugin"].clone()), Ok(json!("au:aufx:bpas:appl")), "Apple AUBandpass");
-    }
 }

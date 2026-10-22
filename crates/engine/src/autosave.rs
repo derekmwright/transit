@@ -200,8 +200,20 @@ impl Autosave {
     /// A new folder under `root` for the session called `name`.
     fn create(root: &Path, name: &str) -> Result<Autosave> {
         let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis();
-        let dir = root.join(format!("{} {stamp}-{}", sanitize_name(name), std::process::id()));
-        let lock = std::fs::create_dir_all(&dir).and_then(|()| std::fs::File::create(dir.join(LOCK))).map_err(|err| io_error(&dir, err))?;
+        let base = format!("{} {stamp}-{}", sanitize_name(name), std::process::id());
+        std::fs::create_dir_all(root).map_err(|err| io_error(root, err))?;
+        // A folder is this session's alone: another created in the same millisecond (a session
+        // closed and reopened at once, or two in one process) gets a number, never the same folder.
+        let mut n = 1;
+        let dir = loop {
+            let dir = root.join(if n == 1 { base.clone() } else { format!("{base}-{n}") });
+            match std::fs::create_dir(&dir) {
+                Ok(()) => break dir,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                Err(err) => return Err(io_error(&dir, err)),
+            }
+        };
+        let lock = std::fs::File::create(dir.join(LOCK)).map_err(|err| io_error(&dir, err))?;
         lock.try_lock().map_err(|err| EngineError::Io(format!("{}: {err}", dir.display())))?;
         Ok(Autosave { dir, lock: Some(lock), copies: BTreeMap::new(), next: 1, recording: false })
     }
@@ -511,6 +523,16 @@ mod tests {
     use serde_json::json;
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{ChannelFormat, Clip, TrackKind};
+
+    #[test]
+    fn folders_made_at_the_same_moment_are_never_shared() {
+        let root = folder("autosave-unique");
+        let all: Vec<Autosave> = (0..40).map(|_| Autosave::create(&root, "Untitled").unwrap()).collect();
+        let dirs: std::collections::BTreeSet<_> = all.iter().map(|a| a.dir.clone()).collect();
+        assert_eq!(dirs.len(), all.len());
+        drop(all);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("soundcraft-{name}-{}", std::process::id()));
