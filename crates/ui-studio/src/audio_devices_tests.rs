@@ -2,7 +2,7 @@
 //! input queue, one frame at a time, over stand-in devices (`audio.fake_devices`). No player, no
 //! audio device is listed or opened.
 
-use crate::audio_devices::{Opened, PAIRED_AUTOMATIC, REFUSED_RECORDING, SHARE_LABEL, fallback_notes};
+use crate::audio_devices::{Opened, PAIRED_AUTOMATIC, REFUSED_RECORDING, SHARE_LABEL, calibration_command, calibration_line, fallback_notes};
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
 use soundcraft_playback::{AudioConfig, Backend};
@@ -984,4 +984,25 @@ fn a_wake_rate_is_the_counter_delta_over_the_time_delta() {
     assert_eq!(w.update(11.1, 1_110), Some(100), "too soon: the previous rate stays");
     assert_eq!(w.update(13.0, 1_300), Some(100), "200 wakes over 2 s");
     assert_eq!(w.update(14.0, 5), None, "a counter that went down is a new stream");
+}
+
+#[test]
+fn the_calibration_command_wraps_inside_the_window_and_has_a_copy_button() {
+    let line = calibration_line(&AudioConfig::default(), "Speakers", Some("Mic"), 48_000, "ui.json");
+    let command = calibration_command(&line).expect("an uncalibrated line carries its command");
+    assert!(command.starts_with("audio-bench --backend wasapi") && command.ends_with("--settings \"ui.json\""), "{command}");
+    let measured = "measured 300 frames \u{b1}2 (today) \u{b7} shared";
+    assert_eq!(calibration_command(measured), None, "a measured line has nothing to copy");
+    if !soundcraft_playback::devices::NATIVE_WASAPI_COMPILED {
+        return;
+    }
+    let mut t = T::new();
+    t.open_window();
+    t.pick("backend", Backend::NativeWasapi.label());
+    let window: [f32; 4] = serde_json::from_value(t.layout()["window"].clone()).unwrap();
+    let text = t.control_rect("calibration_text");
+    let copy = t.control_rect("calibration_copy");
+    assert!(text[2] <= window[2] + 0.5, "the wrapped command stays inside the window: {text:?} in {window:?}");
+    assert!(text[3] - text[1] > 20.0, "the long command wraps onto more than one line: {text:?}");
+    assert!(copy[2] <= window[2], "the Copy button is inside the window");
 }

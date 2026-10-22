@@ -86,7 +86,9 @@ pub fn readout(app: &mut StudioApp, ui: &mut Ui) {
 
     ui.add_space(SPACE);
     let bar_w = 40.0;
-    let text_w = 168.0;
+    let font = crate::theme::mono(ui.ctx(), 11.5);
+    // The text sets the width (a fixed 168 px clipped "WASAPI* shared" past the frame).
+    let text_w = ui.painter().layout_no_wrap(text.clone(), font.clone(), TOKENS.text).size().x.ceil() + 12.0;
     let warn_w = errors.map_or(0.0, |_| 44.0);
     let (r, resp) = ui.allocate_exact_size(vec2(bar_w + text_w + warn_w + SPACE, 26.0), Sense::click());
     let p = ui.painter();
@@ -96,7 +98,7 @@ pub fn readout(app: &mut StudioApp, ui: &mut Ui) {
     let k = (snap.current_load_ppm as f32 / ALERT_PPM as f32).clamp(0.0, 1.0);
     p.rect_filled(Rect::from_min_size(track.min, vec2(track.width() * k, track.height())), RADIUS_SM, tint);
     let ink = if level == Level::Ok { if resp.hovered() { TOKENS.text } else { TOKENS.text_dim } } else { tint };
-    p.text(pos2(track.max.x + 8.0, r.center().y), Align2::LEFT_CENTER, &text, crate::theme::mono(ui.ctx(), 11.5), ink);
+    p.text(pos2(track.max.x + 8.0, r.center().y), Align2::LEFT_CENTER, &text, font, ink);
     if let Some(n) = errors {
         let c = pos2(r.max.x - warn_w + 6.0, r.center().y);
         icons::paint(p, c, Icon::Warning, 14.0, TOKENS.record);

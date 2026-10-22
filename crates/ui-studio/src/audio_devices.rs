@@ -515,6 +515,12 @@ pub fn calibration_line(cfg: &AudioConfig, device: &str, paired_input: Option<&s
     format!("not calibrated \u{b7} {mode}: run {command} (with this app closed)")
 }
 
+/// The bench command inside a "not calibrated" [`calibration_line`] (`None` for a measured one).
+pub fn calibration_command(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("not calibrated")?.split_once(": run ")?.1;
+    Some(rest.strip_suffix(" (with this app closed)").unwrap_or(rest))
+}
+
 /// One list of choices (`None` is "System default"). Returns the combo's rect.
 fn choose<T: Clone + PartialEq>(
     ui: &mut egui::Ui,
@@ -702,7 +708,20 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                         app.player.as_ref().filter(|p| p.device_name.eq_ignore_ascii_case(device)).and_then(|p| p.paired_input.as_deref());
                     let paired = open_pair.or_else(|| app.recorder.as_ref().map(|r| r.device_name.as_str()));
                     let line = calibration_line(&draft, device, paired, rate, &settings_path(app));
-                    ui.label(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5));
+                    // The bench command is long: wrap it inside the panel, with a Copy button for it.
+                    ui.vertical(|ui| {
+                        ui.set_max_width(ui.available_width());
+                        let text = egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5);
+                        let shown = ui.add(egui::Label::new(text).wrap());
+                        controls.push((line.clone(), "calibration_text", shown.rect));
+                        if let Some(command) = calibration_command(&line) {
+                            let copy = ui.small_button("Copy").on_hover_text("Copy the command to the clipboard");
+                            if copy.clicked() {
+                                ui.ctx().copy_text(command.to_string());
+                            }
+                            controls.push(("Copy".into(), "calibration_copy", copy.rect));
+                        }
+                    });
                     lay.calibration = Some(line);
                     ui.end_row();
                 }
@@ -723,23 +742,32 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
             });
             ui.add_space(SPACE);
             lay.opened = opened_lines(app, ui.input(|i| i.time));
-            for line in &lay.opened {
-                ui.label(egui::RichText::new(line).color(TOKENS.text_dim).size(11.5));
-            }
-            if !audio_on {
-                ui.label(
-                    egui::RichText::new("Audio is off in this run (--no-audio): choices are saved and open at the next start.")
-                        .color(TOKENS.text_dim)
-                        .size(11.5),
-                );
-            }
-            for n in &app.audio_devices.notes {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(icons::ICON, icons::ICON), egui::Sense::hover());
-                    icons::paint(ui.painter(), r.center(), Icon::Warning, 14.0, TOKENS.record);
-                    ui.label(egui::RichText::new(n).color(TOKENS.text).size(11.5));
+            // The diagnostics sit in an inset card: the open devices, the backend figures (monospace) and the notes.
+            egui::Frame::NONE
+                .fill(TOKENS.bg)
+                .corner_radius(egui::CornerRadius::same(crate::theme::RADIUS as u8))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for line in &lay.opened {
+                        let text = egui::RichText::new(line).color(TOKENS.text_dim).size(11.5);
+                        ui.label(if line.starts_with("Backend") { text.monospace() } else { text });
+                    }
+                    if !audio_on {
+                        ui.label(
+                            egui::RichText::new("Audio is off in this run (--no-audio): choices are saved and open at the next start.")
+                                .color(TOKENS.text_dim)
+                                .size(11.5),
+                        );
+                    }
+                    for n in &app.audio_devices.notes {
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(icons::ICON, icons::ICON), egui::Sense::hover());
+                            icons::paint(ui.painter(), r.center(), Icon::Warning, 14.0, TOKENS.record);
+                            ui.label(egui::RichText::new(n).color(TOKENS.text).size(11.5));
+                        });
+                    }
                 });
-            }
             if recording {
                 ui.label(egui::RichText::new(REFUSED_RECORDING).color(TOKENS.record).size(11.5));
             }
