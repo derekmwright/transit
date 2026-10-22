@@ -9,10 +9,62 @@
 A desktop DAW built on the [SoundCraft](https://github.com/storytold/soundcraft) engine, with
 Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
+> [!NOTE]
+> transit is alpha software under active development. The current priority is core engine
+> correctness, stability and performance, measured on real hardware, ahead of new features.
+> Expect rough edges in the UI and some missing features; the audio engine, recording alignment
+> and device handling get fixed first. Releases are frequent, and each lists its
+> [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
+> help right now: see [How to help](#how-to-help).
+
 ![Arrangement view](docs/images/transit-arrange.png)
 
 ![Mixer](docs/images/transit-mixer.png)
 ![Piano roll](docs/images/transit-pianoroll.png)
+
+## How to help
+
+transit is measured on real hardware, and the bench has only two Windows interfaces on it. Loopback
+measurements from other machines are the most useful contribution right now.
+
+### What we are looking for
+
+- macOS with any Core Audio interface. We have no Mac; aggregate devices especially.
+- Linux with ALSA, JACK or PipeWire.
+- Windows with an interface other than the Focusrite Scarlett 2i2 or TASCAM Model 12 (RME, MOTU, Universal Audio, Behringer, Audient, PreSonus, SSL, onboard Realtek), on both its ASIO and its WASAPI path.
+- Multichannel interfaces in general.
+
+### What to run
+
+`audio-bench` plays clicks out of one output and finds them again on one input. Cable one output
+of your interface into one input of the same interface, turn the monitors down, set the input gain
+to about the middle and the input to Line/Inst, and close other audio apps. From the next release
+the bench ships in every release zip; until then build it with `cargo xtask audio-bench` (see
+[docs/benchmarks](docs/benchmarks/README.md)). List your devices first (`--list-devices --system WASAPI`
+or `--system ASIO`), then run, with your own names and channels:
+
+```
+audio-bench --backend cpal --system WASAPI --device "<output>" --in-device "<input>" --loopback --out-ch 1 --in-ch 1 --seconds 10 --out results.md
+audio-bench --backend wasapi --loopback --out-device "<output>" --in-device "<input>" --out-ch 1 --in-ch 1 --seconds 10 --out results.md
+audio-bench --backend cpal --system ASIO --device "<ASIO device>" --loopback --out-ch 1 --in-ch 1 --seconds 10 --out results.md
+```
+
+The first is shared WASAPI through cpal; on macOS and Linux use the platform's default system the
+same way. The second is transit's native WASAPI backend and the third is ASIO, both Windows only.
+
+### What to send
+
+- The table row the bench prints, and the `render backend:` and `capture backend:` lines under it.
+- The interface, driver version, OS build and CPU, and whether all the clicks were detected.
+
+File it with the [measurement issue template](https://github.com/derekmwright/transit/issues/new?template=measurement.md)
+or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo names none yet. -->
+
+### Other ways to help
+
+- Try the latest release and report what breaks, with the steps to make it happen.
+- Read the [known issues](docs/known-issues/README.md) and pick one.
+- Review an [ADR](docs/adr) draft when one is posted.
 
 ## Features
 
