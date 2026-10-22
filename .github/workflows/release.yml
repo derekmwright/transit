@@ -2,7 +2,8 @@
 # the tag. Everything is unsigned: macOS is ad-hoc signed by the linker only. Windows ships two zips:
 # transit-<ver>-windows-x86_64-asio (ASIO + native WASAPI) and transit-<ver>-windows-x86_64 (WASAPI
 # only, the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
-# the project owner handles; see docs/building.md.
+# the project owner handles; see docs/building.md. Every archive also carries the audio-bench
+# harness and BENCH-README.txt so testers can measure their interfaces without building.
 name: Release
 
 on:
@@ -29,8 +30,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: windows-x86_64-asio, os: windows-latest, asio: true, features: "--features transit/asio,transit/native-wasapi" }
-          - { name: windows-x86_64, os: windows-latest, asio: false, features: "" }
+          - { name: windows-x86_64-asio, os: windows-latest, asio: true, features: "--features transit/asio,transit/native-wasapi,audio-bench/asio,audio-bench/native-wasapi" }
+          - { name: windows-x86_64, os: windows-latest, asio: false, features: "--features audio-bench/native-wasapi" }
           - { name: macos-arm64, os: macos-14 }
           - { name: linux-x86_64, os: ubuntu-22.04 }
     steps:
@@ -68,8 +69,10 @@ jobs:
             if (-not (Test-Path (Join-Path $sdk.FullName 'common'))) { throw "ASIO SDK layout unexpected in $dst" }
             "CPAL_ASIO_DIR=$($sdk.FullName)" >> $env:GITHUB_ENV
           }
+      # One invocation builds the app and the audio-bench harness (shipped in every archive) so the
+      # shared crates compile once with one feature set.
       - name: Build
-        run: cargo build -p transit --release ${{ matrix.features }}
+        run: cargo build -p transit -p audio-bench --release ${{ matrix.features }}
       - name: Package version
         id: ver
         shell: bash
@@ -82,7 +85,7 @@ jobs:
         run: |
           $d = "${{ steps.ver.outputs.name }}"
           New-Item -ItemType Directory $d | Out-Null
-          Copy-Item target/release/transit.exe, LICENSE-MIT, LICENSE-APACHE, NOTICE $d
+          Copy-Item target/release/transit.exe, target/release/audio-bench.exe, LICENSE-MIT, LICENSE-APACHE, NOTICE $d
           $audio = if ("${{ matrix.asio }}" -eq "true") {
             "- Audio: ASIO and native WASAPI are included, plus the standard WASAPI host."
           } else {
@@ -91,12 +94,37 @@ jobs:
           $notice = if ("${{ matrix.asio }}" -eq "true") {
             "`n" + 'ASIO is a trademark of Steinberg Media Technologies GmbH, registered in Europe and other countries.'
           } else { "" }
+          $asioBench = if ("${{ matrix.asio }}" -eq "true") {
+            @'
+          ASIO (the interface's ASIO driver; use the device name --list-devices prints):
+            .\audio-bench.exe --backend cpal --system ASIO --device "<ASIO driver>" --period 64 --seconds 60 --loopback --out-ch 1 --in-ch 1
+          '@
+          } else { "" }
+          $bench = @"
+          audio-bench: measure your interface (round trip, jitter, xruns)
+
+          1. Cable one output of your interface to one of its inputs (or use its loopback input).
+             Keep input gain at unity or lower, no phantom power, monitors low (a click plays).
+          2. Close other audio programs. In this folder, list devices first:
+               .\audio-bench.exe --list-devices --system WASAPI
+          3. Run the loopback test (add --seconds 120 for a baseline). cpal, Windows audio:
+               .\audio-bench.exe --backend cpal --system WASAPI --device "<output>" --in-device "<input>" --period 64 --seconds 60 --loopback --out-ch 1 --in-ch 1
+             Native WASAPI:
+               .\audio-bench.exe --backend wasapi --loopback --seconds 60 --out-device "<output>" --in-device "<input>"
+          $asioBench
+          Do not pass --settings unless you are calibrating transit on this machine.
+          "No click detected" means a wrong cable, channel or level.
+          Send the table row and the backend lines via the measurement issue template:
+          https://github.com/derekmwright/transit/issues/new/choose
+          "@
+          $bench | Set-Content -Encoding utf8 "$d/BENCH-README.txt"
           @"
           transit for Windows (pre-alpha)
 
           $audio
           - The program is unsigned. If SmartScreen blocks it, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
+          - audio-bench.exe and BENCH-README.txt measure your interface; see that file.
           - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
           $notice
           "@ | Set-Content -Encoding utf8 "$d/README-WINDOWS.txt"
@@ -107,12 +135,27 @@ jobs:
         run: |
           d="${{ steps.ver.outputs.name }}"
           mkdir "$d"
-          cp target/release/transit LICENSE-MIT LICENSE-APACHE NOTICE "$d"
+          cp target/release/transit target/release/audio-bench LICENSE-MIT LICENSE-APACHE NOTICE "$d"
           if [ "$RUNNER_OS" = "macOS" ]; then
             printf '%s\n' 'transit for macOS (pre-alpha, Apple silicon)' '' \
               'Unsigned and not notarized (ad-hoc only). Run: xattr -dr com.apple.quarantine transit' \
               'or right-click the file and choose Open the first time.' > "$d/README-MACOS.txt"
           fi
+          cat > "$d/BENCH-README.txt" <<'EOF'
+          audio-bench: measure your interface (round trip, jitter, xruns)
+
+          1. Cable one output of your interface to one of its inputs (or use its loopback input).
+             Keep input gain at unity or lower, no phantom power, monitors low (a click plays).
+          2. Close other audio programs. In this folder, list devices first:
+               ./audio-bench --list-devices
+          3. Run the loopback test (add --seconds 120 for a baseline):
+               ./audio-bench --backend cpal --device "<output>" --in-device "<input>" --period 64 --seconds 60 --loopback --out-ch 1 --in-ch 1
+
+          Do not pass --settings unless you are calibrating transit on this machine.
+          "No click detected" means a wrong cable, channel or level.
+          Send the table row and the backend lines via the measurement issue template:
+          https://github.com/derekmwright/transit/issues/new/choose
+          EOF
           tar -czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@v4
         with:
@@ -133,6 +176,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body: |
+            Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
+            - windows-x86_64-asio: `audio-bench.exe` with ASIO, native WASAPI and cpal WASAPI.
+            - windows-x86_64: `audio-bench.exe` with native WASAPI and cpal WASAPI.
+            - macos-arm64: `audio-bench` (cpal, Core Audio).
+            - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false
           prerelease: true
           generate_release_notes: true
