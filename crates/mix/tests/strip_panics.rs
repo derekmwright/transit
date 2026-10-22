@@ -219,32 +219,29 @@ fn serial_panicking_instruments_keep_their_payloads_and_allocate_nothing_more() 
     let _ = calibrate(Vec::with_capacity(TRACKS));
     let ((kept, again), expected) = calibrate(Vec::with_capacity(TRACKS));
     drop((kept, again));
+    // Warm the render's own unwind path once with a second engine (a panicked engine keeps its
+    // strips' payloads, so the measured one must be fresh): panics fire through the full render
+    // path, the stats are discarded. Apple's libunwind is thought to allocate once the first time
+    // an unwind walks frames it has not seen (known issue K30; inference); the baseline's frames
+    // are already warm from its first run, the render's deeper ones are not.
+    {
+        let warm = plan_engine(&shared);
+        shared.armed.store(true, Ordering::Relaxed);
+        mark_audio_thread();
+        let mut warm_out = vec![vec![0.0; BLOCK]; 2];
+        let mut warm = warm;
+        let panic = render_active_panic(&mut warm, 4 * BLOCK as i64, &mut warm_out);
+        drop(panic);
+        drop(warm.into_retired());
+        shared.armed.store(false, Ordering::Relaxed);
+    }
     shared.payload_drops.lock().unwrap().clear();
+    shared.raised.lock().unwrap().clear();
     shared.armed.store(true, Ordering::Relaxed);
-    mark_audio_thread();
     let mut out = vec![vec![0.0; BLOCK]; 2];
     let (panic, stats) = measure(|| render_active_panic(&mut mix, 4 * BLOCK as i64, &mut out));
     println!("the panics alone {expected:?}; the render {stats:?}");
-    if cfg!(target_os = "macos") {
-        // Known issue K30. On GitHub's macOS runners (x86_64 and aarch64) the render's catch path
-        // costs exactly one 64-byte allocation, never freed during the render, beyond the same
-        // panics measured outside it (allocs 13 against 14, bytes 440 against 504). Cause not
-        // identified. Hypothesis (inference, unverified): Apple's libunwind allocates once the
-        // first time an unwind walks frames it has not seen (a per-image unwind-info lookup
-        // cached lazily); the baseline's frames are warmed by its first run, but the render's
-        // deeper frames (render_active, run_strips, guarded, process_strip, the plug-in's
-        // process) have never unwound before this measured render. The tolerance is exactly that
-        // one block, so a regression that adds more still fails.
-        assert_eq!(
-            stats.allocs,
-            expected.allocs + 1,
-            "macOS: the render adds exactly one allocation to the panics' own (K30): {stats:?} against {expected:?}"
-        );
-        assert!(stats.bytes <= expected.bytes + 64, "macOS: the extra allocation is at most 64 bytes (K30): {stats:?} against {expected:?}");
-        assert_eq!(stats.frees, expected.frees, "macOS: the render frees nothing the panics' own do not (K30): {stats:?} against {expected:?}");
-    } else {
-        assert_eq!(stats, expected, "the render adds no heap operation to the panics' own");
-    }
+    assert_eq!(stats, expected, "the render adds no heap operation to the panics' own");
     assert!(shared.raised.lock().unwrap().iter().all(|t| *t == here), "serial: every strip rendered on this thread");
     assert_all_dropped_here("serial", &shared, panic, mix);
 }
