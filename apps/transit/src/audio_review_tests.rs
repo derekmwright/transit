@@ -43,7 +43,7 @@ fn review_quit_before_verification_keeps_previous_good_audio() {
     let mut expected = studio.ui.clone();
     expected.audio = previous.clone();
     // Zero callbacks, zero elapsed frames: execute the real desktop exit handler.
-    let mut app = App(studio, None);
+    let mut app = App(studio, None, PrefsCheckpoint::default());
     eframe::App::on_exit(&mut app);
     assert_eq!(config::load_ui(&path).unwrap().unwrap().audio, previous, "quit must not bypass callback verification");
     assert_eq!(
@@ -51,4 +51,44 @@ fn review_quit_before_verification_keeps_previous_good_audio() {
         serde_json::to_value(expected).unwrap(),
         "quit still saves the current values of every other preference"
     );
+}
+
+#[test]
+fn desktop_logic_saves_preferences_before_exit_and_keeps_future_audio() {
+    const CHILD: &str = "TRANSIT_PREFS_CHECKPOINT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = config::TemporaryAutosave::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "audio_review_tests::desktop_logic_saves_preferences_before_exit_and_keeps_future_audio", "--nocapture"])
+            .env(CHILD, "1")
+            .env("TRANSIT_CONFIG_DIR", dir.path())
+            .env("SOUNDCRAFT_CONFIG_DIR", dir.path().join("unused-soundcraft"))
+            .env_remove("TRANSIT_NO_PREFS")
+            .env_remove("SOUNDCRAFT_NO_PREFS")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let path = prefs_path().unwrap();
+    let future_audio = serde_json::json!({"backend": "future-driver", "future_calibration": [1, 2, 3]});
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"audio": future_audio})).unwrap()).unwrap();
+    let mut app = App(StudioApp::new(Engine::default(), None, Services::default()), None, PrefsCheckpoint::default());
+    app.0.ui.window_size = [1234.0, 789.0];
+    app.0.ui.browser.locations.push("test-location".into());
+    let song = path.with_file_name("song.transit");
+    app.0.run("session.save_as", serde_json::json!({"path": song, "replace": true})).unwrap();
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut output = ctx.run_ui(egui::RawInput { time: Some(3.0), ..Default::default() }, |ui| {
+        eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+    });
+    output.textures_delta.clear();
+    let saved = config::load_ui(&path).unwrap().unwrap();
+    assert_eq!(saved.window_size, app.0.ui.window_size);
+    assert_eq!(saved.recent_files, app.0.ui.recent_files);
+    assert_eq!(saved.browser.locations, app.0.ui.browser.locations);
+    let raw: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(raw["audio"], future_audio);
+    assert!(app.0.player.is_none(), "the handler test opens no device");
 }

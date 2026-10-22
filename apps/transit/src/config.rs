@@ -119,6 +119,10 @@ const MAX_UI_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Read bounded settings; `Ok(None)` when there are none yet.
 pub fn load_ui(path: &Path) -> Result<Option<transit_ui_studio::UiState>, String> {
+    read_ui(path)?.map(decode_ui).transpose()
+}
+
+fn read_ui(path: &Path) -> Result<Option<serde_json::Value>, String> {
     use std::io::Read as _;
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -133,12 +137,99 @@ pub fn load_ui(path: &Path) -> Result<Option<transit_ui_studio::UiState>, String
     serde_json::from_slice(&bytes).map(Some).map_err(|error| format!("Settings could not be restored: {error}"))
 }
 
-/// Write settings atomically (temporary file, then rename).
+/// Recover independent preferences even if a newer version wrote an unsupported field value.
+fn decode_ui(value: serde_json::Value) -> Result<transit_ui_studio::UiState, String> {
+    let fields = value.as_object().ok_or("Settings must be a JSON object")?;
+    let mut accepted = serde_json::Map::new();
+    let mut ui = transit_ui_studio::UiState::default();
+    let defaults = serde_json::to_value(&ui).map_err(|error| error.to_string())?;
+    for (key, value) in fields {
+        // Unknown fields stay in the raw file; do not repeatedly deserialize them.
+        if defaults.get(key).is_none() {
+            continue;
+        }
+        accepted.insert(key.clone(), value.clone());
+        match serde_json::from_value(serde_json::Value::Object(accepted.clone())) {
+            Ok(next) => ui = next,
+            Err(error) => {
+                accepted.remove(key);
+                log::warn!("Settings field {key} could not be restored: {error}");
+            }
+        }
+    }
+    Ok(ui)
+}
+
+/// Keep unknown fields and unchanged raw values, including arrays from a newer version.
+/// Only preferences actually changed by this version replace their saved representation.
+fn merge_ui(raw: &mut serde_json::Value, previous: &serde_json::Value, current: &serde_json::Value) {
+    if let (Some(raw), Some(previous), Some(current)) = (raw.as_object_mut(), previous.as_object(), current.as_object()) {
+        for (key, value) in current {
+            if previous.get(key) == Some(value) && raw.contains_key(key) {
+                continue;
+            }
+            if let (Some(raw), Some(previous)) = (raw.get_mut(key), previous.get(key)) {
+                if raw.is_object() && previous.is_object() && value.is_object() {
+                    merge_ui(raw, previous, value);
+                } else {
+                    let identity: &[&str] = match key.as_str() {
+                        "recent_files" => &["path"],
+                        "io_maps" => &["system", "device"],
+                        "paths" => &["name", "direction"],
+                        "hardware_latency" => &["send", "ret", "rate"],
+                        _ => &[],
+                    };
+                    *raw = merge_entries(raw, previous, value, identity);
+                }
+            } else {
+                raw.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Preserve extra fields on retained entries even when a list is reordered or extended.
+fn merge_entries(raw: &serde_json::Value, previous: &serde_json::Value, current: &serde_json::Value, identity: &[&str]) -> serde_json::Value {
+    let (Some(raw), Some(previous), Some(current_entries)) = (raw.as_array(), previous.as_array(), current.as_array()) else {
+        return current.clone();
+    };
+    if identity.is_empty() {
+        return current.clone();
+    }
+    serde_json::Value::Array(
+        current_entries
+            .iter()
+            .map(|entry| {
+                let matches = |other: &&serde_json::Value| identity.iter().all(|key| entry.get(key).is_some() && entry.get(key) == other.get(key));
+                if let (Some(raw), Some(previous)) = (raw.iter().find(matches), previous.iter().find(matches)) {
+                    let mut kept = raw.clone();
+                    merge_ui(&mut kept, previous, entry);
+                    kept
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Write settings atomically (temporary file, then rename). Unreadable files are left intact.
 pub fn save_ui(path: &Path, ui: &transit_ui_studio::UiState) -> Result<(), String> {
     use std::io::Write as _;
     let mut saved = ui.clone();
     saved.plugin_windows.clear();
-    let bytes = serde_json::to_vec_pretty(&saved).map_err(|error| error.to_string())?;
+    let mut raw = read_ui(path)?.unwrap_or_else(|| serde_json::json!({}));
+    let previous = serde_json::to_value(decode_ui(raw.clone())?).map_err(|error| error.to_string())?;
+    let current = serde_json::to_value(saved).map_err(|error| error.to_string())?;
+    let original = raw.clone();
+    merge_ui(&mut raw, &previous, &current);
+    if raw == original {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&raw).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_UI_BYTES {
+        return Err("Settings file exceeds the 4 MiB limit".into());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -155,6 +246,30 @@ pub fn save_ui(path: &Path, ui: &transit_ui_studio::UiState) -> Result<(), Strin
         let _ = std::fs::remove_file(&temporary);
     }
     written.map_err(|error| format!("Settings could not be saved: {error}"))
+}
+
+/// Owns only a fresh temporary directory, never an earlier run's recovery files.
+pub struct TemporaryAutosave(PathBuf);
+
+impl TemporaryAutosave {
+    pub fn new() -> std::io::Result<Self> {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)?.as_nanos();
+        let path = std::env::temp_dir().join(format!("transit-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryAutosave {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            log::warn!("Temporary autosave folder could not be removed: {error}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -295,5 +410,100 @@ mod tests {
         assert_eq!(back.keys.velocity, 87, "new-note velocity is saved in ui.json");
         assert!(back.plugin_windows.is_empty(), "open editors are not remembered");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod preference_regressions {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn one_bad_field_does_not_discard_other_preferences_or_future_data() {
+        let dir = TemporaryAutosave::new().unwrap();
+        let path = dir.path().join("ui.json");
+        let original = json!({
+            "track_height": "future-size",
+            "window_size": [1234, 789],
+            "audio": {"backend": "future-driver", "future_calibration": [1, 2, 3]},
+            "io_maps": [{"future_map": true}],
+            "future_preference": {"keep": true}
+        });
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let mut ui = load_ui(&path).unwrap().unwrap();
+        assert_eq!(ui.window_size, [1234.0, 789.0]);
+        assert_eq!(ui.track_height, transit_ui_studio::UiState::default().track_height);
+        ui.show_mixer = true;
+        save_ui(&path, &ui).unwrap();
+        let saved = read_ui(&path).unwrap().unwrap();
+        for key in ["track_height", "audio", "io_maps", "future_preference"] {
+            assert_eq!(saved[key], original[key], "preserve {key}");
+        }
+        assert_eq!(saved["show_mixer"], true);
+    }
+
+    #[test]
+    fn changed_nested_preferences_keep_unknown_siblings() {
+        let dir = TemporaryAutosave::new().unwrap();
+        let path = dir.path().join("ui.json");
+        std::fs::write(&path, br#"{"keys":{"velocity":80,"future":17}}"#).unwrap();
+        let mut ui = load_ui(&path).unwrap().unwrap();
+        ui.keys.velocity = 90;
+        save_ui(&path, &ui).unwrap();
+        let saved = read_ui(&path).unwrap().unwrap();
+        assert_eq!(saved["keys"]["velocity"], 90);
+        assert_eq!(saved["keys"]["future"], 17);
+    }
+
+    #[test]
+    fn unreadable_settings_are_not_overwritten() {
+        let dir = TemporaryAutosave::new().unwrap();
+        let path = dir.path().join("ui.json");
+        for bytes in [b"{broken".to_vec(), b"[]".to_vec(), vec![b' '; MAX_UI_BYTES as usize + 1]] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(save_ui(&path, &Default::default()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn temporary_autosaves_remove_only_the_owned_directory_on_drop() {
+        let first = TemporaryAutosave::new().unwrap();
+        let second = TemporaryAutosave::new().unwrap();
+        let path = first.path().to_path_buf();
+        std::fs::create_dir(path.join("Autosave")).unwrap();
+        std::fs::write(path.join("Autosave/session.transit"), b"test").unwrap();
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().exists());
+    }
+}
+
+#[cfg(test)]
+mod array_preservation_tests {
+    use super::*;
+
+    #[test]
+    fn changing_lists_keeps_future_fields_on_retained_entries() {
+        let dir = TemporaryAutosave::new().unwrap();
+        let path = dir.path().join("ui.json");
+        let mut ui = transit_ui_studio::UiState::default();
+        ui.remember_recent(Path::new("old.transit"), 1);
+        ui.io_maps.push(soundcraft_engine::model::IoMap::for_device("Test", "Device", 2, 2));
+        let mut raw = serde_json::to_value(&ui).unwrap();
+        raw["recent_files"][0]["future"] = 17.into();
+        raw["io_maps"][0]["future"] = 18.into();
+        raw["io_maps"][0]["paths"][0]["future"] = 19.into();
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        ui.remember_recent(Path::new("new.transit"), 2);
+        ui.io_maps[0].outputs = 4;
+        ui.io_maps[0].paths[0].channels = vec![1];
+        save_ui(&path, &ui).unwrap();
+        let saved = read_ui(&path).unwrap().unwrap();
+        assert_eq!(saved["recent_files"][1]["future"], 17);
+        assert_eq!(saved["io_maps"][0]["future"], 18);
+        assert_eq!(saved["io_maps"][0]["paths"][0]["future"], 19);
+        assert_eq!(saved["io_maps"][0]["outputs"], 4);
+        assert_eq!(saved["io_maps"][0]["paths"][0]["channels"], serde_json::json!([1]));
     }
 }

@@ -25,7 +25,7 @@ use soundcraft_engine::Engine;
 use std::sync::Arc;
 use transit_ui_studio::{Services, StudioApp, UiState};
 
-struct App(StudioApp, Option<&'static logging::AppLogger>);
+struct App(StudioApp, Option<&'static logging::AppLogger>, PrefsCheckpoint);
 
 /// Sends the title only when it changes (copied from `apps/soundcraft`).
 fn set_title(ctx: &egui::Context, title: String) {
@@ -120,6 +120,7 @@ impl eframe::App for App {
                 self.0.ui.window_size = (r.size() * ctx.zoom_factor()).round().into();
             }
         }
+        self.2.poll(&self.0.ui, ctx.input(|i| i.time), save_prefs);
         let dirty = if self.0.engine.is_dirty() { " *" } else { "" };
         set_title(ctx, format!("{}{dirty} — transit", self.0.engine.session().name));
     }
@@ -190,9 +191,9 @@ fn load_prefs() -> Option<UiState> {
     }
 }
 
-fn save_prefs(ui: &UiState) {
+fn save_prefs(ui: &UiState) -> bool {
     if !prefs_enabled() {
-        return;
+        return true;
     }
     let mut saved = ui.clone();
     // save_good_audio persists each choice after two seconds of healthy callbacks. Keep that
@@ -202,7 +203,38 @@ fn save_prefs(ui: &UiState) {
         && let Err(error) = config::save_ui(&path, &saved)
     {
         log::warn!("{error}");
+        return false;
     }
+    true
+}
+
+/// Save changed preferences at most every two seconds; retry failed writes on the next interval.
+#[derive(Default)]
+struct PrefsCheckpoint {
+    saved: Option<serde_json::Value>,
+    next_attempt: f64,
+}
+
+impl PrefsCheckpoint {
+    fn poll(&mut self, ui: &UiState, now: f64, save: impl FnOnce(&UiState) -> bool) {
+        if now < self.next_attempt {
+            return;
+        }
+        self.next_attempt = now + 2.0;
+        let Ok(current) = serde_json::to_value(ui) else { return };
+        if self.saved.as_ref() != Some(&current) && save(ui) {
+            self.saved = Some(current);
+        }
+    }
+}
+
+fn parse_control_port(args: &[String], environment: Option<&str>) -> Result<Option<u16>, String> {
+    let port = if let Some(i) = args.iter().position(|arg| arg == "--control") {
+        Some(args.get(i + 1).map(String::as_str).ok_or("--control requires a port from 0 to 65535")?)
+    } else {
+        environment
+    };
+    port.map(|value| value.parse().map_err(|_| format!("Invalid control port {value:?}: expected 0 to 65535"))).transpose()
 }
 
 fn services() -> Services {
@@ -271,12 +303,8 @@ fn main() -> eframe::Result {
     }
     let demo = args.iter().any(|a| a == "--demo" || a == "--sample");
     let no_audio = args.iter().any(|a| a == "--no-audio");
-    let control_port: Option<u16> = args
-        .iter()
-        .position(|a| a == "--control")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|p| p.parse().ok())
-        .or_else(|| std::env::var("TRANSIT_CONTROL_PORT").ok().and_then(|p| p.parse().ok()));
+    let control_port =
+        parse_control_port(&args, std::env::var("TRANSIT_CONTROL_PORT").ok().as_deref()).map_err(|error| eframe::Error::AppCreation(error.into()))?;
     let files: Vec<String> = args
         .iter()
         .enumerate()
@@ -307,8 +335,7 @@ fn main() -> eframe::Result {
     let mut prefs = loaded.unwrap_or_else(|| UiState { window_maximized: true, ..UiState::default() });
     START_MAXIMIZED.store(prefs.window_maximized, std::sync::atomic::Ordering::Relaxed);
     prefs.window_maximized = false;
-    #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(app_icon())
             .with_title("transit")
@@ -320,7 +347,19 @@ fn main() -> eframe::Result {
     };
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
-    graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
+    let options = {
+        let mut options = options;
+        graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
+        options
+    };
+    // Keep the owner alive until the app and its autosave workers have shut down.
+    let temporary_autosave =
+        if prefs_enabled() { None } else { Some(config::TemporaryAutosave::new().map_err(|error| eframe::Error::AppCreation(error.into()))?) };
+    let autosave_dir = if let Some(temporary) = &temporary_autosave {
+        Some(temporary.path().join("Autosave"))
+    } else {
+        prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")))
+    };
     eframe::run_native(
         "transit",
         options,
@@ -333,11 +372,7 @@ fn main() -> eframe::Result {
             // Our own autosave folder: the two apps must not recover each other's sessions. Runs
             // without preferences (agents' tests) autosave into a folder of their own, so they
             // neither offer the user's leftovers nor leave theirs for the user.
-            app.autosave_dir = if prefs_enabled() {
-                prefs_path().and_then(|p| p.parent().map(|d| d.join("Autosave")))
-            } else {
-                Some(std::env::temp_dir().join(format!("transit-test-{}", std::process::id())).join("Autosave"))
-            };
+            app.autosave_dir = autosave_dir;
             app.leftovers = app.autosave_dir.as_deref().map(soundcraft_engine::autosave::leftovers).unwrap_or_default();
             app.ui = prefs;
             // The plug-in scan cache is SoundCraft's, shared; runs without preferences keep none.
@@ -352,7 +387,7 @@ fn main() -> eframe::Result {
             for f in &files {
                 open_path(&mut app, f);
             }
-            Ok(Box::new(App(app, logger)))
+            Ok(Box::new(App(app, logger, PrefsCheckpoint::default())))
         }),
     )
 }
@@ -365,5 +400,42 @@ mod tests {
     fn nonsense_window_sizes_fall_back() {
         assert_eq!(sane_window_size([f32::NAN, 10.0]), [1600.0, 1000.0]);
         assert_eq!(sane_window_size([1200.0, 800.0]), [1200.0, 800.0]);
+    }
+}
+
+#[cfg(test)]
+mod issue14_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_control_ports_are_errors_and_cli_takes_precedence() {
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for value in ["abc", "65536", "-1", "--demo"] {
+            assert!(parse_control_port(&args(&["--control", value]), Some("1234")).is_err());
+        }
+        assert!(parse_control_port(&args(&["--control"]), None).is_err());
+        assert!(parse_control_port(&[], Some("bad")).is_err());
+        assert_eq!(parse_control_port(&args(&["--control", "0"]), Some("bad")), Ok(Some(0)));
+        assert_eq!(parse_control_port(&[], Some("65535")), Ok(Some(65535)));
+        assert_eq!(parse_control_port(&[], None), Ok(None));
+    }
+
+    #[test]
+    fn preferences_checkpoint_before_exit_and_retry_failed_writes() {
+        let dir = config::TemporaryAutosave::new().unwrap();
+        let path = dir.path().join("ui.json");
+        let mut checkpoint = PrefsCheckpoint::default();
+        let mut ui = UiState::default();
+        checkpoint.poll(&ui, 0.0, |ui| config::save_ui(&path, ui).is_ok());
+        ui.window_size = [1234.0, 789.0];
+        ui.remember_recent(std::path::Path::new("song.transit"), 1);
+        checkpoint.poll(&ui, 1.0, |_| panic!("writes are throttled"));
+        checkpoint.poll(&ui, 2.0, |_| false);
+        assert_ne!(config::load_ui(&path).unwrap().unwrap().window_size, ui.window_size);
+        checkpoint.poll(&ui, 4.0, |ui| config::save_ui(&path, ui).is_ok());
+        let saved = config::load_ui(&path).unwrap().unwrap();
+        assert_eq!(saved.window_size, ui.window_size);
+        assert_eq!(saved.recent_files, ui.recent_files);
+        checkpoint.poll(&ui, 6.0, |_| panic!("unchanged prefs do not write"));
     }
 }
