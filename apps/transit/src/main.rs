@@ -1,4 +1,4 @@
-//! transit desktop app: the studio UI over the SoundCraft engine.
+//! transit desktop app: the studio UI over the transit engine.
 //!
 //! Usage: `transit [--demo] [--control <port>] [--no-audio] [session.scraft]`
 //!

@@ -10,8 +10,10 @@
   <a href="https://github.com/derekmwright/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/derekmwright/transit/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
-A desktop DAW built on the [SoundCraft](https://github.com/storytold/soundcraft) engine, with
-Ableton/Logic-style ergonomics. Pure Rust, egui UI.
+A desktop DAW in pure Rust with Ableton/Logic-style ergonomics and its own audio engine, device
+layer and egui UI. transit began in October 2026 as a fork of
+[SoundCraft](https://github.com/storytold/soundcraft) and has diverged since; the lineage is
+credited in About and in NOTICE.
 
 > [!NOTE]
 > transit is alpha software under active development. The current priority is core engine

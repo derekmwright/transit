@@ -1,6 +1,6 @@
 # transit: instructions for agents
 
-transit is a desktop DAW (Rust, egui) built on the SoundCraft engine. Decisions live in ADRs, which
+transit is a desktop DAW (Rust, egui) with its own engine, forked from SoundCraft in October 2026. Decisions live in ADRs, which
 are maintained by the project owner; do not add or change one without being asked.
 
 ## Read first
