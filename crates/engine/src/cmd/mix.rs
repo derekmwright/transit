@@ -91,7 +91,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_selection,
             automation_mode
         ),
-        cmd!("mix.insert", "Insert Plugin", [], None, "{track?, slot?: 0..9 | a..j, plugin: id, params?: {id: value}}", has_selection, insert),
+        cmd!(
+            "mix.insert",
+            "Insert Plugin",
+            [],
+            None,
+            "{track?, slot?: 0..9 | a..j, plugin: id, params?: {id: value}} | {track?, slot?, hardware: {send: output path, return: input path}}",
+            has_selection,
+            insert
+        ),
         cmd!("mix.insert_remove", "Remove Insert", [], None, "{track?, slot}", has_selection, insert_remove),
         cmd!("mix.insert_bypass", "Bypass Insert", [], None, "{track?, slot, value?: bool}", has_selection, insert_bypass),
         cmd!("mix.insert_param", "Set Plugin Parameter", [], None, "{track?, slot, param, value}", has_selection, insert_param),
@@ -344,7 +352,32 @@ fn track_slot(e: &Engine, p: &Value, cmd: &str, max: usize) -> Result<(TrackId, 
     Ok((t, slot))
 }
 
+/// A hardware insert (ADR 0015 section 5): `hardware: {send, return}` names an output and an input
+/// path of the machine's I/O table. The pair need not exist on this machine (a session made on
+/// another interface keeps its names), but both must be non-empty.
+fn insert_hardware(e: &mut Engine, p: &Value, h: &Value) -> Result<Value> {
+    let path = |k: &str| h.get(k).and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty());
+    let (Some(send), Some(ret)) = (path("send"), path("return")) else {
+        return Err(bad("mix.insert", "`hardware` needs a `send` output path and a `return` input path"));
+    };
+    let t = tracks_required(e, "mix.insert", p)?.first().copied().ok_or_else(|| bad("mix.insert", "no track"))?;
+    let explicit = slot_of(p, "slot", INSERT_SLOTS);
+    let tr = e.session_mut().track_mut(t).ok_or_else(|| bad("mix.insert", "no track"))?;
+    if matches!(tr.kind, soundcraft_model::TrackKind::Master | soundcraft_model::TrackKind::Vca) {
+        return Err(bad("mix.insert", "a hardware insert goes on a track, aux or folder strip, not a master or VCA"));
+    }
+    let slot =
+        explicit.or_else(|| tr.mixer.inserts.iter().position(Option::is_none)).ok_or_else(|| bad("mix.insert", "all insert slots are in use"))?;
+    if let Some(sl) = tr.mixer.inserts.get_mut(slot) {
+        *sl = Some(Insert::hardware(send, ret));
+    }
+    Ok(json!({"track": t, "slot": slot, "hardware": {"send": send, "return": ret}}))
+}
+
 fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
+    if let Some(h) = p.get("hardware").filter(|h| h.is_object()) {
+        return insert_hardware(e, p, h);
+    }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.insert", "`plugin` required"))?.to_string();
     let named = p.get("params").and_then(Value::as_object);
     let (plugin_id, _, info) =

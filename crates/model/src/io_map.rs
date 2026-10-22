@@ -57,6 +57,21 @@ impl std::fmt::Display for IoError {
 
 impl std::error::Error for IoError {}
 
+/// A measured round trip through a hardware insert (ADR 0015 section 5): the frames between a
+/// sample written to the `send` output path and the same sample arriving on the `ret` input path,
+/// at one session `rate`. Stored per machine with the path table, since it is a fact about this
+/// interface and its cabling; a session names the paths only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HardwareLatency {
+    pub send: String,
+    pub ret: String,
+    pub round_trip_frames: u32,
+    pub rate: u32,
+    /// Seconds since the Unix epoch when it was measured (0 when unknown).
+    #[serde(default)]
+    pub measured_at: u64,
+}
+
 /// One device's channel counts and path table. `inputs` and `outputs` are the counts the stream
 /// opened (stored here, so one device in two USB modes is one entry that adapts).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -69,6 +84,8 @@ pub struct IoMap {
     pub paths: Vec<IoPath>,
     /// The output path Main plays on.
     pub main: String,
+    /// Measured hardware-insert round trips (see [`HardwareLatency`]).
+    pub hardware_latency: Vec<HardwareLatency>,
 }
 
 impl Default for IoMap {
@@ -140,7 +157,7 @@ impl IoMap {
             c += 2;
         }
         let main = paths.iter().find(|p| p.direction == IoDirection::Output).map_or_else(|| "Out 1-2".to_string(), |p| p.name.clone());
-        IoMap { system: system.into(), device: device.into(), inputs, outputs, paths, main }
+        IoMap { system: system.into(), device: device.into(), inputs, outputs, paths, main, hardware_latency: Vec::new() }
     }
 
     /// The key the app stores this table under.
@@ -228,7 +245,34 @@ impl IoMap {
         }
         let before = self.paths.len();
         self.paths.retain(|p| !p.name.eq_ignore_ascii_case(name));
-        if self.paths.len() == before { Err(IoError::Missing(name.into())) } else { Ok(()) }
+        if self.paths.len() == before {
+            return Err(IoError::Missing(name.into()));
+        }
+        self.hardware_latency.retain(|m| !m.send.eq_ignore_ascii_case(name) && !m.ret.eq_ignore_ascii_case(name));
+        Ok(())
+    }
+
+    /// The measured round trip, in frames, of a hardware insert sending on `send` and returning on
+    /// `ret` at session rate `rate`; `None` when that pair was not measured at that rate.
+    #[must_use]
+    pub fn hardware_latency(&self, send: &str, ret: &str, rate: u32) -> Option<u32> {
+        self.hardware_latency
+            .iter()
+            .find(|m| m.rate == rate && m.send.eq_ignore_ascii_case(send) && m.ret.eq_ignore_ascii_case(ret))
+            .map(|m| m.round_trip_frames)
+    }
+
+    /// Store a measurement, replacing the one for the same pair and rate.
+    pub fn set_hardware_latency(&mut self, m: HardwareLatency) {
+        self.hardware_latency.retain(|o| !(o.rate == m.rate && o.send.eq_ignore_ascii_case(&m.send) && o.ret.eq_ignore_ascii_case(&m.ret)));
+        self.hardware_latency.push(m);
+    }
+
+    /// Forget the measurements of the pair (every rate). Returns whether there were any.
+    pub fn clear_hardware_latency(&mut self, send: &str, ret: &str) -> bool {
+        let before = self.hardware_latency.len();
+        self.hardware_latency.retain(|o| !(o.send.eq_ignore_ascii_case(send) && o.ret.eq_ignore_ascii_case(ret)));
+        self.hardware_latency.len() != before
     }
 
     /// Choose the output path Main plays on.
@@ -417,6 +461,25 @@ mod tests {
         assert_eq!(input_channel(None, "Guitar", 0), 0);
         // An output path is not an input.
         assert_eq!(input_channel(Some(&m), "Out 1-2", 0), 0);
+    }
+
+    #[test]
+    fn hardware_latency_is_per_pair_and_rate_and_follows_removed_paths() {
+        let mut m = IoMap::for_device("ASIO", "x", 4, 4);
+        assert_eq!(m.hardware_latency("Out 3-4", "In 3-4", 48_000), None);
+        let at = |frames, rate| HardwareLatency { send: "Out 3-4".into(), ret: "In 3-4".into(), round_trip_frames: frames, rate, measured_at: 7 };
+        m.set_hardware_latency(at(300, 48_000));
+        m.set_hardware_latency(at(500, 44_100));
+        m.set_hardware_latency(at(310, 48_000));
+        assert_eq!(m.hardware_latency("out 3-4", "IN 3-4", 48_000), Some(310), "a new measurement replaces the old");
+        assert_eq!(m.hardware_latency("Out 3-4", "In 3-4", 44_100), Some(500));
+        assert_eq!(m.hardware_latency("Out 3-4", "In 1-2", 48_000), None);
+        let back: IoMap = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let mut gone = m.clone();
+        gone.remove_path("In 3-4").unwrap();
+        assert!(gone.hardware_latency.is_empty());
+        assert!(m.clear_hardware_latency("Out 3-4", "In 3-4") && !m.clear_hardware_latency("Out 3-4", "In 3-4"));
     }
 
     #[test]

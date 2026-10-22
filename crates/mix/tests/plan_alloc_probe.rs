@@ -331,6 +331,38 @@ fn output_path_routes_allocate_nothing_when_added_moved_and_removed() {
 }
 
 #[test]
+fn hardware_inserts_allocate_nothing_when_added_bypassed_remeasured_and_removed() {
+    use soundcraft_model::{HardwareLatency, IoMap};
+    let (mut s, t, _) = session_with_clip();
+    let mut rig = Rig::new(&s);
+    let mut io = IoMap::for_device("test", "test", 4, 4);
+    rig.compiler.set_io(Arc::new(io.clone()));
+    rig.out = vec![vec![0.0; BLOCK]; 4];
+    rig.mix.input = vec![vec![0.25; BLOCK]; 4];
+    s.track_mut(t).unwrap().mixer.inserts[1] = Some(Insert::hardware("Out 3-4", "In 3-4"));
+    no_cost("add a hardware insert (unmeasured)", &rig.edit(&s));
+    assert!(rig.out[2].iter().any(|x| *x != 0.0), "the send path carries the track");
+    assert!(rig.out[0].iter().any(|x| *x != 0.0), "and the return plays on Main");
+    let at = |frames| HardwareLatency { send: "Out 3-4".into(), ret: "In 3-4".into(), round_trip_frames: frames, rate: SR, measured_at: 1 };
+    io.set_hardware_latency(at(900));
+    rig.compiler.set_io(Arc::new(io.clone()));
+    no_cost("a measurement lands", &rig.edit(&s));
+    io.set_hardware_latency(at(5_000));
+    rig.compiler.set_io(Arc::new(io.clone()));
+    no_cost("a longer measurement (delay lines regrown)", &rig.edit(&s));
+    for bypass in [true, false] {
+        s.track_mut(t).unwrap().mixer.inserts[1].as_mut().unwrap().bypass = bypass;
+        no_cost(if bypass { "bypass" } else { "engage" }, &rig.edit(&s));
+    }
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(builtin("compressor"));
+    no_cost("a plug-in before it", &rig.edit(&s));
+    s.track_mut(t).unwrap().mixer.inserts[1] = None;
+    let e = rig.edit(&s);
+    no_cost("remove it", &e);
+    assert_eq!(e.status.capacity_exceeded, 0);
+}
+
+#[test]
 fn sidechain_keys_allocate_nothing_when_added_changed_and_removed() {
     use soundcraft_model::{Bus, BusId, KeyFrom, KeySource, Tap};
     let (mut s, bass, _) = session_with_clip();

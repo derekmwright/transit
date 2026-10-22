@@ -53,9 +53,13 @@ pub fn plan_sinks(s: &Session, io: &IoMap, out_channels: u16) -> SinkPlan {
     let mut room = MAX_SINK_CHANNELS;
     let tracks = s.tracks.iter().filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca));
     for t in tracks {
-        let names = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target));
-        for r in names {
-            let Route::Hardware(name) = r else { continue };
+        // A hardware insert's send path is a sink of the plan too (ADR 0015 section 5).
+        let sends = t.mixer.inserts.iter().flatten().filter_map(|i| i.hardware.as_ref()).map(|h| h.send.as_str());
+        let names = std::iter::once(&t.mixer.output).chain(t.mixer.sends.iter().flatten().map(|x| &x.target)).filter_map(|r| match r {
+            Route::Hardware(name) => Some(name.as_str()),
+            _ => None,
+        });
+        for name in names.chain(sends) {
             if seen.iter().any(|n| n.eq_ignore_ascii_case(name)) {
                 continue;
             }
@@ -68,7 +72,7 @@ pub fn plan_sinks(s: &Session, io: &IoMap, out_channels: u16) -> SinkPlan {
                     let format = if p.format.channels() == p.channels.len() { p.format } else { ChannelFormat::for_channels(p.channels.len()) };
                     plan.sinks.push(SinkSpec { name: p.name.clone(), dest: p.channels.clone(), format });
                 }
-                None => plan.unresolved.push(name.clone()),
+                None => plan.unresolved.push(name.to_string()),
             }
         }
     }

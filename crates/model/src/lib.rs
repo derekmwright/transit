@@ -21,16 +21,16 @@ mod track;
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
 pub use clip::{Clip, ClipContent, Fade, FadeShape};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
-pub use io_map::{IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH, input_channel};
+pub use io_map::{HardwareLatency, IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH, input_channel};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use midi_input::{MidiInput, MidiPort};
 pub use mixer::{
-    Bus, ChannelFormat, INSERT_SLOTS, Insert, InsertUid, KeyFrom, KeySource, Mixer, OutputPath, Route, SEND_SLOTS, SendSlot, Speaker, SurroundPan,
-    Tap, fader_db_to_pos, fader_pos_to_db,
+    Bus, ChannelFormat, HARDWARE_PLUGIN, HardwareInsert, INSERT_SLOTS, Insert, InsertUid, KeyFrom, KeySource, Mixer, OutputPath, Route, SEND_SLOTS,
+    SendSlot, Speaker, SurroundPan, Tap, fader_db_to_pos, fader_pos_to_db,
 };
 pub use route_graph::{
-    EdgeKind, Layering, RouteChange, RouteCycle, RouteEdge, RouteGraph, RouteNode, RouteScratch, describe_cycle, new_cycle, would_create_cycle,
-    would_create_cycle_all,
+    EdgeKind, Layering, RouteChange, RouteCycle, RouteEdge, RouteGraph, RouteNode, RouteScratch, describe_cycle, hardware_problem, new_cycle,
+    would_create_cycle, would_create_cycle_all,
 };
 pub use session::{
     BitDepthSetting, EditMode, EditState, FEET_FRAMES_START, MAX_COMMENT_CHARS, MAX_NAME_CHARS, SESSION_EXTENSION, Session, SessionError, Tool,

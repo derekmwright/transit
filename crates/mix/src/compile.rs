@@ -116,6 +116,8 @@ struct Desc {
     sinks: Vec<SinkSpec>,
     /// The machine's input paths (monitoring resolves input names through the active plan's copy).
     inputs: Vec<IoPath>,
+    /// The hardware inserts: their sinks, return channels and measured latency (ADR 0015 section 5).
+    hardware: Vec<(TrackId, crate::hardware::HwSpec)>,
 }
 
 /// What the compiler knows of one plan's tables.
@@ -621,10 +623,13 @@ impl PlanCompiler {
         };
         measure(&session, &self.limits, block, &least, &|_, _| 0)?;
         // Path-based (F05): the slowest path into any summing point bounds every edge's delay.
-        let need = path_need(&session, &|t: &Track| match &t.freeze {
-            Some(f) => f.latency as usize,
-            None if mode == CompileMode::Update => self.active.track_latency(t.id),
-            None => 0,
+        let need = path_need(&session, &|t: &Track| {
+            let hw = crate::hardware::latency_of(t, &self.io, self.target.sample_rate);
+            match &t.freeze {
+                Some(f) => f.latency as usize,
+                None if mode == CompileMode::Update => self.active.track_latency(t.id).saturating_add(hw),
+                None => hw,
+            }
         });
         let sized = |me: &Self, hints: bool| {
             let cap_of = |t: &Track, ch: usize| match me.strip_cap(t, ch, need, hints, mode) {
@@ -776,6 +781,11 @@ impl PlanCompiler {
         }
         desc.sinks = plan_sinks(s, &self.io, self.target.out_channels).sinks;
         desc.inputs = self.io.paths_of(IoDirection::Input).cloned().collect();
+        for t in rows.iter().filter_map(|&ti| s.tracks.get(ti)).filter(|t| !matches!(t.kind, TrackKind::Master | TrackKind::Vca)) {
+            for spec in crate::hardware::specs_of(t, &self.io, &desc.sinks, self.target.in_channels, self.target.sample_rate) {
+                desc.hardware.push((t.id, spec));
+            }
+        }
         (desc, rows, phase1, aux_end, specs, loops)
     }
 
@@ -962,7 +972,7 @@ impl PlanCompiler {
                     .iter()
                     .filter(|p| matches!(p.kind, CellKind::Insert | CellKind::Instrument))
                     .fold(t.freeze.as_ref().map_or(0, |f| f.latency as usize), |a, p| a.saturating_add(latency_of(p, self)));
-                Some((t.id, l))
+                Some((t.id, l.saturating_add(crate::hardware::latency_of(t, &self.io, self.target.sample_rate))))
             })
             .collect();
         let need1 = path_need(s, &|t: &Track| planned.get(&t.id).copied().unwrap_or(0));
@@ -1000,6 +1010,7 @@ impl PlanCompiler {
             st.pre = (0..ch).map(|_| Vec::with_capacity(block)).collect();
             st.scratch = vec![0.0; block];
             st.plugins = (0..t.mixer.inserts.len()).map(|_| None).collect();
+            st.hw = desc.hardware.iter().filter(|(id, _)| *id == t.id).map(|(_, sp)| crate::hardware::HwSlot::new(sp.clone(), block)).collect();
             st.clipbuf = vec![vec![0.0; block]; ch];
             st.key_pre = desc.keys.iter().any(|k| k.pre && k.from == KeyEnd::Strip(si as u16));
             // A line for the strip's own signal before each keyed insert, in case its key arrives late.

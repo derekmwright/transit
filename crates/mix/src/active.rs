@@ -502,7 +502,7 @@ impl MixEngine {
         if pdc {
             for st in auxes.iter_mut() {
                 if let Some(t) = track(st).filter(|t| !t.inactive) {
-                    note_insert_latency(t, st, pos);
+                    note_insert_latency(t, st, pos, !self.input.is_empty());
                 }
             }
         }
@@ -510,7 +510,7 @@ impl MixEngine {
         if pdc {
             for st in others.iter_mut() {
                 if let Some(t) = track(st).filter(|t| t.kind == TrackKind::Master && !t.inactive) {
-                    note_insert_latency(t, st, pos);
+                    note_insert_latency(t, st, pos, !self.input.is_empty());
                     lmax_m = lmax_m.saturating_add(st.latency);
                 }
             }

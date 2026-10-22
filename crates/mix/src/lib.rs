@@ -72,6 +72,7 @@ use std::sync::Arc;
 mod active;
 mod compile;
 mod events;
+mod hardware;
 mod key;
 mod plan;
 #[cfg(test)]
@@ -84,6 +85,7 @@ pub use events::{
     Arrival, Due, EngineEpoch, EventLimits, EventOutcome, EventStatus, InstrumentEvent, MAX_OPEN, MAX_PEDALS, MAX_PORTS, Message, NoteId,
     PluginEvent, QUEUE_CAP, RenderFrame, Shed, ShedCounts, Source, TapRecord, TransportEpoch,
 };
+pub use hardware::{HardwareReport, HardwareState, hardware_report};
 use key::{KeyBank, KeyEnd, KeyIn, KeySpec};
 pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
@@ -182,7 +184,8 @@ pub fn realtime_instance_specs(s: &Session) -> Vec<InstanceSpec> {
         let ch = strip_channels(t, main_ch);
         let mut seen: Vec<u64> = Vec::new();
         for (i, ins) in t.mixer.inserts.iter().enumerate() {
-            if let Some(ins) = ins {
+            // A hardware insert has no plug-in instance (the plan runs it, `hardware.rs`).
+            if let Some(ins) = ins.as_ref().filter(|x| x.hardware.is_none()) {
                 // A copied insert on the same strip keeps no identity (0): its instance stays by slot.
                 let uid = ins.uid.get();
                 let uid = if seen.contains(&uid) { 0 } else { uid };
@@ -503,6 +506,8 @@ struct Strip {
     layout: u16,
     /// The strip's meter.
     meter: StripMeter,
+    /// Plan mode: the strip's hardware inserts (ADR 0015 section 5), made by the compiler.
+    hw: Vec<hardware::HwSlot>,
     /// A panic out of this strip's processing in phase 1, caught by [`guarded`] on the thread that
     /// rendered the strip (moving the box allocates nothing). The render re-raises the first one to
     /// its caller; any other stays here until a later render re-raises it, or leaves with the
@@ -750,6 +755,7 @@ impl Strip {
             id: TrackId(0),
             layout: 0,
             meter: StripMeter::default(),
+            hw: Vec::new(),
             panic: None,
         }
     }
@@ -1022,6 +1028,10 @@ fn pdc_visit(t: &Track, st: &mut Strip, at: usize, live: bool, busses: &mut BusT
 /// line had to clamp (0: none).
 fn route_into(t: &Track, strip: &mut Strip, pos: Samples, frames: usize, out: MixOut<'_>) -> usize {
     let MixOut { busses, main, main_fmt, sinks, law, main_arrival } = out;
+    // Hardware inserts: what the strip sent goes into its send path's sink, where the device plays it.
+    for h in &strip.hw {
+        h.flush(sinks, frames);
+    }
     let Strip { buf, pre, tap, tap_pre, outbuf, muted, pdc_out, pdc_pos, edges, .. } = strip;
     let (o, at, muted) = (*pdc_out, *pdc_pos, *muted);
     // The delay of an edge into `r`, `None` when it is dropped (a loop's feedback, or nowhere).
@@ -1320,7 +1330,20 @@ fn process_strip(
     // A frozen track reports the latency of the chain its render replaces.
     let mut latency = frozen_latency(t).saturating_add(strip.instrument.as_ref().filter(|i| !i.failed).map_or(0, |i| i.plugin.latency()));
     strip.key_in.iter_mut().for_each(|k| k.ran = false);
+    strip.hw.iter_mut().for_each(hardware::HwSlot::rest);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        // A hardware insert sends the signal out and takes the return up; with no live input, or
+        // an unresolved path, it passes the signal through dry and adds no latency.
+        if let Some(ins) = ins.as_ref().filter(|x| x.hardware.is_some()) {
+            if ins.active
+                && !ins.bypass
+                && let Some(h) = strip.hw.iter_mut().find(|h| usize::from(h.spec.slot) == i)
+                && h.run(&mut strip.buf, live.input, frames)
+            {
+                latency = latency.saturating_add(h.spec.latency as usize);
+            }
+            continue;
+        }
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         if !ins.active || ins.bypass || slot.failed {
             continue;
@@ -2333,9 +2356,20 @@ pub(crate) fn frozen_latency(t: &Track) -> usize {
     t.freeze.as_ref().map_or(0, |f| f.latency as usize)
 }
 
-fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples) {
+fn note_insert_latency(t: &Track, strip: &mut Strip, pos: Samples, duplex: bool) {
     let mut latency = frozen_latency(t);
     for (i, ins) in t.mixer.inserts.iter().enumerate() {
+        // As `process_strip`: a hardware insert that runs (live input, resolved paths) adds its round trip.
+        if let Some(ins) = ins.as_ref().filter(|x| x.hardware.is_some()) {
+            if duplex
+                && ins.active
+                && !ins.bypass
+                && let Some(h) = strip.hw.iter().find(|h| usize::from(h.spec.slot) == i && h.spec.runs())
+            {
+                latency = latency.saturating_add(h.spec.latency as usize);
+            }
+            continue;
+        }
         let (Some(ins), Some(Some(slot))) = (ins, strip.plugins.get_mut(i)) else { continue };
         // As `process_strip`: a failed insert is skipped, so its latency no longer counts.
         if !ins.active || ins.bypass || slot.failed {

@@ -746,6 +746,58 @@ pub fn would_create_cycle_all(s: &Session, changes: &[RouteChange]) -> Option<Ve
     None
 }
 
+/// The first reason `s` holds a hardware insert (ADR 0015 section 5) that cannot work, `None` when
+/// it holds none: two hardware inserts sending on one output path (the paths sum, which is wrong
+/// for a send), or a hardware insert whose send path is fed by a route downstream of the insert
+/// itself (its own output, or anything its signal reaches through busses), which would feed the
+/// return back into the send through the device. The send, the device and the return are an edge
+/// that never orders the render (the return arrives blocks later), so this is a check on edits and
+/// not part of the render graph.
+#[must_use]
+pub fn hardware_problem(s: &Session) -> Option<String> {
+    let hw: Vec<(usize, &str)> = s
+        .tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| t.mixer.inserts.iter().flatten().filter_map(move |x| x.hardware.as_ref().map(|h| (i, h.send.as_str()))))
+        .collect();
+    if hw.is_empty() {
+        return None;
+    }
+    for (k, (_, send)) in hw.iter().enumerate() {
+        if hw[..k].iter().any(|(_, o)| o.eq_ignore_ascii_case(send)) {
+            return Some(format!("two hardware inserts send on `{send}`; a send path can serve only one"));
+        }
+    }
+    let graph = RouteGraph::new(s);
+    for &(t, send) in &hw {
+        // Everything the insert's strip feeds: tracks and busses reached through the routing edges.
+        let mut seen: Vec<RouteNode> = vec![RouteNode::Track(t)];
+        let mut at = 0;
+        while let Some(&n) = seen.get(at) {
+            at += 1;
+            for e in graph.edges().iter().filter(|e| e.from == n && !matches!(e.kind, EdgeKind::Key { .. })) {
+                if !seen.contains(&e.to) {
+                    seen.push(e.to);
+                }
+            }
+        }
+        let names = |r: &Route| matches!(r, Route::Hardware(h) if h.eq_ignore_ascii_case(send));
+        for n in &seen {
+            let RouteNode::Track(i) = n else { continue };
+            let Some(src) = s.tracks.get(*i) else { continue };
+            if names(&src.mixer.output) || src.mixer.sends.iter().flatten().any(|x| names(&x.target)) {
+                let from = s.tracks.get(t).map_or("a track", |x| x.name.as_str());
+                return Some(format!(
+                    "`{}` feeds `{send}`, the send path of a hardware insert on `{from}`: the return would feed its own send",
+                    src.name
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Whether two sessions route alike (same tracks, kinds, inputs, outputs, send targets and busses,
 /// in the same order): then no edit between them can have closed a loop. Allocates nothing.
 fn same_routing(a: &Session, b: &Session) -> bool {
@@ -758,7 +810,11 @@ fn same_routing(a: &Session, b: &Session) -> bool {
                 && x.mixer.input == y.mixer.input
                 && x.mixer.output == y.mixer.output
                 && x.mixer.inserts.len() == y.mixer.inserts.len()
-                && x.mixer.inserts.iter().zip(&y.mixer.inserts).all(|(p, q)| p.as_ref().map(|z| z.key) == q.as_ref().map(|z| z.key))
+                && x.mixer
+                    .inserts
+                    .iter()
+                    .zip(&y.mixer.inserts)
+                    .all(|(p, q)| p.as_ref().map(|z| (z.key, &z.hardware)) == q.as_ref().map(|z| (z.key, &z.hardware)))
                 && x.mixer.sends.len() == y.mixer.sends.len()
                 && x.mixer.sends.iter().zip(&y.mixer.sends).all(|(p, q)| p.as_ref().map(|z| &z.target) == q.as_ref().map(|z| &z.target))
         })

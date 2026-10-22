@@ -476,6 +476,23 @@ pub struct KeySource {
     pub tap: Tap,
 }
 
+/// The plug-in id a hardware insert slot carries (ADR 0015 section 5). It names no plug-in: an
+/// older build that does not know the kind sees an unknown plug-in id and passes the signal
+/// through, so a session with a hardware insert still opens there.
+pub const HARDWARE_PLUGIN: &str = "hardware.insert";
+
+/// A hardware insert: the slot sends the strip's signal to an output path and takes the signal
+/// that continues down the chain from an input path (ADR 0015 section 5). Both are path names,
+/// resolved against the machine's I/O map, so the same session opens on another interface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HardwareInsert {
+    /// The output path the signal leaves on.
+    pub send: String,
+    /// The input path it comes back on.
+    #[serde(rename = "return")]
+    pub ret: String,
+}
+
 /// A plugin instance on an insert slot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Insert {
@@ -504,6 +521,10 @@ pub struct Insert {
     /// to the slot and moves with it. Hosted plug-ins ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<KeySource>,
+    /// Set on a hardware insert slot (`plugin` is then [`HARDWARE_PLUGIN`]): the slot has no
+    /// plug-in; the signal goes out one path of the audio interface and comes back on another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareInsert>,
 }
 
 fn yes() -> bool {
@@ -521,8 +542,14 @@ impl Insert {
             state: None,
             sample: None,
             key: None,
+            hardware: None,
             uid: InsertUid::default(),
         }
+    }
+
+    /// A hardware insert slot sending on output path `send` and returning on input path `ret`.
+    pub fn hardware(send: impl Into<String>, ret: impl Into<String>) -> Self {
+        Insert { hardware: Some(HardwareInsert { send: send.into(), ret: ret.into() }), preset: String::new(), ..Insert::new(HARDWARE_PLUGIN) }
     }
 
     /// The decoded plugin state (`None` when absent or malformed).
@@ -812,6 +839,25 @@ mod tests {
         let back = Session::from_json(&v.to_string()).unwrap();
         let m = &back.track(t).unwrap().mixer;
         assert!(!m.record_arm && !m.input_monitor);
+    }
+
+    #[test]
+    fn a_hardware_insert_round_trips_and_other_inserts_do_not_carry_it() {
+        let hw = Insert::hardware("Out 3-4", "In 3-4");
+        assert_eq!(hw.plugin, HARDWARE_PLUGIN);
+        let json = serde_json::to_string(&hw).unwrap();
+        assert!(json.contains(r#""hardware":{"send":"Out 3-4","return":"In 3-4"}"#), "{json}");
+        let back: Insert = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hardware, hw.hardware);
+        assert!(!serde_json::to_string(&Insert::new("gain")).unwrap().contains("hardware"));
+        let old: Insert = serde_json::from_str(r#"{"plugin":"eq_7band"}"#).unwrap();
+        assert!(old.hardware.is_none());
+        // A build that does not know the field reads the slot as an unknown plug-in.
+        #[derive(serde::Deserialize)]
+        struct Previous {
+            plugin: String,
+        }
+        assert_eq!(serde_json::from_str::<Previous>(&json).unwrap().plugin, HARDWARE_PLUGIN);
     }
 
     #[test]

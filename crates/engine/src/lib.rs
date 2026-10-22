@@ -444,7 +444,12 @@ impl Engine {
                         id,
                         format!("that route would create a routing loop: {}", soundcraft_model::describe_cycle(&self.doc, &path)),
                     ))),
-                    None => Ok(Ok(v)),
+                    // A hardware insert (ADR 0015 section 5): a send path serves one insert, and the
+                    // return may not feed its own send.
+                    None => match soundcraft_model::hardware_problem(&self.doc).filter(|_| soundcraft_model::hardware_problem(&before).is_none()) {
+                        Some(why) => Ok(Err(cmd::bad(id, why))),
+                        None => Ok(Ok(v)),
+                    },
                 }
             }
             other => other,
