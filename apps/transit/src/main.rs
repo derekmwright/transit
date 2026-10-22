@@ -227,6 +227,7 @@ fn services() -> Services {
             };
             d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
         })),
+        config_dir: config::config_dir(),
     }
 }
 

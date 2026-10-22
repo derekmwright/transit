@@ -1,0 +1,12 @@
+{
+  "plugin": "eq_7band",
+  "version": 1,
+  "params": {
+    "hpf_on": 1.0,
+    "hpf_freq": 90.0,
+    "hpf_slope": 2.0,
+    "low_mid_freq": 300.0,
+    "low_mid_gain": -2.0,
+    "low_mid_q": 0.8
+  }
+}

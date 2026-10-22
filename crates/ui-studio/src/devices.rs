@@ -475,7 +475,7 @@ pub(crate) fn key_label(s: &soundcraft_model::Session, ins: &Insert) -> String {
 /// The sources an insert on track `t` can take a key from: every other track that carries audio
 /// (an aux or folder only for an aux or folder track, which render after the audio tracks), then,
 /// for an aux or folder track, every bus. The engine refuses what remains impossible, a loop.
-fn key_sources(s: &soundcraft_model::Session, t: TrackId) -> (Vec<(TrackId, String)>, Vec<(soundcraft_model::BusId, String)>) {
+pub(crate) fn key_sources(s: &soundcraft_model::Session, t: TrackId) -> (Vec<(TrackId, String)>, Vec<(soundcraft_model::BusId, String)>) {
     let late = s.track(t).is_some_and(|x| matches!(x.kind, TrackKind::Aux | TrackKind::Folder));
     let tracks = s
         .tracks

@@ -1,0 +1,22 @@
+{
+  "plugin": "subtractive_synth",
+  "version": 1,
+  "params": {
+    "osc1_wave": 0.0,
+    "osc2_wave": 0.0,
+    "osc2_detune": 12.0,
+    "osc_mix": 50.0,
+    "cutoff": 1400.0,
+    "resonance": 10.0,
+    "filter_env_amount": 20.0,
+    "amp_attack": 600.0,
+    "amp_decay": 800.0,
+    "amp_sustain": 80.0,
+    "amp_release": 1500.0,
+    "filter_attack": 700.0,
+    "filter_decay": 900.0,
+    "filter_sustain": 40.0,
+    "filter_release": 1500.0,
+    "velocity": 40.0
+  }
+}

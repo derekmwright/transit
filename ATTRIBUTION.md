@@ -30,6 +30,7 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 
 | Path | Author | Source | License |
 |---|---|---|---|
+| `assets/presets/` | @derekmwright | original parameter sets for the built-in plug-ins (JSON, one file per preset) | MIT OR Apache-2.0 |
 | `assets/app-icon/transit.svg` | @derekmwright | original (the wordmark's first t on a rounded square; the app icon master) | MIT OR Apache-2.0 |
 | `assets/app-icon/transit-1024.png` | @derekmwright | original, export of `transit.svg` | MIT OR Apache-2.0 |
 | `assets/app-icon/transit-macos-512.png` | @derekmwright | original, derived from `transit-1024.png` (Apple-grid margin) | MIT OR Apache-2.0 |

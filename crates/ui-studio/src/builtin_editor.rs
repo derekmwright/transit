@@ -47,6 +47,8 @@ pub struct EditorLayout {
     pub rect: [f32; 4],
     /// The bypass toggle (inserts only), the Sampler's "Load Sample…" button and its sample line.
     pub bypass: [f32; 4],
+    /// The preset dropdown.
+    pub preset: [f32; 4],
     pub picker: [f32; 4],
     pub sample: String,
     pub groups: Vec<String>,
@@ -102,7 +104,7 @@ impl StudioApp {
     }
 
     /// Writes one built-in parameter: merged into the gesture in progress.
-    fn set_builtin_param(&mut self, key: (TrackId, usize), param: &str, value: f32) {
+    pub(crate) fn set_builtin_param(&mut self, key: (TrackId, usize), param: &str, value: f32) {
         let (t, slot) = key;
         self.builtin_editor.gesture = true;
         let r = if slot == soundcraft_mix::INSTRUMENT_SLOT {
@@ -141,6 +143,7 @@ pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
             title: title.clone(),
             rect: [0.0; 4],
             bypass: [0.0; 4],
+            preset: [0.0; 4],
             picker: [0.0; 4],
             sample: String::new(),
             groups: Vec::new(),
@@ -150,7 +153,7 @@ pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
         let shown = egui::Window::new(title)
             .id(egui::Id::new(("builtin_editor", ins.uid.get())))
             .open(&mut open)
-            .default_width(360.0)
+            .default_width(if crate::panel::layout(&ins.plugin).is_some() { 0.0 } else { 360.0 })
             .default_pos(egui::pos2(ctx.content_rect().width() - 400.0 - 24.0 * n as f32, 90.0 + 24.0 * n as f32))
             .show(ctx, |ui| body(app, ui, key, &ins, info, instrument, &mut layout));
         if let Some(w) = shown {
@@ -192,14 +195,21 @@ fn load_sample(app: &mut StudioApp, t: TrackId, path: &str) {
 
 fn body(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &Insert, info: &'static PluginInfo, instrument: bool, lay: &mut EditorLayout) {
     let (t, slot) = key;
-    if !instrument {
-        ui.horizontal(|ui| {
+    ui.horizontal(|ui| {
+        if !instrument {
             let r = ui.selectable_label(ins.bypass, if ins.bypass { "Bypassed" } else { "Bypass" });
             lay.bypass = rect4(r.rect);
             if r.on_hover_text("Bypass this effect").clicked() {
                 let _ = app.toggle_bypass(t, slot);
             }
-        });
+        }
+        if crate::panel::layout(&ins.plugin).is_some() {
+            crate::presets::control(app, ui, key, ins, info, &mut lay.preset);
+        }
+    });
+    if let Some(rows) = crate::panel::layout(&ins.plugin) {
+        crate::panel::show(app, ui, key, ins, info, rows, lay);
+        return;
     }
     if ins.plugin == SAMPLER {
         sample_picker(app, ui, t, ins, lay);
@@ -225,7 +235,7 @@ fn body(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &Insert, i
 }
 
 /// A double-click on the control. (A slider senses drags only, so its response never reports one.)
-fn double_clicked(ui: &Ui, r: &egui::Response) -> bool {
+pub(crate) fn double_clicked(ui: &Ui, r: &egui::Response) -> bool {
     ui.input(|i| {
         (i.pointer.button_double_clicked(egui::PointerButton::Primary) || i.pointer.button_triple_clicked(egui::PointerButton::Primary))
             && i.pointer.interact_pos().is_some_and(|p| r.rect.contains(p))

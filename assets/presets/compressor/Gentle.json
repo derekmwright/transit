@@ -1,0 +1,12 @@
+{
+  "plugin": "compressor",
+  "version": 1,
+  "params": {
+    "threshold": -12.0,
+    "ratio": 2.0,
+    "attack": 20.0,
+    "release": 200.0,
+    "knee": 12.0,
+    "makeup": 1.5
+  }
+}

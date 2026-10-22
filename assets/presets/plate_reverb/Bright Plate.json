@@ -1,0 +1,11 @@
+{
+  "plugin": "plate_reverb",
+  "version": 1,
+  "params": {
+    "mix": 30.0,
+    "pre_delay": 10.0,
+    "decay": 3.2,
+    "damping": 16000.0,
+    "low_cut": 100.0
+  }
+}

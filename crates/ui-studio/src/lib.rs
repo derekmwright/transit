@@ -32,7 +32,9 @@ pub mod menus;
 pub mod metronome;
 mod midi_input;
 pub mod mixer;
+pub mod panel;
 pub mod plugin_scan;
+pub mod presets;
 pub mod recent;
 pub mod shortcuts;
 pub mod splash;
@@ -41,6 +43,7 @@ pub mod tempo_edit;
 pub mod theme;
 pub mod transport;
 pub mod waveform;
+pub mod widgets;
 
 use serde_json::{Value, json};
 use soundcraft_engine::Engine;
@@ -184,6 +187,8 @@ impl Default for UiState {
 pub struct Services {
     pub pick_open: Option<Box<dyn Fn(&str) -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// The app's settings folder; user presets live under `presets/` in it. `None`: factory presets only.
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Ballistic meter display state (copied from `soundcraft-ui-egui`, see [`host::feed_meter`]).

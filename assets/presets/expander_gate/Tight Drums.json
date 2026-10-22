@@ -1,0 +1,12 @@
+{
+  "plugin": "expander_gate",
+  "version": 1,
+  "params": {
+    "threshold": -32.0,
+    "ratio": 20.0,
+    "range": 60.0,
+    "attack": 0.3,
+    "hold": 40.0,
+    "release": 90.0
+  }
+}
