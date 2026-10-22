@@ -44,8 +44,8 @@ fn impulse_track(s: &mut Session, name: &str) -> TrackId {
     t
 }
 
-fn target() -> RenderTarget {
-    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: 4, in_channels: 4 }
+fn target(io: &IoMap) -> RenderTarget {
+    RenderTarget { device: DeviceGeneration(1), sample_rate: SR, max_block: BLOCK as u32, out_channels: io.outputs, in_channels: io.inputs }
 }
 
 fn io(measured: Option<usize>) -> IoMap {
@@ -67,9 +67,16 @@ struct Rendered {
 /// Renders `s` on the fake device. `duplex` feeds the input from the device output `delay` frames
 /// earlier; otherwise the mix gets no input at all.
 fn render(s: &Session, io: &IoMap, duplex: bool, delay: usize) -> Rendered {
+    render_on(s, io, duplex, delay, 2, Some)
+}
+
+/// [`render`] on a device as wide as `io`: input channel `c` is cabled from output `cable(c)`, and
+/// `Rendered::sent` is what output `sent` played.
+fn render_on(s: &Session, io: &IoMap, duplex: bool, delay: usize, sent: usize, cable: impl Fn(usize) -> Option<usize>) -> Rendered {
+    let (outs, ins) = (usize::from(io.outputs), usize::from(io.inputs));
     MixEngine::force_serial(true);
-    let mut mix = MixEngine::realtime(target());
-    let mut compiler = PlanCompiler::new(target(), PlanLimits::default());
+    let mut mix = MixEngine::realtime(target(io));
+    let mut compiler = PlanCompiler::new(target(io), PlanLimits::default());
     compiler.set_io(Arc::new(io.clone()));
     let mut maker = |spec: &InstanceSpec, _: soundcraft_mix::SlotGen| {
         soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), SR as f32, BLOCK, spec.ch)
@@ -78,17 +85,17 @@ fn render(s: &Session, io: &IoMap, duplex: bool, delay: usize) -> Rendered {
     let mut env = compiler.compile(Arc::new(s.clone()), compiler.active(), PlanGeneration::from_raw(1), &mut maker).unwrap();
     assert_eq!(mix.adopt_plan(&mut env), Adoption::Adopted);
     compiler.reclaim(env);
-    let sinks = plan_sinks(s, io, 4);
+    let sinks = plan_sinks(s, io, io.outputs);
     let dest = sinks.destinations();
     let main_w = soundcraft_mix::main_channels(s);
     let mut out = vec![vec![0.0f32; BLOCK]; main_w + sinks.channels()];
     // The device's output stream, per device channel, from sample 0.
-    let mut device: Vec<Vec<f32>> = vec![Vec::new(); 4];
+    let mut device: Vec<Vec<f32>> = vec![Vec::new(); outs];
     let (mut main, mut pos, mut latency) = (Vec::new(), 0usize, 0usize);
     while main.len() < LEN + latency + 2 * D {
         mix.input = if duplex {
-            (0..4)
-                .map(|c| (0..BLOCK).map(|i| (pos + i).checked_sub(delay).and_then(|k| device[c].get(k)).copied().unwrap_or(0.0)).collect())
+            (0..ins)
+                .map(|c| (0..BLOCK).map(|i| (pos + i).checked_sub(delay).and_then(|k| device[cable(c)?].get(k)).copied().unwrap_or(0.0)).collect())
                 .collect()
         } else {
             Vec::new()
@@ -107,7 +114,7 @@ fn render(s: &Session, io: &IoMap, duplex: bool, delay: usize) -> Rendered {
         pos += BLOCK;
     }
     assert_eq!(mix.status().capacity_exceeded, 0, "the plan's delay lines hold the round trip");
-    Rendered { main, latency, sent: device.swap_remove(2) }
+    Rendered { main, latency, sent: device.swap_remove(sent) }
 }
 
 fn hits(x: &[f32]) -> Vec<usize> {
@@ -226,4 +233,35 @@ fn a_disabled_insert_passes_the_signal_through_dry_claims_no_sink_and_reports_wh
     assert!(plan_sinks(&s, &io(None), 4).sinks.is_empty(), "a disabled insert's send path is no sink");
     let report = hardware_report(&s, &io(Some(D)), 4, 4, true, SR);
     assert_eq!((report[0].state.clone(), report[0].latency), (HardwareState::Disabled("send path in use by Other".into()), None));
+}
+
+/// The TASCAM Model 12 over native ASIO opens 12 inputs and 10 outputs: an insert on its last pairs
+/// ("Out 9-10" cabled back to "In 11-12") sends on device channels 8 and 9, returns on 10 and 11,
+/// and is compensated like one on the first channels.
+#[test]
+fn an_insert_on_the_last_channels_of_a_12_in_10_out_device_sends_and_returns_there() {
+    let mut io = IoMap::for_device("ASIO", "Model Mixer ASIO Driver", 12, 10);
+    io.set_hardware_latency(HardwareLatency {
+        send: "Out 9-10".into(),
+        ret: "In 11-12".into(),
+        round_trip_frames: D as u32,
+        rate: SR,
+        measured_at: 1,
+    });
+    let mut s = session();
+    let dry = impulse_track(&mut s, "Dry");
+    let t = impulse_track(&mut s, "Outboard");
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::hardware("Out 9-10", "In 11-12"));
+    let cable = |input: usize| (input >= 10).then(|| input - 2);
+    let r = render_on(&s, &io, true, D, 8, cable);
+    assert_eq!(r.latency, D, "the measured round trip is reported");
+    assert_eq!(hits(&r.main), [AT + D], "the dry track is compensated to the outboard one");
+    assert_eq!(hits(&r.sent), [AT], "the signal left on output 9");
+    assert_eq!(plan_sinks(&s, &io, 10).destinations(), [8, 9]);
+    let report = hardware_report(&s, &io, 10, 12, true, SR);
+    assert_eq!((report[0].state.clone(), report[0].latency), (HardwareState::Ready, Some(D as u32)));
+    // A stem on the last pair leaves on the same channels (ADR 0015 output paths).
+    s.track_mut(t).unwrap().mixer.inserts[0] = None;
+    s.track_mut(dry).unwrap().mixer.output = soundcraft_model::Route::Hardware("Out 9-10".into());
+    assert_eq!(plan_sinks(&s, &io, 10).destinations(), [8, 9]);
 }
