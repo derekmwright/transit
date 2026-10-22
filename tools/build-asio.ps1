@@ -1,3 +1,8 @@
+# NOTE: this script builds the legacy cpal ASIO feature (asio-sys, which needs the Steinberg SDK and
+# libclang). The native ASIO backend, crates/audio-asio (transit-audio-asio), needs none of this: it
+# builds with a plain `cargo build` (bench: `--features audio-bench/native-asio`). This script retires
+# when the app moves to the native backend.
+#
 <#
 Builds transit with the opt-in ASIO feature, from a clean or warm target directory.
 

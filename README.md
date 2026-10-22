@@ -161,13 +161,15 @@ The binary is `target/release/transit` (`transit.exe` on Windows).
 
 ### ASIO on Windows (optional)
 
-ASIO is behind the `transit/asio` feature: `cargo build -p transit --release --features transit/asio`.
-It needs LLVM (for bindgen; set `LIBCLANG_PATH` to LLVM's `bin`, and put LLVM before MinGW on
-`PATH`), the Visual Studio 2019+ Build Tools, and the Steinberg ASIO SDK (`asio-sys` downloads it on
-the first build unless `CPAL_ASIO_DIR` points at a copy). Steinberg's licensing terms apply to
-anyone who redistributes ASIO-enabled binaries; the project owner handles that for the published ASIO release build.
+The native ASIO backend (`crates/audio-asio`, used by `audio-bench --backend asio`) needs nothing
+beyond the Windows prerequisites: no SDK, LLVM or environment variables. The app's ASIO path is still
+cpal's, behind the `transit/asio` feature (`cargo build -p transit --release --features transit/asio`),
+which needs the Visual Studio 2019+ Build Tools, LLVM and the Steinberg ASIO SDK (`asio-sys` downloads
+it on the first build unless `CPAL_ASIO_DIR` points at a copy). Releases ship an ASIO build; Steinberg's
+licensing terms apply to anyone who redistributes ASIO-enabled binaries, and the project owner handles
+that for the published one.
 
-Full steps, the MinGW/libclang pitfall, and licensing: [docs/building.md](docs/building.md#building-with-asio-windows); scripted build: `tools/build-asio.ps1`.
+Full steps, the MinGW/libclang pitfall, and the hardware tests: [docs/building.md](docs/building.md#building-with-asio-windows); scripted build of the cpal feature: `tools/build-asio.ps1`.
 
 ## Run
 

@@ -5,6 +5,17 @@ Code: `crates/audio-asio` (`transit-audio-asio`). Decision: the draft native-ASI
 [ADR 0013](../../adr/0013-unsafe-only-in-soundcraft-rt.md) and [`unsafe.md`](unsafe.md). 64-bit Windows
 only; the crate is empty elsewhere. No ASIO SDK, C++, bindgen or LLVM in its build.
 
+## Building
+
+Nothing to install: the crate has no SDK, C++, bindgen, libclang or environment variables, and it is
+compiled only under `cfg(all(windows, target_pointer_width = "64"))`, so a plain `cargo build` or
+`cargo test -p transit-audio-asio` works on Windows and is a no-op elsewhere. Run the bench with
+`cargo build --release -p audio-bench --features audio-bench/native-asio`, then
+`audio-bench --backend asio --device "<driver registry name>"`. The hardware tests are ignored by
+default: `cargo test -p transit-audio-asio -- --ignored hardware_ --nocapture --test-threads 1`, or
+one by name (for example `hardware_scarlett_duplex_streams_two_seconds`). The app's own ASIO path is
+still cpal's until it is wired to this crate; its build is in [docs/building.md](../../building.md).
+
 ## The host thread (`src/host.rs`)
 
 One dedicated thread, `transit-asio-host`, owns the driver object and makes every `IASIO` call:

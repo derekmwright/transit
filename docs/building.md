@@ -38,11 +38,61 @@ The tagged GitHub release (`.github/workflows/release.yml`) is separate and ship
 
 ## Building with ASIO (Windows)
 
-The Windows release publishes an ASIO build (`transit/asio` and `transit/native-wasapi`) and a
-WASAPI-only build. To get ASIO in your own build, compile with the `transit/asio` feature. It enables `cpal`'s `asio` feature through
-`asio-sys`, which compiles Steinberg's ASIO SDK and generates bindings with bindgen.
+ASIO has two implementations in the tree. The native backend needs nothing beyond the Windows
+prerequisites above. The cpal ASIO feature is the legacy path the app still uses today; it needs the
+Steinberg SDK and libclang, and retires when the app moves to the native backend.
 
-### Prerequisites
+### Native ASIO backend (no SDK)
+
+`crates/audio-asio` (`transit-audio-asio`) has hand-written bindings, so it needs no Steinberg SDK,
+no C++ compile, no bindgen, no libclang, no `CPAL_ASIO_DIR` and no environment variables. It is
+compiled only on 64-bit Windows (`cfg(all(windows, target_pointer_width = "64"))`; the crate is empty
+elsewhere) and builds with a plain `cargo build`. The app is not wired to it yet, so the transit
+app's ASIO path is still cpal's (below). The benchmark uses it through the `audio-bench/native-asio`
+feature:
+
+```powershell
+cargo build --release -p audio-bench --features audio-bench/native-asio
+target\release\audio-bench.exe --list-devices --system ASIO
+target\release\audio-bench.exe --backend asio --device "<driver registry name>" --loopback --out-ch 1 --in-ch 1 --seconds 10
+```
+
+Tests, no hardware needed:
+
+```powershell
+cargo test -p transit-audio-asio
+```
+
+The tests that open real drivers are `#[ignore]`d. Run them on a machine with the interface
+attached and its driver installed, one at a time:
+
+```powershell
+cargo test -p transit-audio-asio -- --ignored hardware_ --nocapture --test-threads 1
+```
+
+Or pick one by name: `hardware_lists_focusrite_and_tascam`, `hardware_open_close_each_driver_twice`,
+`hardware_scarlett_duplex_streams_two_seconds`, `hardware_model12_duplex_streams_two_seconds` or
+`hardware_control_panel_opens_and_returns`. Design notes:
+[contributing/knowledge/asio-backend.md](contributing/knowledge/asio-backend.md).
+
+### cpal ASIO feature (legacy; needs the SDK and libclang)
+
+The `transit/asio` feature enables `cpal`'s `asio` feature through `asio-sys`, which compiles
+Steinberg's ASIO SDK and generates bindings with bindgen. Use it until the app moves to the native
+backend. In CI, the `windows-asio` job (allowed to fail) builds this feature, and its first run
+succeeded, which shows the SDK download works unattended on `windows-latest` with its preinstalled
+LLVM. `release.yml` builds the `windows-x86_64-asio` artifact the same way, with an optional
+`ASIO_SDK_URL` secret for an owner-hosted SDK zip; distributing that build is subject to Steinberg's
+license (see Licensing below).
+
+The one-command build used for the owner's test builds (app, bench, native WASAPI and both ASIO
+paths), in a PowerShell session with the environment from the Build step below:
+
+```powershell
+cargo build --release -p transit -p audio-bench --features transit/asio,transit/native-wasapi,audio-bench/asio,audio-bench/native-wasapi,audio-bench/native-asio
+```
+
+#### Prerequisites
 
 - Everything in the Windows list above (MSVC Build Tools with the C++ workload). `asio-sys` runs
   `vcvarsall` itself when `VCINSTALLDIR` is unset, so a plain PowerShell window is fine.
@@ -50,7 +100,7 @@ WASAPI-only build. To get ASIO in your own build, compile with the `transit/asio
 - The Steinberg ASIO SDK. `asio-sys` downloads it on the first build into `%TEMP%\asio_sdk`. To use
   an SDK you already unpacked, set `CPAL_ASIO_DIR` to its folder.
 
-### Build
+#### Build
 
 The scripted version sets the environment below, purges stale bindings, and builds:
 
@@ -69,7 +119,7 @@ $env:BINDGEN_EXTRA_CLANG_ARGS = '--target=x86_64-pc-windows-msvc'
 cargo build -p transit --release --features transit/asio
 ```
 
-### Pitfall: MinGW's libclang and E0080
+#### Pitfall: MinGW's libclang and E0080
 
 If `C:\mingw64\bin` (or another MinGW) is on `PATH` and `LIBCLANG_PATH` is unset, `clang-sys` loads
 MinGW's libclang, whose default target is `x86_64-w64-windows-gnu`. bindgen then lays out
@@ -89,7 +139,7 @@ assertion. Setting `LIBCLANG_PATH` alone then fails with undeclared `__builtin_i
 because the resource headers still come from MinGW. Put the MSVC LLVM's `bin` first on `PATH` (and in
 `LIBCLANG_PATH`) for the build and run `cargo clean -p asio-sys` once.
 
-### Stale bindings
+#### Stale bindings
 
 `asio-sys`'s build script only generates `asio_bindings.rs` when the file does not exist. Wrong
 bindings from an earlier attempt stay in `target\<profile>\build\asio-sys-*\out` and keep failing
@@ -97,12 +147,14 @@ even after you fix the environment. Delete those `asio-sys-*` build folders (and
 `target\<profile>\.fingerprint\asio-sys-*`) before rebuilding, or run `cargo clean -p asio-sys`.
 `tools\build-asio.ps1` removes bindings that contain Itanium (`_ZN`) names automatically.
 
-### Verify
+#### Verify
 
 Run the new binary, open Audio Devices, and look for your interface listed under the ASIO host.
-If only WASAPI appears, the binary was built without the feature.
+If only WASAPI appears, the binary was built without the feature. To measure it, run
+`audio-bench --backend cpal --system ASIO --device "<ASIO device>" --loopback ...` (see
+[docs/benchmarks](benchmarks/README.md)); the cpal path has no hardware test suite of its own.
 
-### Licensing
+#### Licensing
 
 Building the ASIO SDK into a binary for your own use is allowed by the SDK license. If you want to
 redistribute an ASIO-enabled binary, you must first sign Steinberg's ASIO SDK Licensing Agreement
