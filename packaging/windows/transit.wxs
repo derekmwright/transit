@@ -1,11 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  transit MSI (WiX Toolset v5: `dotnet tool install -g wix`). Built by package.ps1:
+  transit MSI (WiX Toolset v5: `dotnet tool install -g wix, version 5.0.2`). Built by package.ps1
+  and by .github/workflows/release.yml:
 
-    wix build transit.wxs -arch x64 -d Version=1.2.3 -d BinDir=... -d IconPath=... -o out.msi
+    wix build transit.wxs -arch x64 -d Version=1.2.3 -d FullVersion=1.2.3-alpha.1 -d BinDir=... -d IconPath=... -o out.msi
 
-  Per-machine install into Program Files, a Start Menu shortcut, `.transit` sessions owned by
-  transit, and transit offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
+  Version is the numeric MSI ProductVersion (major.minor.build: a pre-release suffix cannot go
+  there). FullVersion is the complete version or tag, recorded in the ARP comments and in
+  HKLM\Software\transit. BinDir holds transit.exe and audio-bench.exe.
+
+  Per-machine install into Program Files, a Start Menu shortcut, `.transit` sessions and
+  `.transitz` bundles owned by transit,
+  and transit offered under "Open with" for WAV/AIFF/FLAC/MP3 and MIDI files
   (without taking over the user's default player for them).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
@@ -17,7 +23,7 @@
       Scope="perMachine"
       Compressed="yes"
       Language="1033">
-    <SummaryInformation Description="transit DAW" Manufacturer="Derek Wright" />
+    <SummaryInformation Description="transit DAW" Manufacturer="Derek Wright" Comments="transit $(var.FullVersion)" />
     <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
          (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
@@ -26,6 +32,7 @@
 
     <Icon Id="TransitIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="TransitIcon.ico" />
+    <Property Id="ARPCOMMENTS" Value="transit $(var.FullVersion)" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/derekmwright/transit" />
     <Property Id="ARPURLUPDATEINFO" Value="https://github.com/derekmwright/transit" />
     <Property Id="ARPHELPLINK" Value="https://github.com/derekmwright/transit/issues" />
@@ -55,6 +62,12 @@
             <Verb Id="open" Command="Open" TargetFile="TransitExe" Argument="&quot;%1&quot;" />
           </Extension>
         </ProgId>
+        <!-- Session bundles (.transitz). -->
+        <ProgId Id="transit.Bundle" Description="transit Session Bundle" Icon="TransitExe" IconIndex="0">
+          <Extension Id="transitz">
+            <Verb Id="open" Command="Open" TargetFile="TransitExe" Argument="&quot;%1&quot;" />
+          </Extension>
+        </ProgId>
         <!-- Audio and MIDI files: offered under "Open with" (imported into a session), never forced
              as the default. -->
         <ProgId Id="transit.Audio" Description="Audio File" Icon="TransitExe" IconIndex="0" />
@@ -73,6 +86,7 @@
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe" Name="FriendlyAppName" Value="transit" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\shell\open\command" Value="&quot;[#TransitExe]&quot; &quot;%1&quot;" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".transit" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".transitz" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".wav" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".aif" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".aiff" Value="" Type="string" />
@@ -81,6 +95,12 @@
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".mid" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Classes\Applications\transit.exe\SupportedTypes" Name=".midi" Value="" Type="string" />
         <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\transit.exe" Value="[#TransitExe]" Type="string" />
+        <!-- The installed version, full (a pre-release suffix is kept here, not in the MSI version). -->
+        <RegistryValue Root="HKLM" Key="Software\transit" Name="Version" Value="$(var.FullVersion)" Type="string" />
+      </Component>
+      <!-- The measurement harness, beside transit.exe. -->
+      <Component Id="AudioBench" Guid="6D0E5A41-7C2B-4E8F-9A13-5B7C2E9D4F60">
+        <File Id="AudioBenchExe" Source="$(var.BinDir)\audio-bench.exe" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Fragment>

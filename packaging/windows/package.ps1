@@ -4,8 +4,8 @@
 
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
-    transit-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    transit-<version>-windows-<arch>-portable.zip   transit.exe
+    transit-<version>-windows-<arch>.msi            per-machine installer (WiX v5): transit.exe and audio-bench.exe
+    transit-<version>-windows-<arch>-portable.zip   transit.exe and audio-bench.exe
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -42,8 +42,10 @@ if (-not $Version) {
   }
 }
 if (-not $Version) { throw 'could not read [package] version from apps/transit/Cargo.toml' }
-# MSI ProductVersion is numeric (major.minor.build); pre-release tags are dropped there.
+# MSI ProductVersion is numeric (major.minor.build); pre-release tags are dropped there. The full
+# version stays in the MSI's ARP comments and in HKLM\Software\transit (FullVersion).
 $MsiVersion = ($Version -split '-')[0]
+if ($MsiVersion -notmatch '^\d+\.\d+\.\d+$') { throw "version '$Version' does not map to an MSI major.minor.build version" }
 
 $Target = switch ($Arch) { 'x64' { 'x86_64-pc-windows-msvc' } 'x86' { 'i686-pc-windows-msvc' } 'arm64' { 'aarch64-pc-windows-msvc' } }
 $Dist = if ($env:DIST) { $env:DIST } else { Join-Path $Root 'dist\release' }
@@ -62,7 +64,7 @@ if (-not $SkipBuild) {
   [Environment]::SetEnvironmentVariable($flagVar, '-C target-feature=+crt-static')
   # Fail the build (rather than warn) if the icon/VERSIONINFO can't be embedded.
   $env:SOUNDCRAFT_REQUIRE_WINRES = '1'
-  Invoke-Native "cargo build ($Target)" { cargo build --release --locked -p transit --target $Target }
+  Invoke-Native "cargo build ($Target)" { cargo build --release --locked -p transit -p audio-bench --target $Target }
 }
 
 $Bin = Join-Path $TargetDir "$Target\release"
@@ -85,15 +87,15 @@ foreach ($check in @(,@('transit.exe', 2))) {
 $Stage = Join-Path $TargetDir "windows-package\$Arch"
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
-Copy-Item (Join-Path $Bin 'transit.exe') $Stage
+Copy-Item (Join-Path $Bin 'transit.exe'), (Join-Path $Bin 'audio-bench.exe') $Stage
 
-& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'transit.exe')
+& (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'transit.exe') (Join-Path $Stage 'audio-bench.exe')
 
 # ---- MSI ---------------------------------------------------------------------------------------
 $Msi = Join-Path $Dist "transit-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   wix build (Join-Path $PSScriptRoot 'transit.wxs') -arch $Arch `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\transit.ico')" `
+    -d "Version=$MsiVersion" -d "FullVersion=$Version" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\transit.ico')" `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.

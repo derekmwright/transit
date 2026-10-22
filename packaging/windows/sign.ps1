@@ -4,7 +4,8 @@
 
 .DESCRIPTION
   Tries, in order:
-    1. A code-signing certificate file:   WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+    1. A code-signing certificate file:   WINDOWS_CERTIFICATE_PFX (base64 .pfx; WINDOWS_CERTIFICATE is
+                                          the older name), WINDOWS_CERTIFICATE_PASSWORD
     2. Azure Trusted Signing:             AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
                                           AZURE_SIGNING_ENDPOINT (e.g. https://eus.codesigning.azure.net),
                                           AZURE_SIGNING_ACCOUNT, AZURE_CERT_PROFILE
@@ -45,12 +46,13 @@ function Invoke-SignTool([string[]] $Arguments) {
 }
 
 $Files = $Files | ForEach-Object { (Resolve-Path $_).Path }
-$haveCert = [bool]$env:WINDOWS_CERTIFICATE
+$pfxBase64 = if ($env:WINDOWS_CERTIFICATE_PFX) { $env:WINDOWS_CERTIFICATE_PFX } else { $env:WINDOWS_CERTIFICATE }
+$haveCert = [bool]$pfxBase64
 $azureVars = 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_SIGNING_ENDPOINT', 'AZURE_SIGNING_ACCOUNT', 'AZURE_CERT_PROFILE'
 $haveAzure = -not ($azureVars | Where-Object { -not [Environment]::GetEnvironmentVariable($_) })
 
 if (-not $haveCert -and -not $haveAzure) {
-  Write-Warn "Windows signing secrets not set (WINDOWS_CERTIFICATE or AZURE_*): leaving unsigned: $($Files -join ', ')"
+  Write-Warn "Windows signing secrets not set (WINDOWS_CERTIFICATE_PFX or AZURE_*): leaving unsigned: $($Files -join ', ')"
   exit 0
 }
 
@@ -61,9 +63,9 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 try {
   if ($haveCert) {
-    Write-Output "Signing with WINDOWS_CERTIFICATE: $($Files -join ', ')"
+    Write-Output "Signing with WINDOWS_CERTIFICATE_PFX: $($Files -join ', ')"
     $pfx = Join-Path $tmp 'cert.pfx'
-    [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+    [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($pfxBase64))
     $ts = if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { 'http://timestamp.digicert.com' }
     $signArgs = $common + @('/tr', $ts, '/f', $pfx)
     if ($env:WINDOWS_CERTIFICATE_PASSWORD) { $signArgs += @('/p', $env:WINDOWS_CERTIFICATE_PASSWORD) }

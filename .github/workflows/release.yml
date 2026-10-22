@@ -1,7 +1,8 @@
 # Builds transit for Windows, macOS and Linux and attaches the archives to the GitHub Release for
-# the tag. Windows and Linux are unsigned. macOS ships transit.app on a DMG (packaging/macos/package.sh),
+# the tag. Linux is unsigned; Windows is unsigned unless the optional signing secrets are set
+# (docs/releasing.md). macOS ships transit.app on a DMG (packaging/macos/package.sh),
 # ad-hoc signed unless the optional signing secrets are set (docs/releasing.md), plus a tarball with
-# the bare binary and the bench harness. Windows ships two zips:
+# the bare binary and the bench harness. Windows ships two zips and two MSIs (packaging/windows/transit.wxs):
 # transit-<ver>-windows-x86_64-asio (ASIO + native WASAPI) and transit-<ver>-windows-x86_64 (WASAPI
 # only, the fallback). Distributing the ASIO build is subject to Steinberg's ASIO SDK license, which
 # the project owner handles; see docs/building.md. Every archive also carries the audio-bench
@@ -81,6 +82,44 @@ jobs:
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then v="${GITHUB_REF_NAME}"; else v="dev-${GITHUB_SHA::7}"; fi
           echo "name=transit-${v}-${{ matrix.name }}" >> "$GITHUB_OUTPUT"
+      # The MSI is built from packaging/windows/transit.wxs (WiX v5; the .wxs uses the v4 schema, which
+      # the v3 toolset preinstalled on windows-latest cannot compile). The numeric MSI version is the
+      # tag without "v" and without any pre-release suffix (v0.2.0 is 0.2.0, v0.1.0-alpha.1 is
+      # 0.1.0); the full tag is recorded in the installer's comments and in HKLM\Software\transit.
+      # Optional signing: with WINDOWS_CERTIFICATE_PFX (base64 .pfx) and WINDOWS_CERTIFICATE_PASSWORD
+      # set, sign.ps1 signs transit.exe, audio-bench.exe (before they go into the MSI and the zip)
+      # and the MSI with signtool; without them it logs "unsigned" and the build continues.
+      - name: Build MSI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $full = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $full = $null
+            $inPkg = $false
+            foreach ($line in Get-Content apps/transit/Cargo.toml) {
+              if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[package]'); continue }
+              if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $full = $Matches[1]; break }
+            }
+          }
+          $msiVersion = ($full -split '-')[0]
+          if ($msiVersion -notmatch '^\d+\.\d+\.\d+$') { throw "version '$full' does not map to an MSI major.minor.build version" }
+          Write-Output "MSI version $msiVersion (full version $full)"
+          ./packaging/windows/sign.ps1 target/release/transit.exe target/release/audio-bench.exe
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          $msi = "${{ steps.ver.outputs.name }}.msi"
+          wix build packaging/windows/transit.wxs -arch x64 `
+            -d "Version=$msiVersion" -d "FullVersion=$full" -d "BinDir=$PWD/target/release" `
+            -d "IconPath=$PWD/assets/app-icon/transit.ico" -o $msi
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
+          Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($msi, '.wixpdb'))
+          ./packaging/windows/sign.ps1 $msi
+          Get-Item $msi | Format-Table Name, Length
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -124,7 +163,8 @@ jobs:
           transit for Windows (pre-alpha)
 
           $audio
-          - The program is unsigned. If SmartScreen blocks it, click "More info", then "Run anyway".
+          - Install: run the .msi (the installer, with the Start Menu shortcut and .transit/.transitz file associations). This zip is the portable form: unzip and run transit.exe.
+          - The program and the installer are unsigned. If SmartScreen blocks them, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
           - audio-bench.exe and BENCH-README.txt measure your interface; see that file.
           - Based on SoundCraft by storytold: https://github.com/storytold/soundcraft
@@ -216,6 +256,7 @@ jobs:
           name: ${{ steps.ver.outputs.name }}
           path: |
             transit-*.zip
+            transit-*.msi
             transit-*.tar.gz
             transit-*.dmg
 
@@ -233,6 +274,8 @@ jobs:
           files: dist/*
           body: |
             macOS: the `.dmg` holds `transit.app`; open it and drag transit to Applications. The app is unsigned (ad-hoc signed only) unless these notes say notarized. If macOS blocks it, run `xattr -dr com.apple.quarantine /Applications/transit.app` (or right-click the app and choose Open). The `.tar.gz` holds the bare binary and `audio-bench`; the same command applies to the binary.
+
+            Windows: the `.msi` installs transit and `audio-bench.exe` to Program Files (per-machine, needs administrator approval), with a Start Menu shortcut and the `.transit` and `.transitz` file associations; the `.zip` is the portable form. Both are unsigned unless these notes say signed: SmartScreen will warn, so click "More info", then "Run anyway".
 
             Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
             - windows-x86_64-asio: `audio-bench.exe` with ASIO, native WASAPI and cpal WASAPI.

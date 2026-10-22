@@ -34,7 +34,7 @@ real settings. The plug-in scan cache is shared with SoundCraft (`SOUNDCRAFT_CON
 the `dev.derekmwright.transit*.yml` manifests for Flatpak), `macos/package.sh` (`transit.app` in a DMG
 named `transit`; the icon is `assets/app-icon/transit.icns`), `windows/package.ps1` (MSI and portable zip),
 and `freebsd/package.sh`. Outputs land in `dist/release/` as `transit-<version>-<platform>-<arch>.*`.
-The tagged GitHub release (`.github/workflows/release.yml`) is separate and ships plain archives.
+The tagged GitHub release (`.github/workflows/release.yml`) is separate: it ships plain archives, plus on Windows an MSI built from `packaging/windows/transit.wxs` with the same WiX v5 (`dotnet tool install --global wix --version 5.0.2`) and optional signing (`docs/releasing.md`).
 
 ## Building with ASIO (Windows)
 
