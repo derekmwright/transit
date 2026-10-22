@@ -6,7 +6,7 @@
 
 use crate::convert::{ConvertSink, Wire};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use transit_audio_backend::{ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
+use transit_audio_backend::{Calibration, ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
 
 /// `AUDCLNT_E_DEVICE_INVALIDATED`: the endpoint was removed, disabled or its format changed.
 const E_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
@@ -99,6 +99,10 @@ impl<F: FnOnce()> Drop for UnwindGuard<F> {
 
 /// Maps device positions to stamps: signed nanoseconds in the Player's host origin through the
 /// `(QPC, Instant)` pair captured when the stream opened, like the cpal adapter's `Stamper`.
+///
+/// Stamps never step backward: a position or padding read that jitters below the previous one is
+/// held at it (the clock fit rejects a backward step of a `Measured` stamp as a discontinuity), and
+/// host time strictly increases.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stamper {
     /// QPC, in 100 ns units, at the capture of the pair.
@@ -108,27 +112,78 @@ pub(crate) struct Stamper {
     rate: u32,
     /// `GetStreamLatency`, in nanoseconds.
     latency_ns: i64,
+    calibration: Option<Calibration>,
+    last: Held,
+}
+
+/// The previous stamp's times (callback, frame, host), so the next never goes backward.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Held(Option<(i64, i64, u64)>);
+
+impl Held {
+    /// Clamp `callback`, `frame` and `host` to be no earlier than the previous stamp's. With
+    /// `frame_before_callback` (an input) the frame time is also held at or before the callback.
+    pub(crate) fn hold(&mut self, callback: i64, frame: i64, host: u64, frame_before_callback: bool) -> (i64, i64, u64) {
+        let (callback, mut frame, host) = match self.0 {
+            Some((c, f, h)) => (callback.max(c), frame.max(f), host.max(h.saturating_add(1))),
+            None => (callback, frame, host),
+        };
+        if frame_before_callback {
+            frame = frame.min(callback);
+        }
+        self.0 = Some((callback, frame, host));
+        (callback, frame, host)
+    }
+
+    /// Forget the history: the next stamp follows a gap or a fit reset.
+    pub(crate) fn reset(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// The quality a stream's stamps carry: `Measured` with its bound under a calibration.
+pub(crate) fn quality_of(calibration: Option<Calibration>) -> (Quality, Option<u64>) {
+    match calibration {
+        Some(c) => (Quality::Measured, Some(c.uncertainty_ns)),
+        None => (Quality::BackendEstimate, None),
+    }
+}
+
+/// A QPC reading in 100 ns units as signed nanoseconds in the host origin.
+pub(crate) fn relative_ns(qpc_100ns: u64, origin_qpc: u64, origin_ns: i64) -> i64 {
+    let since = (i128::from(qpc_100ns) - i128::from(origin_qpc)) * 100;
+    i64::try_from(i128::from(origin_ns) + since).unwrap_or(i64::MAX)
 }
 
 impl Stamper {
     pub(crate) fn new(origin_qpc_100ns: u64, origin_ns: i64, rate: u32, latency_100ns: i64) -> Self {
-        Self { origin_qpc: origin_qpc_100ns, origin_ns, rate: rate.max(1), latency_ns: latency_100ns.saturating_mul(100) }
+        Self {
+            origin_qpc: origin_qpc_100ns,
+            origin_ns,
+            rate: rate.max(1),
+            latency_ns: latency_100ns.saturating_mul(100),
+            calibration: None,
+            last: Held::default(),
+        }
+    }
+
+    /// Stamp as `Measured` under `calibration`. The round trip is carried by the input stream, so
+    /// the output keeps its presentation time and only claims the bound.
+    pub(crate) fn calibrated(mut self, calibration: Option<Calibration>) -> Self {
+        self.calibration = calibration;
+        self
     }
 
     /// The stamp of a block: the callback instant is the position read, and the first frame
     /// written is presented one padding plus one stream latency later (ADR 0016, section 3).
-    pub(crate) fn stamp(&self, position: Option<Position>, padding: u32, host_ns: Option<u64>) -> Stamp {
+    pub(crate) fn stamp(&mut self, position: Option<Position>, padding: u32, host_ns: Option<u64>) -> Stamp {
         let (Some(position), Some(host_ns)) = (position, host_ns) else { return Stamp::INVALID };
-        let since = (i128::from(position.qpc_100ns) - i128::from(self.origin_qpc)) * 100;
-        let callback = i64::try_from(i128::from(self.origin_ns) + since).unwrap_or(i64::MAX);
+        let callback = relative_ns(position.qpc_100ns, self.origin_qpc, self.origin_ns);
         let queued = i64::try_from(u128::from(padding) * 1_000_000_000 / u128::from(self.rate)).unwrap_or(i64::MAX);
-        Stamp {
-            host_callback_ns: host_ns,
-            backend_callback_ns: callback,
-            backend_frame_ns: callback.saturating_add(queued).saturating_add(self.latency_ns),
-            quality: Quality::BackendEstimate,
-            offset_uncertainty_ns: None,
-        }
+        let frame = callback.saturating_add(queued).saturating_add(self.latency_ns);
+        let (callback, frame, host) = self.last.hold(callback, frame, host_ns, false);
+        let (quality, offset_uncertainty_ns) = quality_of(self.calibration);
+        Stamp { host_callback_ns: host, backend_callback_ns: callback, backend_frame_ns: frame, quality, offset_uncertainty_ns }
     }
 }
 
@@ -161,6 +216,7 @@ pub(crate) fn run(
     render: &mut RenderCallback,
     error: &mut ErrorCallback,
 ) -> Exit {
+    let mut stamper = config.stamper;
     loop {
         match device.wait(config.timeout_ms) {
             Wake::Event => {}
@@ -181,7 +237,7 @@ pub(crate) fn run(
         }
         // A clock that cannot be read publishes an invalid stamp and the block still renders.
         let position = device.position().ok();
-        let stamp = config.stamper.stamp(position, padding, config.origin.now_ns());
+        let stamp = stamper.stamp(position, padding, config.origin.now_ns());
         let written = device.write(frames, &mut |bytes| {
             let mut sink = ConvertSink { scratch: &mut *scratch, bytes, wire: config.wire };
             let mut block = RenderBlock::new(frames as usize, stamp, config.format, &mut sink);
@@ -204,7 +260,15 @@ pub(crate) fn serve(
     render: &mut RenderCallback,
     error: &mut ErrorCallback,
 ) -> Exit {
-    let exit = match catch_unwind(AssertUnwindSafe(|| run(&mut *device, config, scratch, render, error))) {
+    let exit = contain(error, |error| run(&mut *device, config, scratch, render, error));
+    device.halt();
+    exit
+}
+
+/// Run `work` under `catch_unwind`: a panic is reported once through `error` as
+/// [`StreamError::Other`] and becomes [`Exit::Panicked`], so the caller still tears the stream down.
+pub(crate) fn contain(error: &mut ErrorCallback, work: impl FnOnce(&mut ErrorCallback) -> Exit) -> Exit {
+    match catch_unwind(AssertUnwindSafe(|| work(&mut *error))) {
         Ok(exit) => exit,
         Err(payload) => {
             // The error callback may panic too; there is nobody left to tell.
@@ -213,12 +277,10 @@ pub(crate) fn serve(
             let _ = catch_unwind(AssertUnwindSafe(move || drop(payload)));
             Exit::Panicked
         }
-    };
-    device.halt();
-    exit
+    }
 }
 
-fn fail(error: &mut ErrorCallback, fault: Fault) -> Exit {
+pub(crate) fn fail(error: &mut ErrorCallback, fault: Fault) -> Exit {
     error(fault.stream_error());
     Exit::Faulted(fault)
 }

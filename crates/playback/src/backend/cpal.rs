@@ -77,6 +77,7 @@ fn request(config: &cpal::StreamConfig, format: cpal::SampleFormat) -> Result<ab
         period: period_of(config.buffer_size),
         mode: ab::Mode::Shared,
         origin: ab::HostOrigin::default(),
+        calibration: None,
     })
 }
 

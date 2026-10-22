@@ -5,18 +5,21 @@
 //! This is the one crate besides `transit-rt` that contains `unsafe` (ADR 0013, second
 //! amendment), for COM and WASAPI through the `windows` crate only. Each stream is owned by one
 //! MTA thread; see [`com`] for the threading rules and [`render_loop`] for the audio-thread loop.
-//! Capture arrives with slice (d); exclusive mode with slice (e).
+//! Capture and the pairing of capture with render endpoints are slice (d); exclusive mode is
+//! slice (e).
 #![cfg(windows)]
 // The callback modules (`render_loop`, `convert`) deny these lints; control-thread code may
 // allocate and format.
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
+mod capture_loop;
 mod com;
 mod convert;
 mod lifecycle;
+mod pairing;
 mod render_loop;
 
-use com::{EndpointInfo, OpenParams, RenderStream, Watcher};
+use com::{EndpointInfo, NativeStream, OpenParams, Watcher};
 use std::sync::{Mutex, PoisonError};
 use transit_audio_backend as ab;
 
@@ -24,11 +27,18 @@ use transit_audio_backend as ab;
 pub const SYSTEM: &str = "WASAPI";
 
 /// Creates the native backend for the system named "WASAPI" (or the default one).
-pub struct WasapiFactory;
+#[derive(Debug, Clone, Default)]
+pub struct WasapiFactory {
+    /// The capture endpoint (id or name) the user paired with the output, for devices whose
+    /// endpoints share no container id. `None` pairs by container id alone.
+    pub input_pairing: Option<String>,
+}
 
 impl ab::BackendFactory for WasapiFactory {
     fn backend(&self, system: Option<&str>) -> Option<Box<dyn ab::Backend>> {
-        system.is_none_or(|s| s == SYSTEM).then(|| Box::new(WasapiBackend::default()) as Box<dyn ab::Backend>)
+        system
+            .is_none_or(|s| s == SYSTEM)
+            .then(|| Box::new(WasapiBackend { pairing: self.input_pairing.clone(), ..Default::default() }) as Box<dyn ab::Backend>)
     }
 }
 
@@ -36,12 +46,15 @@ impl ab::BackendFactory for WasapiFactory {
 /// threads. Each open resolves it again on the stream thread.
 struct WasapiEndpoint {
     id: String,
+    /// A render endpoint (a capture open on it goes to its paired capture endpoint).
+    output: bool,
 }
 
 /// The native WASAPI audio system.
 #[derive(Default)]
 pub struct WasapiBackend {
     watcher: Mutex<Option<Watcher>>,
+    pairing: Option<String>,
 }
 
 fn endpoint_of(info: &EndpointInfo, output: bool) -> ab::Endpoint {
@@ -55,12 +68,55 @@ fn endpoint_of(info: &EndpointInfo, output: bool) -> ab::Endpoint {
         inputs,
         outputs,
         formats,
-        std::sync::Arc::new(WasapiEndpoint { id: info.id.clone() }),
+        std::sync::Arc::new(WasapiEndpoint { id: info.id.clone(), output }),
     )
 }
 
 fn range(format: &ab::Format, rate: u32, period: Option<(u32, u32)>) -> ab::FormatRange {
     ab::FormatRange { sample: format.sample, channels: format.channels, min_rate: rate, max_rate: rate, period }
+}
+
+/// The requests to try on `info`: its own rate first (no conversion in the engine), then the wished
+/// rates, which the engine converts.
+fn attempts(info: &EndpointInfo, wished: Vec<u32>, period: Option<u32>) -> Vec<ab::OpenRequest> {
+    let mut rates = vec![info.mix.rate];
+    for rate in wished {
+        if !rates.contains(&rate) {
+            rates.push(rate);
+        }
+    }
+    let period = period.map_or(ab::Period::Default, ab::Period::Frames);
+    rates
+        .into_iter()
+        .map(|rate| ab::OpenRequest {
+            format: ab::Format { rate, ..info.mix.format() },
+            period,
+            mode: ab::Mode::Shared,
+            origin: ab::HostOrigin::default(),
+            calibration: None,
+        })
+        .collect()
+}
+
+impl WasapiBackend {
+    /// The capture endpoint to use for `endpoint`: itself when it is a capture endpoint, else the
+    /// one paired with the render endpoint.
+    fn paired_input(&self, endpoint: &ab::Endpoint) -> Result<EndpointInfo, ab::OpenError> {
+        let device = endpoint.handle::<WasapiEndpoint>().ok_or_else(|| ab::OpenError::Other("the endpoint is not a WASAPI device".into()))?;
+        let inputs = com::list_endpoints(false)?;
+        if !device.output {
+            return inputs
+                .into_iter()
+                .find(|i| i.id == device.id)
+                .ok_or_else(|| ab::OpenError::DeviceNotAvailable("the input endpoint is gone".into()));
+        }
+        let outputs = com::list_endpoints(true)?;
+        let render =
+            outputs.iter().find(|o| o.id == device.id).ok_or_else(|| ab::OpenError::DeviceNotAvailable("the output endpoint is gone".into()))?;
+        let at = com::paired_input(render, &inputs, self.pairing.as_deref())
+            .ok_or_else(|| ab::OpenError::Other(format!("no input shares the container of {}; pair one in Audio Devices", render.name)))?;
+        inputs.into_iter().nth(at).ok_or_else(|| ab::OpenError::Other("the paired input vanished".into()))
+    }
 }
 
 impl ab::Backend for WasapiBackend {
@@ -81,34 +137,29 @@ impl ab::Backend for WasapiBackend {
             .and_then(|name| endpoints.iter().find(|e| e.name == name || e.id == name))
             .or_else(|| endpoints.first())
             .ok_or("no output device")?;
-        // The endpoint's own rate first (no conversion in the engine); the wished rates after it
-        // are tried with the engine converting.
-        let mut rates = vec![info.mix.rate];
-        rates.extend(wish.rates.iter().copied().filter(|r| !rates.contains(r)).collect::<Vec<_>>());
-        rates.dedup();
-        let period = wish.period.map_or(ab::Period::Default, ab::Period::Frames);
-        let attempts = rates
-            .into_iter()
-            .map(|rate| ab::OpenRequest {
-                format: ab::Format { rate, ..info.mix.format() },
-                period,
-                mode: ab::Mode::Shared,
-                origin: ab::HostOrigin::default(),
-            })
-            .collect();
-        Ok(ab::Plan { endpoint: endpoint_of(info, true), attempts })
+        Ok(ab::Plan { endpoint: endpoint_of(info, true), attempts: attempts(info, wish.rates.clone(), wish.period) })
     }
 
-    fn plan_capture(&self, _wish: &ab::InputWish) -> Result<ab::Plan, String> {
-        Err(NO_CAPTURE.into())
+    fn plan_capture(&self, wish: &ab::InputWish) -> Result<ab::Plan, String> {
+        let endpoints = com::list_endpoints(false).map_err(|e| e.to_string())?;
+        let info = wish
+            .device
+            .as_deref()
+            .and_then(|name| endpoints.iter().find(|e| e.name == name || e.id == name))
+            .or_else(|| endpoints.first())
+            .ok_or("no input device")?;
+        Ok(ab::Plan { endpoint: endpoint_of(info, false), attempts: attempts(info, wish.rate.into_iter().collect(), wish.period) })
     }
 
-    fn capture_with_render(&self, _render: &ab::Endpoint) -> bool {
-        false
+    /// A capture endpoint belongs with `render` when the user paired it or it has the same
+    /// container id (see [`pairing`]).
+    fn capture_with_render(&self, render: &ab::Endpoint) -> bool {
+        self.paired_input(render).is_ok()
     }
 
-    fn capture_format(&self, _endpoint: &ab::Endpoint, _rate: Option<u32>) -> Result<ab::Format, String> {
-        Err(NO_CAPTURE.into())
+    fn capture_format(&self, endpoint: &ab::Endpoint, rate: Option<u32>) -> Result<ab::Format, String> {
+        let info = self.paired_input(endpoint).map_err(|e| e.to_string())?;
+        Ok(ab::Format { rate: rate.unwrap_or(info.mix.rate), ..info.mix.format() })
     }
 
     fn open_render(
@@ -119,18 +170,23 @@ impl ab::Backend for WasapiBackend {
         error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
         let device = endpoint.handle::<WasapiEndpoint>().ok_or_else(|| ab::OpenError::Other("the endpoint is not a WASAPI device".into()))?;
-        let (stream, achieved) = RenderStream::open(OpenParams { id: device.id.clone(), request: *request }, render, error)?;
+        let (stream, achieved) = NativeStream::open_render(OpenParams { id: device.id.clone(), request: *request }, render, error)?;
         Ok((Box::new(stream), achieved))
     }
 
+    /// Open a capture stream on `endpoint`, or, for a render endpoint, on the capture endpoint
+    /// paired with it: the duplex open of the Player and the harness.
     fn open_capture(
         &self,
-        _endpoint: &ab::Endpoint,
-        _request: &ab::OpenRequest,
-        _capture: ab::CaptureCallback,
-        _error: ab::ErrorCallback,
+        endpoint: &ab::Endpoint,
+        request: &ab::OpenRequest,
+        capture: ab::CaptureCallback,
+        error: ab::ErrorCallback,
     ) -> Result<(Box<dyn ab::Stream>, ab::Achieved), ab::OpenError> {
-        Err(ab::OpenError::Other(NO_CAPTURE.into()))
+        let device = endpoint.handle::<WasapiEndpoint>().ok_or_else(|| ab::OpenError::Other("the endpoint is not a WASAPI device".into()))?;
+        let id = if device.output { self.paired_input(endpoint)?.id } else { device.id.clone() };
+        let (stream, achieved) = NativeStream::open_capture(OpenParams { id, request: *request }, capture, error)?;
+        Ok((Box::new(stream), achieved))
     }
 
     fn on_device_change(&self, handler: Box<dyn FnMut(ab::DeviceEvent) + Send>) -> bool {
@@ -146,8 +202,6 @@ impl ab::Backend for WasapiBackend {
         }
     }
 }
-
-const NO_CAPTURE: &str = "capture arrives with slice (d)";
 
 #[cfg(test)]
 mod hardware {
@@ -215,11 +269,130 @@ mod hardware {
         assert!(stream.start().is_err(), "a stopped stream is reopened, not restarted");
     }
 
+    #[derive(Default)]
+    struct Tally {
+        blocks: AtomicU64,
+        frames: AtomicU64,
+        invalid: AtomicU64,
+        faults: AtomicU64,
+        /// `host_callback_ns - backend_callback_ns` of each valid block: the host/backend offset.
+        offsets: std::sync::Mutex<Vec<i64>>,
+    }
+
+    fn median(values: &mut [i64]) -> i64 {
+        values.sort_unstable();
+        values.get(values.len() / 2).copied().unwrap_or(0)
+    }
+
+    fn capture_callback(tally: &Arc<Tally>) -> ab::CaptureCallback {
+        let tally = Arc::clone(tally);
+        Box::new(move |block| {
+            tally.blocks.fetch_add(1, Ordering::Relaxed);
+            tally.frames.fetch_add(block.frames as u64, Ordering::Relaxed);
+            if block.stamp.quality == ab::Quality::Invalid {
+                tally.invalid.fetch_add(1, Ordering::Relaxed);
+            } else if let Ok(mut offsets) = tally.offsets.lock() {
+                offsets.push(block.stamp.host_callback_ns as i64 - block.stamp.backend_callback_ns);
+            }
+            block.chunks(&mut |_, _| {});
+        })
+    }
+
+    fn render_callback(tally: &Arc<Tally>) -> ab::RenderCallback {
+        let tally = Arc::clone(tally);
+        Box::new(move |block| {
+            tally.blocks.fetch_add(1, Ordering::Relaxed);
+            tally.frames.fetch_add(block.frames as u64, Ordering::Relaxed);
+            if block.stamp.quality == ab::Quality::Invalid {
+                tally.invalid.fetch_add(1, Ordering::Relaxed);
+            } else if let Ok(mut offsets) = tally.offsets.lock() {
+                offsets.push(block.stamp.host_callback_ns as i64 - block.stamp.backend_callback_ns);
+            }
+            block.render(&mut |chunk| chunk.fill(0.0));
+        })
+    }
+
+    fn fault_callback(tally: &Arc<Tally>) -> ab::ErrorCallback {
+        let tally = Arc::clone(tally);
+        Box::new(move |_| {
+            tally.faults.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    #[test]
+    #[ignore = "opens the default audio capture endpoint"]
+    fn hardware_capture_default_endpoint_runs_two_seconds() {
+        let backend = WasapiBackend::default();
+        let plan = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint");
+        let tally = Arc::new(Tally::default());
+        let (stream, achieved) =
+            backend.open_capture(&plan.endpoint, &plan.attempts[0], capture_callback(&tally), fault_callback(&tally)).expect("open");
+        println!("achieved {achieved:?}, priority {:?}", stream.thread_priority());
+        stream.start().expect("start");
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_secs(2));
+        let (blocks, frames) = (tally.blocks.load(Ordering::Relaxed), tally.frames.load(Ordering::Relaxed));
+        drop(stream);
+        let rate = f64::from(achieved.format.rate);
+        let expected = started.elapsed().as_secs_f64() * rate;
+        println!("{blocks} blocks, {frames} frames in 2 s; expected about {expected:.0} frames");
+        assert!(blocks > 0 && tally.faults.load(Ordering::Relaxed) == 0);
+        assert!((frames as f64 - expected).abs() < expected * 0.1, "captured frames are not the elapsed time at the rate");
+        assert_eq!(tally.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+    }
+
+    #[test]
+    #[ignore = "opens the default audio render and capture endpoints"]
+    fn hardware_duplex_scarlett_pair_by_container() {
+        let backend = WasapiBackend::default();
+        let render_plan = backend.plan_render(&ab::OutputWish { channels: 2, ..Default::default() }).expect("a default render endpoint");
+        // The default devices pair by container id when they are one interface (the Scarlett);
+        // otherwise this opens the default capture endpoint next to the default render one.
+        let paired = backend.capture_with_render(&render_plan.endpoint);
+        println!("default render {} pairs with a capture endpoint by container: {paired}", render_plan.endpoint.name);
+        let capture_plan = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint");
+        let origin = ab::HostOrigin::default();
+        let (render, capture) = (Arc::new(Tally::default()), Arc::new(Tally::default()));
+        let mut capture_request = capture_plan.attempts[0];
+        capture_request.origin = origin;
+        let (capture_stream, _) = if paired {
+            let request = ab::OpenRequest { format: backend.capture_format(&render_plan.endpoint, None).expect("format"), ..capture_request };
+            backend.open_capture(&render_plan.endpoint, &request, capture_callback(&capture), fault_callback(&capture)).expect("open paired")
+        } else {
+            backend.open_capture(&capture_plan.endpoint, &capture_request, capture_callback(&capture), fault_callback(&capture)).expect("open")
+        };
+        let mut render_request = render_plan.attempts[0];
+        render_request.origin = origin;
+        let (render_stream, _) =
+            backend.open_render(&render_plan.endpoint, &render_request, render_callback(&render), fault_callback(&render)).expect("open render");
+        capture_stream.start().expect("start capture");
+        render_stream.start().expect("start render");
+        std::thread::sleep(Duration::from_secs(2));
+        drop((render_stream, capture_stream));
+        let (rb, cb) = (render.blocks.load(Ordering::Relaxed), capture.blocks.load(Ordering::Relaxed));
+        assert!(rb > 0 && cb > 0, "both streams ran ({rb} render, {cb} capture blocks)");
+        assert_eq!(render.faults.load(Ordering::Relaxed) + capture.faults.load(Ordering::Relaxed), 0);
+        assert_eq!(render.invalid.load(Ordering::Relaxed) + capture.invalid.load(Ordering::Relaxed), 0, "stamps with an unreadable clock");
+        // Both stamp against the one host origin through QPC: the offset between host time and
+        // each stream's own backend time is the same number for both, within callback jitter.
+        let (render_offset, capture_offset) = (median(&mut render.offsets.lock().unwrap()), median(&mut capture.offsets.lock().unwrap()));
+        println!("host - backend offset: render {render_offset} ns, capture {capture_offset} ns");
+        assert!((render_offset - capture_offset).abs() < 5_000_000, "the two streams' stamps are not comparable in one host origin");
+    }
+
     #[test]
     #[ignore = "enumerates the audio endpoints"]
     fn hardware_endpoints_list_names_formats_and_the_period_floor() {
-        for endpoint in WasapiBackend::default().endpoints(ab::Direction::Output).expect("endpoints") {
-            println!("{} [{}]: {} ch, formats {:?}", endpoint.name, endpoint.id, endpoint.outputs, endpoint.formats);
+        for direction in [ab::Direction::Output, ab::Direction::Input] {
+            for endpoint in WasapiBackend::default().endpoints(direction).expect("endpoints") {
+                println!(
+                    "{direction:?} {} [{}]: {} ch, formats {:?}",
+                    endpoint.name,
+                    endpoint.id,
+                    endpoint.outputs.max(endpoint.inputs),
+                    endpoint.formats
+                );
+            }
         }
     }
 }

@@ -266,7 +266,8 @@ impl Player {
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
         #[cfg(all(windows, feature = "native-wasapi"))]
         if cfg.backend == crate::Backend::NativeWasapi && crate::devices::is_wasapi_system(cfg.system.as_deref()) {
-            return Self::open_native_or_cpal(session, cfg, &transit_audio_wasapi::WasapiFactory, &crate::backend::cpal::CpalFactory);
+            let native = transit_audio_wasapi::WasapiFactory { input_pairing: cfg.input_pairing.clone() };
+            return Self::open_native_or_cpal(session, cfg, &native, &crate::backend::cpal::CpalFactory);
         }
         Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
     }

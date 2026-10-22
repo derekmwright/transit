@@ -50,4 +50,30 @@ backend serves the device and `WASAPI` for cpal; the saved I/O map is keyed by t
 (`WASAPI`) in both cases. Native stream stamps are `BackendEstimate` (device position plus padding
 plus `GetStreamLatency`); measure them with `audio-bench --backend wasapi` before trusting them.
 
+## Native capture, duplex and what `Measured` means (ADR 0016 slice d)
+
+The native backend opens capture as its own endpoint, client, thread and position counter
+(`transit-audio-wasapi`, `capture_loop.rs`); only QPC is shared with the render stream. Each stream
+captures its `(QPC, Instant)` pair at its own `start()` against the Player's one `HostOrigin`, so the
+stamps of the two streams are comparable in host nanoseconds, and each has its own `ClockKey`. A
+capture packet's frame time is the QPC `GetBuffer` reports for its first frame; its callback time is
+the `IAudioClock2` position read right after. A `DATA_DISCONTINUITY` or `TIMESTAMP_ERROR` packet is
+delivered with an invalid stamp (the fit restarts) and counted; a `SILENT` packet is delivered as
+zeros. Stamps never step backward and host time strictly increases (`render_loop::Held`).
+
+A render and a capture endpoint are one duplex device when the user paired them
+(`AudioConfig.input_pairing`) or they report the same `PKEY_Device_ContainerId`
+(`pairing.rs`); the Player then opens the input with the output. The recorder maps the output's
+host time to input frames through the input stream's own fit.
+
+`OpenRequest.calibration` (`Calibration { round_trip_ns, uncertainty_ns }`) is what turns the native
+stamps to `Quality::Measured`. The round trip is the delay the stamps do not account for, measured in
+the stamps' own time (an output frame's presentation time to the input frame time of the same click
+over a loopback cable). The input stream carries all of it (its frame time moves earlier by the round
+trip), so the output's presentation time stays the reference, and both streams report the
+`uncertainty_ns` bound. `Measured` therefore claims the pair is tied together to within that bound;
+it does not separate the DAC delay from the ADC delay. Nothing stores or supplies a calibration yet:
+the measurement (`audio-bench --backend wasapi --loopback`), its per-machine storage and the "calibrated"
+label are the remaining part of slice (d).
+
 Tests: `crates/playback/src/device_clock/tests.rs`, `crates/playback/tests/backend_time_contract.rs`.

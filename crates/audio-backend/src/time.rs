@@ -28,6 +28,17 @@ impl Stamp {
         Stamp { host_callback_ns: 0, backend_callback_ns: 0, backend_frame_ns: 0, quality: Quality::Invalid, offset_uncertainty_ns: None };
 }
 
+/// A loopback calibration of one device pair at one mode, rate and period, as the Player hands it
+/// to the streams it opens. The round trip is the delay the stamps do not account for, measured
+/// in the stamps' own time (the output's presented frame to the input's captured frame of the
+/// same click); the input stream carries all of it, so the output's presentation time stays the
+/// reference. Both streams then report [`Quality::Measured`] with `uncertainty_ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Calibration {
+    pub round_trip_ns: u64,
+    pub uncertainty_ns: u64,
+}
+
 /// Initialized on control. Reading the cached origin performs no lazy callback initialization.
 #[derive(Clone, Copy)]
 pub struct HostOrigin {

@@ -27,7 +27,8 @@ impl Script {
 /// The fake system for `request`: one device with the requested rate and period.
 pub fn backend(request: &Request, period: u32) -> FakeBackend {
     let format = ab::Format::new(request.rate, request.out_ch.max(2), ab::SampleFormat::F32);
-    let attempt = ab::OpenRequest { format, period: ab::Period::Frames(period), mode: ab::Mode::Shared, origin: ab::HostOrigin::default() };
+    let attempt =
+        ab::OpenRequest { format, period: ab::Period::Frames(period), mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration: None };
     let fake = FakeBackend::new(format).with_attempts(vec![attempt]);
     if request.loopback { fake.with_capture(request.in_ch.max(2), false) } else { fake }
 }

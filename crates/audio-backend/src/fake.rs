@@ -37,7 +37,7 @@ pub struct FakeBackend {
 impl FakeBackend {
     /// A system named "Fake" with one device that opens in `format`.
     pub fn new(format: Format) -> Self {
-        let request = OpenRequest { format, period: Period::Default, mode: Mode::Shared, origin: crate::HostOrigin::default() };
+        let request = OpenRequest { format, period: Period::Default, mode: Mode::Shared, origin: crate::HostOrigin::default(), calibration: None };
         Self { state: Arc::default(), name: "Fake device".into(), system: "Fake".into(), attempts: vec![request], capture_channels: 0, duplex: false }
     }
     /// Plan these requests, in order, instead of one.

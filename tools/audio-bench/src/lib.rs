@@ -110,7 +110,7 @@ pub fn cpal_backend(system: Option<&str>) -> Result<Box<dyn ab::Backend>, String
 #[cfg(all(windows, feature = "native-wasapi"))]
 pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
     use ab::BackendFactory;
-    transit_audio_wasapi::WasapiFactory.backend(None).ok_or_else(|| "the native WASAPI backend is not available".to_string())
+    transit_audio_wasapi::WasapiFactory::default().backend(None).ok_or_else(|| "the native WASAPI backend is not available".to_string())
 }
 
 /// Without the feature (or off Windows) there is no native backend to measure.

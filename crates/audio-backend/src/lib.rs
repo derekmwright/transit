@@ -12,7 +12,7 @@
 pub mod fake;
 mod time;
 
-pub use time::{HostOrigin, Quality, Stamp};
+pub use time::{Calibration, HostOrigin, Quality, Stamp};
 
 use std::any::Any;
 use std::sync::Arc;
@@ -103,6 +103,9 @@ pub struct OpenRequest {
     pub period: Period,
     pub mode: Mode,
     pub origin: HostOrigin,
+    /// The loopback calibration of this device pair, when the user has measured one. Only the
+    /// native WASAPI backend applies it.
+    pub calibration: Option<Calibration>,
 }
 
 /// What a stream opened with. An adapter may not be able to honor the request exactly.

@@ -323,6 +323,7 @@ fn audio_patch_merges_fields_and_rejects_zero_atomically() {
             sample_rate: Some(48000),
             buffer_size: Some(128),
             output: None,
+            input_pairing: None,
             backend: Backend::Auto,
         }
     );

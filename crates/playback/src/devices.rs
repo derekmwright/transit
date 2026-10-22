@@ -70,6 +70,10 @@ pub struct AudioConfig {
     pub system: Option<String>,
     pub output: Option<String>,
     pub input: Option<String>,
+    /// The native WASAPI backend opens this input (endpoint id or name) together with the output
+    /// for duplex recording, for interfaces whose endpoints share no container id. `None` pairs
+    /// by container id alone.
+    pub input_pairing: Option<String>,
     /// Device sample rate; the mix resamples when it differs from the session's.
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
@@ -322,6 +326,7 @@ mod tests {
             system: Some("WASAPI".into()),
             output: Some("Speakers".into()),
             input: None,
+            input_pairing: Some("{0.0.1.00000000}.{abc}".into()),
             sample_rate: Some(48_000),
             buffer_size: Some(256),
             backend: Backend::NativeWasapi,

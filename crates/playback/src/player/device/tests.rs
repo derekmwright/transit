@@ -518,3 +518,67 @@ fn hardware_player_opens_native_wasapi() {
     assert_eq!((telemetry.backend_errors, telemetry.device_lost_errors), (0, 0));
     drop(player);
 }
+
+/// The duplex open of the native path on the scripted backend: the output and the paired input are
+/// opened as two streams, each with its own clock key, and the stamps of both are in the one host
+/// origin, so an output frame maps to the input frame that was captured when it was presented.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_native_duplex_open_gives_both_streams_clocks_in_one_host_origin() {
+    use ab::fake::{SliceSink, SliceSource};
+    const BLOCK: usize = 192;
+    const PERIOD_NS: u64 = 4_000_000;
+    // The output is presented 6 ms after its callback; the input frame was captured 3 ms before its.
+    const PRESENT_NS: i64 = 6_000_000;
+    const CAPTURED_NS: i64 = 3_000_000;
+    let fake = fake_factory(false).with_capture(2, true);
+    let cfg = AudioConfig::default();
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &cfg, &fake, &fake_factory(false)).unwrap();
+    assert!(player.native_backend && !player.silent);
+    let mut recorder = player.open_input(&cfg).expect("the duplex input is held for the recorder");
+    assert_eq!(fake.opens().iter().map(|(direction, _)| *direction).collect::<Vec<_>>(), [ab::Direction::Input, ab::Direction::Output]);
+    assert!(fake.running(ab::Direction::Input) && fake.running(ab::Direction::Output));
+
+    let origin = player.origin;
+    let t0 = origin.now_ns().unwrap();
+    let stamp = |i: u64, direction: ab::Direction| {
+        let callback = (i * PERIOD_NS) as i64;
+        let frame = if direction == ab::Direction::Output { callback + PRESENT_NS } else { callback - CAPTURED_NS };
+        ab::Stamp {
+            host_callback_ns: t0 + i * PERIOD_NS,
+            backend_callback_ns: callback,
+            backend_frame_ns: frame,
+            quality: ab::Quality::BackendEstimate,
+            offset_uncertainty_ns: None,
+        }
+    };
+    let (mut output, mut input) = ([0.0f32; BLOCK * 2], [0.25f32; BLOCK * 2]);
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    // A device that keeps pace with the real clock: block `i` is pumped once its host time has come.
+    let mut maps = None;
+    for i in 0..2_000u64 {
+        while origin.now_ns().unwrap() < t0 + i * PERIOD_NS + 1_000_000 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(fake.pump_capture(BLOCK, stamp(i, ab::Direction::Input), format, &mut SliceSource { data: &input, channels: 2 }));
+        assert!(fake.pump_render(BLOCK, stamp(i, ab::Direction::Output), &mut SliceSink { data: &mut output, channels: 2 }));
+        if i % 4 == 3
+            && let (Some(out), Some(inp)) = (player.clock_report().and_then(|r| r.map), recorder.clock_report().and_then(|r| r.map))
+        {
+            maps = Some((out, inp));
+            break;
+        }
+    }
+    let (out, inp) = maps.expect("both streams' clocks fitted");
+    input.fill(0.0);
+    assert_eq!((out.key.direction, inp.key.direction), (device_clock::Direction::Output, device_clock::Direction::Input));
+    assert_ne!((out.key.generation, out.key.domain), (inp.key.generation, inp.key.domain), "each stream has its own clock domain");
+    assert_eq!((out.quality, inp.quality), (ab::Quality::BackendEstimate, ab::Quality::BackendEstimate));
+    // The recorder's mapping: the host time at which output frame F is presented, in the input's fit.
+    let now = origin.now_ns().unwrap();
+    let frame = out.frame_range().start() + 4_800;
+    let host = out.frame_to_host(out.key, frame, now).expect("an output frame in the window");
+    let captured = inp.host_to_frame(inp.key, host, now).expect("the input frame of that host time");
+    let expected = frame + ((PRESENT_NS + CAPTURED_NS) as u64) * 48_000 / 1_000_000_000;
+    assert!(captured.abs_diff(expected) <= 1, "input frame {captured}, expected {expected}");
+}

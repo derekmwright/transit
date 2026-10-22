@@ -325,7 +325,7 @@ impl Recorder {
         if format.rate != rate {
             return Err(format!("the input does not run at {rate} Hz"));
         }
-        let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default() };
+        let request = ab::OpenRequest { format, period, mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration: None };
         Recorder::build(backend, endpoint, &request, Some(progress)).map_err(|e| e.to_string())
     }
 

@@ -5,8 +5,10 @@
 //! for a COM type); what crosses is plain data, strings and kernel event handles.
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
+use crate::capture_loop::{self, CaptureConfig, CaptureDevice, CaptureStamper, CaptureStats, Packet};
 use crate::convert::Wire;
 use crate::lifecycle::Lifecycle;
+use crate::pairing::{self, Candidate};
 use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -19,8 +21,8 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY};
 use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-    AUDCLNT_STREAMOPTIONS_RAW, AudioCategory_Media, AudioClientProperties, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioClient,
-    IAudioClient2, IAudioClient3, IAudioClock, IAudioClock2, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+    AUDCLNT_STREAMOPTIONS_RAW, AudioCategory_Media, AudioClientProperties, DEVICE_STATE, DEVICE_STATE_ACTIVE, EDataFlow, ERole, IAudioCaptureClient,
+    IAudioClient, IAudioClient2, IAudioClient3, IAudioClock, IAudioClock2, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
     IMMNotificationClient_Impl, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, STGM_READ};
@@ -35,6 +37,8 @@ const SUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00aa_0038_9
 const SUBTYPE_FLOAT: GUID = GUID::from_u128(0x0000_0003_0000_0010_8000_00aa_0038_9b71);
 /// `PKEY_Devices_AudioDevice_RawProcessingSupported` (`devpkey.h`: {B3F8FA53-0004-438E-9003-51A46E139BFC}, 3).
 const PKEY_RAW_SUPPORTED: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xb3f8fa53_0004_438e_9003_51a46e139bfc), pid: 3 };
+/// `PKEY_Device_ContainerId` (`devpkey.h`: {8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C}, 2): the physical device an endpoint belongs to.
+const PKEY_CONTAINER_ID: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x8c7ed206_3f8a_4827_b3ab_ae9e1faefc6c), pid: 2 };
 /// `AUDCLNT_BUFFERFLAGS_SILENT` for `ReleaseBuffer`.
 const BUFFER_SILENT: u32 = 2;
 /// The most channels a mix format may declare.
@@ -243,6 +247,20 @@ pub(crate) struct EndpointInfo {
     pub(crate) mix: Fmt,
     /// `GetSharedModeEnginePeriod` (min, max) in frames, where `IAudioClient3` exists.
     pub(crate) periods: Option<(u32, u32)>,
+    /// The `IMMDevice` container id of the physical device, as the system prints it.
+    pub(crate) container: Option<String>,
+}
+
+impl EndpointInfo {
+    pub(crate) fn candidate(&self) -> Candidate<'_> {
+        Candidate { id: &self.id, name: &self.name, container: self.container.as_deref() }
+    }
+}
+
+/// The index in `inputs` of the capture endpoint that pairs with `render` (see [`pairing::pair`]).
+pub(crate) fn paired_input(render: &EndpointInfo, inputs: &[EndpointInfo], pairing: Option<&str>) -> Option<usize> {
+    let candidates: Vec<Candidate<'_>> = inputs.iter().map(EndpointInfo::candidate).collect();
+    pairing::pair(render.candidate(), &candidates, pairing)
 }
 
 fn string_of(text: PWSTR) -> String {
@@ -288,6 +306,11 @@ fn raw_supported(device: &IMMDevice) -> bool {
         .unwrap_or(false)
 }
 
+fn container_id(device: &IMMDevice) -> Option<String> {
+    // SAFETY: as `friendly_name`; the variant is a string or CLSID that `to_string` prints.
+    unsafe { device.OpenPropertyStore(STGM_READ).and_then(|s| s.GetValue(&PKEY_CONTAINER_ID)) }.ok().map(|v| v.to_string()).filter(|t| !t.is_empty())
+}
+
 fn describe(device: &IMMDevice) -> Result<EndpointInfo, ab::OpenError> {
     let client = activate(device)?;
     let (mut raw, mix) = mix_format(&client)?;
@@ -302,7 +325,7 @@ fn describe(device: &IMMDevice) -> Result<EndpointInfo, ab::OpenError> {
     // other rate (and `E_POINTER` without a closest-match out-pointer), so probing cannot find
     // the rates the engine converts; the open path asks for the session rate with
     // `AUTOCONVERTPCM` and reports the rate it achieved.
-    Ok(EndpointInfo { id: id_of(device)?, name: friendly_name(device), mix, periods })
+    Ok(EndpointInfo { id: id_of(device)?, name: friendly_name(device), mix, periods, container: container_id(device) })
 }
 
 /// The active endpoints of one direction, default first.
@@ -331,6 +354,88 @@ pub(crate) struct OpenParams {
     pub(crate) request: ab::OpenRequest,
 }
 
+/// Resolve the endpoint and initialize an event-driven shared-mode client on it: raw where
+/// offered, `IAudioClient3` at the requested (else the minimum) period, else the plain
+/// `IAudioClient` at its default period, with the engine converting a differing session rate.
+/// Returns the client, its period in frames and the format of the buffer.
+fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt), ab::OpenError> {
+    let device = {
+        let wide = wide(&params.id);
+        // SAFETY: `GetDevice` reads the NUL-terminated UTF-16 id in `wide`, valid for the call.
+        unsafe { enumerator()?.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(|e| open_error("GetDevice", &e))?
+    };
+    // Raw mode (APOs bypassed) where the endpoint supports it; a failure degrades to non-raw.
+    let want_raw = raw_supported(&device);
+    let client = activate(&device)?;
+    if want_raw {
+        apply_raw(&client);
+    }
+    let (mix_raw, mix) = mix_format(&client)?;
+    let requested = params.request.format.rate;
+    if requested != mix.rate && requested != 0 {
+        // The session rate differs from the endpoint's: the engine converts.
+        let (converted, fmt) = float_format(&mix, requested);
+        let frames = initialize_plain(&client, &converted, &fmt, true)?;
+        return Ok((client, frames, fmt));
+    }
+    match initialize_low_latency(&client, mix_raw, params.request.period) {
+        Ok(frames) => Ok((client, frames, mix)),
+        Err(e) => {
+            log::info!("IAudioClient3 low-latency open failed ({e}); using event-driven IAudioClient");
+            // A failed `Initialize` cannot be retried on the same client.
+            let client = activate(&device)?;
+            if want_raw {
+                apply_raw(&client);
+            }
+            let frames = initialize_plain(&client, &mix_raw, &mix, false)?;
+            Ok((client, frames, mix))
+        }
+    }
+}
+
+/// `IAudioClient3`: the requested period (else the minimum) within the engine's range.
+fn initialize_low_latency(client: &IAudioClient, mut mix_raw: WAVEFORMATEXTENSIBLE, period: ab::Period) -> Result<u32, ab::OpenError> {
+    let client3 = client.cast::<IAudioClient3>().map_err(|e| open_error("IAudioClient3", &e))?;
+    let format = (&raw mut mix_raw).cast::<WAVEFORMATEX>();
+    let (mut default, mut fundamental, mut min, mut max) = (0, 0, 0, 0);
+    // SAFETY: `format` points at the mix format copy, valid for both calls; the out-pointers
+    // are live `u32`s. `InitializeSharedAudioStream` takes a period within
+    // `[min, max]` that is a multiple of `fundamental` and the exact mix format, and may be
+    // called once on a client that has not been initialized.
+    unsafe {
+        client3
+            .GetSharedModeEnginePeriod(format, &mut default, &mut fundamental, &mut min, &mut max)
+            .map_err(|e| open_error("GetSharedModeEnginePeriod", &e))?;
+        let step = fundamental.max(1);
+        let frames = match period {
+            ab::Period::Frames(n) => ((n + step / 2) / step * step).clamp(min, max.max(min)),
+            ab::Period::Default => min,
+        };
+        client3
+            .InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, frames, format, None)
+            .map_err(|e| open_error("InitializeSharedAudioStream", &e))?;
+        Ok(frames)
+    }
+}
+
+/// `IAudioClient::Initialize` event-driven at the engine's default period; with `convert`,
+/// the engine converts from `format` to the mix format (`AUTOCONVERTPCM`).
+fn initialize_plain(client: &IAudioClient, raw: &WAVEFORMATEXTENSIBLE, fmt: &Fmt, convert: bool) -> Result<u32, ab::OpenError> {
+    let mut default_hns = 0i64;
+    let flags =
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | if convert { AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY } else { 0 };
+    // SAFETY: `raw` is a valid format for the call; `GetDevicePeriod` fills the live `i64`;
+    // `Initialize` is called once on an uninitialized client, shared mode with
+    // `hnsPeriodicity` 0 (required for shared mode) and the default period as the buffer.
+    unsafe {
+        client.GetDevicePeriod(Some(&mut default_hns), None).map_err(|e| open_error("GetDevicePeriod", &e))?;
+        client
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, default_hns, 0, (raw as *const WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(), None)
+            .map_err(|e| open_error("Initialize", &e))?;
+    }
+    Ok((default_hns.unsigned_abs() * u64::from(fmt.rate) / 10_000_000) as u32)
+}
+
 /// The opened, not yet started, stream: owned by the stream thread.
 struct Live {
     client: IAudioClient,
@@ -343,88 +448,22 @@ struct Live {
     buffer_frames: u32,
     period_frames: u32,
     latency_100ns: i64,
+    calibration: Option<ab::Calibration>,
 }
 
 impl Live {
     fn open(params: &OpenParams, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
-        let device = {
-            let wide = wide(&params.id);
-            // SAFETY: `GetDevice` reads the NUL-terminated UTF-16 id in `wide`, valid for the call.
-            unsafe { enumerator()?.GetDevice(PCWSTR(wide.as_ptr())) }.map_err(|e| open_error("GetDevice", &e))?
-        };
-        // Raw mode (APOs bypassed) where the endpoint supports it; a failure degrades to non-raw.
-        let want_raw = raw_supported(&device);
-        let client = activate(&device)?;
-        if want_raw {
-            apply_raw(&client);
-        }
-        let (mix_raw, mix) = mix_format(&client)?;
-        let requested = params.request.format.rate;
-        if requested != mix.rate && requested != 0 {
-            // The session rate differs from the endpoint's: the engine converts.
-            let (converted, fmt) = float_format(&mix, requested);
-            let frames = Self::initialize_plain(&client, &converted, &fmt, true)?;
-            return Self::finish(client, frames, fmt, stop);
-        }
-        match Self::initialize_low_latency(&client, mix_raw, params.request.period) {
-            Ok(frames) => Self::finish(client, frames, mix, stop),
-            Err(e) => {
-                log::info!("IAudioClient3 low-latency open failed ({e}); using event-driven IAudioClient");
-                // A failed `Initialize` cannot be retried on the same client.
-                let client = activate(&device)?;
-                if want_raw {
-                    apply_raw(&client);
-                }
-                let frames = Self::initialize_plain(&client, &mix_raw, &mix, false)?;
-                Self::finish(client, frames, mix, stop)
-            }
-        }
+        let (client, frames, fmt) = open_client(params)?;
+        Self::finish(client, frames, fmt, stop, params.request.calibration)
     }
 
-    /// `IAudioClient3`: the requested period (else the minimum) within the engine's range.
-    fn initialize_low_latency(client: &IAudioClient, mut mix_raw: WAVEFORMATEXTENSIBLE, period: ab::Period) -> Result<u32, ab::OpenError> {
-        let client3 = client.cast::<IAudioClient3>().map_err(|e| open_error("IAudioClient3", &e))?;
-        let format = (&raw mut mix_raw).cast::<WAVEFORMATEX>();
-        let (mut default, mut fundamental, mut min, mut max) = (0, 0, 0, 0);
-        // SAFETY: `format` points at the mix format copy, valid for both calls; the out-pointers
-        // are live `u32`s. `InitializeSharedAudioStream` takes a period within
-        // `[min, max]` that is a multiple of `fundamental` and the exact mix format, and may be
-        // called once on a client that has not been initialized.
-        unsafe {
-            client3
-                .GetSharedModeEnginePeriod(format, &mut default, &mut fundamental, &mut min, &mut max)
-                .map_err(|e| open_error("GetSharedModeEnginePeriod", &e))?;
-            let step = fundamental.max(1);
-            let frames = match period {
-                ab::Period::Frames(n) => ((n + step / 2) / step * step).clamp(min, max.max(min)),
-                ab::Period::Default => min,
-            };
-            client3
-                .InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, frames, format, None)
-                .map_err(|e| open_error("InitializeSharedAudioStream", &e))?;
-            Ok(frames)
-        }
-    }
-
-    /// `IAudioClient::Initialize` event-driven at the engine's default period; with `convert`,
-    /// the engine converts from `format` to the mix format (`AUTOCONVERTPCM`).
-    fn initialize_plain(client: &IAudioClient, raw: &WAVEFORMATEXTENSIBLE, fmt: &Fmt, convert: bool) -> Result<u32, ab::OpenError> {
-        let mut default_hns = 0i64;
-        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-            | if convert { AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY } else { 0 };
-        // SAFETY: `raw` is a valid format for the call; `GetDevicePeriod` fills the live `i64`;
-        // `Initialize` is called once on an uninitialized client, shared mode with
-        // `hnsPeriodicity` 0 (required for shared mode) and the default period as the buffer.
-        unsafe {
-            client.GetDevicePeriod(Some(&mut default_hns), None).map_err(|e| open_error("GetDevicePeriod", &e))?;
-            client
-                .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, default_hns, 0, (raw as *const WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(), None)
-                .map_err(|e| open_error("Initialize", &e))?;
-        }
-        Ok((default_hns.unsigned_abs() * u64::from(fmt.rate) / 10_000_000) as u32)
-    }
-
-    fn finish(client: IAudioClient, period_frames: u32, fmt: Fmt, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
+    fn finish(
+        client: IAudioClient,
+        period_frames: u32,
+        fmt: Fmt,
+        stop: Arc<Event>,
+        calibration: Option<ab::Calibration>,
+    ) -> Result<Self, ab::OpenError> {
         let event = Event::new(false)?;
         // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
         // handle that outlives the client (`event` is a field of `Live`, dropped after the
@@ -444,33 +483,60 @@ impl Live {
             render.GetBuffer(buffer_frames).map_err(|e| open_error("GetBuffer", &e))?;
             render.ReleaseBuffer(buffer_frames, BUFFER_SILENT).map_err(|e| open_error("ReleaseBuffer", &e))?;
         }
-        Ok(Self { client, render, clock, clock_frequency, event, stop, fmt, buffer_frames, period_frames, latency_100ns: latency })
+        Ok(Self { client, render, clock, clock_frequency, event, stop, fmt, buffer_frames, period_frames, latency_100ns: latency, calibration })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
     fn start(&self, origin: ab::HostOrigin) -> Result<Stamper, ab::OpenError> {
-        let (mut ticks, mut frequency) = (0i64, 0i64);
-        // SAFETY: `QueryPerformanceCounter` and `Frequency` fill live `i64`s and cannot fail on
-        // Windows XP and later (the `Result` is still checked).
-        unsafe {
-            QueryPerformanceCounter(&mut ticks).map_err(|e| open_error("QueryPerformanceCounter", &e))?;
-            QueryPerformanceFrequency(&mut frequency).map_err(|e| open_error("QueryPerformanceFrequency", &e))?;
-        }
-        let instant = std::time::Instant::now();
-        let qpc_100ns = (ticks.unsigned_abs() as u128 * 10_000_000 / frequency.unsigned_abs().max(1) as u128) as u64;
-        let origin_ns = match instant.checked_duration_since(origin.instant()) {
-            Some(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
-            None => -i64::try_from(origin.instant().duration_since(instant).as_nanos()).unwrap_or(i64::MAX),
-        };
+        let (qpc_100ns, origin_ns) = origin_pair(origin)?;
         // SAFETY: `Start` on an initialized client whose event handle is set; it is called once.
         unsafe { self.client.Start() }.map_err(|e| open_error("Start", &e))?;
-        Ok(Stamper::new(qpc_100ns, origin_ns, self.fmt.rate, self.latency_100ns))
+        Ok(Stamper::new(qpc_100ns, origin_ns, self.fmt.rate, self.latency_100ns).calibrated(self.calibration))
     }
+}
+
+/// The `(QPC in 100 ns units, host-origin nanoseconds)` pair of one instant. Every stream takes its
+/// own pair at its own `start()` against the Player's shared `HostOrigin`, so the stamps of a render
+/// and a capture stream are comparable in that origin although the devices share only QPC.
+fn origin_pair(origin: ab::HostOrigin) -> Result<(u64, i64), ab::OpenError> {
+    let (mut ticks, mut frequency) = (0i64, 0i64);
+    // SAFETY: `QueryPerformanceCounter` and `Frequency` fill live `i64`s and cannot fail on
+    // Windows XP and later (the `Result` is still checked).
+    unsafe {
+        QueryPerformanceCounter(&mut ticks).map_err(|e| open_error("QueryPerformanceCounter", &e))?;
+        QueryPerformanceFrequency(&mut frequency).map_err(|e| open_error("QueryPerformanceFrequency", &e))?;
+    }
+    let instant = std::time::Instant::now();
+    let qpc_100ns = (ticks.unsigned_abs() as u128 * 10_000_000 / frequency.unsigned_abs().max(1) as u128) as u64;
+    let origin_ns = match instant.checked_duration_since(origin.instant()) {
+        Some(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+        None => -i64::try_from(origin.instant().duration_since(instant).as_nanos()).unwrap_or(i64::MAX),
+    };
+    Ok((qpc_100ns, origin_ns))
 }
 
 fn unsafe_frequency(clock: &IAudioClock) -> Result<u64, ab::OpenError> {
     // SAFETY: `GetFrequency` on a live clock service of an initialized client.
     unsafe { clock.GetFrequency() }.map_err(|e| open_error("GetFrequency", &e))
+}
+
+/// `IAudioClock2::GetDevicePosition` in frames of `rate`, with its QPC time in 100 ns units.
+#[deny(clippy::disallowed_macros, clippy::disallowed_methods)]
+fn device_position(clock: &IAudioClock2, clock_frequency: u64, rate: u32) -> Result<Position, Fault> {
+    let (mut device, mut qpc) = (0u64, 0u64);
+    // SAFETY: `IAudioClock2::GetDevicePosition` with two live `u64`s on the started stream's
+    // clock; raw vtable call for the same allocation-free reason as `padding`. The position
+    // is in units of `GetFrequency()` per second and the QPC value in 100 ns units.
+    let hr = unsafe { (Interface::vtable(clock).GetDevicePosition)(Interface::as_raw(clock), &mut device, &mut qpc) };
+    if hr.is_err() {
+        return Err(Fault::from_hresult(hr.0));
+    }
+    let frames = if clock_frequency == u64::from(rate) || clock_frequency == 0 {
+        device
+    } else {
+        (u128::from(device) * u128::from(rate) / u128::from(clock_frequency)) as u64
+    };
+    Ok(Position { frames, qpc_100ns: qpc })
 }
 
 // Hot-path methods: the allocation bans of `render_loop` apply to the real device too, not only
@@ -502,20 +568,7 @@ impl RenderDevice for Live {
     }
 
     fn position(&mut self) -> Result<Position, Fault> {
-        let (mut device, mut qpc) = (0u64, 0u64);
-        // SAFETY: `IAudioClock2::GetDevicePosition` with two live `u64`s on the started stream's
-        // clock; raw vtable call for the same allocation-free reason as `padding`. The position
-        // is in units of `GetFrequency()` per second and the QPC value in 100 ns units.
-        let hr = unsafe { (Interface::vtable(&self.clock).GetDevicePosition)(Interface::as_raw(&self.clock), &mut device, &mut qpc) };
-        if hr.is_err() {
-            return Err(Fault::from_hresult(hr.0));
-        }
-        let frames = if self.clock_frequency == u64::from(self.fmt.rate) || self.clock_frequency == 0 {
-            device
-        } else {
-            (u128::from(device) * u128::from(self.fmt.rate) / u128::from(self.clock_frequency)) as u64
-        };
-        Ok(Position { frames, qpc_100ns: qpc })
+        device_position(&self.clock, self.clock_frequency, self.fmt.rate)
     }
 
     fn write(&mut self, frames: u32, fill: &mut dyn FnMut(&mut [u8])) -> Result<(), Fault> {
@@ -566,6 +619,146 @@ impl RenderDevice for Live {
     }
 }
 
+/// The opened, not yet started, capture stream: owned by the stream thread.
+struct LiveCapture {
+    client: IAudioClient,
+    capture: IAudioCaptureClient,
+    clock: IAudioClock2,
+    clock_frequency: u64,
+    event: Event,
+    stop: Arc<Event>,
+    fmt: Fmt,
+    period_frames: u32,
+    latency_100ns: i64,
+    calibration: Option<ab::Calibration>,
+}
+
+impl LiveCapture {
+    fn open(params: &OpenParams, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
+        let (client, period_frames, fmt) = open_client(params)?;
+        let event = Event::new(false)?;
+        // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
+        // handle that outlives the client (`event` is a field of `LiveCapture`); `GetService` asks
+        // the initialized client for its services.
+        let (capture, clock, latency) = unsafe {
+            client.SetEventHandle(event.0).map_err(|e| open_error("SetEventHandle", &e))?;
+            let capture = client.GetService::<IAudioCaptureClient>().map_err(|e| open_error("IAudioCaptureClient", &e))?;
+            let clock = client.GetService::<IAudioClock>().map_err(|e| open_error("IAudioClock", &e))?;
+            (capture, clock, client.GetStreamLatency().unwrap_or(0))
+        };
+        let clock_frequency = unsafe_frequency(&clock)?;
+        let clock = clock.cast::<IAudioClock2>().map_err(|e| open_error("IAudioClock2", &e))?;
+        Ok(Self {
+            client,
+            capture,
+            clock,
+            clock_frequency,
+            event,
+            stop,
+            fmt,
+            period_frames,
+            latency_100ns: latency,
+            calibration: params.request.calibration,
+        })
+    }
+
+    /// Capture the `(QPC, Instant)` origin pair and start the stream.
+    fn start(&self, origin: ab::HostOrigin) -> Result<CaptureStamper, ab::OpenError> {
+        let (qpc_100ns, origin_ns) = origin_pair(origin)?;
+        // SAFETY: `Start` on an initialized client whose event handle is set; it is called once.
+        unsafe { self.client.Start() }.map_err(|e| open_error("Start", &e))?;
+        Ok(CaptureStamper::new(qpc_100ns, origin_ns, self.calibration))
+    }
+}
+
+/// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, `_SILENT` (`BUFFER_SILENT`) and `_TIMESTAMP_ERROR`.
+const BUFFER_DISCONTINUITY: u32 = 1;
+const BUFFER_TIMESTAMP_ERROR: u32 = 4;
+
+// Hot-path methods: the allocation bans of `capture_loop` apply to the real device too.
+#[deny(clippy::disallowed_macros, clippy::disallowed_methods)]
+impl CaptureDevice for LiveCapture {
+    fn wait(&mut self, timeout_ms: u32) -> Wake {
+        // The stop event is first so that it wins when both are signaled.
+        let handles = [self.stop.0, self.event.0];
+        // SAFETY: both handles are live events owned by this stream; `WaitForMultipleObjects`
+        // with `bWaitAll` false returns the index of the first signaled handle, `WAIT_TIMEOUT`,
+        // or `WAIT_FAILED`. It does not allocate.
+        let woke = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
+        match woke.0 {
+            0 => Wake::Stop,
+            1 => Wake::Event,
+            0x102 => Wake::Timeout,
+            _ => Wake::Failed(Fault::Other(-1)),
+        }
+    }
+
+    fn read(&mut self, fill: &mut dyn FnMut(&Packet, Option<&[u8]>)) -> Result<bool, Fault> {
+        let mut data: *mut u8 = std::ptr::null_mut();
+        let (mut frames, mut flags, mut position, mut qpc) = (0u32, 0u32, 0u64, 0u64);
+        // SAFETY: `GetBuffer` on the started capture client with five live out-pointers returns,
+        // when `frames` is nonzero, a pointer to `frames * nBlockAlign` readable bytes that stay
+        // valid and exclusively ours until the paired `ReleaseBuffer(frames)`, called exactly once
+        // before any other `GetBuffer` (on the normal path, or by the unwind guard below, never
+        // both). `AUDCLNT_S_BUFFER_EMPTY` is a success code with `frames` 0 and nothing acquired,
+        // so nothing is released then. The slice length is `frames * channels * bytes`, which
+        // `parse_format` proved equal to `frames * nBlockAlign`; a silent packet's bytes are
+        // never read. Raw vtable calls keep failures as bare `HRESULT`s.
+        unsafe {
+            let hr = (Interface::vtable(&self.capture).GetBuffer)(
+                Interface::as_raw(&self.capture),
+                &mut data,
+                &mut frames,
+                &mut flags,
+                &mut position,
+                &mut qpc,
+            );
+            if hr.is_err() {
+                return Err(Fault::from_hresult(hr.0));
+            }
+            if frames == 0 {
+                return Ok(false);
+            }
+            let packet = Packet {
+                frames,
+                silent: flags & BUFFER_SILENT != 0 || data.is_null(),
+                discontinuity: flags & BUFFER_DISCONTINUITY != 0,
+                timestamp_error: flags & BUFFER_TIMESTAMP_ERROR != 0,
+                device_position: position,
+                qpc_100ns: qpc,
+                clock: device_position(&self.clock, self.clock_frequency, self.fmt.rate).ok(),
+            };
+            let capture = &self.capture;
+            // If `fill` unwinds, hand the packet back unread so the buffer is never left outstanding.
+            let guard = UnwindGuard::new(|| {
+                // Covered by the SAFETY comment above: the packet returned by `GetBuffer` is still
+                // outstanding here, because the guard is disarmed before the normal `ReleaseBuffer`.
+                let _ = (Interface::vtable(capture).ReleaseBuffer)(Interface::as_raw(capture), frames);
+            });
+            let bytes = (!packet.silent).then(|| {
+                let len = frames as usize * usize::from(self.fmt.channels) * self.fmt.wire.bytes();
+                std::slice::from_raw_parts(data.cast_const(), len)
+            });
+            fill(&packet, bytes);
+            guard.disarm();
+            let hr = (Interface::vtable(&self.capture).ReleaseBuffer)(Interface::as_raw(&self.capture), frames);
+            if hr.is_err() {
+                return Err(Fault::from_hresult(hr.0));
+            }
+        }
+        Ok(true)
+    }
+
+    fn halt(&mut self) {
+        // SAFETY: `Stop` then `Reset` on a client that was started (or never started: both then
+        // fail harmlessly); `Reset` requires the stream to be stopped, which it is.
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = self.client.Reset();
+        }
+    }
+}
+
 /// The audio thread's published scheduling state, as `WorkerPriority` codes.
 const PRIO_PENDING: u8 = 0;
 const PRIO_PRO_AUDIO: u8 = 1;
@@ -583,8 +776,17 @@ struct Opened {
     achieved: ab::Achieved,
 }
 
-/// One native render stream: a dedicated MTA thread owns every COM object and runs the loop.
-pub(crate) struct RenderStream {
+/// The stream thread's ends of the channels and events it shares with the control side.
+struct Ctx {
+    stop: Arc<Event>,
+    priority: Arc<AtomicU8>,
+    ready: mpsc::SyncSender<Result<Opened, ab::OpenError>>,
+    commands: Receiver<Command>,
+}
+
+/// One native stream, render or capture: a dedicated MTA thread owns every COM object and runs the
+/// loop.
+pub(crate) struct NativeStream {
     stop: Arc<Event>,
     commands: Mutex<Option<Sender<Command>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -593,17 +795,33 @@ pub(crate) struct RenderStream {
     latency: Option<Duration>,
 }
 
-impl RenderStream {
-    pub(crate) fn open(params: OpenParams, render: ab::RenderCallback, error: ab::ErrorCallback) -> Result<(Self, ab::Achieved), ab::OpenError> {
+impl NativeStream {
+    pub(crate) fn open_render(
+        params: OpenParams,
+        render: ab::RenderCallback,
+        error: ab::ErrorCallback,
+    ) -> Result<(Self, ab::Achieved), ab::OpenError> {
+        Self::spawn("transit-wasapi-render", move |ctx| render_thread(params, ctx, render, error))
+    }
+
+    pub(crate) fn open_capture(
+        params: OpenParams,
+        capture: ab::CaptureCallback,
+        error: ab::ErrorCallback,
+    ) -> Result<(Self, ab::Achieved), ab::OpenError> {
+        Self::spawn("transit-wasapi-capture", move |ctx| capture_thread(params, ctx, capture, error))
+    }
+
+    fn spawn(name: &str, body: impl FnOnce(Ctx) + Send + 'static) -> Result<(Self, ab::Achieved), ab::OpenError> {
         let stop = Arc::new(Event::new(true)?);
         let priority = Arc::new(AtomicU8::new(PRIO_PENDING));
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Opened, ab::OpenError>>(1);
         let (command_tx, command_rx) = mpsc::channel::<Command>();
         let thread = {
-            let (stop, priority) = (Arc::clone(&stop), Arc::clone(&priority));
+            let ctx = Ctx { stop: Arc::clone(&stop), priority: Arc::clone(&priority), ready: ready_tx, commands: command_rx };
             std::thread::Builder::new()
-                .name("transit-wasapi-render".into())
-                .spawn(move || stream_thread(params, stop, priority, ready_tx, command_rx, render, error))
+                .name(name.into())
+                .spawn(move || body(ctx))
                 .map_err(|e| ab::OpenError::Other(format!("could not start the WASAPI stream thread: {e}")))?
         };
         let opened = match ready_rx.recv_timeout(CONTROL_TIMEOUT) {
@@ -624,7 +842,7 @@ impl RenderStream {
     }
 }
 
-impl ab::Stream for RenderStream {
+impl ab::Stream for NativeStream {
     fn start(&self) -> Result<(), ab::OpenError> {
         // The thread reads one `Start`: a second one (or one after `stop`) fails here at once.
         self.life.begin_start().map_err(|e| ab::OpenError::Other(e.message().into()))?;
@@ -663,9 +881,9 @@ impl ab::Stream for RenderStream {
 }
 
 /// Dropping joins the stream thread, so it must run on the control thread (the Player's), never
-/// from the render or error callback: that would join the calling thread with itself and
+/// from the render, capture or error callback: that would join the calling thread with itself and
 /// deadlock. The Player drops streams only when it reopens or closes the device.
-impl Drop for RenderStream {
+impl Drop for NativeStream {
     fn drop(&mut self) {
         self.stop.set();
         self.commands.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -675,24 +893,8 @@ impl Drop for RenderStream {
     }
 }
 
-fn stream_thread(
-    params: OpenParams,
-    stop: Arc<Event>,
-    priority: Arc<AtomicU8>,
-    ready: mpsc::SyncSender<Result<Opened, ab::OpenError>>,
-    commands: Receiver<Command>,
-    mut render: ab::RenderCallback,
-    mut error: ab::ErrorCallback,
-) {
-    // Declared first, so dropped last: COM stays initialized until every COM object is released.
-    let com = match ComGuard::mta() {
-        Ok(com) => com,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-    // MMCSS "Pro Audio" on this thread (transit-rt), reverted on this thread at exit.
+/// MMCSS "Pro Audio" on the calling thread (transit-rt), with the observed state published.
+fn promote(priority: &AtomicU8) -> transit_rt::Promotion {
     let promotion = transit_rt::promote_audio_thread();
     priority.store(
         match promotion {
@@ -703,17 +905,38 @@ fn stream_thread(
         },
         Ordering::Release,
     );
-    let origin = params.request.origin;
-    let finish = |priority: &AtomicU8| {
-        transit_rt::demote(promotion);
-        if promotion.is_promoted() {
-            priority.store(PRIO_RELEASED, Ordering::Release);
+    promotion
+}
+
+/// Revert the promotion on the thread that made it.
+fn demote(promotion: transit_rt::Promotion, priority: &AtomicU8) {
+    transit_rt::demote(promotion);
+    if promotion.is_promoted() {
+        priority.store(PRIO_RELEASED, Ordering::Release);
+    }
+}
+
+/// Four periods, but never so short that a scheduling hiccup reads as a dead device.
+fn timeout_ms(period_frames: u32, rate: u32) -> u32 {
+    ((u64::from(period_frames) * 1000 / u64::from(rate.max(1))) as u32 * 4).max(250)
+}
+
+fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, mut error: ab::ErrorCallback) {
+    let Ctx { stop, priority, ready, commands } = ctx;
+    // Declared first, so dropped last: COM stays initialized until every COM object is released.
+    let com = match ComGuard::mta() {
+        Ok(com) => com,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
         }
     };
+    let promotion = promote(&priority);
+    let origin = params.request.origin;
     let mut live = match Live::open(&params, stop) {
         Ok(live) => live,
         Err(e) => {
-            finish(&priority);
+            demote(promotion, &priority);
             let _ = ready.send(Err(e));
             drop(com);
             return;
@@ -731,15 +954,13 @@ fn stream_thread(
         match live.start(origin) {
             Ok(stamper) => {
                 let _ = reply.send(Ok(()));
-                let frames_ms = (u64::from(live.period_frames) * 1000 / u64::from(live.fmt.rate.max(1))) as u32;
                 let config = LoopConfig {
                     buffer_frames: live.buffer_frames,
                     format: live.fmt.format(),
                     wire: live.fmt.wire,
                     stamper,
                     origin,
-                    // Four periods, but never so short that a scheduling hiccup reads as a dead device.
-                    timeout_ms: (frames_ms * 4).max(250),
+                    timeout_ms: timeout_ms(live.period_frames, live.fmt.rate),
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
                 // Stops and resets the client when the loop ends, even by a panic in the callback.
@@ -755,7 +976,67 @@ fn stream_thread(
         live.halt();
     }
     drop(live);
-    finish(&priority);
+    demote(promotion, &priority);
+    drop(com);
+}
+
+fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback, mut error: ab::ErrorCallback) {
+    let Ctx { stop, priority, ready, commands } = ctx;
+    let com = match ComGuard::mta() {
+        Ok(com) => com,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let promotion = promote(&priority);
+    let origin = params.request.origin;
+    let mut live = match LiveCapture::open(&params, stop) {
+        Ok(live) => live,
+        Err(e) => {
+            demote(promotion, &priority);
+            let _ = ready.send(Err(e));
+            drop(com);
+            return;
+        }
+    };
+    let achieved = ab::Achieved {
+        format: live.fmt.format(),
+        period: ab::Period::Frames(live.period_frames),
+        latency: Some(Duration::from_nanos(live.latency_100ns.unsigned_abs().saturating_mul(100))),
+        device_position: Some(0),
+    };
+    let _ = ready.send(Ok(Opened { achieved }));
+    if let Ok(Command::Start(reply)) = commands.recv() {
+        match live.start(origin) {
+            Ok(stamper) => {
+                let _ = reply.send(Ok(()));
+                let config = CaptureConfig {
+                    format: live.fmt.format(),
+                    wire: live.fmt.wire,
+                    stamper,
+                    origin,
+                    timeout_ms: timeout_ms(live.period_frames, live.fmt.rate),
+                };
+                let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
+                let mut stats = CaptureStats::default();
+                // Stops and resets the client when the loop ends, even by a panic in the callback.
+                let exit = capture_loop::serve(&mut live, &config, &mut scratch, &mut capture, &mut error, &mut stats);
+                log::debug!("WASAPI capture loop ended: {exit:?}, {stats:?}");
+                if stats.discontinuities + stats.timestamp_errors > 0 {
+                    log::info!("WASAPI capture saw {} discontinuities and {} timestamp errors", stats.discontinuities, stats.timestamp_errors);
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                live.halt();
+            }
+        }
+    } else {
+        live.halt();
+    }
+    drop(live);
+    demote(promotion, &priority);
     drop(com);
 }
 
