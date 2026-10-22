@@ -1,4 +1,10 @@
-# transit
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/transit-wordmark-white-2172.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/transit-wordmark-graphite-2172.png">
+    <img alt="transit" src="assets/brand/transit-wordmark-graphite-2172.png" width="360">
+  </picture>
+</p>
 
 A desktop DAW built on the [SoundCraft](https://github.com/storytold/soundcraft) engine, with
 Ableton/Logic-style ergonomics. Pure Rust, egui UI.

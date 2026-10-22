@@ -40,6 +40,11 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `docs/images/transit-arrange.png` | @derekmwright | screenshot of transit (arrange) | MIT OR Apache-2.0 |
 | `docs/images/transit-mixer.png` | @derekmwright | screenshot of transit (mixer) | MIT OR Apache-2.0 |
 | `docs/images/transit-pianoroll.png` | @derekmwright | screenshot of transit (pianoroll) | MIT OR Apache-2.0 |
+| `assets/brand/transit-wordmark-white.svg` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
+| `assets/brand/transit-wordmark-graphite.svg` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
+| `assets/brand/transit-wordmark-white-2172.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
+| `assets/brand/transit-wordmark-graphite-2172.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
+| `docs/images/transit-wordmark-dark.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
 | `apps/transit/assets/fonts/inter/Inter-Regular.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
 | `apps/transit/assets/fonts/inter/Inter-Medium.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
 | `apps/transit/assets/fonts/inter/Inter-SemiBold.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
