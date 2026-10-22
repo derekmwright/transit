@@ -45,13 +45,12 @@ test-hooks = []
 # Audio Devices. Off by default; without it the choice is not offered and `Backend::NativeWasapi` opens cpal.
 native-wasapi = ["dep:transit-audio-wasapi"]
 # ASIO on Windows (cpal's ASIO host). Off by default: building it downloads Steinberg's ASIO SDK
-# (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p soundcraft --features asio`.
+# (its own licence) and needs LLVM (libclang) for the bindings. `cargo build -p transit --features asio`.
 asio = ["cpal/asio", "soundcraft-asio-panel/asio"]
 
 [dev-dependencies]
 transit-rt = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
-soundcraft-midi.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 transit-midi-io = { workspace = true, features = ["fake"] }

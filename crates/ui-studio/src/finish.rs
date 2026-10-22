@@ -13,7 +13,7 @@ use crate::theme::TOKENS;
 use crate::{Dialog, StudioApp};
 use egui::{FontId, Rect, pos2, vec2};
 use serde_json::{Value, json};
-use soundcraft_model::{ClipId, TrackId, TrackKind};
+use soundcraft_model::{ClipId, TrackId};
 
 /// What a name being typed renames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -965,9 +965,4 @@ pub fn history_window(app: &mut StudioApp, ctx: &egui::Context) {
     if !open {
         app.ui.show_history = false;
     }
-}
-
-/// The take lanes of `kind`'s tracks hold clips: audio and instrument tracks.
-pub fn holds_takes(kind: TrackKind) -> bool {
-    kind.has_playlist()
 }

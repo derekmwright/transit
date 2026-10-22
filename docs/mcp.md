@@ -7,7 +7,7 @@ Claude and other agents can make music with it.
 soundcraft-cli mcp                    # headless engine (no window, no audio device)
 soundcraft-cli mcp --demo             # headless, starting from the demo session
 soundcraft-cli mcp --automation-read-root DIR --automation-write-root DIR   # headless, confined to folders
-soundcraft --control 7801 &           # the desktop app…
+transit --control 7801 &              # the desktop app…
 soundcraft-cli mcp --connect 7801     # …driven over MCP: same tools plus screenshots and clicks
 ```
 
@@ -68,7 +68,7 @@ works across the suite) keep the agent to the folders you give it:
 
 The flags confine the in-process server, so `--connect` together with them is an error: the server
 would otherwise talk to an app that isn't confined. SoundCraft's desktop app has no equivalent flags
-yet, so a running app (`soundcraft --control`) is not confined. `--demo` is the operator's own
+yet, so a running app (`transit --control`) is not confined. `--demo` is the operator's own
 choice and is built before the roots apply.
 
 Playback and bounce need no check of their own. SoundCraft decodes audio into the session when it

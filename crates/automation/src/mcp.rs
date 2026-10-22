@@ -11,7 +11,7 @@ const INSTRUCTIONS: &str = "SoundCraft is a digital audio workstation (Pro Tools
 command: call `list_commands` to discover ids and their params, then `execute` (or `batch`). Positions are samples \
 (integers), `{\"seconds\": x}`, or time strings like \"bars_beats:5|1|000\" / \"0:12.500\". Tracks are referenced by id \
 or name. Verify your work with `inspect_session` (tracks, clips, mixer, automation, markers, selection). Programmatic \
-calls never open dialogs. Tools marked APP_ONLY need the desktop app (`soundcraft --control 0` + `soundcraft-cli mcp --connect PORT`).";
+calls never open dialogs. Tools marked APP_ONLY need the desktop app (`transit --control 0` + `soundcraft-cli mcp --connect PORT`).";
 
 pub struct Server<B: Backend> {
     pub backend: B,

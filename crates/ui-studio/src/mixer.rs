@@ -577,11 +577,6 @@ impl StudioApp {
         self.tracks_selected_by_header = !tracks.is_empty();
     }
 
-    /// Fader gesture: one undo step per drag (merge key `fader:<track>`).
-    pub fn set_volume_merged(&mut self, t: TrackId, db: f32) -> Result<Value, String> {
-        self.engine.execute_merged("mix.volume", &json!({"tracks": [t.0], "db": db}), &format!("fader:{}", t.0)).map_err(|e| e.to_string())
-    }
-
     /// Balance knob (L10): both panners of a stereo track, one undo step per gesture.
     pub fn set_balance(&mut self, t: TrackId, b: f32) -> Result<Value, String> {
         self.set_balance_keyed(t, b, &format!("pan:{}", t.0))
@@ -897,13 +892,6 @@ impl StudioApp {
     /// Send slot `slot` somewhere else; its level and pre/post setting stay.
     pub fn retarget_send(&mut self, t: TrackId, slot: usize, bus: &str) -> Result<Value, String> {
         self.run("mix.send", json!({"track": t.0, "slot": slot, "bus": bus}))
-    }
-
-    /// Send level gesture: one undo step per drag (merge key `send:<track>:<slot>`).
-    pub fn set_send_level_merged(&mut self, t: TrackId, slot: usize, db: f32) -> Result<Value, String> {
-        self.engine
-            .execute_merged("mix.send_level", &json!({"track": t.0, "slot": slot, "db": db}), &format!("send:{}:{slot}", t.0))
-            .map_err(|e| e.to_string())
     }
 
     pub fn remove_send(&mut self, t: TrackId, slot: usize) -> Result<Value, String> {
