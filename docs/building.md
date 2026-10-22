@@ -82,6 +82,13 @@ error[E0080]: ... Offset of field: AsioDrivers::connID
 The fix is the environment above: `LIBCLANG_PATH`, `CLANG_PATH`, LLVM first on `PATH`, and
 `BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-msvc`.
 
+`asio-sys` takes `libclang` and the `clang` resource headers from `LIBCLANG_PATH` and `PATH`. If a
+MinGW LLVM (for example `C:\mingw64in`) comes before the MSVC LLVM on `PATH`, the bindings come out in
+the GNU ABI (Itanium mangling, GCC struct offsets) and the crate fails to compile with an E0080 layout
+assertion. Setting `LIBCLANG_PATH` alone then fails with undeclared `__builtin_ia32_*` identifiers,
+because the resource headers still come from MinGW. Put the MSVC LLVM's `bin` first on `PATH` (and in
+`LIBCLANG_PATH`) for the build and run `cargo clean -p asio-sys` once.
+
 ### Stale bindings
 
 `asio-sys`'s build script only generates `asio_bindings.rs` when the file does not exist. Wrong
