@@ -254,6 +254,8 @@ pub struct Leftover {
     pub saved: SystemTime,
     /// A recording was still running in it.
     pub recording: bool,
+    /// The MIDI take journal of that recording, if it left one.
+    pub midi_journal: Option<PathBuf>,
 }
 
 /// Leftover autosaves under `root`, newest first: folders no open session holds, written after the
@@ -275,7 +277,8 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
                 let text = std::fs::read_to_string(dir.join(SESSION)).unwrap_or_default();
                 let named = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("name")?.as_str().map(str::to_string));
                 let name = named.unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned());
-                out.push(Leftover { dir, name, origin, saved, recording });
+                let midi_journal = recording.then(|| journal_of(&dir)).flatten();
+                out.push(Leftover { dir, name, origin, saved, recording, midi_journal });
             }
             _ => {
                 let _ = std::fs::remove_dir_all(&dir);
@@ -390,8 +393,23 @@ fn is_take_header(head: &[u8], expected: &[u8]) -> bool {
     magic && same_fmt && data
 }
 
-/// Delete a leftover autosave.
+/// The MIDI journal the recording plan in `dir` names, if the file is still there.
+fn journal_of(dir: &Path) -> Option<PathBuf> {
+    let plan: Recording = serde_json::from_str(&std::fs::read_to_string(dir.join(RECORDING)).ok()?).ok()?;
+    plan.midi_journal.filter(|j| j.is_file())
+}
+
+/// Rebuild the MIDI clips of the recording `left` was running, from its journal, into `e` (call
+/// after [`recover`]). Returns the clips made; none when it left no journal or nothing was played.
+pub fn recover_midi(e: &mut Engine, left: &Leftover) -> Result<Vec<soundcraft_model::ClipId>> {
+    left.midi_journal.as_deref().map_or_else(|| Ok(Vec::new()), |journal| crate::midi_journal::recover(e, journal))
+}
+
+/// Delete a leftover autosave, and the MIDI journal it names.
 pub fn discard(left: &Leftover) {
+    if let Some(journal) = &left.midi_journal {
+        let _ = std::fs::remove_file(journal);
+    }
     let _ = std::fs::remove_dir_all(&left.dir);
 }
 
@@ -523,7 +541,14 @@ mod tests {
         std::fs::create_dir_all(take.parent().unwrap()).unwrap();
         let audio: Vec<u8> = (0..480).flat_map(|i| (i as f32 / 1000.0).to_le_bytes()).collect();
         std::fs::write(&take, [soundcraft_audio_io::wav_float_header(1, 48_000, 100).unwrap(), audio].concat()).unwrap();
-        let plan = Recording { start: 48_000, pass: None, punch: None, rate: 48_000, takes: vec![Take { track, path: take, channels: 1 }] };
+        let plan = Recording {
+            start: 48_000,
+            pass: None,
+            punch: None,
+            rate: 48_000,
+            takes: vec![Take { track, path: take, channels: 1 }],
+            midi_journal: None,
+        };
         let clips = |e: &Engine| e.session().track(track).unwrap().clips().iter().map(|c| (c.start, c.length)).collect::<Vec<_>>();
         let w = Autosaver::new(root.clone());
         w.write(e.session_arc(), None, Some(plan.clone()));
@@ -576,6 +601,7 @@ mod tests {
             punch: None,
             rate: 48_000,
             takes: paths.iter().map(|p| Take { track, path: p.clone(), channels: 1 }).collect(),
+            midi_journal: None,
         };
         let w = Autosaver::new(root.clone());
         w.write(e.session_arc(), None, Some(plan));

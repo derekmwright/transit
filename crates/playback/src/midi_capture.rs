@@ -202,4 +202,18 @@ mod tests {
         capture.poll();
         assert!(capture.events().is_empty());
     }
+
+    #[test]
+    fn draining_for_the_journal_leaves_the_audio_side_push_allocation_free() {
+        // The control side polls and reads `events()` every frame to append them to the MIDI
+        // journal; the audio side's `push` stays bounded and allocation free around it.
+        let (mut capture, mut sink) = pair(64);
+        for round in 0..4 {
+            let (pushed, heap) = measure(|| (0..8).filter(|i| sink.push(on(round * 100 + *i))).count());
+            assert!(heap.is_zero(), "{heap:?}");
+            assert_eq!(pushed, 8);
+            capture.poll();
+            assert_eq!(capture.events().len(), usize::try_from((round + 1) * 8).unwrap());
+        }
+    }
 }

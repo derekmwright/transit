@@ -16,7 +16,7 @@ A new issue is a new row; give it its own file only if the row cannot hold what 
 | K8 | `crates/mix/src/key.rs`: a post-fader sidechain tap stops ducking when the source is muted or faded to silence, because the tap follows the fader. | Open, documented | Use the pre-fader tap. Consider a UI hint. |
 | K9 | `crates/mix/src/key.rs`: the early-key delay history restarts after a structural plan swap, causing a brief detector dropout on the keyed insert. | Open | Carry delay history across plan swaps. |
 | K10 | A heavy plug-in's single create call still blocks the UI thread for its duration (SDK main-thread rule). | Open, unchanged | A dedicated plug-in-host thread (needs an ADR). |
-| K11 | No MIDI take file: a crash mid-pass loses the MIDI of that pass. | Open | A MIDI take journal like the audio take file. |
+| K11 | Closed: a MIDI take journal (`<Audio Files>/<session>_<stamp>.midijournal`) is appended during a pass and recovered at launch as `<Track>_recovered`. | Closed | Done. |
 | K12 | Freeze uses a fixed 2 s tail (`TAIL_SECS` in `crates/engine/src/cmd/freeze.rs`); longer reverb tails are truncated. | Open | Measure or ask the plug-in for its tail. |
 | Note | The MIDI capture ring is shared by all tracks: a heavily played unarmed instrument could crowd out armed events (reported as events lost). | Note | Revisit if reports appear; a per-armed-track filter would remove it. |
 

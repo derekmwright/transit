@@ -16,6 +16,7 @@ pub mod file_access;
 pub mod import;
 pub mod inspect;
 pub mod io;
+pub mod midi_journal;
 pub mod midi_take;
 pub mod retime;
 pub mod score;

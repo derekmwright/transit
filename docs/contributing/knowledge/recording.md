@@ -23,7 +23,9 @@ A lost take is a merge-blocking defect. Treat every change here as high risk.
   session, so a MIDI take lines up with an audio take. `crates/engine/src/midi_take.rs` assembles
   takes at Stop: pairs note-ons with note-offs, converts to ticks, merges an overdub into the one
   clip under the pass, duplicates the playlist when several clips are in the way, and makes one
-  playlist per loop pass. There is no MIDI take file yet (known issue K11).
+  playlist per loop pass.
+- **MIDI take journal:** `crates/engine/src/midi_journal.rs`. The control thread appends each drained event (newline JSON, header with the latch and plan first, flushed every 250 ms and at Stop) to `<Audio Files>/<session>_<stamp>.midijournal`, never the audio thread; a clean Stop deletes it.
+  A crash leaves it named in the autosave's `recording.json`; the next launch's recovery prompt rebuilds `<Track>_recovered` through `midi_take::build`, and Discard deletes it.
 
 Tests: `crates/engine/tests/recording.rs`, `crates/playback/tests/monitor_contract.rs`,
 `crates/playback/tests/publication_contract.rs`.

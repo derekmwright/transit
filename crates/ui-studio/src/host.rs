@@ -164,7 +164,14 @@ impl StudioApp {
         count_in: Option<CountIn>,
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
-        self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        self.take_plan = Some(soundcraft_engine::io::Recording {
+            start: self.record_start,
+            pass,
+            punch: self.punch,
+            rate,
+            takes,
+            midi_journal: self.midi_journal.as_ref().map(|j| j.path().to_path_buf()),
+        });
         if !self.sync_player_session() {
             self.finish_recording();
             return;
@@ -232,12 +239,49 @@ impl StudioApp {
                 Some(player) => {
                     let latch = if audio { self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::start_reader) } else { None };
                     player.prepare_midi_recording(midi, latch)?;
+                    self.midi_journal = Some(soundcraft_engine::midi_journal::Writer::new(self.midi_journal_path()));
                 }
                 None if !audio => return Err("no audio device is open to record MIDI".into()),
                 None => {}
             }
         }
         Ok(takes)
+    }
+
+    /// Where this pass's MIDI journal goes: beside the audio takes (the `Audio Files` of the
+    /// session's folder, or its folder under the autosave root until it is saved).
+    fn midi_journal_path(&self) -> std::path::PathBuf {
+        let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
+        let unsaved = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(&name));
+        let home = self.engine.path.as_deref().and_then(|p| std::path::Path::new(p).parent()).unwrap_or(&unsaved);
+        soundcraft_engine::midi_journal::journal_path(&home.join("Audio Files"), &self.engine.session().name)
+    }
+
+    /// Append the events of the pass the journal hasn't taken yet. Control thread; the audio
+    /// side only pushes to the ring. A failure is reported once and the pass carries on.
+    fn journal_midi(&mut self, take: &soundcraft_playback::MidiTake, plan: &soundcraft_engine::io::Recording, flush: bool) {
+        let (Some(journal), Some(point)) = (self.midi_journal.as_mut(), take.start) else { return };
+        let s = self.engine.session();
+        let latch = soundcraft_engine::midi_journal::Latch {
+            output_frame: point.output_frame,
+            position: point.position.sample,
+            device_rate: take.device_rate,
+            session_rate: s.sample_rate.hz(),
+        };
+        let loop_range = plan.pass.map(|_| s.edit.cycle_range());
+        let mut plan = plan.clone();
+        plan.start = point.position.sample;
+        let header = soundcraft_engine::midi_journal::Header::new(latch, &plan, loop_range, take.tracks.clone());
+        let from = journal.consumed().min(take.events.len());
+        let records: Vec<_> = take.events[from..].iter().filter_map(journal_record).collect();
+        let mut written = journal.append(&header, &records, take.events.len());
+        if flush && written.is_ok() {
+            written = journal.flush();
+        }
+        if let Err(e) = written {
+            log::warn!("MIDI journal: {e}");
+            self.status = format!("MIDI take journal failed ({e}); the pass is still recording");
+        }
     }
 
     fn arm_audio_takes(&mut self) -> Result<Vec<soundcraft_engine::io::Take>, String> {
@@ -417,7 +461,7 @@ impl StudioApp {
         written.is_ok()
     }
 
-    fn write_autosave(&mut self) -> bool {
+    pub(crate) fn write_autosave(&mut self) -> bool {
         self.autosave_dir.clone().is_some_and(|root| self.autosave_to(&root))
     }
 
@@ -468,13 +512,21 @@ impl StudioApp {
         self.close_autosave();
         match soundcraft_engine::autosave::recover(&mut self.engine, left) {
             Ok(missing) => {
-                if self.write_autosave() {
+                let midi = soundcraft_engine::autosave::recover_midi(&mut self.engine, left);
+                if midi.is_ok() && self.write_autosave() {
                     soundcraft_engine::autosave::discard(left);
                 }
                 self.status = match missing.len() {
                     0 => format!("Recovered “{}”. Save it to keep the changes.", left.name),
                     n => format!("Recovered “{}”, but {n} audio file(s) are missing. Save it to keep the changes.", left.name),
                 };
+                match midi {
+                    Ok(clips) if !clips.is_empty() => {
+                        self.status = format!("{} {} recovered MIDI clip(s) from the interrupted recording.", self.status, clips.len());
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.status = format!("{} The MIDI journal couldn't be read: {e}", self.status),
+                }
             }
             Err(e) => self.status = format!("Couldn't recover “{}”: {e}", left.name),
         }
@@ -545,10 +597,11 @@ impl StudioApp {
         let take = self.player.as_ref().and_then(Player::midi_recording_snapshot);
         #[cfg(test)]
         let take = take.or_else(|| self.finished_test_midi.clone());
-        let (Some(take), Some(plan)) = (take, self.take_plan.as_ref()) else {
+        let (Some(take), Some(plan)) = (take, self.take_plan.clone()) else {
             self.midi_live = None;
             return;
         };
+        self.journal_midi(&take, &plan, false);
         self.midi_live_tick = self.midi_live_tick.wrapping_add(1);
         if take.events.len() > 2_000 && self.midi_live_tick % 2 == 1 && self.midi_live.is_some() {
             return;
@@ -716,7 +769,11 @@ impl StudioApp {
         let midi = self.player.as_ref().and_then(Player::finish_midi_recording);
         #[cfg(test)]
         let midi = midi.or_else(|| self.finished_test_midi.take());
+        let journal = self.midi_journal.take();
         if finished.is_none() && midi.is_none() {
+            if let Some(journal) = journal {
+                journal.discard();
+            }
             return;
         }
         let mut plan = plan.unwrap_or_else(|| soundcraft_engine::io::Recording {
@@ -725,6 +782,7 @@ impl StudioApp {
             punch: self.punch,
             rate: 0,
             takes: Vec::new(),
+            midi_journal: None,
         });
         // The audio take and the MIDI pass share one latch; either's applied start is the real one.
         let latch = finished
@@ -750,7 +808,17 @@ impl StudioApp {
         }
         if let Some(midi) = midi {
             let end = self.position().max(plan.start);
+            // Whatever the last frame hadn't journaled reaches the file before the clip is built,
+            // which then deletes it: a crash while placing still leaves the whole pass.
+            self.midi_journal = journal;
+            self.journal_midi(&midi, &plan, true);
+            let journal = self.midi_journal.take();
             self.place_midi_take(&plan, &midi, end);
+            if let Some(journal) = journal {
+                journal.discard();
+            }
+        } else if let Some(journal) = journal {
+            journal.discard();
         }
         // An audio take and a MIDI take of the same pass are one undo step.
         if let Ok(added) = usize::try_from(self.engine.undo_pushes() - pushes)
@@ -1277,6 +1345,13 @@ pub(crate) struct MidiLive {
     pub start: Samples,
     pub end: Samples,
     pub built: Vec<soundcraft_engine::midi_take::Built>,
+}
+
+/// A captured event as the journal keeps it (device frame, not yet placed); None for what
+/// [`rec_event`] cannot keep.
+fn journal_record(e: &soundcraft_playback::midi_capture::CapturedEvent) -> Option<soundcraft_engine::midi_journal::Record> {
+    let kept = rec_event(0, e)?;
+    Some(soundcraft_engine::midi_journal::Record { frame: e.frame, track: e.track, channel: e.channel, approximate: e.approximate, msg: kept.msg })
 }
 
 /// A captured live message as the engine's recorder takes it; controllers it cannot keep (14-bit

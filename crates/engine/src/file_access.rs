@@ -467,7 +467,7 @@ mod tests {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // `io` and this module are the checked gateway; `autosave` writes the app's own
             // recovery folder; `tests*.rs` are test-only modules.
-            let gateway = path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs");
+            let gateway = path.parent() == Some(src.as_path()) && matches!(name, "io.rs" | "file_access.rs" | "autosave.rs" | "midi_journal.rs");
             // `io/` holds submodules of `io.rs` (the bounce writers), behind the same checks.
             if gateway || path.starts_with(src.join("io")) || name.starts_with("tests") {
                 continue;

@@ -625,7 +625,8 @@ impl SoundApp {
         play: Option<(Samples, Option<Samples>, Option<Range>)>,
     ) {
         let rate = self.recorder.as_ref().map_or(0, |r| r.sample_rate);
-        self.take_plan = Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes });
+        self.take_plan =
+            Some(soundcraft_engine::io::Recording { start: self.record_start, pass, punch: self.punch, rate, takes, midi_journal: None });
         if !self.sync_player_session() {
             self.finish_recording();
             return;
@@ -1155,6 +1156,7 @@ impl SoundApp {
             punch: self.punch,
             rate: 0,
             takes: Vec::new(),
+            midi_journal: None,
         });
         if let Some(point) = self.recorder.as_ref().and_then(soundcraft_playback::record::Recorder::applied_start) {
             plan.start = point.position.sample;

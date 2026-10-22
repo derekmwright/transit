@@ -308,7 +308,7 @@ fn a_tempo_change_moves_ticks_material_with_the_bars_and_leaves_samples_audio_in
     std::fs::create_dir_all(&dir).unwrap();
     let wav = dir.join("a.wav");
     std::fs::write(&wav, silent_wav(96_000)).unwrap();
-    let plan = soundcraft_engine::io::Recording { start: 96_000, pass: None, punch: None, rate: 48_000, takes: Vec::new() };
+    let plan = soundcraft_engine::io::Recording { start: 96_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None };
     t.app.place_takes(&plan, vec![(audio, wav)], 192_000, 1);
     t.app.run("automation.write_range", json!({"track": inst.0, "param": "volume", "start": 96_000, "end": 192_000, "value": -6.0})).unwrap();
     t.frames(3);

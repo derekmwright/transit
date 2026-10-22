@@ -43,7 +43,8 @@ fn pass(track: TrackId, sample: Option<i64>, events: Vec<CapturedEvent>) -> Midi
 /// then Stop through the host.
 fn record(app: &mut StudioApp, start: i64, pass_len: Option<i64>, stop: i64, take: MidiTake) {
     app.record_start = start;
-    app.take_plan = Some(soundcraft_engine::io::Recording { start, pass: pass_len, punch: None, rate: 48_000, takes: Vec::new() });
+    app.take_plan =
+        Some(soundcraft_engine::io::Recording { start, pass: pass_len, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
     app.engine.transport.recording = true;
     app.start_play(stop, None, None);
     app.finished_test_midi = Some(take);
@@ -218,7 +219,7 @@ fn the_lane_shows_a_growing_recording_clip_with_the_notes_played_so_far_until_st
     assert!(app.arrange.layout.recording.is_empty());
     let events = vec![on(LATCH, t, 60), off(LATCH + BEAT as u64, t, 60), on(LATCH + 2 * BEAT as u64, t, 64)];
     app.record_start = 0;
-    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new() });
+    app.take_plan = Some(soundcraft_engine::io::Recording { start: 0, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
     app.engine.transport.recording = true;
     app.start_play(4 * BEAT, None, None);
     app.finished_test_midi = Some(pass(t, Some(0), events));
@@ -233,4 +234,97 @@ fn the_lane_shows_a_growing_recording_clip_with_the_notes_played_so_far_until_st
     frames(&mut app, 3);
     assert!(app.arrange.layout.recording.is_empty());
     assert_eq!(app.engine.session().track(t).unwrap().clips().len(), 1, "the real clip replaces it");
+}
+
+// K11: the MIDI take journal.
+
+use soundcraft_engine::midi_journal;
+
+fn folder(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("transit-midijournal-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// A pass of two notes under way with its journal armed and drained once (as a frame does).
+fn journaled_pass(app: &mut StudioApp, t: TrackId, journal: &std::path::Path) {
+    let frames = |beats: f64| LATCH + (beats * BEAT as f64) as u64;
+    let events = vec![on(frames(1.5), t, 60), off(frames(2.5), t, 60), on(frames(3.0), t, 64), off(frames(3.5), t, 64)];
+    app.midi_journal = Some(midi_journal::Writer::new(journal.to_path_buf()));
+    app.record_start = 0;
+    app.take_plan = Some(soundcraft_engine::io::Recording {
+        start: 0,
+        pass: None,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: Some(journal.to_path_buf()),
+    });
+    app.engine.transport.recording = true;
+    app.start_play(4 * BEAT, None, None);
+    app.finished_test_midi = Some(pass(t, Some(0), events));
+    app.update_midi_live();
+    app.midi_journal.as_mut().unwrap().flush().unwrap();
+}
+
+#[test]
+fn a_pass_is_journaled_each_frame_with_its_latch_and_the_clean_stop_deletes_the_journal() {
+    let (mut app, t) = app();
+    let dir = folder("clean");
+    let path = midi_journal::journal_path(&dir, "Song");
+    journaled_pass(&mut app, t, &path);
+    let j = midi_journal::read(&path).unwrap();
+    assert_eq!((j.header.output_frame, j.header.position, j.header.device_rate, j.header.session_rate), (LATCH, 0, 48_000, 48_000));
+    assert_eq!((j.header.plan_start, j.header.tracks.clone()), (0, vec![t]));
+    assert_eq!((j.records.len(), j.truncated), (4, false));
+    // A second frame with nothing new appends nothing.
+    app.update_midi_live();
+    app.midi_journal.as_mut().unwrap().flush().unwrap();
+    assert_eq!(midi_journal::read(&path).unwrap().records.len(), 4);
+    app.stop_play();
+    assert!(!path.exists(), "a clean Stop deletes the journal");
+    assert_eq!(app.engine.session().track(t).unwrap().clips().len(), 1);
+    assert!(app.midi_journal.is_none());
+}
+
+/// A pass whose app dies after its autosave is written: the journal and the plan stay on disk.
+fn crash(root: &std::path::Path) -> (std::path::PathBuf, TrackId) {
+    let (mut app, t) = app();
+    app.autosave_dir = Some(root.join("Autosave"));
+    let path = midi_journal::journal_path(&root.join("Audio Files"), "Song");
+    journaled_pass(&mut app, t, &path);
+    assert!(app.write_autosave());
+    drop(app);
+    assert!(path.is_file());
+    (path, t)
+}
+
+#[test]
+fn after_a_crash_the_next_launch_offers_recovery_and_rebuilds_the_clip_on_the_same_track() {
+    let root = folder("crash");
+    let (path, t) = crash(&root);
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].midi_journal.as_deref(), Some(path.as_path()));
+    let mut next = StudioApp::new(Engine::default(), None, Services::default());
+    next.autosave_dir = Some(root.join("Autosave"));
+    next.recover(&left[0]);
+    let track = next.engine.session().track(t).unwrap();
+    let clips = track.clips().to_vec();
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].name, format!("{}_recovered", soundcraft_engine::io::sanitize_name(&track.name)));
+    assert_eq!(clip_notes(&next, clips[0].id), vec![(60, TICKS * 3 / 2, TICKS, 100), (64, TICKS * 3, TICKS / 2, 100)]);
+    assert!(next.status.contains("recovered MIDI clip"), "{}", next.status);
+    assert!(!path.exists() && !left[0].dir.exists(), "recovered: the journal and the leftover are gone");
+}
+
+#[test]
+fn declining_recovery_deletes_the_journal() {
+    let root = folder("decline");
+    let (path, _) = crash(&root);
+    let left = soundcraft_engine::autosave::leftovers(&root.join("Autosave"));
+    soundcraft_engine::autosave::discard(&left[0]);
+    assert!(!path.exists() && !left[0].dir.exists());
+    assert!(soundcraft_engine::autosave::leftovers(&root.join("Autosave")).is_empty());
 }

@@ -248,6 +248,8 @@ pub struct StudioApp {
     /// The MIDI pass under way as drawn: provisional notes, rebuilt each frame (or every other).
     pub(crate) midi_live: Option<host::MidiLive>,
     midi_live_tick: u32,
+    /// The MIDI take journal of the pass under way (crash recovery, K11).
+    pub(crate) midi_journal: Option<soundcraft_engine::midi_journal::Writer>,
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
     recorder_failed: bool,
@@ -350,6 +352,7 @@ impl StudioApp {
             record_start: 0,
             midi_live: None,
             midi_live_tick: 0,
+            midi_journal: None,
             punch: None,
             recorder_failed: false,
             lost_shown: 0,

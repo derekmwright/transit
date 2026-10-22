@@ -192,7 +192,8 @@ fn recording_stop(count: u32) {
     let mut t = T::new();
     let track = TrackId(t.app.run("track.new", json!({"kind": "audio", "format": "mono"})).unwrap()["tracks"][0].as_u64().unwrap());
     t.app.record_start = 48_000;
-    t.app.take_plan = Some(soundcraft_engine::io::Recording { start: 48_000, pass: None, punch: None, rate: 48_000, takes: Vec::new() });
+    t.app.take_plan =
+        Some(soundcraft_engine::io::Recording { start: 48_000, pass: None, punch: None, rate: 48_000, takes: Vec::new(), midi_journal: None });
     t.app.finished_test_takes = Some((vec![(track, take.0.clone())], None));
     t.app.engine.transport.recording = true;
     t.app.start_play(96_000, None, None);
