@@ -359,7 +359,7 @@ pub fn recover(e: &mut Engine, left: &Leftover) -> Result<Vec<String>> {
 }
 
 /// The takes of the recording `left` holds the plan of, repaired, minus those already in `s`.
-/// A take the plan names that isn't a take file SoundCraft recorded, in a folder it records into,
+/// A take the plan names that isn't a take file transit recorded, in a folder it records into,
 /// is left untouched and added to `skipped`.
 fn unfinished_takes(left: &Leftover, s: &Session, skipped: &mut Vec<String>) -> Option<(Recording, Vec<(soundcraft_model::TrackId, PathBuf)>)> {
     let plan: Recording = serde_json::from_str(&std::fs::read_to_string(left.dir.join(RECORDING)).ok()?).ok()?;
@@ -401,14 +401,14 @@ fn repair_take(path: &Path, folders: &[PathBuf], channels: usize, rate: u32) -> 
     }
     let folder = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
     if !folder.is_some_and(|d| folders.contains(&d)) {
-        return Err(refuse("not in a folder SoundCraft records into"));
+        return Err(refuse("not in a folder transit records into"));
     }
     let header = |frames| soundcraft_audio_io::wav_float_header(channels, rate, frames).map_err(std::io::Error::other);
     let expected = header(0)?;
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     let mut head = vec![0u8; expected.len()];
     if std::io::Read::read_exact(&mut f, &mut head).is_err() || !is_take_header(&head, &expected) {
-        return Err(refuse("not a take SoundCraft recorded"));
+        return Err(refuse("not a take transit recorded"));
     }
     let audio = f.metadata()?.len().saturating_sub(expected.len() as u64);
     let frames = audio / (channels.max(1) as u64 * 4);
@@ -441,7 +441,7 @@ fn plan_of(dir: &Path) -> Option<Recording> {
     serde_json::from_str(&std::fs::read_to_string(dir.join(RECORDING)).ok()?).ok()
 }
 
-/// `path`, which `left`'s plan names as its MIDI journal, is one SoundCraft wrote: a regular file
+/// `path`, which `left`'s plan names as its MIDI journal, is one transit wrote: a regular file
 /// with the journal extension in a folder it records into (as [`repair_take`] checks a take).
 /// The plan is only a file in a folder, so nothing it names is trusted further than that.
 fn trusted_journal(left: &Leftover, path: &Path) -> std::io::Result<()> {
@@ -454,7 +454,7 @@ fn trusted_journal(left: &Leftover, path: &Path) -> std::io::Result<()> {
     }
     let folder = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
     if !folder.is_some_and(|d| take_folders(left).contains(&d)) {
-        return Err(refuse("not in a folder SoundCraft records into"));
+        return Err(refuse("not in a folder transit records into"));
     }
     Ok(())
 }
@@ -485,7 +485,7 @@ pub fn recover_midi(e: &mut Engine, left: &Leftover) -> Result<Vec<soundcraft_mo
         .map_err(|err| EngineError::Io(format!("{err} (the journal was discarded)")))
 }
 
-/// Delete a leftover autosave, and the MIDI journal it names if it is one SoundCraft wrote.
+/// Delete a leftover autosave, and the MIDI journal it names if it is one transit wrote.
 pub fn discard(left: &Leftover) {
     if let Some(journal) = &left.midi_journal {
         match trusted_journal(left, journal) {
