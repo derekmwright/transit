@@ -17,8 +17,8 @@ use crate::arrange::{R4, r4};
 use crate::icons::{self, Icon};
 use crate::mixer::MenuItem;
 use crate::theme::{SPACE, TOKENS};
-use soundcraft_playback::AudioConfig;
 use soundcraft_playback::devices::{self, AudioSystem, DeviceInfo};
+use soundcraft_playback::{AudioConfig, Backend};
 
 /// Said when Apply (or `ui.set {audio}`) is asked while recording.
 pub const REFUSED_RECORDING: &str = "Stop recording before changing the audio devices.";
@@ -36,7 +36,7 @@ pub struct AudioDevicesLayout {
     /// The audio systems listed.
     pub systems: Vec<String>,
     /// The controls: label is the text shown, value the control (`system`, `output`, `input`,
-    /// `rate`, `buffer`, `apply`, `reconnect`, `rescan`, `panel`).
+    /// `backend` (only where offered), `rate`, `buffer`, `apply`, `reconnect`, `rescan`, `panel`).
     pub controls: Vec<MenuItem>,
     /// The entries of the open list: label is the text shown, value the control it belongs to.
     pub items: Vec<MenuItem>,
@@ -334,7 +334,8 @@ impl StudioApp {
             self.status = "Audio devices saved. Audio is off in this run (--no-audio); they open at the next start.".into();
             return Ok(());
         };
-        let notes = fallback_notes(&cfg, self.audio_devices.systems.as_deref(), &opened);
+        let mut notes = fallback_notes(&cfg, self.audio_devices.systems.as_deref(), &opened);
+        notes.extend(self.player.as_ref().and_then(|p| p.backend_note.clone()));
         let stopped = if was_playing { "Playback stopped to change devices. " } else { "" };
         self.status = if notes.is_empty() {
             let name = opened.output.unwrap_or_else(|| "no audio device".into());
@@ -392,7 +393,8 @@ impl StudioApp {
 fn check(app: &mut StudioApp) {
     if !app.audio_devices.startup_checked && app.player.is_some() {
         app.audio_devices.startup_checked = true;
-        let notes = fallback_notes(&app.ui.audio, None, &app.opened());
+        let mut notes = fallback_notes(&app.ui.audio, None, &app.opened());
+        notes.extend(app.player.as_ref().and_then(|p| p.backend_note.clone()));
         if !notes.is_empty() {
             app.status = format!("{} {CHOOSE_ANOTHER}", notes.join(" "));
             app.audio_devices.notes = notes;
@@ -443,6 +445,23 @@ fn choose<T: Clone + PartialEq>(
                 items.push(MenuItem::at(ui, t.clone(), key.into(), b.rect));
                 if b.clicked() {
                     *value = Some(v.clone());
+                }
+            }
+        })
+    });
+    (r.inner.response.rect, text)
+}
+
+/// The Backend selector: Auto, cpal, Native WASAPI (experimental). Returns the combo's rect and text.
+fn choose_backend(ui: &mut egui::Ui, enabled: bool, value: &mut Backend, items: &mut Vec<MenuItem>) -> (egui::Rect, String) {
+    let text = value.label().to_string();
+    let r = ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt(("audio_devices", "backend")).selected_text(&text).width(360.0).show_ui(ui, |ui| {
+            for option in Backend::ALL {
+                let b = crate::menus::check_button(ui, *value == option, option.label());
+                items.push(MenuItem::at(ui, option.label().into(), "backend".into(), b.rect));
+                if b.clicked() {
+                    *value = option;
                 }
             }
         })
@@ -503,6 +522,14 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 }
                 controls.push((text, "system", rect));
                 ui.end_row();
+
+                // Offered only where it can apply: a build with the feature, on the WASAPI system.
+                if devices::native_wasapi_offered(draft.system.as_deref()) {
+                    label(ui, "Backend");
+                    let (rect, text) = choose_backend(ui, audio_on, &mut draft.backend, &mut lay.items);
+                    controls.push((text, "backend", rect));
+                    ui.end_row();
+                }
 
                 label(ui, "Output");
                 let outs: Vec<(String, String)> =

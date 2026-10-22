@@ -20,6 +20,8 @@ use soundcraft_audio_backend as ab;
 pub enum Kind {
     /// The cpal adapter (WASAPI shared or ASIO, chosen with `--system`).
     Cpal,
+    /// The native WASAPI backend (shared mode, `IAudioClient3`); needs the `native-wasapi` feature.
+    Wasapi,
     /// The scripted [`ab::fake::FakeBackend`] in virtual time.
     Fake,
 }
@@ -28,6 +30,7 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Cpal => "cpal",
+            Kind::Wasapi => "wasapi",
             Kind::Fake => "fake",
         }
     }
@@ -58,6 +61,15 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
             let handle = fake_backend.clone();
             let opened = session::run(&fake_backend, &config.request, &shared, &mut || fake::drive(&handle, &config.request, period, &script))?;
             (ab::Backend::system(&fake_backend).to_string(), opened)
+        }
+        Kind::Wasapi => {
+            let backend = wasapi_backend()?;
+            let seconds = config.seconds;
+            let opened = session::run(backend.as_ref(), &config.request, &shared, &mut || {
+                std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+                Ok(())
+            })?;
+            (backend.system().to_string(), opened)
         }
         Kind::Cpal => {
             let backend = cpal_backend(config.system.as_deref())?;
@@ -92,6 +104,19 @@ pub fn cpal_backend(system: Option<&str>) -> Result<Box<dyn ab::Backend>, String
         }
         _ => Ok(backend),
     }
+}
+
+/// The native WASAPI backend (`--backend wasapi`).
+#[cfg(all(windows, feature = "native-wasapi"))]
+pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
+    use ab::BackendFactory;
+    soundcraft_audio_wasapi::WasapiFactory.backend(None).ok_or_else(|| "the native WASAPI backend is not available".to_string())
+}
+
+/// Without the feature (or off Windows) there is no native backend to measure.
+#[cfg(not(all(windows, feature = "native-wasapi")))]
+pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
+    Err("--backend wasapi needs Windows and a build with --features native-wasapi".into())
 }
 
 /// The device names of a cpal system, for `--list-devices` (enumerates; opens no stream).

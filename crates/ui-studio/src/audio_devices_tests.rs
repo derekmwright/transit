@@ -5,7 +5,7 @@
 use crate::audio_devices::{Opened, REFUSED_RECORDING, fallback_notes};
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
-use soundcraft_playback::AudioConfig;
+use soundcraft_playback::{AudioConfig, Backend};
 
 const SCARLETT_IN: &str = "Analogue 1 + 2 (Focusrite USB Audio)";
 const WEBCAM_IN: &str = "Microphone (HD Webcam)";
@@ -211,6 +211,30 @@ fn changing_the_system_resets_its_devices_and_asio_takes_the_input_from_the_outp
     assert!(t.layout()["items"].as_array().unwrap().iter().all(|i| i["value"] != "input"), "the input list is disabled on ASIO");
 }
 
+fn has_control(t: &T, key: &str) -> bool {
+    t.layout()["controls"].as_array().unwrap().iter().any(|c| c["value"] == key)
+}
+
+#[test]
+fn the_backend_selector_is_offered_only_with_the_feature_on_the_wasapi_system() {
+    let mut t = T::new();
+    t.open_window();
+    let compiled = soundcraft_playback::devices::NATIVE_WASAPI_COMPILED;
+    assert_eq!(has_control(&t, "backend"), compiled, "WASAPI is the default system of the fake devices");
+    t.pick("system", "ASIO");
+    assert!(!has_control(&t, "backend"), "no backend choice on ASIO");
+    t.pick("system", "WASAPI");
+    assert_eq!(has_control(&t, "backend"), compiled);
+    if compiled {
+        t.pick("backend", Backend::NativeWasapi.label());
+        assert_eq!(t.app.audio_devices.draft.backend, Backend::NativeWasapi);
+        let apply = t.control_rect("apply");
+        t.click(mid(apply));
+        assert_eq!(t.reopened().last().map(|c| c.backend), Some(Backend::NativeWasapi), "changing the backend reopens the device");
+        assert_eq!(t.app.ui.audio.backend, Backend::NativeWasapi);
+    }
+}
+
 #[test]
 fn without_audio_the_choice_is_only_saved() {
     let mut app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
@@ -299,6 +323,7 @@ fn audio_patch_merges_fields_and_rejects_zero_atomically() {
             sample_rate: Some(48000),
             buffer_size: Some(128),
             output: None,
+            backend: Backend::Auto,
         }
     );
     let before = t.app.ui.audio.clone();

@@ -6,6 +6,7 @@
 
 use crate::convert::{ConvertSink, Wire};
 use soundcraft_audio_backend::{ErrorCallback, Format, HostOrigin, Quality, RenderBlock, RenderCallback, Stamp, StreamError};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// `AUDCLNT_E_DEVICE_INVALIDATED`: the endpoint was removed, disabled or its format changed.
 const E_DEVICE_INVALIDATED: i32 = 0x8889_0004_u32 as i32;
@@ -69,6 +70,31 @@ pub(crate) trait RenderDevice {
     fn position(&mut self) -> Result<Position, Fault>;
     /// Lend the `frames` of the device buffer to `fill` (`GetBuffer`, then `ReleaseBuffer`).
     fn write(&mut self, frames: u32, fill: &mut dyn FnMut(&mut [u8])) -> Result<(), Fault>;
+    /// Stop and reset the client. Idempotent; called once the loop has ended, however it ended.
+    fn halt(&mut self);
+}
+
+/// Runs a closure when dropped unless disarmed: the unwind half of the `GetBuffer` /
+/// `ReleaseBuffer` pairing, so a panic in the render callback still releases the buffer.
+pub(crate) struct UnwindGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> UnwindGuard<F> {
+    pub(crate) fn new(on_unwind: F) -> Self {
+        Self(Some(on_unwind))
+    }
+
+    /// The normal path released the buffer itself: do nothing on drop.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for UnwindGuard<F> {
+    fn drop(&mut self) {
+        if let Some(on_unwind) = self.0.take() {
+            on_unwind();
+        }
+    }
 }
 
 /// Maps device positions to stamps: signed nanoseconds in the Player's host origin through the
@@ -122,6 +148,8 @@ pub(crate) enum Exit {
     Stopped,
     Timeout,
     Faulted(Fault),
+    /// The render callback (or the loop) panicked; reported through `error` as `Other`.
+    Panicked,
 }
 
 /// Serve the device until it stops or fails. A fault or timeout is reported once through
@@ -166,6 +194,30 @@ pub(crate) fn run(
     }
 }
 
+/// [`run`] under `catch_unwind`, then the device teardown. A panic is reported once through
+/// `error` as [`StreamError::Other`] and the caller continues into its normal teardown, so the
+/// Player is told and the client is stopped, reset and released instead of dying silently.
+pub(crate) fn serve(
+    device: &mut impl RenderDevice,
+    config: &LoopConfig,
+    scratch: &mut [f32],
+    render: &mut RenderCallback,
+    error: &mut ErrorCallback,
+) -> Exit {
+    let exit = match catch_unwind(AssertUnwindSafe(|| run(&mut *device, config, scratch, render, error))) {
+        Ok(exit) => exit,
+        Err(payload) => {
+            // The error callback may panic too; there is nobody left to tell.
+            let _ = catch_unwind(AssertUnwindSafe(|| error(StreamError::Other)));
+            // A payload whose own drop panics must not abort the teardown either.
+            let _ = catch_unwind(AssertUnwindSafe(move || drop(payload)));
+            Exit::Panicked
+        }
+    };
+    device.halt();
+    exit
+}
+
 fn fail(error: &mut ErrorCallback, fault: Fault) -> Exit {
     error(fault.stream_error());
     Exit::Faulted(fault)
@@ -196,6 +248,12 @@ mod tests {
         fail_write: Option<Fault>,
         buffer: Vec<u8>,
         writes: u32,
+        halts: u32,
+        /// `GetBuffer` calls and `ReleaseBuffer` calls, as the real client counts them.
+        gets: u32,
+        releases: std::cell::Cell<u32>,
+        /// A second `GetBuffer` while one is outstanding.
+        double_get: bool,
     }
 
     impl Fake {
@@ -209,6 +267,10 @@ mod tests {
                 fail_write: None,
                 buffer: vec![0; 4 * 2 * 4 * PERIOD as usize],
                 writes: 0,
+                halts: 0,
+                gets: 0,
+                releases: std::cell::Cell::new(0),
+                double_get: false,
             }
         }
     }
@@ -233,8 +295,21 @@ mod tests {
                 return Err(fault);
             }
             self.writes += 1;
+            if self.gets != self.releases.get() {
+                self.double_get = true;
+            }
+            self.gets += 1;
+            let gets = self.gets;
+            // The same pairing as `Live::write`: release on unwind unless the normal path did.
+            let releases = &self.releases;
+            let guard = UnwindGuard::new(|| releases.set(gets));
             fill(&mut self.buffer[..frames as usize * 2 * 4]);
+            guard.disarm();
+            self.releases.set(gets);
             Ok(())
+        }
+        fn halt(&mut self) {
+            self.halts += 1;
         }
     }
 
@@ -365,5 +440,55 @@ mod tests {
         assert_eq!(exit, Exit::Stopped);
         assert!(stats.is_zero(), "the loop allocated: {stats:?}");
         assert_eq!(device.writes, 200);
+    }
+
+    fn serve_with(device: &mut Fake, mut render: RenderCallback) -> (Exit, Vec<StreamError>) {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let faults = Arc::clone(&errors);
+        let mut error: ErrorCallback = Box::new(move |e| faults.lock().unwrap().push(e));
+        let mut scratch = vec![0.0f32; 64];
+        let exit = serve(device, &config(0, 0), &mut scratch, &mut render, &mut error);
+        let errors = errors.lock().unwrap().clone();
+        (exit, errors)
+    }
+
+    #[test]
+    fn a_panicking_render_callback_reports_other_once_and_tears_down() {
+        let mut device = Fake::new([Wake::Event; 5]);
+        let calls = Arc::new(Mutex::new(0u32));
+        let counted = Arc::clone(&calls);
+        let render: RenderCallback = Box::new(move |_block| {
+            *counted.lock().unwrap() += 1;
+            panic!("render callback bug");
+        });
+        let (exit, errors) = serve_with(&mut device, render);
+        assert_eq!(exit, Exit::Panicked);
+        assert_eq!(errors, vec![StreamError::Other], "the error callback is called exactly once");
+        assert_eq!(*calls.lock().unwrap(), 1, "the loop exited after the panic");
+        assert_eq!(device.halts, 1, "Stop/Reset ran");
+        assert_eq!((device.gets, device.releases.get()), (1, 1), "the buffer was released on unwind");
+        assert!(!device.double_get, "no second GetBuffer without ReleaseBuffer");
+    }
+
+    #[test]
+    fn a_panicking_error_callback_does_not_stop_the_teardown() {
+        let mut device = Fake::new([Wake::Event; 2]);
+        let render: RenderCallback = Box::new(|_| panic!("render"));
+        let mut error: ErrorCallback = Box::new(|_| panic!("error"));
+        let mut scratch = vec![0.0f32; 64];
+        let exit = serve(&mut device, &config(0, 0), &mut scratch, &mut { render }, &mut error);
+        assert_eq!((exit, device.halts), (Exit::Panicked, 1));
+    }
+
+    #[test]
+    fn serve_halts_after_a_normal_stop_and_a_fault() {
+        let mut device = Fake::new([Wake::Event; 3]);
+        let (exit, errors) = serve_with(&mut device, Box::new(|block| block.render(&mut |c| c.fill(0.0))));
+        assert_eq!((exit, errors.len(), device.halts), (Exit::Stopped, 0, 1));
+        assert_eq!((device.gets, device.releases.get()), (3, 3));
+        let mut broken = Fake::new([Wake::Event]);
+        broken.fail_write = Some(Fault::DeviceGone);
+        let (exit, errors) = serve_with(&mut broken, Box::new(|_| {}));
+        assert_eq!((exit, errors, broken.halts), (Exit::Faulted(Fault::DeviceGone), vec![StreamError::DeviceNotAvailable], 1));
     }
 }

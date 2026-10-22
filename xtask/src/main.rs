@@ -43,8 +43,19 @@ const LAYERS: &[(&str, u8)] = &[
 const STANDALONE: &[&str] = &["time", "audio-io", "midi-io", "midi", "video", "dsp"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask", "audio-bench"];
-/// The only crates whose manifest may set `unsafe_code = "allow"` (ADR 0013 and its amendments).
-const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi"];
+/// The only crates whose manifest may opt out of the workspace `unsafe_code = "forbid"` (ADR 0013
+/// and its amendments): `rt` and `audio-wasapi` set `allow`; the SDK and FFI crates set `deny`
+/// and allow `unsafe` only on their FFI module. `au-host` and `asio-panel` are the two isolated
+/// FFI helpers that predate the amendments and follow the same `deny` pattern.
+const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi", "clap-host", "vst3-host", "au-host", "asio-panel"];
+
+/// True when the manifest sets `unsafe_code` to anything but `forbid` (any spacing or quoting).
+fn opts_out_of_forbid(manifest: &str) -> bool {
+    manifest.lines().any(|line| {
+        let line: String = line.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
+        line.strip_prefix("unsafe_code=").is_some_and(|level| !level.starts_with("forbid") && !level.starts_with('#'))
+    })
+}
 
 fn layers() -> Result<(), String> {
     let out =
@@ -53,13 +64,14 @@ fn layers() -> Result<(), String> {
     let mut problems = Vec::new();
     for p in v["packages"].as_array().cloned().unwrap_or_default() {
         let name = p["name"].as_str().unwrap_or("").to_string();
-        if EXEMPT.contains(&name.as_str()) {
-            continue;
-        }
         let short = name.trim_start_matches("soundcraft-");
         let manifest = p["manifest_path"].as_str().and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
-        if manifest.contains("unsafe_code = \"allow\"") && !UNSAFE_ALLOWED.contains(&short) {
-            problems.push(format!("{name}: sets unsafe_code = allow but is not in the xtask unsafe allowlist"));
+        // Exempt crates are exempt from layering, not from the unsafe policy.
+        if opts_out_of_forbid(&manifest) && !UNSAFE_ALLOWED.contains(&short) {
+            problems.push(format!("{name}: opts out of unsafe_code = forbid but is not in the xtask unsafe allowlist"));
+        }
+        if EXEMPT.contains(&name.as_str()) {
+            continue;
         }
         let Some(&(_, layer)) = LAYERS.iter().find(|(n, _)| *n == short) else {
             problems.push(format!("{name}: not registered in xtask LAYERS"));
@@ -235,5 +247,31 @@ fn main() -> ExitCode {
             eprintln!("xtask: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opts_out_of_forbid;
+
+    #[test]
+    fn the_unsafe_check_sees_any_spelling_of_an_opt_out() {
+        assert!(opts_out_of_forbid(
+            "[lints.rust]
+unsafe_code = \"allow\"
+"
+        ));
+        assert!(opts_out_of_forbid("unsafe_code=\"allow\""));
+        assert!(opts_out_of_forbid("unsafe_code = 'deny'"));
+        assert!(!opts_out_of_forbid(
+            "unsafe_code = \"forbid\"
+"
+        ));
+        assert!(!opts_out_of_forbid(
+            "# opts out of `unsafe_code = \"allow\"` for itself
+[lints]
+workspace = true
+"
+        ));
     }
 }

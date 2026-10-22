@@ -127,6 +127,12 @@ pub fn detail_rows(t: &CallbackTelemetry) -> Vec<String> {
     rows
 }
 
+/// The host shown in the load readout: the audio system, starred when the native backend serves it
+/// (`WASAPI*`; see `docs/contributing/knowledge/clocks.md`).
+fn host_name(player: &soundcraft_playback::Player) -> String {
+    if player.native_backend { format!("{}*", player.device_system) } else { player.device_system.clone() }
+}
+
 /// Read the counters when due (about four times a second) and keep the overload hold running.
 /// Returns false, with the readout and window closed, when there is no player and no test snapshot.
 pub fn poll(app: &mut StudioApp, ctx: &egui::Context) -> bool {
@@ -139,7 +145,7 @@ pub fn poll(app: &mut StudioApp, ctx: &egui::Context) -> bool {
     }
     if app.telemetry.due(now) {
         let (snap, host, rate, buffer) = match (&app.player, app.telemetry.injected) {
-            (Some(p), _) => (p.callback_telemetry(), p.device_system.clone(), p.device_rate, p.device_buffer.unwrap_or(0)),
+            (Some(p), _) => (p.callback_telemetry(), host_name(p), p.device_rate, p.device_buffer.unwrap_or(0)),
             (None, Some(s)) => (s, app.telemetry.injected_host.clone().unwrap_or_default(), s.sample_rate, s.callback_frames),
             (None, None) => Default::default(),
         };

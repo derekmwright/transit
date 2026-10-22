@@ -12,9 +12,15 @@ publish = false
 # Measure the ASIO host on Windows (see `soundcraft-playback`'s `asio` feature for its build needs).
 asio = ["soundcraft-playback/asio"]
 
+# `--backend wasapi`: the native WASAPI backend (ADR 0016 slice c), Windows only.
+native-wasapi = ["dep:soundcraft-audio-wasapi"]
+
 [dependencies]
 soundcraft-audio-backend.workspace = true
 soundcraft-playback.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+soundcraft-audio-wasapi = { workspace = true, optional = true }
 
 [dev-dependencies]
 soundcraft-rt = { workspace = true, features = ["testing"] }

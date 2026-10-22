@@ -26,6 +26,10 @@ serde_json.workspace = true
 log.workspace = true
 image.workspace = true
 
+[features]
+# Offer the "Native WASAPI (experimental)" backend in Audio Devices (see soundcraft-playback).
+native-wasapi = ["soundcraft-playback/native-wasapi"]
+
 [dev-dependencies]
 soundcraft-playback = { workspace = true, features = ["test-hooks"] }
 soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }

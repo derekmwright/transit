@@ -6,7 +6,8 @@
 #![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use crate::convert::Wire;
-use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, Wake};
+use crate::lifecycle::Lifecycle;
+use crate::render_loop::{self, E_DEVICE_IN_USE, Fault, LoopConfig, Position, RenderDevice, Stamper, UnwindGuard, Wake};
 use soundcraft_audio_backend as ab;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -36,6 +37,8 @@ const SUBTYPE_FLOAT: GUID = GUID::from_u128(0x0000_0003_0000_0010_8000_00aa_0038
 const PKEY_RAW_SUPPORTED: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0xb3f8fa53_0004_438e_9003_51a46e139bfc), pid: 3 };
 /// `AUDCLNT_BUFFERFLAGS_SILENT` for `ReleaseBuffer`.
 const BUFFER_SILENT: u32 = 2;
+/// The most channels a mix format may declare.
+const MAX_CHANNELS: u16 = 64;
 /// `ERROR_NOT_FOUND` / `E_NOTFOUND`-style "no such endpoint" codes that mean the device is gone.
 const E_ELEMENT_NOT_FOUND: i32 = 0x8007_0490_u32 as i32;
 /// How long the control thread waits for the stream thread to open or start.
@@ -172,6 +175,18 @@ fn parse_format(raw: &WAVEFORMATEXTENSIBLE) -> Result<Fmt, ab::OpenError> {
     if extensible && !float && sub != SUBTYPE_PCM {
         return Err(ab::OpenError::Other("unsupported mix format subtype".into()));
     }
+    if channels == 0 || channels > MAX_CHANNELS {
+        return Err(ab::OpenError::Other(format!("unsupported mix channel count: {channels}")));
+    }
+    if !matches!(bits, 16 | 24 | 32) {
+        return Err(ab::OpenError::Other(format!("unsupported mix sample size: {bits} bits")));
+    }
+    // The device buffer holds `nBlockAlign` bytes per frame and `Live::write` sizes its slice from
+    // the parsed channels and sample size, so the two must agree.
+    let block_align = raw.Format.nBlockAlign;
+    if usize::from(block_align) != usize::from(channels) * usize::from(bits / 8) {
+        return Err(ab::OpenError::Other(format!("inconsistent mix format: block align {block_align} for {channels} x {bits} bits")));
+    }
     let (sample, wire) = match (float, bits) {
         (true, 32) => (ab::SampleFormat::F32, Wire::F32),
         (false, 16) => (ab::SampleFormat::I16, Wire::I16),
@@ -228,11 +243,7 @@ pub(crate) struct EndpointInfo {
     pub(crate) mix: Fmt,
     /// `GetSharedModeEnginePeriod` (min, max) in frames, where `IAudioClient3` exists.
     pub(crate) periods: Option<(u32, u32)>,
-    /// Standard rates `IsFormatSupported` accepts in shared mode, besides the mix rate.
-    pub(crate) rates: Vec<u32>,
 }
-
-const PROBE_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 
 fn string_of(text: PWSTR) -> String {
     // SAFETY: `GetId` and the notification callbacks hand over a NUL-terminated UTF-16 string;
@@ -287,19 +298,11 @@ fn describe(device: &IMMDevice) -> Result<EndpointInfo, ab::OpenError> {
         unsafe { c.GetSharedModeEnginePeriod((&raw mut raw).cast::<WAVEFORMATEX>(), &mut default, &mut fundamental, &mut min, &mut max) }.ok()?;
         Some((min, max))
     });
-    let mut rates = Vec::new();
-    for rate in PROBE_RATES.into_iter().filter(|r| *r != mix.rate) {
-        let (probe, _) = float_format(&mix, rate);
-        // SAFETY: `probe` is a valid extensible format for the call. In shared mode
-        // `IsFormatSupported` returns `S_OK` for a format the engine accepts and `S_FALSE` with a
-        // closest match (a `CoTaskMemAlloc`ed block, freed below) otherwise. No closest-match
-        // pointer is requested, so nothing is allocated for us.
-        let hr = unsafe { client.IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, (&raw const probe).cast::<WAVEFORMATEX>(), None) };
-        if hr.0 == 0 {
-            rates.push(rate);
-        }
-    }
-    Ok(EndpointInfo { id: id_of(device)?, name: friendly_name(device), mix, periods, rates })
+    // Shared mode advertises the mix rate only. `IsFormatSupported` answers `S_FALSE` for every
+    // other rate (and `E_POINTER` without a closest-match out-pointer), so probing cannot find
+    // the rates the engine converts; the open path asks for the session rate with
+    // `AUTOCONVERTPCM` and reports the rate it achieved.
+    Ok(EndpointInfo { id: id_of(device)?, name: friendly_name(device), mix, periods })
 }
 
 /// The active endpoints of one direction, default first.
@@ -463,15 +466,6 @@ impl Live {
         unsafe { self.client.Start() }.map_err(|e| open_error("Start", &e))?;
         Ok(Stamper::new(qpc_100ns, origin_ns, self.fmt.rate, self.latency_100ns))
     }
-
-    fn halt(&self) {
-        // SAFETY: `Stop` then `Reset` on a client that was started (or never started: both then
-        // fail harmlessly); `Reset` requires the stream to be stopped, which it is.
-        unsafe {
-            let _ = self.client.Stop();
-            let _ = self.client.Reset();
-        }
-    }
 }
 
 fn unsafe_frequency(clock: &IAudioClock) -> Result<u64, ab::OpenError> {
@@ -479,6 +473,9 @@ fn unsafe_frequency(clock: &IAudioClock) -> Result<u64, ab::OpenError> {
     unsafe { clock.GetFrequency() }.map_err(|e| open_error("GetFrequency", &e))
 }
 
+// Hot-path methods: the allocation bans of `render_loop` apply to the real device too, not only
+// to the fake the `no_alloc` test runs the loop on.
+#[deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 impl RenderDevice for Live {
     fn wait(&mut self, timeout_ms: u32) -> Wake {
         // The stop event is first so that it wins when both are signaled.
@@ -525,8 +522,10 @@ impl RenderDevice for Live {
         let mut data: *mut u8 = std::ptr::null_mut();
         // SAFETY: `GetBuffer(frames)` with `frames <= buffer size - padding` returns a pointer to
         // `frames * nBlockAlign` writable bytes that stay valid and exclusively ours until the
-        // paired `ReleaseBuffer(frames)` below, called exactly once before any other `GetBuffer`.
-        // Raw vtable calls keep failures as bare `HRESULT`s (no `windows::core::Error`).
+        // paired `ReleaseBuffer(frames)`, called exactly once before any other `GetBuffer` (on
+        // the normal path, or by the unwind guard below, never both). The
+        // slice length is `frames * channels * bytes`, which `parse_format` proved equal to
+        // `frames * nBlockAlign`. Raw vtable calls keep failures as bare `HRESULT`s.
         unsafe {
             let hr = (Interface::vtable(&self.render).GetBuffer)(Interface::as_raw(&self.render), frames, &mut data);
             if hr.is_err() {
@@ -536,7 +535,17 @@ impl RenderDevice for Live {
                 BUFFER_SILENT
             } else {
                 let len = frames as usize * usize::from(self.fmt.channels) * self.fmt.wire.bytes();
+                let render = &self.render;
+                // If `fill` unwinds, hand the whole span back as silence so the buffer is never
+                // left outstanding (the next `GetBuffer` would fail and the engine would stall).
+                let guard = UnwindGuard::new(|| {
+                    // Covered by the SAFETY comment above: the span returned by `GetBuffer` is
+                    // still outstanding here, because the guard is disarmed before the normal
+                    // `ReleaseBuffer` runs.
+                    let _ = (Interface::vtable(render).ReleaseBuffer)(Interface::as_raw(render), frames, BUFFER_SILENT);
+                });
                 fill(std::slice::from_raw_parts_mut(data, len));
+                guard.disarm();
                 0
             };
             let hr = (Interface::vtable(&self.render).ReleaseBuffer)(Interface::as_raw(&self.render), frames, flags);
@@ -545,6 +554,15 @@ impl RenderDevice for Live {
             }
         }
         Ok(())
+    }
+
+    fn halt(&mut self) {
+        // SAFETY: `Stop` then `Reset` on a client that was started (or never started: both then
+        // fail harmlessly); `Reset` requires the stream to be stopped, which it is.
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = self.client.Reset();
+        }
     }
 }
 
@@ -570,6 +588,7 @@ pub(crate) struct RenderStream {
     stop: Arc<Event>,
     commands: Mutex<Option<Sender<Command>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    life: Lifecycle,
     priority: Arc<AtomicU8>,
     latency: Option<Duration>,
 }
@@ -599,13 +618,16 @@ impl RenderStream {
             }
         };
         let latency = opened.achieved.latency;
-        let stream = Self { stop, commands: Mutex::new(Some(command_tx)), thread: Mutex::new(Some(thread)), priority, latency };
+        let stream =
+            Self { stop, commands: Mutex::new(Some(command_tx)), thread: Mutex::new(Some(thread)), life: Lifecycle::default(), priority, latency };
         Ok((stream, opened.achieved))
     }
 }
 
 impl ab::Stream for RenderStream {
     fn start(&self) -> Result<(), ab::OpenError> {
+        // The thread reads one `Start`: a second one (or one after `stop`) fails here at once.
+        self.life.begin_start().map_err(|e| ab::OpenError::Other(e.message().into()))?;
         let (reply_tx, reply_rx) = mpsc::channel();
         let sent = self.commands.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|c| c.send(Command::Start(reply_tx)));
         match sent {
@@ -619,6 +641,7 @@ impl ab::Stream for RenderStream {
     /// Stops the stream for good: the thread stops and resets the client and exits. A stopped
     /// stream is reopened, not restarted.
     fn stop(&self) -> Result<(), ab::OpenError> {
+        self.life.stop();
         self.stop.set();
         Ok(())
     }
@@ -639,6 +662,9 @@ impl ab::Stream for RenderStream {
     }
 }
 
+/// Dropping joins the stream thread, so it must run on the control thread (the Player's), never
+/// from the render or error callback: that would join the calling thread with itself and
+/// deadlock. The Player drops streams only when it reopens or closes the device.
 impl Drop for RenderStream {
     fn drop(&mut self) {
         self.stop.set();
@@ -716,15 +742,18 @@ fn stream_thread(
                     timeout_ms: (frames_ms * 4).max(250),
                 };
                 let mut scratch = vec![0.0f32; ab::SCRATCH_FRAMES * usize::from(live.fmt.channels).max(1)];
-                let exit = render_loop::run(&mut live, &config, &mut scratch, &mut render, &mut error);
+                // Stops and resets the client when the loop ends, even by a panic in the callback.
+                let exit = render_loop::serve(&mut live, &config, &mut scratch, &mut render, &mut error);
                 log::debug!("WASAPI render loop ended: {exit:?}");
             }
             Err(e) => {
                 let _ = reply.send(Err(e));
+                live.halt();
             }
         }
+    } else {
+        live.halt();
     }
-    live.halt();
     drop(live);
     finish(&priority);
     drop(com);
@@ -813,8 +842,20 @@ impl Watcher {
             .map_err(|e| ab::OpenError::Other(format!("could not start the device watcher: {e}")))?;
         match ready_rx.recv_timeout(CONTROL_TIMEOUT) {
             Ok(Ok(())) => Ok(Self { done, thread: Some(thread) }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(ab::OpenError::Other("starting the device watcher timed out".into())),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(failure) => {
+                // Timed out or the thread died: ask it to finish (it checks `done` once set up) and
+                // join it, so no thread outlives the failed start.
+                done.store(true, Ordering::Release);
+                let _ = thread.join();
+                Err(ab::OpenError::Other(match failure {
+                    mpsc::RecvTimeoutError::Timeout => "starting the device watcher timed out".into(),
+                    mpsc::RecvTimeoutError::Disconnected => "the device watcher thread exited while starting".into(),
+                }))
+            }
         }
     }
 }
@@ -841,5 +882,56 @@ fn apply_raw(client: &IAudioClient) {
     // valid struct whose `cbSize` is its size, live for the call.
     if let Err(e) = unsafe { client2.SetClientProperties(&raw const properties) } {
         log::info!("WASAPI raw mode unavailable: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extensible(channels: u16, bits: u16, block_align: u16, float: bool) -> WAVEFORMATEXTENSIBLE {
+        let mut raw = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+                nChannels: channels,
+                nSamplesPerSec: 48_000,
+                nAvgBytesPerSec: 48_000 * u32::from(block_align),
+                nBlockAlign: block_align,
+                wBitsPerSample: bits,
+                cbSize: 22,
+            },
+            ..Default::default()
+        };
+        raw.Samples.wValidBitsPerSample = bits;
+        raw.SubFormat = if float { SUBTYPE_FLOAT } else { SUBTYPE_PCM };
+        raw
+    }
+
+    fn rejected(raw: &WAVEFORMATEXTENSIBLE) -> bool {
+        matches!(parse_format(raw), Err(ab::OpenError::Other(_)))
+    }
+
+    #[test]
+    fn a_consistent_mix_format_parses() {
+        let fmt = parse_format(&extensible(2, 32, 8, true)).expect("float stereo");
+        assert_eq!((fmt.rate, fmt.channels, fmt.sample), (48_000, 2, ab::SampleFormat::F32));
+        assert!(parse_format(&extensible(6, 24, 18, false)).is_ok());
+        assert!(parse_format(&extensible(2, 16, 4, false)).is_ok());
+        assert!(parse_format(&extensible(64, 32, 256, true)).is_ok());
+    }
+
+    #[test]
+    fn an_inconsistent_block_align_is_rejected() {
+        assert!(rejected(&extensible(2, 32, 4, true)), "block align smaller than channels x bytes");
+        assert!(rejected(&extensible(2, 32, 16, true)), "block align larger than channels x bytes");
+        assert!(rejected(&extensible(2, 24, 8, false)), "24-bit in a 4-byte block is not packed 24");
+    }
+
+    #[test]
+    fn unsupported_sample_sizes_and_channel_counts_are_rejected() {
+        assert!(rejected(&extensible(2, 8, 2, false)));
+        assert!(rejected(&extensible(2, 64, 16, true)));
+        assert!(rejected(&extensible(0, 32, 0, true)));
+        assert!(rejected(&extensible(65, 32, 260, true)));
     }
 }

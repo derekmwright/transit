@@ -464,3 +464,57 @@ fn session_identity_tracks_view_cow_and_same_rate_replace_keeps_the_device_clock
     assert!(player.has_requested_session(&view));
     assert!(!player.has_requested_session(&original));
 }
+
+fn fake_factory(failing: bool) -> ab::fake::FakeBackend {
+    let fake = ab::fake::FakeBackend::new(ab::Format::new(48_000, 2, ab::SampleFormat::F32));
+    if failing {
+        fake.fail_next_open(ab::OpenError::DeviceNotAvailable("scripted".into()));
+    }
+    fake
+}
+
+#[test]
+fn a_native_backend_that_opens_is_marked_and_says_nothing() {
+    let (native, fallback) = (fake_factory(false), fake_factory(false));
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).unwrap();
+    assert!(player.native_backend && player.backend_note.is_none() && !player.silent);
+    assert_eq!((native.opens().len(), fallback.opens().len()), (1, 0), "cpal was not touched");
+}
+
+#[test]
+fn a_native_backend_that_fails_to_open_falls_back_and_says_why() {
+    let (native, fallback) = (fake_factory(true), fake_factory(false));
+    let player = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).unwrap();
+    assert!(!player.native_backend && !player.silent, "the fallback backend serves the device");
+    assert_eq!(player.backend_note.as_deref(), Some("Native WASAPI failed: scripted; using the cpal backend"));
+    assert_eq!(fallback.opens().len(), 1);
+}
+
+#[test]
+fn both_backends_failing_reports_the_fallbacks_error() {
+    let (native, fallback) = (fake_factory(true), fake_factory(true));
+    let error = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &native, &fallback).err();
+    assert_eq!(error.as_deref(), Some("scripted"));
+}
+
+/// Opens the owner's default endpoint through the whole Player path with the native backend.
+/// Run it with `cargo test -p soundcraft-playback --features native-wasapi -- --ignored hardware_ --nocapture`.
+#[cfg(all(windows, feature = "native-wasapi"))]
+#[test]
+#[ignore = "opens the default audio endpoint"]
+fn hardware_player_opens_native_wasapi() {
+    let cfg = AudioConfig { backend: crate::Backend::NativeWasapi, system: Some("WASAPI".into()), ..Default::default() };
+    let player = Player::with_config(Arc::new(Session::default()), &cfg);
+    println!(
+        "device {:?} system {:?} rate {} buffer {:?} native {} note {:?}",
+        player.device_name, player.device_system, player.device_rate, player.device_buffer, player.native_backend, player.backend_note
+    );
+    assert!(!player.silent, "the device did not open: {:?}", player.initial_error());
+    assert!(player.native_backend, "the native backend did not serve the device: {:?}", player.backend_note);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let telemetry = player.callback_telemetry();
+    println!("{telemetry:?}");
+    assert!(telemetry.frames > 0, "no callbacks in two seconds");
+    assert_eq!((telemetry.backend_errors, telemetry.device_lost_errors), (0, 0));
+    drop(player);
+}

@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         input: None,
         sample_rate: Some(48_000),
         buffer_size: Some(buffer),
+        ..Default::default()
     };
     for reopen in 0..2 {
         let player = Player::with_config(Arc::new(Session::default()), &config);

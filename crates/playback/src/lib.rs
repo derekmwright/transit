@@ -31,7 +31,7 @@ pub mod timeline_map;
 
 #[cfg(test)]
 pub(crate) use backend::cpal::OutputCallback;
-pub use devices::AudioConfig;
+pub use devices::{AudioConfig, Backend};
 pub use player::{ActionResult, CountIn, MidiTake, PlayedNote, Player, PlayerCommand, PlayerError, PlayerNotice, StartFailure};
 
 use soundcraft_mix::{MAX_CHANNELS, StripMeter, itu_stereo_fold};

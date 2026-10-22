@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 pub const USAGE: &str = "\
 usage: audio-bench [options]
-  --backend cpal|fake    backend to measure (default cpal; wasapi follows slice c)
+  --backend cpal|wasapi|fake  backend to measure (default cpal; wasapi is the native backend, built with --features native-wasapi,
+                         render only: no --loopback until slice d)
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
   --device <name>        output device (and input, with --loopback); default device when absent
   --in-device <name>     input device when it differs from --device
@@ -50,8 +51,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 kind = match value().as_deref() {
                     Some("cpal") => Kind::Cpal,
                     Some("fake") => Kind::Fake,
-                    Some("wasapi") => return Err("--backend wasapi arrives with ADR 0016 slice (c)".into()),
-                    other => return Err(format!("--backend: expected cpal or fake, got {other:?}")),
+                    Some("wasapi") => Kind::Wasapi,
+                    other => return Err(format!("--backend: expected cpal, wasapi or fake, got {other:?}")),
                 }
             }
             "--system" => system = Some(value().ok_or("--system needs a value")?),
@@ -86,7 +87,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if request.period == Some(0) || request.rate == 0 {
         return Err("--period and --rate must be positive".into());
     }
-    if kind == Kind::Cpal && (delay.is_some() || jitter.is_some() || gap.is_some()) {
+    if kind == Kind::Wasapi && system.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("WASAPI")) {
+        return Err("--backend wasapi is the native WASAPI system; --system applies to the cpal backend".into());
+    }
+    if kind == Kind::Wasapi && request.loopback {
+        return Err("--backend wasapi renders only until capture arrives (slice d); drop --loopback".into());
+    }
+    if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some()) {
         return Err("--fake-* options need --backend fake".into());
     }
     let mut script = fake::Script::new(seconds);
@@ -120,7 +127,11 @@ mod tests {
     fn defaults_and_errors() {
         let Ok(Command::Run(c)) = parse_str("--backend fake") else { panic!("did not parse") };
         assert_eq!((c.seconds, c.request.rate, c.fake.gap_at_s), (20.0, 48_000, Some(10.0)));
-        assert!(parse_str("--backend wasapi").unwrap_err().contains("slice (c)"));
+        let Ok(Command::Run(c)) = parse_str("--backend wasapi --seconds 5 --period 64") else { panic!("did not parse") };
+        assert_eq!((c.kind, c.request.period), (Kind::Wasapi, Some(64)));
+        assert!(parse_str("--backend wasapi --system ASIO").is_err());
+        assert!(parse_str("--backend wasapi --loopback").unwrap_err().contains("slice d"));
+        assert!(parse_str("--backend nope").is_err());
         assert!(parse_str("--period abc").is_err());
         assert!(parse_str("--seconds 0").is_err());
         assert!(parse_str("--fake-delay 5").is_err(), "fake options need the fake backend");

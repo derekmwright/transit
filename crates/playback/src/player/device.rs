@@ -92,6 +92,10 @@ pub struct Player {
     pub device_name: String,
     /// The audio system (cpal host) of the open device: "ASIO", "WASAPI", ...; empty for the silent clock.
     pub device_system: String,
+    /// The open device is served by the native WASAPI backend (ADR 0016), not cpal.
+    pub native_backend: bool,
+    /// Said when the chosen backend did not open and another did: "Native WASAPI failed: ...".
+    pub backend_note: Option<String>,
     pub device_rate: u32,
     pub device_channels: u16,
     /// This machine's paths on the open device (ADR 0015).
@@ -183,6 +187,8 @@ impl Player {
             silent_stop: Arc::new(AtomicBool::new(false)),
             device_name: "No audio device (silent)".into(),
             device_system: String::new(),
+            native_backend: false,
+            backend_note: None,
             device_rate: rate,
             device_channels: 0,
             io: RefCell::new(Arc::new(IoMap::default())),
@@ -258,7 +264,36 @@ impl Player {
     }
 
     fn open(session: Arc<Session>, cfg: &AudioConfig) -> Result<Self, String> {
+        #[cfg(all(windows, feature = "native-wasapi"))]
+        if cfg.backend == crate::Backend::NativeWasapi && crate::devices::is_wasapi_system(cfg.system.as_deref()) {
+            return Self::open_native_or_cpal(session, cfg, &soundcraft_audio_wasapi::WasapiFactory, &crate::backend::cpal::CpalFactory);
+        }
         Self::open_with(session, cfg, &crate::backend::cpal::CpalFactory)
+    }
+
+    /// The native WASAPI backend; when it cannot open (before `start()` succeeded) the cpal backend
+    /// opens the same choices and the Player says why. The failed attempt's streams are dropped
+    /// here, on the control thread: dropping a native stream joins its thread (see
+    /// `soundcraft-audio-wasapi`'s `RenderStream`) and must never happen on a callback thread.
+    #[cfg(any(test, all(windows, feature = "native-wasapi")))]
+    fn open_native_or_cpal(
+        session: Arc<Session>,
+        cfg: &AudioConfig,
+        native: &dyn ab::BackendFactory,
+        fallback: &dyn ab::BackendFactory,
+    ) -> Result<Self, String> {
+        match Self::open_with(Arc::clone(&session), cfg, native) {
+            Ok(mut player) => {
+                player.native_backend = true;
+                Ok(player)
+            }
+            Err(reason) => {
+                log::warn!("native WASAPI did not open ({reason}); using the cpal backend");
+                let mut player = Self::open_with(session, cfg, fallback)?;
+                player.backend_note = Some(native_fallback_note(&reason));
+                Ok(player)
+            }
+        }
     }
 
     /// Open the output through the audio system `factory` makes. Every device call goes through
@@ -858,6 +893,12 @@ impl Player {
         }
         Ok(())
     }
+}
+
+/// What the Player says when the native backend did not open and cpal did.
+#[cfg(any(test, all(windows, feature = "native-wasapi")))]
+pub(crate) fn native_fallback_note(reason: &str) -> String {
+    format!("Native WASAPI failed: {reason}; using the cpal backend")
 }
 
 impl Drop for Player {

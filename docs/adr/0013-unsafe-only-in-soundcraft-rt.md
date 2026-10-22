@@ -76,4 +76,4 @@ Accepted with ADR 0016.
 - All COM objects live on one dedicated MTA thread per stream and never cross threads unmarshaled.
 - Any failure falls back to the cpal backend.
 - The crate compiles to empty on other platforms (wholly under `#![cfg(windows)]`).
-- It is registered in xtask `LAYERS`, and the `unsafe` allowlist check lists exactly `crates/rt`, `crates/clap-host`, `crates/vst3-host` (SDK-interface code) and `crates/audio-wasapi`.
+- It is registered in xtask `LAYERS`, and the `unsafe` allowlist check lists exactly `crates/rt`, `crates/audio-wasapi`, `crates/clap-host`, `crates/vst3-host` (SDK-interface code) and the two older isolated FFI helpers `crates/au-host` and `crates/asio-panel`. The check reads every package manifest, exempt ones included, and flags any `unsafe_code` setting other than `forbid` (any spacing or quoting) outside that list.

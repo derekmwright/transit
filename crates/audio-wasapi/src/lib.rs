@@ -13,6 +13,7 @@
 
 mod com;
 mod convert;
+mod lifecycle;
 mod render_loop;
 
 use com::{EndpointInfo, OpenParams, RenderStream, Watcher};
@@ -44,8 +45,7 @@ pub struct WasapiBackend {
 }
 
 fn endpoint_of(info: &EndpointInfo, output: bool) -> ab::Endpoint {
-    let mut formats = vec![range(&info.mix.format(), info.mix.rate, info.periods)];
-    formats.extend(info.rates.iter().map(|rate| range(&info.mix.format(), *rate, info.periods)));
+    let formats = vec![range(&info.mix.format(), info.mix.rate, info.periods)];
     let channels = info.mix.channels;
     let (inputs, outputs) = if output { (0, channels) } else { (channels, 0) };
     ab::Endpoint::new(

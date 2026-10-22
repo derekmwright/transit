@@ -451,6 +451,7 @@ name = "audio-bench"
 version = "0.8.0"
 dependencies = [
  "soundcraft-audio-backend",
+ "soundcraft-audio-wasapi",
  "soundcraft-playback",
  "soundcraft-rt",
 ]
@@ -4004,6 +4005,7 @@ dependencies = [
  "soundcraft-asio-panel",
  "soundcraft-audio-backend",
  "soundcraft-audio-io",
+ "soundcraft-audio-wasapi",
  "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-midi",

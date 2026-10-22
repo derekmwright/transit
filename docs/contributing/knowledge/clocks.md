@@ -38,4 +38,16 @@ backwards, missing validity flags), so approximate is a normal state, not an err
 Reported latency is nominal unless measured. Do not claim certified latency from backend numbers;
 see `../evidence/hardware-and-ci.md`. Device backend work: [ADR 0016](../../adr/0016-native-wasapi-backend.md).
 
+## Which backend serves the device
+
+`AudioConfig.backend` (`Auto | Cpal | NativeWasapi`, saved with the audio settings) picks the
+implementation on the WASAPI system; `Auto` is cpal until ADR 0016 slice (f). `NativeWasapi` takes
+effect only in a build with the `native-wasapi` feature (`transit`, `soundcraft-playback`,
+`audio-bench`); if its open fails before `start()`, the Player opens cpal with the same choices and
+keeps "Native WASAPI failed: <reason>; using the cpal backend" (`Player::backend_note`), shown on the
+status line and in Audio Devices. The load readout's host text is `WASAPI*` while the native
+backend serves the device and `WASAPI` for cpal; the saved I/O map is keyed by the system name
+(`WASAPI`) in both cases. Native stream stamps are `BackendEstimate` (device position plus padding
+plus `GetStreamLatency`); measure them with `audio-bench --backend wasapi` before trusting them.
+
 Tests: `crates/playback/src/device_clock/tests.rs`, `crates/playback/tests/backend_time_contract.rs`.

@@ -21,10 +21,51 @@ pub(crate) fn format_rank(f: cpal::SampleFormat) -> Option<usize> {
     FORMATS.iter().position(|x| *x == f)
 }
 
+/// Which implementation talks to the audio system (ADR 0016).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// The app's choice: cpal in this slice.
+    #[default]
+    Auto,
+    Cpal,
+    /// The native WASAPI backend (shared mode, `IAudioClient3`). Used only on the WASAPI system
+    /// of a build with the `native-wasapi` feature; otherwise, or if it fails to open, cpal.
+    NativeWasapi,
+}
+
+impl Backend {
+    pub const ALL: [Backend; 3] = [Backend::Auto, Backend::Cpal, Backend::NativeWasapi];
+
+    /// The label of the Audio Devices selector.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Backend::Auto => "Auto",
+            Backend::Cpal => "cpal",
+            Backend::NativeWasapi => "Native WASAPI (experimental)",
+        }
+    }
+}
+
+/// Whether this build can open the native WASAPI backend (Windows with the `native-wasapi` feature).
+pub const NATIVE_WASAPI_COMPILED: bool = cfg!(all(windows, feature = "native-wasapi"));
+
+/// Whether `system` (the choice's audio system; `None` is the platform default) is WASAPI.
+pub fn is_wasapi_system(system: Option<&str>) -> bool {
+    system.map_or(cfg!(windows), |s| s.eq_ignore_ascii_case("WASAPI"))
+}
+
+/// Whether the Backend selector applies: the feature is compiled in and the system is WASAPI.
+pub fn native_wasapi_offered(system: Option<&str>) -> bool {
+    NATIVE_WASAPI_COMPILED && is_wasapi_system(system)
+}
+
 /// The user's audio device choice. Every field is optional: `None` means "the system default".
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
+    /// Which backend opens the device on the WASAPI system (`Auto` is cpal in this slice).
+    pub backend: Backend,
     /// Audio system (cpal host name: "WASAPI", "ASIO", "CoreAudio", "ALSA", "JACK", ...).
     pub system: Option<String>,
     pub output: Option<String>,
@@ -283,10 +324,13 @@ mod tests {
             input: None,
             sample_rate: Some(48_000),
             buffer_size: Some(256),
+            backend: Backend::NativeWasapi,
         };
         let s = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<AudioConfig>(&s).unwrap(), c);
         assert_eq!(serde_json::from_str::<AudioConfig>("{}").unwrap(), AudioConfig::default());
+        assert_eq!(serde_json::from_str::<AudioConfig>("{}").unwrap().backend, Backend::Auto, "settings saved before the field exist stay on Auto");
+        assert!(s.contains("\"native_wasapi\""));
         assert_eq!(serde_json::from_str::<AudioConfig>(r#"{"output":"X","unknown":1}"#).unwrap().output.as_deref(), Some("X"));
     }
 
