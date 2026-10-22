@@ -56,6 +56,9 @@ fn registry_ids_unique_and_creatable() {
         assert!(info.short_name.chars().count() <= 8, "{} short name too long", info.id);
         let p = create(info.id).unwrap_or_else(|| panic!("cannot create {}", info.id));
         assert_eq!(p.info().id, info.id);
+        let keyed = matches!(info.id, "compressor" | "expander_gate");
+        assert_eq!(soundcraft_dsp::builtin_takes_key(info.id), keyed);
+        assert_eq!(p.has_key_input(), keyed);
         assert_eq!(plugin_info(info.id).unwrap().id, info.id);
     }
     assert!(create("nope").is_none());

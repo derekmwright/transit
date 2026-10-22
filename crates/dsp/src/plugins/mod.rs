@@ -14,67 +14,46 @@ pub mod utility;
 
 use crate::{Plugin, PluginInfo};
 
-/// Every built-in plugin, in menu order.
-pub(crate) static REGISTRY: &[&PluginInfo] = &[
-    &eq::EQ1_INFO,
-    &eq::EQ7_INFO,
-    &dynamics::COMP_INFO,
-    &dynamics::GATE_INFO,
-    &dynamics::DEESS_INFO,
-    &dynamics::MAX_INFO,
-    &strip::STRIP_INFO,
-    &reverb::ROOM_INFO,
-    &reverb::PLATE_INFO,
-    &modulation::DELAY_INFO,
-    &modulation::CHORUS_INFO,
-    &modulation::FLANGER_INFO,
-    &modulation::PHASER_INFO,
-    &harmonic::SAT_INFO,
-    &harmonic::LOFI_INFO,
-    &harmonic::RECT_INFO,
-    &pitch::PITCH_INFO,
-    &utility::SHIFT_INFO,
-    &utility::GAIN_INFO,
-    &utility::TRIM_INFO,
-    &utility::INVERT_INFO,
-    &utility::DC_INFO,
-    &utility::GEN_INFO,
-    &utility::DITHER_INFO,
-    &synth::SYNTH_INFO,
-    &drums::DRUM_INFO,
-    &sampler::SAMPLER_INFO,
-];
+// One table owns menu order and construction; IDs come from the descriptions themselves.
+macro_rules! registry {
+    ($($info:path => $make:expr),+ $(,)?) => {
+        pub(crate) static REGISTRY: &[&PluginInfo] = &[$(&$info),+];
 
-/// Constructs an (unprepared) plugin by id.
-pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
-    Some(match id {
-        "eq_1band" => Box::new(eq::Eq1::new()),
-        "eq_7band" => Box::new(eq::Eq7::new()),
-        "compressor" => Box::new(dynamics::Compressor::new()),
-        "expander_gate" => Box::new(dynamics::ExpanderGate::new()),
-        "de_esser" => Box::new(dynamics::DeEsser::new()),
-        "maximizer" => Box::new(dynamics::Maximizer::new()),
-        "channel_strip" => Box::new(strip::ChannelStrip::new()),
-        "room_reverb" => Box::new(reverb::Reverb::room()),
-        "plate_reverb" => Box::new(reverb::Reverb::plate()),
-        "mod_delay" => Box::new(modulation::ModDelay::new()),
-        "chorus" => Box::new(modulation::ModFx::chorus()),
-        "flanger" => Box::new(modulation::ModFx::flanger()),
-        "phaser" => Box::new(modulation::Phaser::new()),
-        "saturator" => Box::new(harmonic::Saturator::new()),
-        "lofi" => Box::new(harmonic::LoFi::new()),
-        "rectifier" => Box::new(harmonic::Rectifier::new()),
-        "pitch_shifter" => Box::new(pitch::PitchShifter::new()),
-        "time_shift" => Box::new(utility::TimeShift::new()),
-        "gain" => Box::new(utility::Gain::new()),
-        "trim" => Box::new(utility::Trim::new()),
-        "invert" => Box::new(utility::Invert::default()),
-        "dc_offset_removal" => Box::new(utility::DcRemoval::new()),
-        "signal_generator" => Box::new(utility::SignalGenerator::new()),
-        "dither" => Box::new(utility::Dither::new()),
-        "subtractive_synth" => Box::new(synth::SubtractiveSynth::new()),
-        "drum_synth" => Box::new(drums::DrumSynth::new()),
-        "sampler" => Box::new(sampler::Sampler::new()),
-        _ => return None,
-    })
+        pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
+            $(if id == $info.id {
+                return Some(Box::new($make));
+            })+
+            None
+        }
+    };
+}
+
+registry! {
+    eq::EQ1_INFO => eq::Eq1::new(),
+    eq::EQ7_INFO => eq::Eq7::new(),
+    dynamics::COMP_INFO => dynamics::Compressor::new(),
+    dynamics::GATE_INFO => dynamics::ExpanderGate::new(),
+    dynamics::DEESS_INFO => dynamics::DeEsser::new(),
+    dynamics::MAX_INFO => dynamics::Maximizer::new(),
+    strip::STRIP_INFO => strip::ChannelStrip::new(),
+    reverb::ROOM_INFO => reverb::Reverb::room(),
+    reverb::PLATE_INFO => reverb::Reverb::plate(),
+    modulation::DELAY_INFO => modulation::ModDelay::new(),
+    modulation::CHORUS_INFO => modulation::ModFx::chorus(),
+    modulation::FLANGER_INFO => modulation::ModFx::flanger(),
+    modulation::PHASER_INFO => modulation::Phaser::new(),
+    harmonic::SAT_INFO => harmonic::Saturator::new(),
+    harmonic::LOFI_INFO => harmonic::LoFi::new(),
+    harmonic::RECT_INFO => harmonic::Rectifier::new(),
+    pitch::PITCH_INFO => pitch::PitchShifter::new(),
+    utility::SHIFT_INFO => utility::TimeShift::new(),
+    utility::GAIN_INFO => utility::Gain::new(),
+    utility::TRIM_INFO => utility::Trim::new(),
+    utility::INVERT_INFO => utility::Invert::default(),
+    utility::DC_INFO => utility::DcRemoval::new(),
+    utility::GEN_INFO => utility::SignalGenerator::new(),
+    utility::DITHER_INFO => utility::Dither::new(),
+    synth::SYNTH_INFO => synth::SubtractiveSynth::new(),
+    drums::DRUM_INFO => drums::DrumSynth::new(),
+    sampler::SAMPLER_INFO => sampler::Sampler::new(),
 }

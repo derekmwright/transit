@@ -192,7 +192,7 @@ impl Plugin for Compressor {
     }
 
     fn has_key_input(&self) -> bool {
-        true
+        crate::builtin_takes_key(self.info().id)
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         self.run(io, None, frames);
@@ -341,7 +341,7 @@ impl Plugin for ExpanderGate {
     }
 
     fn has_key_input(&self) -> bool {
-        true
+        crate::builtin_takes_key(self.info().id)
     }
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
         self.run(io, None, frames);

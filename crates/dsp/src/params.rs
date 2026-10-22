@@ -33,16 +33,25 @@ pub(crate) const fn choice(id: &'static str, name: &'static str, choices: &'stat
 pub(crate) struct Params {
     info: &'static [ParamInfo],
     values: Vec<f32>,
+    /// Parameter indices sorted by ID, built once off the audio thread.
+    by_id: Vec<usize>,
 }
 
 impl Params {
     pub(crate) fn new(info: &'static [ParamInfo]) -> Self {
-        Self { info, values: info.iter().map(|p| p.default).collect() }
+        let mut by_id: Vec<usize> = (0..info.len()).collect();
+        by_id.sort_by_key(|&i| info.get(i).map(|p| p.id));
+        Self { info, values: info.iter().map(|p| p.default).collect(), by_id }
+    }
+
+    fn index(&self, id: &str) -> Option<usize> {
+        let at = self.by_id.partition_point(|&i| self.info.get(i).is_some_and(|p| p.id < id));
+        self.by_id.get(at).copied().filter(|&i| self.info.get(i).is_some_and(|p| p.id == id))
     }
 
     /// Clamps and stores; returns the parameter index, or `None` for an unknown id.
     pub(crate) fn set(&mut self, id: &str, value: f32) -> Option<usize> {
-        let idx = self.info.iter().position(|p| p.id == id)?;
+        let idx = self.index(id)?;
         let info = self.info.get(idx)?;
         let slot = self.values.get_mut(idx)?;
         *slot = info.clamp(value);
@@ -50,7 +59,7 @@ impl Params {
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<f32> {
-        let idx = self.info.iter().position(|p| p.id == id)?;
+        let idx = self.index(id)?;
         self.values.get(idx).copied()
     }
 
@@ -93,3 +102,24 @@ macro_rules! param_plumbing {
     };
 }
 pub(crate) use param_plumbing;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_preserves_parameter_order_clamping_and_unknown_ids() {
+        for info in crate::plugins() {
+            let mut params = Params::new(info.params);
+            for (i, param) in info.params.iter().enumerate() {
+                assert_eq!(params.get(param.id), Some(param.default));
+                assert_eq!(params.set(param.id, param.max + 1.0), Some(i));
+                assert_eq!(params.get(param.id), Some(param.max));
+                assert_eq!(params.set(param.id, f32::NAN), Some(i));
+                assert_eq!(params.v(i), param.default);
+            }
+            assert_eq!(params.set("unknown", 1.0), None);
+            assert_eq!(params.get("unknown"), None);
+        }
+    }
+}
