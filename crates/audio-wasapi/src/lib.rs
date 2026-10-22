@@ -408,7 +408,7 @@ mod hardware {
     }
 
     /// An exclusive request at the first probed format of `endpoint` (its shared rate and channels
-    /// first), at the driver's minimum period, stamped against `origin`.
+    /// first), at the device's default period, stamped against `origin`.
     fn exclusive_request(backend: &WasapiBackend, endpoint: &ab::Endpoint, like: ab::Format, origin: ab::HostOrigin) -> ab::OpenRequest {
         let formats = or_in_use(backend.exclusive_formats(endpoint, like.rate, &[like.channels]), "probe");
         println!("{} accepts in exclusive mode: {formats:?}", endpoint.name);
@@ -420,13 +420,14 @@ mod hardware {
         let f = achieved.format;
         let ms = achieved.period.frames().map(|n| f64::from(n) * 1000.0 / f64::from(f.rate));
         println!(
-            "{what}: {:?} {} valid bits, {} ch, mask {:?}, {} Hz; period {:?} ({ms:.2?} ms); latency {:?}",
+            "{what}: {:?} {} valid bits, {} ch, mask {:?}, {} Hz; period {:?} ({ms:.2?} ms), device minimum {:?} frames; latency {:?}",
             f.sample,
             f.valid_bits.map_or("all".to_string(), |b| b.to_string()),
             f.channels,
             f.channel_mask,
             f.rate,
             achieved.period,
+            achieved.min_period,
             achieved.latency
         );
     }
@@ -457,14 +458,35 @@ mod hardware {
     }
 
     #[test]
-    #[ignore = "opens the default audio capture endpoint exclusively"]
+    #[ignore = "opens the capture endpoint paired with the default render endpoint exclusively"]
     fn hardware_exclusive_capture_default_endpoint_two_seconds() {
+        // The capture endpoint of the default render device (paired by container id): the system
+        // default capture endpoint may be another device (a webcam mic) with no exclusive format.
         let backend = WasapiBackend::default();
-        let plan = backend.plan_capture(&ab::InputWish::default()).expect("a default capture endpoint");
-        let request = exclusive_request(&backend, &plan.endpoint, plan.attempts[0].format, ab::HostOrigin::default());
+        let render = backend.plan_render(&ab::OutputWish { channels: 2, ..Default::default() }).expect("a default render endpoint").endpoint;
+        let input = match backend.paired_input(&render) {
+            Ok(input) => input,
+            Err(why) => {
+                println!("skipped: the default render endpoint {} has no paired capture endpoint ({why})", render.name);
+                return;
+            }
+        };
+        let Some(endpoint) = backend.endpoints(ab::Direction::Input).expect("inputs").into_iter().find(|e| e.id == input.id) else {
+            println!("skipped: the paired capture endpoint {} is gone", input.name);
+            return;
+        };
+        let like = backend.capture_format(&render, None).expect("format");
+        let formats = or_in_use(backend.exclusive_formats(&endpoint, like.rate, &[like.channels]), "probe");
+        println!("{} accepts in exclusive mode: {formats:?}", endpoint.name);
+        let Some(&format) = formats.first() else {
+            println!("skipped: {} accepts no exclusive format at {} channels", endpoint.name, like.channels);
+            return;
+        };
+        let request =
+            ab::OpenRequest { format, period: ab::Period::Default, mode: ab::Mode::Exclusive, origin: ab::HostOrigin::default(), calibration: None };
         let tally = Arc::new(Tally::default());
         let (stream, achieved) =
-            or_in_use(backend.open_capture(&plan.endpoint, &request, capture_callback(&tally), fault_callback(&tally)), "open exclusive capture");
+            or_in_use(backend.open_capture(&endpoint, &request, capture_callback(&tally), fault_callback(&tally)), "open exclusive capture");
         print_achieved("exclusive capture", &achieved);
         or_in_use(stream.start(), "start exclusive capture");
         let started = Instant::now();

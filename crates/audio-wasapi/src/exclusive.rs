@@ -101,19 +101,25 @@ pub(crate) struct Opened<C> {
     pub(crate) client: C,
     pub(crate) format: ab::Format,
     pub(crate) buffer_frames: u32,
+    /// The device's minimum period (`GetDevicePeriod`), in frames at the format's rate: reported
+    /// so a user can choose it, never used by default.
+    pub(crate) min_period: u32,
 }
 
 /// Activate, choose the format, and initialize an event-driven exclusive client. The period is
-/// `Period::Frames(n)` at the format's rate, else the device's minimum period, and the buffer
+/// `Period::Frames(n)` at the format's rate, else the device's default period, and the buffer
 /// duration equals it (the exclusive event-driven rule). A period the driver cannot align is
 /// retried once at the aligned size `GetBufferSize` reports, on a freshly activated client.
 pub(crate) fn open<A: ExclusiveApi>(api: &mut A, requested: &ab::Format, period: ab::Period) -> Result<Opened<A::Client>, ab::OpenError> {
     let client = api.activate().map_err(|e| open_error("Activate(IAudioClient)", &e))?;
     let format = choose(api, &client, requested)?;
     let (default_100ns, min_100ns) = api.device_period(&client).map_err(|e| open_error("GetDevicePeriod", &e))?;
+    // The default is the device's default period, not its minimum: the Focusrite Scarlett 2i2
+    // reports a 3 ms minimum but signals only every other period below its 10 ms default (K25).
+    // An explicit `Period::Frames(n)` is the user's choice and is honored as asked.
     let duration = match period {
         ab::Period::Frames(n) => frames_to_100ns(n, format.rate),
-        ab::Period::Default => min_100ns,
+        ab::Period::Default => default_100ns,
     };
     let client = match api.initialize(&client, &format, duration) {
         Ok(()) => client,
@@ -131,7 +137,7 @@ pub(crate) fn open<A: ExclusiveApi>(api: &mut A, requested: &ab::Format, period:
         Err(e) => return Err(initialize_error(&e, format.rate, default_100ns, min_100ns)),
     };
     let buffer_frames = api.buffer_size(&client).map_err(|e| open_error("GetBufferSize", &e))?;
-    Ok(Opened { client, format, buffer_frames })
+    Ok(Opened { client, format, buffer_frames, min_period: frames_of_100ns(min_100ns, format.rate) })
 }
 
 /// A failed exclusive `Initialize`; an out-of-range period names the range the device reported.
@@ -221,10 +227,20 @@ mod tests {
     #[test]
     fn the_requested_format_is_kept_when_the_device_takes_it() {
         let mut fake = scarlett();
-        fake.sizes.push_back(144);
+        fake.sizes.push_back(480);
         let opened = open(&mut fake, &i32_24(48_000), ab::Period::Default).unwrap();
-        assert_eq!((opened.format, opened.buffer_frames, opened.client), (i32_24(48_000), 144, 1));
-        assert_eq!(fake.log, ["activate 1", "initialize 1 I32 30000", "buffer size 1 = 144"], "default is the minimum period");
+        assert_eq!((opened.format, opened.buffer_frames, opened.client), (i32_24(48_000), 480, 1));
+        assert_eq!(fake.log, ["activate 1", "initialize 1 I32 100000", "buffer size 1 = 480"], "default is the device default period");
+        assert_eq!(opened.min_period, 144, "the minimum is reported, not used");
+    }
+
+    #[test]
+    fn an_explicit_period_below_the_default_is_honored_as_asked() {
+        let mut fake = scarlett();
+        fake.sizes.push_back(144);
+        let opened = open(&mut fake, &i32_24(48_000), ab::Period::Frames(144)).unwrap();
+        assert_eq!((opened.buffer_frames, opened.min_period), (144, 144));
+        assert_eq!(fake.log[1], "initialize 1 I32 30000");
     }
 
     #[test]

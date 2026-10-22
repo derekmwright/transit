@@ -372,7 +372,7 @@ pub(crate) struct OpenParams {
 /// `IAudioClient` at its default period, with the engine converting a differing session rate.
 /// Returns the client, its period in frames and the format of the buffer.
 /// An exclusive request goes to [`open_exclusive`] instead (no raw mode, no engine, no conversion).
-fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt), ab::OpenError> {
+fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt, Option<u32>), ab::OpenError> {
     let device = device_by_id(&params.id)?;
     if params.request.mode == ab::Mode::Exclusive {
         return open_exclusive(device, &params.request);
@@ -389,10 +389,10 @@ fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt), ab::Open
         // The session rate differs from the endpoint's: the engine converts.
         let (converted, fmt) = float_format(&mix, requested);
         let frames = initialize_plain(&client, &converted, &fmt, true)?;
-        return Ok((client, frames, fmt));
+        return Ok((client, frames, fmt, None));
     }
     match initialize_low_latency(&client, mix_raw, params.request.period) {
-        Ok(frames) => Ok((client, frames, mix)),
+        Ok(frames) => Ok((client, frames, mix, None)),
         Err(e) => {
             log::info!("IAudioClient3 low-latency open failed ({e}); using event-driven IAudioClient");
             // A failed `Initialize` cannot be retried on the same client.
@@ -401,7 +401,7 @@ fn open_client(params: &OpenParams) -> Result<(IAudioClient, u32, Fmt), ab::Open
                 apply_raw(&client);
             }
             let frames = initialize_plain(&client, &mix_raw, &mix, false)?;
-            Ok((client, frames, mix))
+            Ok((client, frames, mix, None))
         }
     }
 }
@@ -558,12 +558,12 @@ impl ExclusiveApi for ComExclusive {
 
 /// Initialize an event-driven exclusive client on `device` (see [`exclusive::open`]). The period is
 /// the buffer, so both are `GetBufferSize`.
-fn open_exclusive(device: IMMDevice, request: &ab::OpenRequest) -> Result<(IAudioClient, u32, Fmt), ab::OpenError> {
+fn open_exclusive(device: IMMDevice, request: &ab::OpenRequest) -> Result<(IAudioClient, u32, Fmt, Option<u32>), ab::OpenError> {
     let mut api = ComExclusive { device };
     let opened = exclusive::open(&mut api, &request.format, request.period)?;
     let (_, fmt) = exclusive_format(&opened.format).ok_or_else(|| ab::OpenError::Other("the exclusive format has no WASAPI layout".into()))?;
-    log::info!("WASAPI exclusive: {:?} at {} frames", opened.format, opened.buffer_frames);
-    Ok((opened.client, opened.buffer_frames, fmt))
+    log::info!("WASAPI exclusive: {:?} at {} frames (device minimum {} frames)", opened.format, opened.buffer_frames, opened.min_period);
+    Ok((opened.client, opened.buffer_frames, fmt, Some(opened.min_period)))
 }
 
 /// The `candidates` the endpoint `id` accepts in exclusive mode, in order (on a control thread).
@@ -590,13 +590,15 @@ struct Live {
     calibration: Option<ab::Calibration>,
     /// How much of the buffer each wake fills: the whole buffer in exclusive mode.
     fill: Fill,
+    /// The device minimum period in frames (exclusive mode), for `Achieved::min_period`.
+    min_period: Option<u32>,
 }
 
 impl Live {
     fn open(params: &OpenParams, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
-        let (client, frames, fmt) = open_client(params)?;
+        let (client, frames, fmt, min_period) = open_client(params)?;
         let fill = if params.request.mode == ab::Mode::Exclusive { Fill::Whole } else { Fill::Free };
-        Self::finish(client, frames, fmt, stop, params.request.calibration, fill)
+        Self::finish(client, frames, fmt, stop, params.request.calibration, fill).map(|live| Self { min_period, ..live })
     }
 
     fn finish(
@@ -626,7 +628,21 @@ impl Live {
             render.GetBuffer(buffer_frames).map_err(|e| open_error("GetBuffer", &e))?;
             render.ReleaseBuffer(buffer_frames, BUFFER_SILENT).map_err(|e| open_error("ReleaseBuffer", &e))?;
         }
-        Ok(Self { client, render, clock, clock_frequency, event, stop, fmt, buffer_frames, period_frames, latency_100ns: latency, calibration, fill })
+        Ok(Self {
+            client,
+            render,
+            clock,
+            clock_frequency,
+            event,
+            stop,
+            fmt,
+            buffer_frames,
+            period_frames,
+            latency_100ns: latency,
+            calibration,
+            fill,
+            min_period: None,
+        })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
@@ -784,11 +800,13 @@ struct LiveCapture {
     period_frames: u32,
     latency_100ns: i64,
     calibration: Option<ab::Calibration>,
+    /// The device minimum period in frames (exclusive mode), for `Achieved::min_period`.
+    min_period: Option<u32>,
 }
 
 impl LiveCapture {
     fn open(params: &OpenParams, stop: Arc<Event>) -> Result<Self, ab::OpenError> {
-        let (client, period_frames, fmt) = open_client(params)?;
+        let (client, period_frames, fmt, min_period) = open_client(params)?;
         let event = Event::new(false)?;
         // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
         // handle that outlives the client (`event` is a field of `LiveCapture`); `GetService` asks
@@ -798,7 +816,7 @@ impl LiveCapture {
             let capture = client.GetService::<IAudioCaptureClient>().map_err(|e| open_error("IAudioCaptureClient", &e))?;
             (capture, client.GetStreamLatency().unwrap_or(0))
         };
-        Ok(Self { client, capture, event, stop, fmt, period_frames, latency_100ns: latency, calibration: params.request.calibration })
+        Ok(Self { client, capture, event, stop, fmt, period_frames, latency_100ns: latency, calibration: params.request.calibration, min_period })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
@@ -1086,6 +1104,7 @@ fn render_thread(params: OpenParams, ctx: Ctx, mut render: ab::RenderCallback, m
         period: ab::Period::Frames(live.period_frames),
         latency: Some(Duration::from_nanos(live.latency_100ns.unsigned_abs().saturating_mul(100))),
         device_position: Some(0),
+        min_period: live.min_period,
     };
     let _ = ready.send(Ok(Opened { achieved }));
     // Wait for `start`; a dropped control side ends the thread.
@@ -1145,6 +1164,7 @@ fn capture_thread(params: OpenParams, ctx: Ctx, mut capture: ab::CaptureCallback
         period: ab::Period::Frames(live.period_frames),
         latency: Some(Duration::from_nanos(live.latency_100ns.unsigned_abs().saturating_mul(100))),
         device_position: Some(0),
+        min_period: live.min_period,
     };
     let _ = ready.send(Ok(Opened { achieved }));
     if let Ok(Command::Start(reply)) = commands.recv() {

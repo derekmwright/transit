@@ -113,6 +113,15 @@ exclusively fails with "in use", and one whose Advanced settings forbid exclusiv
 Notes column gives the format and period the driver granted ("exclusive, i32/24 valid, 128 fr"), and
 with `--settings` the calibration is stored under the mode `exclusive`, apart from the shared one
 (see `../contributing/knowledge/wasapi-modes.md`). The fake backend accepts the flag as if shared.
+Without `--period` the stream runs at the device's default period; a smaller `--period` is honored as
+asked, and the table shows what it costs.
+
+On the Focusrite Scarlett 2i2 (2026-10-22, [run](2026-10-22-ryzen-5900x-scarlett-2i2.md)) exclusive mode
+at the 480-frame (10 ms) default is clean but its round trip is still about 223 ms in host time (203 ms
++-12 ms calibrated in stamp time), against 248 ms shared and 23 ms through ASIO on the same cable. So on
+this device the roughly 200 ms sits inside the Focusrite WDM driver, not in the Windows audio engine,
+and ASIO stays its low-latency path. Below the default the driver signals only every other period
+(992 output xruns in 6 s at 144 frames, 213 at 256; known issue K25).
 
 The hardware tests open the owner's default endpoints and stay `#[ignore]`d; run them by hand:
 

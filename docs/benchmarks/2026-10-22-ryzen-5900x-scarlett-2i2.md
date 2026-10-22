@@ -28,3 +28,23 @@ output xruns); the cause is not identified (known issue K24).
 The loopback needs input gain: with the gain at minimum the run detects 0 of 40 clicks on both
 backends. The bench prints the input peak per channel on a failed run, which shows a quiet or silent
 channel.
+
+## Exclusive mode
+
+The same cable at 48 kHz through the native backend in WASAPI exclusive mode (`--mode exclusive`),
+at `--period` 480, 256 and 144 frames (144 is the 3 ms minimum the driver reports); the driver granted
+packed 24-bit stereo each time.
+
+| Backend | System | Device | Period req. (frames) | Period achieved | Rate (Hz) | Jitter p50 / p95 / max (ms) | Xruns (out/in) | Xruns/min | Callback p50 / p95 (us) | Round trip min / median / p95 (ms) | Round trip (frames) | Machine | OS | Date (UTC) | Notes |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| wasapi | WASAPI | Speakers (2- Focusrite USB Audio) | 480 | 480 fr / 10.000 ms | 48000 | 2.009 / 4.016 / 4.093 | 0/0 | 0.00 | 3.6 / 4.6 | 217.021 / 223.067 / 229.095 (12 of 12) | 10417 / 10707 / 10997 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | exclusive, i24, 480 fr |
+| wasapi | WASAPI | Speakers (2- Focusrite USB Audio) | 256 | 256 fr / 5.333 ms | 48000 | 0.673 / 6.680 / 6.942 | 213/2 | 2129.82 | 2.1 / 2.5 | 119.102 / 146.403 / 289.768 (8 of 8) | 5717 / 7027 / 13909 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | exclusive, i24, 256 fr; invalid stamps 134 |
+| wasapi | WASAPI | Speakers (2- Focusrite USB Audio) | 144 | 144 fr / 3.000 ms | 48000 | 3.000 / 3.024 / 3.087 | 992/91 | 9929.22 | 1.5 / 1.6 | 168.966 / 258.008 / 361.955 (4 of 6) | 8110 / 12384 / 17374 | AMD Ryzen 9 5900X 12-Core Processor | Microsoft Windows [Version 10.0.26200.9711] | 2026-10-22 | exclusive, i24, 144 fr; invalid stamps 950 |
+
+Calibrations, in the same order:
+
+- calibration: round trip 9747 frames (203.062 ms) +-581 frames (12.104 ms), 12 of 12 clicks paired
+- calibration: round trip 6516 frames (135.750 ms) +-8194 frames (170.708 ms), 8 of 8 clicks paired
+- calibration: round trip 12096 frames (252.000 ms) +-9265 frames (193.021 ms), 4 of 6 clicks paired
+
+Exclusive mode at the 10 ms default period is clean (no xruns, 12 of 12 clicks) but its round trip is still 223 ms, against 248 ms shared and 23 ms through ASIO, so the latency sits inside the Focusrite WDM driver, not the Windows audio engine. Below the default the driver signals only every other period (6 ms intervals at a 3 ms period), which shows as hundreds of xruns and invalid stamps; see known issue K25.

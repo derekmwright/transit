@@ -14,9 +14,11 @@ silenced while it is open. What changes:
   counts and F32, I32 with 24 valid bits, I32, packed I24, I16; `probe_exclusive` asks
   `IsFormatSupported(EXCLUSIVE)` for each (control thread only, never during enumeration). The open tries
   the requested format, then the candidates at its rate and channel count, and reports the one it got.
-- **Period.** The driver's: `Period::Frames(n)` or else `GetDevicePeriod`'s minimum, with
-  `hnsPeriodicity == hnsBufferDuration`. The buffer is one period and the render loop fills all of it on
-  every event (`Fill::Whole`); padding is not read.
+- **Period.** `Period::Frames(n)` as asked, or else `GetDevicePeriod`'s default (not its minimum: the
+  Scarlett 2i2 reports 3 ms but signals only every other period below its 10 ms default, K25), with
+  `hnsPeriodicity == hnsBufferDuration`. The minimum is reported in `Achieved::min_period` for the UI to
+  offer. The buffer is one period and the render loop fills all of it on every event (`Fill::Whole`);
+  padding is not read.
 - **Alignment retry.** `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` means: read the aligned frames from
   `GetBufferSize`, drop the client, activate a new one and `Initialize` once more at that size (a failed
   `Initialize` cannot be retried on the same client). `AUDCLNT_E_BUFFER_SIZE_ERROR` names the range.
@@ -25,4 +27,6 @@ silenced while it is open. What changes:
   settings forbid it); a gone endpoint is `DeviceNotAvailable`. No raw mode, no `AUTOCONVERTPCM`.
 - **Calibration.** A loopback calibration is keyed by mode (`"shared"` or `"exclusive"`); measure each.
 
-The cpal adapter opens shared streams only; it refuses `Mode::Exclusive`.
+On the Scarlett 2i2 exclusive mode at 480 frames still measures about 223 ms round trip: that latency is
+in the Focusrite WDM driver, and ASIO is the low-latency path there. The cpal adapter opens shared
+streams only; it refuses `Mode::Exclusive`.

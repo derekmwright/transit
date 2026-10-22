@@ -97,7 +97,7 @@ pub enum Mode {
     Shared,
     /// The device is held by this process: other apps are silenced while the stream is open. Any
     /// format the device accepts in this mode ([`Backend::probe_exclusive`]); the period is the
-    /// driver's (its minimum unless one is requested).
+    /// driver's (its default unless one is requested; [`Achieved::min_period`] reports its minimum).
     Exclusive,
 }
 
@@ -153,12 +153,15 @@ pub struct Achieved {
     pub latency: Option<Duration>,
     /// The device frame position at open, where the system reports one.
     pub device_position: Option<u64>,
+    /// The smallest period the device reports for this mode, in frames, where it says (WASAPI
+    /// exclusive: `GetDevicePeriod`'s minimum). A driver may not sustain it; it is offered, not used.
+    pub min_period: Option<u32>,
 }
 
 impl Achieved {
     /// The request honored as asked, with nothing more reported.
     pub const fn requested(format: Format, period: Period) -> Self {
-        Self { format, period, latency: None, device_position: None }
+        Self { format, period, latency: None, device_position: None, min_period: None }
     }
 }
 
