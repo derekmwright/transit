@@ -462,6 +462,11 @@ impl Control {
         }
     }
 
+    /// The scope taps of the compiler (see [`soundcraft_mix::ScopeHub`]).
+    pub fn scope_hub(&self) -> Arc<soundcraft_mix::ScopeHub> {
+        self.compiler.scope_hub()
+    }
+
     /// Control-only snapshot. Channel/track allocation, when needed, happens here.
     pub fn copy_meters(&self, out: &mut MeterSnapshot) {
         self.meters.copy_into(out);

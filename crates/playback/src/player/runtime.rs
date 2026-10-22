@@ -305,6 +305,9 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn copy_meters(&self, out: &mut MeterSnapshot) {
         self.control.sessions.copy_meters(out);
     }
+    pub fn scope_hub(&self) -> Arc<soundcraft_mix::ScopeHub> {
+        self.control.sessions.scope_hub()
+    }
 
     pub fn binding(&self, track: TrackId, slot: usize) -> Option<SlotBinding> {
         self.handles.binding(track, slot)

@@ -323,6 +323,9 @@ impl SessionControl {
     pub fn copy_meters(&self, out: &mut MeterSnapshot) {
         self.bridge.copy_meters(out);
     }
+    pub fn scope_hub(&self) -> Arc<soundcraft_mix::ScopeHub> {
+        self.bridge.scope_hub()
+    }
     pub(super) fn actions<T: Copy, R: Copy>(&self) -> (action_lane::Control<T, R>, action_lane::Audio<T, R>) {
         action_lane::pair_with_result(&self.bridge)
     }

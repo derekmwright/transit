@@ -369,3 +369,50 @@ fn every_factory_preset_file_parses_belongs_to_its_plugin_and_applies_in_one_ste
     }
     assert_eq!(files, presets::FACTORY.len(), "every table entry has a file");
 }
+
+/// A tap in a headless hub for the insert in `slot` of `tr`.
+fn tap_for(t: &mut T, tr: TrackId, slot: usize) -> std::sync::Arc<soundcraft_mix::ScopeTap> {
+    let uid = t.app.engine.session().track(tr).unwrap().mixer.inserts[slot].as_ref().unwrap().uid.get();
+    let hub = std::sync::Arc::new(soundcraft_mix::ScopeHub::default());
+    let tap = std::sync::Arc::new(soundcraft_mix::ScopeTap::new());
+    hub.register(tr, uid, &tap);
+    t.app.builtin_editor.hub = Some(hub);
+    tap
+}
+
+#[test]
+fn a_compressor_panel_shows_a_scope_and_gain_reduction_and_drives_its_tap() {
+    let mut t = T::new();
+    let tr = t.track("audio");
+    t.app.add_device(tr, "compressor").unwrap();
+    t.frames(4);
+    let tap = tap_for(&mut t, tr, 0);
+    assert!(!tap.enabled(), "a closed panel leaves the tap off");
+    t.open_editor(0);
+    assert!(tap.enabled(), "opening the panel switches the tap on");
+    let w = t.window(tr);
+    let (sw, sh) = (w.scope[2] - w.scope[0], w.scope[3] - w.scope[1]);
+    assert_eq!((sw, sh), (crate::scope_strip::SCOPE_W, crate::scope_strip::SCOPE_H), "the scope strip has its rect");
+    assert!(w.scope[1] < w.rows[0].control[1], "the strip is above the knobs");
+    assert_eq!(w.level, "-inf dB");
+    assert_eq!(w.gr, "GR 0.0 dB", "the gain reduction readout");
+    assert!(w.gr_bar[2] > w.gr_bar[0]);
+    t.open_editor(0);
+    assert!(t.app.builtin_editor.windows.is_empty());
+    t.frames(2);
+    assert!(!tap.enabled(), "closing the panel switches it off");
+}
+
+#[test]
+fn a_panel_without_dynamics_has_a_scope_and_no_gain_reduction() {
+    let mut t = T::new();
+    let tr = t.track("audio");
+    t.app.add_device(tr, "eq_7band").unwrap();
+    t.frames(4);
+    let tap = tap_for(&mut t, tr, 0);
+    t.open_editor(0);
+    assert!(tap.enabled());
+    let w = t.window(tr);
+    assert!(w.scope[2] > w.scope[0]);
+    assert!(w.gr.is_empty() && w.gr_bar == [0.0; 4]);
+}

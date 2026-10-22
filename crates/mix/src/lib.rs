@@ -76,6 +76,7 @@ mod key;
 mod plan;
 #[cfg(test)]
 mod plan_tests;
+mod scope;
 mod sink;
 
 pub use compile::{CompileError, CompileMode, MIN_DELAY_CAPACITY, PlanCompiler, PlanLimits};
@@ -88,6 +89,7 @@ pub use plan::{
     Adoption, DeviceGeneration, EnvelopeState, PlanEnvelope, PlanGeneration, PlanIdentity, PlanStatus, PreparedPlan, RejectReason, Rejected,
     RenderTarget, Retired, SlotBinding, SlotGen,
 };
+pub use scope::{INSTRUMENT_UID, SCOPE_FRAMES, ScopeHub, ScopeTap};
 pub use sink::{MAX_SINK_CHANNELS, SinkPlan, SinkSpec, plan_sinks, unresolved_routes};
 use sink::{Sink, sink_index};
 
@@ -424,6 +426,8 @@ struct PluginSlot {
     /// Plan mode, instruments: the event queue and the open notes and pedals (F10), prepared by
     /// the compiler. They travel with the instance and retire with it.
     events: Option<Box<events::InstrumentEvents>>,
+    /// Plan mode, inserts and instruments: the scope ring the panel reads (see [`ScopeTap`]).
+    tap: Option<Arc<ScopeTap>>,
 }
 
 impl PluginSlot {
@@ -447,6 +451,7 @@ impl PluginSlot {
             sample_audio: None,
             sample_wrapper: None,
             events: None,
+            tap: None,
         }
     }
 }
@@ -1290,6 +1295,9 @@ fn process_strip(
                         *x = 0.5 * (*x + *y);
                     }
                 }
+                if let Some(tap) = &inst.tap {
+                    tap.push(&strip.buf, frames, 0.0);
+                }
                 if contain_failure(inst, &mut strip.buf, frames) {
                     strip.failures.record(INSTRUMENT_SLOT);
                     // Out until the next reset: its queue is voided and what it held released (F10).
@@ -1333,8 +1341,12 @@ fn process_strip(
             continue;
         }
         latency = latency.saturating_add(slot.plugin.latency());
+        let slot_gr = slot.plugin.gain_reduction_db();
         if gr == 0.0 {
-            gr = slot.plugin.gain_reduction_db();
+            gr = slot_gr;
+        }
+        if let Some(tap) = &slot.tap {
+            tap.push(&strip.buf, frames, slot_gr);
         }
     }
     strip.key_in.iter_mut().filter(|k| !k.ran).for_each(|k| k.line.idle());
@@ -1402,6 +1414,8 @@ fn process_master(t: &Track, strip: &mut Strip, main: &mut [Vec<f32>], pos: Samp
             apply_params(slot, ins, t, i, pos);
             if run_insert(slot, &mut strip.buf, None, frames, transport, no_suspend) && contain_failure(slot, &mut strip.buf, frames) {
                 strip.failures.record(i);
+            } else if let Some(tap) = &slot.tap {
+                tap.push(&strip.buf, frames, slot.plugin.gain_reduction_db());
             }
         }
     }

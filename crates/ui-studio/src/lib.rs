@@ -36,6 +36,7 @@ pub mod panel;
 pub mod plugin_scan;
 pub mod presets;
 pub mod recent;
+pub mod scope_strip;
 pub mod shortcuts;
 pub mod splash;
 pub mod telemetry;
@@ -744,7 +745,7 @@ impl StudioApp {
         }
         // Autosave only runs on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
-        let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty();
+        let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty() || self.scope_open();
         // A plug-in being made is created one frame after it is announced; come back for it.
         let loading = self.player.as_ref().is_some_and(Player::any_loading);
         ctx.request_repaint_after_secs(

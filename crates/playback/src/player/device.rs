@@ -779,6 +779,24 @@ impl Player {
         self.owner()?.copy_meters(out);
         Ok(())
     }
+    /// The scope taps of the open device's plans; `None` while the player is busy or faulted.
+    pub fn scope_hub(&self) -> Option<Arc<soundcraft_mix::ScopeHub>> {
+        self.owner().ok().map(|o| o.scope_hub())
+    }
+    /// Switches the scope tap of an insert (by `Insert.uid`) on or off, with no recompile; false when
+    /// the insert has no tap yet.
+    pub fn scope_enable(&self, track: TrackId, uid: u64, on: bool) -> bool {
+        self.scope_hub().is_some_and(|h| h.set_enabled(track, uid, on))
+    }
+    /// Copies the last `out.len()` frames of an insert's scope tap into `out` (see
+    /// [`soundcraft_mix::ScopeTap::read`]); 0 while there is no tap.
+    pub fn scope_frames(&self, track: TrackId, uid: u64, out: &mut [f32]) -> usize {
+        self.scope_hub().map_or(0, |h| h.frames(track, uid, out))
+    }
+    /// The gain reduction in dB an insert last reported to its tap.
+    pub fn scope_gain_reduction_db(&self, track: TrackId, uid: u64) -> f32 {
+        self.scope_hub().map_or(0.0, |h| h.gain_reduction_db(track, uid))
+    }
     pub fn meters(&self) -> Result<MeterSnapshot, PlayerError> {
         let mut out = MeterSnapshot::default();
         self.copy_meters(&mut out)?;

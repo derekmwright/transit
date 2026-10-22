@@ -2,6 +2,7 @@
 //! a [`PlanEnvelope`] whose tables are sized and bounded before the audio thread sees them.
 
 use super::plan::{Attach, CellKind, CellLoc, CellMove, PlanTables, PreparedPlan, Shape, SlotBinding, needs_storage};
+use super::scope::INSTRUMENT_UID;
 use super::*;
 use soundcraft_model::{IoDirection, IoMap, IoPath};
 use std::collections::{BTreeMap, HashMap};
@@ -208,6 +209,8 @@ pub struct PlanCompiler {
     loops: Vec<RouteCycle>,
     /// This machine's I/O paths: output routes by name become sinks, input names resolve here.
     io: Arc<IoMap>,
+    /// Where the scope taps of the instances are found (see [`ScopeHub`]).
+    scopes: Arc<ScopeHub>,
 }
 
 /// The planned content of one slot cell.
@@ -309,6 +312,8 @@ fn measure(
             let line = mul(mul(ch, add(key_cap_of(t, ch), block)?)?, size_of::<f32>())?;
             bytes = add(bytes, mul(mul(keyed, 2)?, line)?)?;
         }
+        // A scope ring for each insert and the instrument.
+        bytes = add(bytes, mul(add(t.mixer.inserts.iter().flatten().count(), usize::from(t.instrument.is_some()))?, ScopeTap::BYTES)?)?;
         for ins in t.mixer.inserts.iter().flatten().chain(t.instrument.iter()) {
             if needs_storage(ins.params.len()) {
                 bytes = add(bytes, mul(ins.params.len(), size_of::<f32>())?)?;
@@ -388,7 +393,14 @@ impl PlanCompiler {
             faulted: None,
             loops: Vec::new(),
             io: Arc::new(IoMap::default()),
+            scopes: Arc::new(ScopeHub::default()),
         }
+    }
+
+    /// The scope taps of this compiler's instances: the UI switches one on while a panel is open.
+    #[must_use]
+    pub fn scope_hub(&self) -> Arc<ScopeHub> {
+        Arc::clone(&self.scopes)
     }
 
     /// Compile for a headless render: an inactive track is never processed, so it gets no plug-in
@@ -817,6 +829,12 @@ impl PlanCompiler {
                 make(&p.spec, generation).map(|n| {
                     let mut s = PluginSlot::new(n.plugin, p.spec.id.clone(), p.spec.ch, p.key.1);
                     s.generation = generation;
+                    if matches!(p.kind, CellKind::Insert | CellKind::Instrument) {
+                        let tap = Arc::new(ScopeTap::new());
+                        let uid = if p.kind == CellKind::Instrument { INSTRUMENT_UID } else { p.spec.uid };
+                        self.scopes.register(p.key.0, uid, &tap);
+                        s.tap = Some(tap);
+                    }
                     s
                 })
             }

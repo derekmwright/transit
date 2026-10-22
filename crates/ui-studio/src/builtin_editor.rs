@@ -49,6 +49,12 @@ pub struct EditorLayout {
     pub bypass: [f32; 4],
     /// The preset dropdown.
     pub preset: [f32; 4],
+    /// The scope and level strip of a bespoke panel: the scope, the peak readout, and for the
+    /// Compressor and Expander/Gate the gain-reduction bar and readout (zero rects and empty text elsewhere).
+    pub scope: [f32; 4],
+    pub level: String,
+    pub gr_bar: [f32; 4],
+    pub gr: String,
     pub picker: [f32; 4],
     pub sample: String,
     pub groups: Vec<String>,
@@ -60,6 +66,12 @@ pub struct EditorState {
     pub windows: Vec<EditorLayout>,
     /// A control changed since the pointer went down: its undo step ends on release.
     gesture: bool,
+    /// The scope taps to use when there is no player (tests, `--no-audio`).
+    pub hub: Option<std::sync::Arc<soundcraft_mix::ScopeHub>>,
+    /// The frames last read from a tap, reused every frame.
+    pub(crate) frames: Vec<f32>,
+    /// The insert taps this module switched on: (track, hub uid).
+    scoped: Vec<(TrackId, u64)>,
 }
 
 fn rect4(r: egui::Rect) -> [f32; 4] {
@@ -131,6 +143,7 @@ pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
     app.builtin_editor.windows.clear();
     let keys = app.ui.plugin_windows.clone();
     let mut closed = Vec::new();
+    let mut active: Vec<(TrackId, u64)> = Vec::new();
     for (n, key) in keys.into_iter().enumerate() {
         let Some(ins) = app.builtin_at(key) else { continue };
         let Some(info) = soundcraft_dsp::plugin_info(&ins.plugin) else { continue };
@@ -144,6 +157,10 @@ pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
             rect: [0.0; 4],
             bypass: [0.0; 4],
             preset: [0.0; 4],
+            scope: [0.0; 4],
+            level: String::new(),
+            gr_bar: [0.0; 4],
+            gr: String::new(),
             picker: [0.0; 4],
             sample: String::new(),
             groups: Vec::new(),
@@ -164,12 +181,15 @@ pub fn windows(app: &mut StudioApp, ctx: &egui::Context) {
         }
         if !open {
             closed.push(key);
+        } else if crate::panel::layout(&ins.plugin).is_some() {
+            active.push((key.0, crate::scope_strip::hub_uid(key, &ins)));
         }
         app.builtin_editor.windows.push(layout);
     }
     for key in closed {
         app.close_editor(key);
     }
+    sync_scopes(app, active);
     if app.builtin_editor.gesture && ctx.input(|i| i.pointer.any_released()) {
         app.builtin_editor.gesture = false;
         app.engine.end_merge();
@@ -314,4 +334,27 @@ fn sample_picker(app: &mut StudioApp, ui: &mut Ui, t: TrackId, ins: &Insert, lay
         ui.label(RichText::new("The Sampler is silent until it has a sample: load one or drop an audio file here.").color(TOKENS.text_dim));
     }
     ui.add_space(4.0);
+}
+
+/// Switches on the scope tap of every open bespoke panel and off the ones whose window is gone.
+/// Setting a flag needs no recompile; a tap that does not exist yet (its plan is still being
+/// built) is switched on by a later frame.
+fn sync_scopes(app: &mut StudioApp, active: Vec<(TrackId, u64)>) {
+    let hub = app.scope_hub();
+    if let Some(hub) = &hub {
+        for (t, uid) in &active {
+            hub.set_enabled(*t, *uid, true);
+        }
+        for (t, uid) in app.builtin_editor.scoped.iter().filter(|k| !active.contains(k)) {
+            hub.set_enabled(*t, *uid, false);
+        }
+    }
+    app.builtin_editor.scoped = active;
+}
+
+impl StudioApp {
+    /// A built-in panel with a scope is open: the window repaints about 30 times a second.
+    pub(crate) fn scope_open(&self) -> bool {
+        !self.builtin_editor.scoped.is_empty()
+    }
 }

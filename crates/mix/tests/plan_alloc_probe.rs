@@ -581,3 +581,31 @@ fn routing_changes_and_a_loop_allocate_nothing() {
     no_cost("a loop", &rig.edit(&s));
     assert!(rig.out.iter().any(|c| c.iter().any(|x| *x != 0.0)), "the track plays");
 }
+
+#[test]
+fn scope_taps_fill_and_report_gain_reduction_without_callback_allocation() {
+    let (mut s, t, _) = session_with_clip();
+    let mut comp = builtin("compressor");
+    comp.params.insert("threshold".into(), -50.0);
+    comp.params.insert("ratio".into(), 8.0);
+    let uid = comp.uid.get();
+    s.track_mut(t).unwrap().mixer.inserts[0] = Some(comp);
+    let mut rig = Rig::new(&s);
+    let hub = rig.compiler.scope_hub();
+    let mut frames = vec![0.0f32; 512];
+    assert_eq!(hub.frames(t, uid, &mut frames), 0, "a tap is silent while it is off");
+    assert!(hub.set_enabled(t, uid, true), "the insert has a tap, switched on without a recompile");
+    // The tap write is part of the measured callback: no allocation, no free.
+    no_cost("tap enabled", &rig.edit(&s));
+    assert!(hub.frames(t, uid, &mut frames) > 0);
+    assert!(frames.iter().any(|x| *x > 0.0), "the compressor's output reaches the ring");
+    assert!(hub.gain_reduction_db(t, uid) > 0.0, "gain reduction is reported");
+    assert!(hub.set_enabled(t, uid, false));
+    let (_, stats) = measure(|| {
+        for _ in 0..BLOCKS {
+            rig.mix.render_active(rig.pos, BLOCK, &mut rig.out);
+            rig.pos += BLOCK as i64;
+        }
+    });
+    assert_eq!(stats, AllocStats::default());
+}

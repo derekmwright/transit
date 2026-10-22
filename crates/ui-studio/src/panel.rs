@@ -121,6 +121,7 @@ pub fn layout(plugin: &str) -> Option<&'static [Row]> {
 /// Draws a plug-in's panel into `ui`, one row of sections after another.
 pub fn show(app: &mut StudioApp, ui: &mut Ui, key: (TrackId, usize), ins: &Insert, info: &'static PluginInfo, rows: &[Row], lay: &mut EditorLayout) {
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+    crate::scope_strip::show(app, ui, key, ins, lay);
     for row in rows {
         ui.horizontal_top(|ui| {
             for s in *row {
