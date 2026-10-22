@@ -138,8 +138,8 @@ pub struct OpenRequest {
     pub period: Period,
     pub mode: Mode,
     pub origin: HostOrigin,
-    /// The loopback calibration of this device pair, when the user has measured one. Only the
-    /// native WASAPI backend applies it.
+    /// The loopback calibration of this device pair, when the user has measured one. The native
+    /// WASAPI and ASIO backends apply it.
     pub calibration: Option<Calibration>,
 }
 
@@ -282,6 +282,10 @@ impl std::error::Error for OpenError {}
 pub enum StreamError {
     DeviceNotAvailable,
     Other,
+    /// The driver asked the host to close and reopen it (ASIO `kAsioResetRequest`, or a sample
+    /// rate change under a running stream): the stream keeps its buffers but the driver's settings
+    /// moved, so the owner reopens it.
+    ResetRequested,
 }
 
 /// Device changes a backend reports outside any stream.
@@ -351,6 +355,13 @@ pub struct StreamStats {
     pub min_padding_frames: u32,
     /// The most packets one wake drained (capture; 0 for render).
     pub max_packets_per_wake: u32,
+    /// Overloads the driver reported (ASIO `kAsioOverload`; 0 where the backend has no such report).
+    pub overloads: u64,
+    /// Callbacks whose device sample position did not advance by exactly one buffer from the
+    /// previous one (ASIO); not proof of an audible glitch.
+    pub position_jumps: u64,
+    /// Reset, resync and sample-rate-change requests from the driver (ASIO).
+    pub resets: u64,
 }
 
 impl StreamStats {
@@ -391,8 +402,9 @@ impl StreamStats {
     pub fn line_with_wakes(&self, capture: bool, wakes: &str) -> String {
         let tail = if capture { format!("max packets {}", self.max_packets_per_wake) } else { format!("min padding {}", self.min_padding_frames) };
         let faults = if self.faults > 0 { format!("; faults {}", self.faults) } else { String::new() };
+        let events = if self.overloads + self.position_jumps + self.resets > 0 { self.events_tail() } else { String::new() };
         format!(
-            "wakes {}, late p95 {} µs, max {} µs; service p95 {} µs, max {} µs; skipped {}, timeouts {}; {tail}{faults}",
+            "wakes {}, late p95 {} µs, max {} µs; service p95 {} µs, max {} µs; skipped {}, timeouts {}; {tail}{faults}{events}",
             wakes,
             self.wake_late_p95_us(),
             self.max_wake_late_us,
@@ -401,6 +413,12 @@ impl StreamStats {
             self.skipped_wakes,
             self.timeouts,
         )
+    }
+
+    /// "; overloads 0, position jumps 0, resets 0": the driver-event counters, which [`Self::line`]
+    /// appends only when one is not zero.
+    pub fn events_tail(&self) -> String {
+        format!("; overloads {}, position jumps {}, resets {}", self.overloads, self.position_jumps, self.resets)
     }
 
     pub fn wake_late_p95_us(&self) -> u64 {
@@ -591,6 +609,15 @@ mod tests {
         assert_eq!(StreamStats::p95_us(&hist, 400_000), 128);
         let stats = StreamStats { wake_late_us: hist, max_wake_late_us: 90, ..Default::default() };
         assert_eq!(stats.wake_late_p95_us(), 90);
+    }
+
+    #[test]
+    fn the_driver_events_join_the_line_only_when_one_happened() {
+        let quiet = StreamStats { wakes: 5, ..Default::default() };
+        assert!(!quiet.line(false).contains("overloads"));
+        assert_eq!(quiet.events_tail(), "; overloads 0, position jumps 0, resets 0");
+        let busy = StreamStats { wakes: 5, overloads: 2, position_jumps: 1, ..Default::default() };
+        assert!(busy.line(true).ends_with("max packets 0; overloads 2, position jumps 1, resets 0"), "{}", busy.line(true));
     }
 
     #[test]
