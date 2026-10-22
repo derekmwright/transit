@@ -270,5 +270,5 @@ jobs:
             - macos-arm64: `audio-bench` (cpal, Core Audio), in the tarball only, not in the DMG.
             - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false
-          prerelease: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
