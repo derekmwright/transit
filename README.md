@@ -36,6 +36,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Hosted plug-ins can take a sidechain key too.
 - Plug-in delay compensation keeps every path time-aligned.
 - Opens every output on your interface; name your own paths and route tracks, buses and sends to any of them.
+- Hardware inserts: send a track through outboard gear on your interface. Choose "Hardware Insert..." in the device chain's "+" menu, then pick a send path and a return path (a pair) on the insert. Audio Devices > I/O > Hardware inserts has a Measure button that plays a click and records the round trip, which delay compensation then uses so the track stays aligned. The insert shows Ready, Unmeasured, No input, Missing send, Missing return or Disabled, with the reason. A route to a path an insert sends on is refused.
 
 ### Instruments and effects
 
@@ -53,13 +54,15 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
 - MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass; each loop pass becomes a take; the lane shows the growing clip while you play.
-- A MIDI take journal is written during the pass; after a crash, the next launch offers to recover it as a `<Track>_recovered` clip. Record works without a calibrated device clock: alignment is approximate, and when it cannot start you get a plain-English reason.
+- A MIDI take journal is written during the pass and kept until an autosave that holds the recording lands; after a crash, the next launch recovers it as a `<Track>_recovered` clip. Record works without a validated device clock: alignment is approximate, a take recorded that way says so, and when recording cannot start you get a plain-English reason.
+- A hosted plug-in that re-sends an unchanged parameter value no longer registers an automation touch; only a real change does.
 
 ### Audio devices
 
 - Audio Devices window to pick the driver (WASAPI, or ASIO in builds you make yourself), device and buffer size.
 - Named input and output paths, saved per machine.
-- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. `audio-bench --backend wasapi` measures it.
+- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. `audio-bench --backend wasapi` measures it.
+- Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated".
 - Tracks, buses and sends route to any output path, with latency aligned across them.
 
 ### Sessions and rendering
@@ -123,15 +126,15 @@ disables saving settings.
 
 - Pre-alpha; the session format and UI change freely.
 - A heavy plug-in can still block the UI for the duration of its single create call.
-- A crash between Stop and the next autosave can still lose a MIDI pass (K13); approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
+- Approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
 - Windows releases are unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft
 
 transit is based on [SoundCraft](https://github.com/storytold/soundcraft) by storytold, an
 open-source Rust digital audio workstation. The audio engine, plug-in hosts and most crates come
-from it; the transit UI and product work are by @derekmwright. The internal crates keep their
-`soundcraft-*` names. Engine fixes may be offered back upstream.
+from it; the transit UI and product work are by @derekmwright. The crates we own are named `transit-*`; crates inherited from SoundCraft keep their
+`soundcraft-*` names until they are renamed. Engine fixes may be offered back upstream.
 
 ## License
 
@@ -145,6 +148,7 @@ Issues are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Background on past d
 ## For contributors and their agents
 
 - [AGENTS.md](AGENTS.md): read this first.
+- Crates we own are `transit-*`; inherited ones are still `soundcraft-*` ([ADR 0014](docs/adr/0014-transit-gets-its-own-repository.md)).
 - [docs/adr/](docs/adr/README.md): architecture decisions.
 - [docs/contributing/](docs/contributing/README.md): evidence and knowledge notes.
 - [docs/known-issues/](docs/known-issues/README.md): accepted, tracked limitations.

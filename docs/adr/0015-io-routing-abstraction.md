@@ -2,7 +2,7 @@
 
 - **Status:** accepted 2026-10-21 (direction pre-approved by the project owner; refutation review round 1 resolved)
 - **Date:** 2026-10-21
-- **Implementation:** none yet. Slice 0 and slices (a) to (e) below, each shippable. Slice 0 and (a) are not MIDI-path work, so they are sequenced after the live MIDI work.
+- **Implementation:** (d) hardware inserts f1add1e+074baac landed; all slices done. Slice 0 and slices (a) to (e) below, each shippable. Slice 0 and (a) are not MIDI-path work, so they are sequenced after the live MIDI work.
 - **Reopen when:** a slice's gate proves unmeasurable on the reference machine; or upstream SoundCraft lands its own multi-output or sidechain model that we should converge with; or the TASCAM Model 12 shows that device channel counts differ between input and output (or between USB modes) enough that one channel-map shape cannot describe both; or dependency layers for key edges prove too costly in slice (c) (fallback in section 4). WASAPI shared mode exposing one channel count is a stated limit, not a reopen trigger (section 1).
 
 ## Context
@@ -51,6 +51,8 @@ An insert gets an optional key: `Insert.key: Option<KeySource>` with `#[serde(de
 
 ### 5. Hardware inserts
 A hardware insert is a send to an output path plus a return from an input path: a sibling `Option<HardwareInsert { send, ret }>` on `Insert` (`Insert` is a struct, `mixer.rs:425`), by path name. **Duplex only:** it needs input and output on one clock, which is ASIO on Windows (`player/device.rs:200-232`); on other backends the drift invalidates a fixed measured latency, so the insert is unavailable and flagged. The return for block N arrives in a later callback: the slot is a send, a FIFO of the measured round-trip length, and a read from the input ring, and `latency()` equals that length (the measured value covers the blocks of delay). A ping measurement writes an impulse on the send path, finds it on the return and stores `{ send, return, device identity, rate, buffer, frames }` per machine. No measurement means zero latency and a flag. A missing path bypasses the insert dry, flagged. Offline render is dry bypass with a flag. Implementation is slice (d).
+
+*As built (slice d):* the implementation uses no in-slot FIFO, because the capture ring already delivers the return one round trip late. The loop check is edit-time plus open-time disabling (an offending insert becomes `Disabled` and runs dry), not a graph edge.
 
 ### 6. PDC and L22 across all edge kinds
 Every sink (Main, each output path, each hardware send) is padded to one shared device latency L = max over all sinks of their arrival, plus the master-insert latency (`main_arrival + lmax_m`, generalized). A path fed only by a zero-latency track is delayed to L, so stems and cues align with Main sample for sample. `path_need_with` sizes per-sink capacity and respects the `MAX_LATENCY` clamp (`lib.rs:507`). One stated exception: a path declared "live" (a performer's headphone cue) may opt out of compensation, off by default. Sidechain edges align at the keyed slot input (section 4); hardware insert latency counts through `latency()`. `route_graph`, `pdc_visit`, `route_into`, `path_need_with` and `RouteScratch` change together per slice. New `plan_parity` cases for sinks and keys compare against hand-computed golden outputs, not the legacy renderer. Outputs to paths are not loopable edges (sinks have no readers); only key edges add cycles.
