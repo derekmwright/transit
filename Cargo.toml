@@ -16,6 +16,7 @@ soundcraft-time = { path = "crates/time" }
 soundcraft-rt = { path = "crates/rt" }
 soundcraft-audio-io = { path = "crates/audio-io" }
 soundcraft-audio-backend = { path = "crates/audio-backend" }
+soundcraft-audio-wasapi = { path = "crates/audio-wasapi" }
 soundcraft-midi-io = { path = "crates/midi-io" }
 soundcraft-midi = { path = "crates/midi" }
 soundcraft-video = { path = "crates/video" }

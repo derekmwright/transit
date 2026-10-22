@@ -73,7 +73,7 @@ fn period_of(size: cpal::BufferSize) -> ab::Period {
 fn request(config: &cpal::StreamConfig, format: cpal::SampleFormat) -> Result<ab::OpenRequest, String> {
     let sample = sample_of(format).ok_or_else(|| format!("unsupported device sample format: {format}"))?;
     Ok(ab::OpenRequest {
-        format: ab::Format { rate: config.sample_rate.0, channels: config.channels, sample },
+        format: ab::Format::new(config.sample_rate.0, config.channels, sample),
         period: period_of(config.buffer_size),
         mode: ab::Mode::Shared,
         origin: ab::HostOrigin::default(),
@@ -313,7 +313,7 @@ impl ab::Backend for CpalBackend {
         let device = device_of(endpoint).map_err(|e| e.to_string())?;
         let cfg = input_config(&device, rate)?;
         let sample = sample_of(cfg.sample_format()).ok_or("unsupported input sample format")?;
-        Ok(ab::Format { rate: cfg.sample_rate().0, channels: cfg.channels(), sample })
+        Ok(ab::Format::new(cfg.sample_rate().0, cfg.channels(), sample))
     }
 
     #[cfg(target_os = "freebsd")]
@@ -346,7 +346,7 @@ impl ab::Backend for CpalBackend {
             _ => return Err(ab::OpenError::Other(format!("unsupported device sample format: {:?}", request.format.sample))),
         };
         let stream = built.map_err(open_error)?;
-        Ok((Box::new(CpalStream(stream)), ab::Achieved { format: request.format, period: request.period }))
+        Ok((Box::new(CpalStream(stream)), ab::Achieved::requested(request.format, request.period)))
     }
 
     #[cfg(not(target_os = "freebsd"))]
@@ -366,7 +366,7 @@ impl ab::Backend for CpalBackend {
             _ => build_capture::<f32>(&device, &config, request, capture, error),
         };
         let stream = built.map_err(open_error)?;
-        Ok((Box::new(CpalStream(stream)), ab::Achieved { format: request.format, period: request.period }))
+        Ok((Box::new(CpalStream(stream)), ab::Achieved::requested(request.format, request.period)))
     }
 
     #[cfg(target_os = "freebsd")]

@@ -103,7 +103,7 @@ impl FakeBackend {
         if let Some(error) = state.fail_open.take() {
             return Err(error);
         }
-        Ok((Box::new(FakeStream { state: Arc::clone(&self.state), direction }), Achieved { format: request.format, period: request.period }))
+        Ok((Box::new(FakeStream { state: Arc::clone(&self.state), direction }), Achieved::requested(request.format, request.period)))
     }
 }
 
@@ -134,7 +134,7 @@ impl Backend for FakeBackend {
         if self.capture_channels == 0 {
             return Err("the audio input has no channels".into());
         }
-        Ok(Format { rate: rate.unwrap_or(first.rate), channels: self.capture_channels, sample: SampleFormat::F32 })
+        Ok(Format::new(rate.unwrap_or(first.rate), self.capture_channels, SampleFormat::F32))
     }
     fn open_render(
         &self,
@@ -246,7 +246,7 @@ mod tests {
     use super::*;
 
     fn fake() -> FakeBackend {
-        FakeBackend::new(Format { rate: 48_000, channels: 2, sample: SampleFormat::F32 })
+        FakeBackend::new(Format::new(48_000, 2, SampleFormat::F32))
     }
 
     #[test]

@@ -130,7 +130,7 @@ fn trait_path_bytes<T: crate::backend::cpal::Sample + Wire>(channels: u16) -> Ve
     session.edit.click = true;
     let io = IoMap::for_device("WASAPI", "golden", 0, channels);
     let (player, access, clock) = Player::prepare(Arc::new(session), 48_000, io).unwrap();
-    let format = ab::Format { rate: 48_000, channels, sample: ab::SampleFormat::F32 };
+    let format = ab::Format::new(48_000, channels, ab::SampleFormat::F32);
     let fake = ab::fake::FakeBackend::new(format);
     let plan = fake.plan_render(&ab::OutputWish::default()).unwrap();
     let (render, on_error) = render_callbacks(&player, access, clock, usize::from(channels), 48_000);
@@ -177,7 +177,7 @@ fn the_backend_trait_path_reproduces_the_captured_device_goldens() {
 fn a_scripted_device_loss_reaches_the_fault_path_and_a_failed_open_is_reported() {
     use ab::Backend;
     let (player, access, clock) = Player::prepare(Arc::new(Session::default()), 48_000, IoMap::default()).unwrap();
-    let fake = ab::fake::FakeBackend::new(ab::Format { rate: 48_000, channels: 2, sample: ab::SampleFormat::F32 });
+    let fake = ab::fake::FakeBackend::new(ab::Format::new(48_000, 2, ab::SampleFormat::F32));
     let plan = fake.plan_render(&ab::OutputWish::default()).unwrap();
     fake.fail_next_open(ab::OpenError::DeviceNotAvailable("scripted".into()));
     let (render, on_error) = render_callbacks(&player, access, clock, 2, 48_000);

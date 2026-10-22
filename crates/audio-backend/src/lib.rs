@@ -57,6 +57,19 @@ pub struct Format {
     pub rate: u32,
     pub channels: u16,
     pub sample: SampleFormat,
+    /// Significant bits when fewer than the container holds (24 valid bits in a 32-bit
+    /// container); `None` means the whole container.
+    pub valid_bits: Option<u8>,
+    /// The speaker mask of the channels where the system reports one (WASAPI `dwChannelMask`);
+    /// `None` means unspecified and 0 means direct output (channel i is device channel i).
+    pub channel_mask: Option<u32>,
+}
+
+impl Format {
+    /// A format with whole-container samples and no channel mask.
+    pub const fn new(rate: u32, channels: u16, sample: SampleFormat) -> Self {
+        Self { rate, channels, sample, valid_bits: None, channel_mask: None }
+    }
 }
 
 /// The device buffer size in frames.
@@ -96,7 +109,19 @@ pub struct OpenRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Achieved {
     pub format: Format,
+    /// The real period when the system reports it, else what was requested.
     pub period: Period,
+    /// The stream latency the system reports, where it says.
+    pub latency: Option<Duration>,
+    /// The device frame position at open, where the system reports one.
+    pub device_position: Option<u64>,
+}
+
+impl Achieved {
+    /// The request honored as asked, with nothing more reported.
+    pub const fn requested(format: Format, period: Period) -> Self {
+        Self { format, period, latency: None, device_position: None }
+    }
 }
 
 /// A range of formats an endpoint offers: any rate in `min_rate..=max_rate`.
@@ -175,15 +200,17 @@ pub struct Plan {
 /// Why a stream did not open (or start).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenError {
-    /// The device is gone or in use. The text comes from the audio system.
+    /// The device is gone or unavailable. The text comes from the audio system.
     DeviceNotAvailable(String),
+    /// Another client holds the device exclusively (`AUDCLNT_E_DEVICE_IN_USE`).
+    InUse(String),
     Other(String),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::DeviceNotAvailable(text) | OpenError::Other(text) => f.write_str(text),
+            OpenError::DeviceNotAvailable(text) | OpenError::InUse(text) | OpenError::Other(text) => f.write_str(text),
         }
     }
 }
@@ -219,6 +246,10 @@ pub enum WorkerPriority {
     /// Successful MMCSS Audio registration on this worker, before data callbacks.
     /// Does not imply Pro Audio priority, glitch-free playback or a hardware deadline margin.
     MmcssAudio,
+    /// Successful MMCSS "Pro Audio" registration on this worker, before data callbacks.
+    MmcssProAudio,
+    /// MMCSS was unavailable and the worker runs at a raised thread priority instead.
+    RaisedPriority,
     /// The worker tried registration and the helper reported failure; playback may continue.
     PromotionFailed,
     /// The worker explicitly released its successful registration at exit.

@@ -22,6 +22,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("rt", 0),
     ("audio-io", 0),
     ("audio-backend", 0),
+    ("audio-wasapi", 0),
     ("midi-io", 0),
     ("midi", 0),
     ("video", 0),
@@ -42,6 +43,8 @@ const LAYERS: &[(&str, u8)] = &[
 const STANDALONE: &[&str] = &["time", "audio-io", "midi-io", "midi", "video", "dsp"];
 const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
 const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "transit", "xtask", "audio-bench"];
+/// The only crates whose manifest may set `unsafe_code = "allow"` (ADR 0013 and its amendments).
+const UNSAFE_ALLOWED: &[&str] = &["rt", "audio-wasapi"];
 
 fn layers() -> Result<(), String> {
     let out =
@@ -54,6 +57,10 @@ fn layers() -> Result<(), String> {
             continue;
         }
         let short = name.trim_start_matches("soundcraft-");
+        let manifest = p["manifest_path"].as_str().and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
+        if manifest.contains("unsafe_code = \"allow\"") && !UNSAFE_ALLOWED.contains(&short) {
+            problems.push(format!("{name}: sets unsafe_code = allow but is not in the xtask unsafe allowlist"));
+        }
         let Some(&(_, layer)) = LAYERS.iter().find(|(n, _)| *n == short) else {
             problems.push(format!("{name}: not registered in xtask LAYERS"));
             continue;

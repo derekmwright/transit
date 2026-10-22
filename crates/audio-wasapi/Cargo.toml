@@ -1,0 +1,45 @@
+[package]
+name = "soundcraft-audio-wasapi"
+description = "SoundCraft native WASAPI backend: shared low-latency render through IAudioClient3 (ADR 0016); empty on other platforms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+soundcraft-audio-backend.workspace = true
+soundcraft-rt.workspace = true
+log.workspace = true
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Variant",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+soundcraft-rt = { workspace = true, features = ["testing"] }
+cpal.workspace = true
+
+# ADR 0013, second amendment: this crate may contain `unsafe` for COM and WASAPI through the
+# `windows` crate only. Every `unsafe` block carries a `// SAFETY:` comment quoting the rule it
+# relies on. The rest mirrors `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"

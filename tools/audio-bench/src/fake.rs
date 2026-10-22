@@ -26,7 +26,7 @@ impl Script {
 
 /// The fake system for `request`: one device with the requested rate and period.
 pub fn backend(request: &Request, period: u32) -> FakeBackend {
-    let format = ab::Format { rate: request.rate, channels: request.out_ch.max(2), sample: ab::SampleFormat::F32 };
+    let format = ab::Format::new(request.rate, request.out_ch.max(2), ab::SampleFormat::F32);
     let attempt = ab::OpenRequest { format, period: ab::Period::Frames(period), mode: ab::Mode::Shared, origin: ab::HostOrigin::default() };
     let fake = FakeBackend::new(format).with_attempts(vec![attempt]);
     if request.loopback { fake.with_capture(request.in_ch.max(2), false) } else { fake }
@@ -70,7 +70,7 @@ pub fn drive(fake: &FakeBackend, request: &Request, period: u32, script: &Script
     let mut capture = vec![0.0f32; period as usize * in_channels];
     let mut line: VecDeque<f32> = VecDeque::with_capacity(script.delay_frames as usize + period as usize + 1);
     line.extend(std::iter::repeat_n(0.0, script.delay_frames as usize));
-    let format = ab::Format { rate: request.rate, channels: request.in_ch.max(2), sample: ab::SampleFormat::F32 };
+    let format = ab::Format::new(request.rate, request.in_ch.max(2), ab::SampleFormat::F32);
     for k in 0..blocks {
         let mut sink = SliceSink { data: &mut render, channels: out_channels };
         if !fake.pump_render(period as usize, stamp(arrival(k, 1)), &mut sink) {

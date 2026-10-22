@@ -3860,6 +3860,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "soundcraft-audio-wasapi"
+version = "0.8.0"
+dependencies = [
+ "cpal",
+ "log",
+ "soundcraft-audio-backend",
+ "soundcraft-rt",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "soundcraft-automation"
 version = "0.8.0"
 dependencies = [

@@ -21,7 +21,7 @@ fn stamp(ns: u64) -> ab::Stamp {
 
 #[test]
 fn the_callbacks_allocate_nothing_and_still_find_the_clicks() {
-    let format = ab::Format { rate: RATE, channels: 2, sample: ab::SampleFormat::F32 };
+    let format = ab::Format::new(RATE, 2, ab::SampleFormat::F32);
     let fake = FakeBackend::new(format).with_capture(2, false);
     let shared = Shared::new(RATE, 2.0);
     shared.render_click.set(ClickTemplate::new(RATE).unwrap()).ok().unwrap();
