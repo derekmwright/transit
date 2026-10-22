@@ -473,8 +473,9 @@ fn reorder_keeps_the_editor_wanted_until_the_plan_adopts() {
     let mut t = T::new();
     t.app.add_track("audio").unwrap();
     let track = t.app.engine.session().tracks[0].id;
-    for p in ["gain", "saturator", "compressor"] {
-        t.app.add_device(track, p).unwrap();
+    // Hosted plug-ins: they have native editor windows, built-ins have ours (`builtin_editor`).
+    for (slot, id) in ["clap:test.a", "clap:test.b", "clap:test.c"].into_iter().enumerate() {
+        t.app.engine.session_mut().track_mut(track).unwrap().mixer.inserts[slot] = Some(soundcraft_model::Insert::new(id));
     }
     t.app.want_editor((track, 2));
     t.frames(2);

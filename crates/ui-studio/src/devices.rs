@@ -400,11 +400,13 @@ fn card(
     }
     // Open editor: the plug-in's own window, through the same path as `ui.set {plugin_windows}`.
     let key_slot = slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
-    let enabled = !loading && app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot));
+    // A built-in's editor is our own window, so it needs no player and no loaded instance.
+    let builtin = app.builtin_at((t, key_slot)).is_some();
+    let enabled = builtin || (!loading && app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot)));
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
     pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
-    let label = if loading {
+    let label = if loading && !builtin {
         LOADING
     } else if open {
         "Close editor"
@@ -417,10 +419,10 @@ fn card(
     let x0 = eb.center().x - w / 2.0;
     crate::icons::paint(&pc, pos2(x0 + 6.0, eb.center().y), Icon::OpenEditor, 12.0, ink);
     pc.text(pos2(x0 + 16.0, eb.center().y), Align2::LEFT_CENTER, label, font, ink);
-    let tip = if loading {
+    let tip = if loading && !builtin {
         "The plug-in is still loading; its editor opens when it is ready"
     } else if !enabled {
-        "No editor window (built-in, or no audio device)"
+        "No editor window (no audio device)"
     } else if open {
         "Close the plug-in's window"
     } else {

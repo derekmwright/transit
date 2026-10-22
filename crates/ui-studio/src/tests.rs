@@ -528,7 +528,7 @@ fn plus_inserts_a_built_in_device_and_bypass_and_remove_round_trip() {
     assert_eq!(ins.iter().flatten().map(|i| i.plugin.as_str()).collect::<Vec<_>>(), vec!["gain"]);
     let card = app.mixer.devices.cards.first().cloned().expect("a device card");
     assert_eq!((card.slot, card.plugin.as_str()), (Some(0), "gain"));
-    assert!(!card.editor_enabled, "no editor without a player");
+    assert!(card.editor_enabled, "a built-in has its own editor window, player or not");
     click(&mut app, mid(card.bypass_button));
     frames(&mut app, &ctx, 6, &mut time);
     assert!(app.engine.session().track(t).unwrap().mixer.inserts[0].as_ref().unwrap().bypass);

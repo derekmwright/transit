@@ -13,6 +13,7 @@ pub mod audio_devices;
 pub mod audio_devices_io;
 pub mod automation;
 pub mod browser;
+pub mod builtin_editor;
 pub mod control;
 pub mod devices;
 pub mod fine;
@@ -313,6 +314,8 @@ pub struct StudioApp {
     pub audio_devices: audio_devices::AudioDevicesState,
     /// The Open Recent entries as last drawn (empty while the submenu is closed).
     pub recent_menu: Vec<recent::RecentItemLayout>,
+    /// The built-in plug-in editor windows as last drawn.
+    pub builtin_editor: builtin_editor::EditorState,
 }
 
 impl StudioApp {
@@ -378,6 +381,7 @@ impl StudioApp {
             auto: automation::AutoState::default(),
             audio_devices: audio_devices::AudioDevicesState::default(),
             recent_menu: Vec::new(),
+            builtin_editor: builtin_editor::EditorState::default(),
         }
     }
 
@@ -568,6 +572,11 @@ impl StudioApp {
 
     /// Close a plug-in editor window (or stop waiting for it to open).
     pub fn close_editor(&mut self, key: (TrackId, usize)) {
+        if self.builtin_at(key).is_some() {
+            // A built-in's editor is a window of ours: nothing in the player to close.
+            self.ui.plugin_windows.retain(|k| *k != key);
+            return;
+        }
         if let Some(p) = &self.player
             && self.player_requests.result(&mut self.status, p.close_editor(key.0, key.1)).is_none()
         {
@@ -581,6 +590,10 @@ impl StudioApp {
     pub fn want_editor(&mut self, key: (TrackId, usize)) {
         if !self.ui.plugin_windows.contains(&key) {
             self.ui.plugin_windows.push(key);
+        }
+        if self.builtin_at(key).is_some() {
+            // Drawn by `builtin_editor::windows`; the player has no editor to wait for.
+            return;
         }
         if self.editors.iter().any(|e| e.key == key) {
             return;
@@ -815,6 +828,7 @@ impl StudioApp {
         menus::shortcuts_window(self, &ctx);
         telemetry::window(self, &ctx);
         audio_devices::window(self, &ctx);
+        builtin_editor::windows(self, &ctx);
         if self.is_playing() || self.engine.transport.recording {
             ctx.request_repaint_after(std::time::Duration::from_millis(1000 / 30));
         } else if self.main_meter.level[0] > 0.0001 {
@@ -884,6 +898,8 @@ mod audio_devices_tests;
 mod automation_tests;
 #[cfg(test)]
 mod browser_tests;
+#[cfg(test)]
+mod builtin_editor_tests;
 #[cfg(test)]
 mod groups_tests;
 #[cfg(test)]
