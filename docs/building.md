@@ -38,8 +38,8 @@ The tagged GitHub release (`.github/workflows/release.yml`) is separate and ship
 
 ## Building with ASIO (Windows)
 
-The published releases use WASAPI only. If you have an ASIO audio interface and want ASIO in your
-own build, compile with the `transit/asio` feature. It enables `cpal`'s `asio` feature through
+The Windows release publishes an ASIO build (`transit/asio` and `transit/native-wasapi`) and a
+WASAPI-only build. To get ASIO in your own build, compile with the `transit/asio` feature. It enables `cpal`'s `asio` feature through
 `asio-sys`, which compiles Steinberg's ASIO SDK and generates bindings with bindgen.
 
 ### Prerequisites
@@ -107,5 +107,6 @@ If only WASAPI appears, the binary was built without the feature.
 Building the ASIO SDK into a binary for your own use is allowed by the SDK license. If you want to
 redistribute an ASIO-enabled binary, you must first sign Steinberg's ASIO SDK Licensing Agreement
 (free; signed and emailed to Steinberg) and show this notice: "ASIO is a trademark of Steinberg
-Media Technologies GmbH, registered in Europe and other countries." That is why the published
-releases are WASAPI-only.
+Media Technologies GmbH, registered in Europe and other countries." Distributing the ASIO-enabled
+release build is subject to Steinberg's ASIO SDK license, which the project owner handles; the
+release workflow also publishes a WASAPI-only build as a fallback.

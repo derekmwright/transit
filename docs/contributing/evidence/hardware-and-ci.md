@@ -6,6 +6,10 @@
 `rt.yml` adds the realtime-crate matrix. A pull request therefore has no automatic checks: run the
 gates locally (`gates.md`) and report what you ran.
 
+The Windows release job builds twice: `windows-x86_64-asio` (`transit/asio` and
+`transit/native-wasapi`, LLVM from the runner for bindgen, optional `ASIO_SDK_URL` secret for the SDK
+zip) and the WASAPI-only `windows-x86_64`. Like the others it runs only on tags and manual dispatch.
+
 ## Hardware evidence
 
 Needed when the claim is about real devices: latency, clock behavior, driver quirks, MIDI timing,

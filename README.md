@@ -59,7 +59,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 ### Audio devices
 
-- Audio Devices window to pick the driver (WASAPI, or ASIO in builds you make yourself), device and buffer size.
+- Audio Devices window to pick the driver (WASAPI, or ASIO in the ASIO release build or builds you make yourself), device and buffer size.
 - Named input and output paths, saved per machine.
 - Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. It opens the device shared by default; a "Take exclusive control of the device" checkbox opens it exclusive instead (other apps are silenced while transit runs), and an exclusive open that fails steps down to shared, with a message, rather than failing silently. `audio-bench --backend wasapi` measures it. Verified on a Scarlett 2i2 in shared and exclusive mode (a Model 12 run is pending).
 - Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated". Shared mode is not a low-latency path (about 248 ms round trip on the Scarlett 2i2); exclusive mode measured about 223 ms there (and about 276 ms, often silent, on a Model 12), and ASIO about 23 ms, so ASIO remains the tracking path on that interface.
@@ -84,8 +84,7 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 ## Status
 
-Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). Releases are WASAPI-only;
-ASIO is available when you build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
+Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). Windows releases include an ASIO build (ASIO and native WASAPI, `transit-<version>-windows-x86_64-asio.zip`) and a WASAPI-only build; you can also build ASIO yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
 Expect rough edges and breaking changes to the session format. Back up anything you care about.
 
 ## Build
@@ -105,7 +104,7 @@ ASIO is behind the `transit/asio` feature: `cargo build -p transit --release --f
 It needs LLVM (for bindgen; set `LIBCLANG_PATH` to LLVM's `bin`, and put LLVM before MinGW on
 `PATH`), the Visual Studio 2019+ Build Tools, and the Steinberg ASIO SDK (`asio-sys` downloads it on
 the first build unless `CPAL_ASIO_DIR` points at a copy). Steinberg's licensing terms apply to
-anyone who redistributes ASIO-enabled binaries, so the published releases are WASAPI-only.
+anyone who redistributes ASIO-enabled binaries; the project owner handles that for the published ASIO release build.
 
 Full steps, the MinGW/libclang pitfall, and licensing: [docs/building.md](docs/building.md#building-with-asio-windows); scripted build: `tools/build-asio.ps1`.
 
@@ -127,7 +126,7 @@ disables saving settings.
 - Pre-alpha; the session format and UI change freely.
 - A heavy plug-in can still block the UI for the duration of its single create call.
 - Approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
-- Windows releases are unsigned: SmartScreen shows "More info", then "Run anyway".
+- The Windows release includes an ASIO build (with native WASAPI) and a WASAPI-only fallback. Both are unsigned: SmartScreen shows "More info", then "Run anyway".
 
 ## Based on SoundCraft
 
