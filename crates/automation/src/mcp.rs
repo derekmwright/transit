@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "SoundCraft is a digital audio workstation (Pro Tools-class). Everything a user can do is a \
+const INSTRUCTIONS: &str = "transit is a digital audio workstation. Everything a user can do is a \
 command: call `list_commands` to discover ids and their params, then `execute` (or `batch`). Positions are samples \
 (integers), `{\"seconds\": x}`, or time strings like \"bars_beats:5|1|000\" / \"0:12.500\". Tracks are referenced by id \
 or name. Verify your work with `inspect_session` (tracks, clips, mixer, automation, markers, selection). Programmatic \
@@ -25,7 +25,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "list_commands",
-            "List SoundCraft commands (id, label, menu path, shortcut, params doc, enabled).",
+            "List transit commands (id, label, menu path, shortcut, params doc, enabled).",
             json!({"filter": {"type": "string", "description": "substring of id or label"}}),
             &[],
         ),

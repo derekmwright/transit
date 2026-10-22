@@ -1,10 +1,10 @@
-//! Agent control for SoundCraft.
+//! Agent control for transit.
 //!
 //! - [`Backend`]: something that answers control-protocol methods (`engine.execute`,
 //!   `session.inspect`, `ui.*`…). [`Headless`] runs an in-process engine; [`Remote`] talks to a
 //!   running app's `--control` port.
 //! - [`mcp::Server`]: a Model Context Protocol server over stdio (newline-delimited JSON-RPC 2.0)
-//!   exposing SoundCraft as tools and resources.
+//!   exposing transit as tools and resources.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod mcp;
@@ -88,6 +88,17 @@ pub struct Remote {
     next_id: u64,
 }
 
+enum RemoteError {
+    Connection(String),
+    Rejected(String),
+}
+
+impl From<String> for RemoteError {
+    fn from(message: String) -> Self {
+        Self::Connection(message)
+    }
+}
+
 impl Remote {
     /// `target` is a port (`7979`) or `host:port`.
     pub fn new(target: &str) -> Self {
@@ -106,8 +117,7 @@ impl Remote {
             return Ok(());
         }
         let sock = self.addr.parse().map_err(|e| format!("{}: {e}", self.addr))?;
-        let s =
-            TcpStream::connect_timeout(&sock, Duration::from_millis(800)).map_err(|e| format!("cannot reach SoundCraft at {}: {e}", self.addr))?;
+        let s = TcpStream::connect_timeout(&sock, Duration::from_millis(800)).map_err(|e| format!("cannot reach transit at {}: {e}", self.addr))?;
         s.set_read_timeout(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
         let r = s.try_clone().map_err(|e| e.to_string())?;
         let mut s = s;
@@ -120,25 +130,25 @@ impl Remote {
         Ok(())
     }
 
-    fn roundtrip(&mut self, method: &str, params: &Value) -> Result<Value, String> {
+    fn roundtrip(&mut self, method: &str, params: &Value) -> Result<Value, RemoteError> {
         self.connect()?;
         let id = self.next_id;
         self.next_id += 1;
         let line = json!({"id": id, "method": method, "params": params}).to_string();
-        let (w, r) = self.conn.as_mut().ok_or("not connected")?;
+        let (w, r) = self.conn.as_mut().ok_or_else(|| RemoteError::Connection("not connected".into()))?;
         writeln!(w, "{line}").map_err(|e| e.to_string())?;
         let mut buf = String::new();
         r.read_line(&mut buf).map_err(|e| e.to_string())?;
         if buf.is_empty() {
-            return Err(
-                "connection closed (the app closes connections that do not start with the control token; see TRANSIT_CONTROL_TOKEN_FILE)".into()
-            );
+            return Err(RemoteError::Connection(
+                "connection closed (the app closes connections that do not start with the control token; see TRANSIT_CONTROL_TOKEN_FILE)".into(),
+            ));
         }
         let v: Value = serde_json::from_str(&buf).map_err(|e| e.to_string())?;
         if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             Ok(v.get("result").cloned().unwrap_or(Value::Null))
         } else {
-            Err(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string())
+            Err(RemoteError::Rejected(v.get("error").and_then(Value::as_str).unwrap_or("error").to_string()))
         }
     }
 }
@@ -147,19 +157,20 @@ impl Backend for Remote {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         match self.roundtrip(method, &params) {
             Ok(v) => Ok(v),
-            Err(e) if e.contains("closed") || e.contains("Broken pipe") || e.contains("reset") => {
-                // Retry once on a fresh connection.
+            Err(RemoteError::Connection(e)) => {
+                // A write or lost response may follow an applied edit. Reconnect on the next
+                // call, but never replay an operation whose outcome is unknown.
                 self.conn = None;
-                self.roundtrip(method, &params)
+                Err(e)
             }
-            Err(e) => Err(e),
+            Err(RemoteError::Rejected(e)) => Err(e),
         }
     }
     fn has_ui(&self) -> bool {
         true
     }
     fn describe(&self) -> String {
-        format!("SoundCraft app at {}", self.addr)
+        format!("transit app at {}", self.addr)
     }
 }
 
@@ -196,6 +207,50 @@ mod tests {
         let (first, second) = server.join().unwrap();
         assert_eq!(first, "auth 0123abcd\n");
         assert!(second.contains("session.inspect"), "{second}");
+    }
+
+    #[test]
+    fn server_errors_are_not_retried_based_on_their_wording_issue_10() {
+        for message in ["session closed", "Broken pipe in file export", "reset rejected"] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                drop(listener); // A retry would fail to reconnect and replace the server error.
+                let mut reader = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                writeln!(&s, "{}", json!({"ok": false, "error": message})).unwrap();
+            });
+            let mut remote = Remote::new(&addr.to_string()).with_token("fixture");
+            assert_eq!(remote.call("engine.execute", json!({})), Err(message.to_string()));
+            assert!(remote.conn.is_some(), "an application error does not discard the connection");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_lost_response_is_reported_without_replaying_the_command_issue_10() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            drop(listener);
+            let mut reader = BufReader::new(s);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("engine.execute"));
+            // The command was received; the response is lost.
+        });
+        let mut remote = Remote::new(&addr.to_string()).with_token("fixture");
+        let result = remote.call("engine.execute", json!({}));
+        assert!(result.unwrap_err().starts_with("connection closed"));
+        assert!(remote.conn.is_none());
+        server.join().unwrap();
     }
 
     #[test]
