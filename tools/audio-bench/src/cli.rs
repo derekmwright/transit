@@ -11,7 +11,7 @@ usage: audio-bench [options]
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
   --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device);
                          with --backend asio the ASIO driver's registry name (Focusrite USB ASIO)
-  --in-device <name>     input device when it differs from --device
+  --in-device <name>     input device when it differs from --device (not with --backend asio: capture is the driver's own)
   --mode shared|exclusive  device sharing of --backend wasapi (default shared); exclusive holds the device and silences other apps
   --in-mode shared|exclusive  mode of the capture stream when it differs from --mode (the calibration stays keyed on --mode)
   --period <frames>      requested period: 32, 64, 128, ... (default: the driver's); with --backend asio the buffer size
@@ -134,8 +134,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if (request.mode == ab::Mode::Exclusive || request.in_mode == Some(ab::Mode::Exclusive)) && kind == Kind::Asio {
         return Err("--mode does not apply to --backend asio: an ASIO driver has one mode".into());
     }
+    if request.in_device.is_some() && kind == Kind::Asio {
+        return Err("--in-device does not apply to --backend asio: capture opens on the --device driver (one ASIO driver per process)".into());
+    }
     if settings.is_some() && kind == Kind::Asio {
-        return Err("--settings needs --backend wasapi: the app does not open native ASIO streams yet".into());
+        return Err("--settings needs --backend wasapi: a native ASIO calibration is not written yet (the Focusrite driver's getLatencies \
+                    over-reports, see the known issues)"
+            .into());
     }
     if settings.is_some() && !request.loopback {
         return Err("--settings needs --loopback: a calibration is a measured round trip".into());
@@ -213,6 +218,9 @@ mod tests {
         assert!(matches!(parse_str("--backend asio --system ASIO"), Ok(Command::Run(_))));
         assert!(parse_str("--backend asio --mode exclusive").unwrap_err().contains("one mode"));
         assert!(parse_str("--backend asio --loopback --settings ui.json").unwrap_err().contains("--backend wasapi"));
+        let refused = parse_str("--backend asio --device Scarlett --in-device Other --loopback").unwrap_err();
+        assert!(refused.contains("--in-device does not apply"), "{refused}");
+        assert!(matches!(parse_str("--backend wasapi --in-device Mic --loopback"), Ok(Command::Run(_))), "the other backends keep it");
     }
 
     #[test]
