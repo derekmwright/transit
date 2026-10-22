@@ -98,7 +98,10 @@ cargo run -p audio-bench --features native-wasapi --release -- --backend wasapi 
 It prints the round trip in frames and ms with its uncertainty (`+-` the spread of the per-click
 round trips plus one frame) and merges it into `audio.calibrations` of that file. The app must be
 closed: it rewrites its `audio` block from memory when it saves. The fake mode proves the logic
-without a device: `cargo xtask audio-bench --backend fake --loopback --seconds 3`.
+without a device: `cargo xtask audio-bench --backend fake --loopback --seconds 3`. A run that
+detects too few clicks prints the peak level of every input channel (`-inf dBFS` is a silent
+channel); the clicks play at -6 dBFS and a detection needs about -20 dBFS on the input channel
+(`--in-ch`), so a quieter or silent channel points to the cable, the channel or the input gain.
 
 The hardware tests open the owner's default endpoints and stay `#[ignore]`d; run them by hand:
 

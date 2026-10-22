@@ -4,6 +4,7 @@
 //! both streams, which then report `Measured` stamps.
 
 use crate::analysis::FrameTrip;
+use crate::probe::{CLICK_LEVEL, MIN_ENERGY_RATIO};
 use soundcraft_playback::LoopbackCalibration;
 use soundcraft_playback::devices::MODE_SHARED;
 use std::path::Path;
@@ -44,13 +45,36 @@ impl Figures {
     }
 }
 
+/// A linear peak as dBFS with one decimal; `-inf dBFS` for silence.
+pub fn dbfs(peak: f32) -> String {
+    if peak > 0.0 && peak.is_finite() { format!("{:.1} dBFS", 20.0 * peak.log10()) } else { "-inf dBFS".to_string() }
+}
+
+/// "input peak on ch2: -6.0 dBFS" for the 1-based input channel `in_ch`.
+pub fn input_peak_line(peaks: &[f32], in_ch: u16) -> String {
+    let peak = peaks.get(usize::from(in_ch).saturating_sub(1)).copied().unwrap_or(0.0);
+    format!("input peak on ch{in_ch}: {}", dbfs(peak))
+}
+
+/// "input peaks: ch1 -inf dBFS, ch2 -42.1 dBFS; clicks play at -6 dBFS and a detection needs about
+/// -20 dBFS" (the figures follow the click level and the detector's energy threshold).
+fn peaks_note(peaks: &[f32]) -> String {
+    let list = peaks.iter().enumerate().map(|(i, p)| format!("ch{} {}", i + 1, dbfs(*p))).collect::<Vec<_>>().join(", ");
+    let play = 20.0 * CLICK_LEVEL.log10();
+    let need = play + 10.0 * MIN_ENERGY_RATIO.log10();
+    let list = if list.is_empty() { "no input channels".to_string() } else { list };
+    format!("input peaks: {list}; clicks play at {play:.0} dBFS and a detection needs about {need:.0} dBFS")
+}
+
 /// The calibration of `trip` at `rate` Hz: the median of the per-click round trips, and the spread
 /// `p95 - min` plus one frame (positions are whole frames) as its uncertainty.
-pub fn figures(trip: &FrameTrip, rate: u32) -> Result<Figures, String> {
+pub fn figures(trip: &FrameTrip, rate: u32, peaks: &[f32]) -> Result<Figures, String> {
     if trip.paired < MIN_PAIRED || trip.paired * 2 < trip.clicks {
         return Err(format!(
-            "only {} of {} clicks were detected on the loopback; check the cable, the channels and the levels (need at least {MIN_PAIRED} and half)",
-            trip.paired, trip.clicks
+            "only {} of {} clicks were detected on the loopback ({}); check the cable, the channels and the levels (need at least {MIN_PAIRED} and half)",
+            trip.paired,
+            trip.clicks,
+            peaks_note(peaks)
         ));
     }
     let frames = |ns: f64| ns * f64::from(rate) / 1e9;
@@ -129,20 +153,40 @@ mod tests {
     #[test]
     fn the_median_is_the_round_trip_and_the_spread_plus_a_frame_is_the_bound() {
         // 48 kHz: a frame is 20 833.3 ns.
-        let f = figures(&trip(3_000_000.0, 3_000_000.0, 3_000_000.0), 48_000).unwrap();
+        let f = figures(&trip(3_000_000.0, 3_000_000.0, 3_000_000.0), 48_000, &[]).unwrap();
         assert_eq!((f.round_trip_frames, f.spread_frames), (144, 1), "no spread: one frame of granularity");
-        let f = figures(&trip(2_950_000.0, 3_000_000.0, 3_100_000.0), 48_000).unwrap();
+        let f = figures(&trip(2_950_000.0, 3_000_000.0, 3_100_000.0), 48_000, &[]).unwrap();
         assert_eq!((f.round_trip_frames, f.spread_frames), (144, 9), "150 us is 7.2 frames; plus one, rounded up");
         assert!(f.describe().contains("144 frames (3.000 ms) +-9 frames (0.188 ms), 8 of 8 clicks paired"), "{}", f.describe());
+    }
+
+    #[test]
+    fn levels_print_as_dbfs_with_one_decimal() {
+        assert_eq!(dbfs(0.5), "-6.0 dBFS");
+        assert_eq!(dbfs(0.0), "-inf dBFS");
+        assert_eq!(dbfs(1.0), "0.0 dBFS");
+        assert_eq!(input_peak_line(&[0.0, 0.5], 2), "input peak on ch2: -6.0 dBFS");
+    }
+
+    #[test]
+    fn the_failure_names_the_input_peaks() {
+        let mut t = trip(1.0, 1.0, 1.0);
+        t.paired = 0;
+        t.clicks = 40;
+        let why = figures(&t, 48_000, &[0.0, 0.00785]).unwrap_err();
+        assert!(
+            why.contains("only 0 of 40 clicks were detected on the loopback (input peaks: ch1 -inf dBFS, ch2 -42.1 dBFS; clicks play at -6 dBFS and a detection needs about -20 dBFS); check the cable"),
+            "{why}"
+        );
     }
 
     #[test]
     fn a_loopback_that_lost_clicks_is_not_a_calibration() {
         let mut t = trip(1.0, 1.0, 1.0);
         t.paired = 2;
-        assert!(figures(&t, 48_000).unwrap_err().contains("2 of 8"));
+        assert!(figures(&t, 48_000, &[]).unwrap_err().contains("2 of 8"));
         t.paired = 3;
-        assert!(figures(&t, 48_000).is_err(), "fewer than half");
+        assert!(figures(&t, 48_000, &[]).is_err(), "fewer than half");
     }
 
     #[test]

@@ -41,6 +41,13 @@ fn a_clean_run_reports_the_period_no_jitter_no_xruns_and_the_exact_delay() {
 }
 
 #[test]
+fn the_loopback_reports_the_input_peak_per_channel() {
+    let m = measure(&config(64, 2.0, true, script(0, None, 144)));
+    assert_eq!(m.input_peaks, vec![0.5, 0.0], "the click level on the looped channel, silence on the other");
+    assert_eq!(audio_bench::calibration::input_peak_line(&m.input_peaks, 1), "input peak on ch1: -6.0 dBFS");
+}
+
+#[test]
 fn the_delay_is_recovered_to_the_frame_at_other_periods_and_delays() {
     for (period, delay) in [(32, 145), (128, 1000), (64, 1), (256, 4799)] {
         let trip = measure(&config(period, 3.0, true, script(0, None, delay))).round_trip.expect("loopback");

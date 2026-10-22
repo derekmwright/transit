@@ -210,6 +210,7 @@ mod tests {
                 backend_errors: 0,
                 invalid_stamps: 0,
                 dropped: 0,
+                input_peaks: Vec::new(),
             },
             calibration: None,
             machine: Machine { cpu: "Test CPU | 8 cores".into(), os: "Test OS 1.0".into() },

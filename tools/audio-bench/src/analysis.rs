@@ -55,6 +55,8 @@ pub struct Measurements {
     /// Callbacks with an invalid stamp, and log entries lost to a full log.
     pub invalid_stamps: u64,
     pub dropped: u64,
+    /// Peak absolute sample (linear) per captured channel over the run; empty without a capture stream.
+    pub input_peaks: Vec<f32>,
 }
 
 impl Measurements {
@@ -258,7 +260,14 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
         backend_errors: errors,
         invalid_stamps: invalid,
         dropped,
+        input_peaks: input_peaks(shared),
     }
+}
+
+/// The per-channel input peaks the capture callback tracked.
+fn input_peaks(shared: &Shared) -> Vec<f32> {
+    let channels = shared.input_channels.load(Ordering::Relaxed);
+    shared.input_peaks[..channels].iter().map(|p| f32::from_bits(p.load(Ordering::Relaxed))).collect()
 }
 
 #[cfg(test)]

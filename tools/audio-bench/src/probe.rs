@@ -2,7 +2,7 @@
 //! stream starts, logs are fixed-size and single-writer, and nothing locks or allocates.
 
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use transit_audio_backend as ab;
@@ -23,6 +23,9 @@ pub const BURST_HZ: f32 = 3000.0;
 pub const MIN_CORRELATION: f32 = 0.7;
 /// The window energy must be at least this fraction of the template's (amplitude 0.2 = -14 dB).
 pub const MIN_ENERGY_RATIO: f32 = 0.04;
+
+/// Input channels whose peak is tracked; further channels are not reported.
+pub const MAX_PEAK_CHANNELS: usize = 32;
 
 /// A fixed-size, single-writer log of `u64`. Pushing past the capacity counts a drop.
 pub struct Log {
@@ -144,6 +147,11 @@ pub struct Shared {
     /// Set before the streams start, once the achieved rates are known.
     pub render_click: OnceLock<ClickTemplate>,
     pub capture_click: OnceLock<ClickTemplate>,
+    /// Peak absolute sample per captured channel over the run, as `f32` bits (non-negative floats
+    /// order like their bits, so `fetch_max` works). Preallocated; the callback never allocates.
+    pub input_peaks: [AtomicU32; MAX_PEAK_CHANNELS],
+    /// Channels the capture stream delivered (at most [`MAX_PEAK_CHANNELS`]).
+    pub input_channels: AtomicUsize,
 }
 
 impl Shared {
@@ -157,6 +165,8 @@ impl Shared {
             detections: Log::new(clicks),
             render_click: OnceLock::new(),
             capture_click: OnceLock::new(),
+            input_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            input_channels: AtomicUsize::new(0),
         })
     }
 }
@@ -246,7 +256,8 @@ impl Detector {
     }
 }
 
-/// The capture callback: logs arrivals and scans `channel` (0-based) for the click.
+/// The capture callback: logs arrivals, tracks the peak of every channel and scans `channel`
+/// (0-based) for the click.
 pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallback {
     let (mut position, mut detector) = (0u64, Detector::new());
     Box::new(move |block| {
@@ -254,7 +265,17 @@ pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallb
         let (stamp, frames, channels) = (block.stamp, block.frames, usize::from(block.channels).max(1));
         let click = shared.capture_click.get();
         let base = position;
+        let tracked = channels.min(MAX_PEAK_CHANNELS);
+        let mut peaks = [0.0f32; MAX_PEAK_CHANNELS];
         block.chunks(&mut |offset, samples| {
+            for frame in samples.chunks_exact(channels) {
+                for (peak, sample) in peaks.iter_mut().zip(&frame[..tracked]) {
+                    let magnitude = sample.abs();
+                    if magnitude > *peak {
+                        *peak = magnitude;
+                    }
+                }
+            }
             let Some(click) = click else { return };
             for (i, frame) in samples.chunks_exact(channels).enumerate() {
                 let at = base + (offset + i) as u64;
@@ -262,6 +283,10 @@ pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallb
             }
         });
         position += frames as u64;
+        shared.input_channels.fetch_max(tracked, Ordering::Relaxed);
+        for (slot, peak) in shared.input_peaks.iter().zip(&peaks[..tracked]) {
+            slot.fetch_max(peak.to_bits(), Ordering::Relaxed);
+        }
         shared.capture.record(&stamp, frames, nanos(started));
     })
 }

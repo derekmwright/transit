@@ -91,7 +91,7 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
     let calibration = (config.kind != Kind::Cpal && opened.capture_rate == Some(opened.render_rate))
         .then_some(measurements.frame_trip)
         .flatten()
-        .map(|trip| calibration::figures(&trip, opened.render_rate));
+        .map(|trip| calibration::figures(&trip, opened.render_rate, &measurements.input_peaks));
     if let Some(path) = &config.settings {
         let figures = calibration.clone().ok_or("--settings needs a native loopback run (--backend wasapi --loopback) at one rate")??;
         let record = calibration::record(&figures, &opened.device, config.request.in_device.as_deref(), config.request.period.unwrap_or(0), &date);
