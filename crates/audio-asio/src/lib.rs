@@ -288,8 +288,8 @@ impl AsioStream {
         if self.direction == ab::Direction::Output { "render" } else { "capture" }
     }
 
-    /// The smallest step of the driver's `systemTime` seen so far, in ns (the diagnostic of its
-    /// grain: about 1_000_000 for a `timeGetTime` clock), `None` before two valid readings.
+    /// The smallest step between consecutive callbacks' `systemTime` seen so far, in ns (an upper
+    /// bound on the grain of the driver's clock), `None` before two valid readings.
     pub(crate) fn system_time_step_ns(&self) -> Option<u64> {
         Some(self.system_step.load(Ordering::Relaxed)).filter(|step| *step != u64::MAX)
     }

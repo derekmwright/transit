@@ -230,8 +230,8 @@ impl Engine {
         self.rate
     }
 
-    /// The smallest non-zero step of the driver's `systemTime` seen, in ns (`u64::MAX` before two
-    /// valid readings): about 1_000_000 for a `timeGetTime` clock.
+    /// The smallest non-zero step between consecutive callbacks' `systemTime`, in ns (`u64::MAX`
+    /// before two valid readings): an upper bound on the clock's grain, not a measure of it.
     pub(crate) fn system_time_step_ns(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.system_step)
     }
