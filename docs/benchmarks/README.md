@@ -120,6 +120,8 @@ Also record, once per interface, `GetSharedModeEnginePeriod` (default, fundament
 maximum period in frames) from the Windows audio engine and paste it under the table; the harness
 does not read it yet (it arrives with the native backend).
 
+Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal)](2026-10-22-ryzen-5900x-scarlett-2i2.md).
+
 ## Results
 
 The gate is fixed by amendment to ADR 0016 after this baseline is filled in (starting value: a round

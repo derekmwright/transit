@@ -61,8 +61,8 @@ Ableton/Logic-style ergonomics. Pure Rust, egui UI.
 
 - Audio Devices window to pick the driver (WASAPI, or ASIO in builds you make yourself), device and buffer size.
 - Named input and output paths, saved per machine.
-- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. `audio-bench --backend wasapi` measures it.
-- Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated".
+- Experimental native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. `audio-bench --backend wasapi` measures it. Verified on a Scarlett 2i2 (shared mode; exclusive mode pending).
+- Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated". Shared mode is not a low-latency path (about 248 ms round trip on the Scarlett 2i2).
 - Tracks, buses and sends route to any output path, with latency aligned across them.
 
 ### Sessions and rendering

@@ -2,7 +2,7 @@
 
 - **Status:** accepted 2026-10-21 (direction from the project owner; refutation review round 1 resolved); implementation after ADR 0015 slice (c)
 - **Date:** 2026-10-21
-- **Implementation:** slices (a) 0ef51ae, (b) 51e79d6, (c) 799049d+3c3257f, (d) ea803b7+8f25586 landed; (e) exclusive/raw and (f) default remain, gated on a hardware run. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
+- **Implementation:** slices (a) 0ef51ae, (b) 51e79d6, (c) 799049d+3c3257f, (d) ea803b7+8f25586 landed and was verified on hardware on 2026-10-22; (e) exclusive/raw and (f) default remain. Slices (a) to (f) below, each shippable, sequenced after ADR 0015 slice (c). Slice (c) improves output latency and the render clock, which helps live MIDI monitoring; slice (d) adds capture and calibrated placement for recording. Both touch the MIDI clock path.
 - **Reopen when:** the benchmark harness (slice b) shows CPAL-shared already within the gate margin of ASIO on both reference interfaces (measured by the method in section 5, so this cannot fire before slice b); or the native shared low-latency path cannot beat CPAL-shared on the Scarlett 2i2 and the TASCAM Model 12 after slice (c); or `IAudioClock2` device positions prove no better a clock than QPC arrival on the reference drivers (slice d gate fails); or upstream CPAL gains exclusive mode, `IAudioClient3` and device-position timestamps.
 
 ## Context
@@ -82,6 +82,8 @@ Gate: the section 5 gate on both interfaces; fallback to cpal on every injected 
 **(d) Capture, paired endpoints and calibration.**
 Files: `audio-wasapi` (capture client, discontinuity flags, container-id pairing); `playback` (`record.rs` through the trait, `NativeObserver`); `ui-studio` (loopback wizard).
 Gate: the clock fit reaches `Measured` and the UI says "calibrated" with its uncertainty; the placement test lands within one frame; a second open converges (the annex's live-probe failure); the paired-domain fixture and its drifting-pair counter-case pass; an ADR 0015 hardware insert measures on WASAPI.
+
+Hardware verification (2026-10-22, Focusrite Scarlett 2i2 over USB, shared mode, 48 kHz, 480-frame period; run in `docs/benchmarks/2026-10-22-ryzen-5900x-scarlett-2i2.md`): the five ignored `hardware_` tests of `transit-audio-wasapi` pass (render, capture, lifecycle, enumeration, and duplex pairing by container id, with render and capture stamps agreeing in one host origin). The run found two capture defects, since fixed: WASAPI flags the first packet after Start as a discontinuity (now ignored, not counted as a loss), and the capture client's `IAudioClock` reads zero frames and zero QPC on this device, so capture stamps now come from the packet's own QPC (frame time) and a QPC read at the callback (callback time). The loopback calibration merged into the app's settings. The shared-mode round trip measured about 248 ms on the Scarlett through the Focusrite driver, the same through cpal's WASAPI backend, so it is the driver's shared-mode path and not the backend; that is why slice (e), exclusive/raw mode, is the path to tracking latency on this class of device.
 
 **(e) Exclusive mode; multichannel on the Model 12.**
 Files: `audio-wasapi` (`probe_exclusive`, alignment re-activation, valid-bits formats); `playback` `choose_output`; `ui-studio`.
