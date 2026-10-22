@@ -833,4 +833,39 @@ mod hardware_inserts {
         assert_eq!(t.app.engine.io_map().hardware_latency.len(), 1);
         assert!(t.app.status.contains("612 frames"), "{}", t.app.status);
     }
+
+    #[test]
+    fn transport_starts_are_refused_while_a_measurement_runs() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        for id in ["transport.play", "transport.toggle", "transport.record", "transport.half_speed", "transport.play_selection", "edit.play_timeline"]
+        {
+            t.app.status.clear();
+            let why = t.app.run(id, json!({})).unwrap_err();
+            assert_eq!(why, "Stop the hardware insert measurement first", "{id}");
+            assert_eq!(t.app.status, why, "{id}");
+        }
+        t.frames(3);
+        assert!(!t.app.is_playing());
+        assert!(t.app.engine.transport_requests.is_empty());
+        // Once it is done, Play works again.
+        probe(&mut t).result = Some(done(612, 0));
+        t.frames(3);
+        assert!(t.app.run("transport.play", json!({})).is_ok());
+    }
+
+    #[test]
+    fn reopening_the_device_cancels_a_pending_measurement_at_once() {
+        let mut t = with_fake_probe();
+        pick_pair(&mut t);
+        t.click(mid(item(&t, "hw_measure", "Measure")));
+        assert!(t.app.audio_devices.measuring.is_some());
+        t.app.reopen_audio().unwrap();
+        assert!(t.app.audio_devices.measuring.is_none());
+        assert_eq!(probe(&mut t).cancelled, 1);
+        t.frames(3);
+        assert_eq!(t.layout()["hardware"]["progress"], "");
+        assert_eq!(t.layout()["hardware"]["result"], "Measurement cancelled: the audio device was re-opened");
+    }
 }

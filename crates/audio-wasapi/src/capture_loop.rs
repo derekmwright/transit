@@ -102,23 +102,25 @@ pub(crate) struct CaptureConfig {
 struct Previous {
     frames: u32,
     qpc_100ns: u64,
-    /// The clock service's position read right after that packet's `GetBuffer`.
-    clock_frames: Option<u64>,
+    /// The device position just after that packet's last frame, or `None` when its position was
+    /// unreliable (a timestamp error).
+    end_position: Option<u64>,
 }
 
-/// Frames lost before `packet`, a discontinuity: the device position advanced by more than the
-/// frames delivered since the previous packet. With both clock positions that is
-/// `(clock - previous clock) - frames of this packet`; without either, the QPC time the packet
-/// starts late of where the previous one ended, at the stream rate. Clamped to one second. A packet
-/// with a timestamp error has no trustworthy position, so nothing is filled.
+/// Frames lost before `packet`, a discontinuity: how far the device position jumped past where the
+/// previous packet ended, `packet.device_position - (previous.device_position + previous.frames)`.
+/// That is exact however many packets one wake drains (a clock read after `GetBuffer` is the same
+/// for all of them). Only when the previous packet's position was unreliable does it fall back to
+/// the QPC time the packet starts late of where the previous one ended, at the stream rate. Clamped
+/// to one second. A packet with a timestamp error has no trustworthy position, so nothing is filled.
 fn gap_frames(previous: &Previous, packet: &Packet, rate: u32) -> u64 {
     if packet.timestamp_error {
         return 0;
     }
     let rate = u64::from(rate);
-    let lost = match (previous.clock_frames, packet.clock) {
-        (Some(before), Some(now)) => now.frames.saturating_sub(before).saturating_sub(u64::from(packet.frames)),
-        _ => {
+    let lost = match previous.end_position {
+        Some(end) => packet.device_position.saturating_sub(end),
+        None => {
             let ended = previous.qpc_100ns.saturating_add(u64::from(previous.frames) * 10_000_000 / rate.max(1));
             let late = u128::from(packet.qpc_100ns.saturating_sub(ended));
             u64::try_from(late * u128::from(rate) / 10_000_000).unwrap_or(u64::MAX)
@@ -174,7 +176,8 @@ pub(crate) fn run(
                     let gap = gap_frames(previous, packet, config.format.rate);
                     fill_gap(capture, scratch, channels, config, &mut stamper, packet, gap);
                 }
-                previous = Some(Previous { frames: packet.frames, qpc_100ns: packet.qpc_100ns, clock_frames: packet.clock.map(|c| c.frames) });
+                let end_position = (!packet.timestamp_error).then(|| packet.device_position.saturating_add(u64::from(packet.frames)));
+                previous = Some(Previous { frames: packet.frames, qpc_100ns: packet.qpc_100ns, end_position });
                 let stamp = stamper.stamp(packet, config.origin.now_ns());
                 let bytes = if packet.silent { None } else { bytes };
                 let mut source = ConvertSource { scratch: &mut *scratch, channels, frames: packet.frames as usize, bytes, wire: config.wire };
@@ -290,6 +293,10 @@ mod tests {
         position: u64,
         fail_read: Option<Fault>,
         clock_ok: bool,
+        /// The device position when the wake happened, read once for every packet of the wake.
+        wake_end: Option<u64>,
+        /// Read the clock like the device: once per wake, the same for every packet drained in it.
+        shared_clock: bool,
         bytes: Vec<u8>,
         halts: u32,
         gets: u32,
@@ -306,6 +313,8 @@ mod tests {
                 position: 0,
                 fail_read: None,
                 clock_ok: true,
+                wake_end: None,
+                shared_clock: false,
                 bytes: vec![0; 4 * CHANNELS * 4 * PERIOD as usize],
                 halts: 0,
                 gets: 0,
@@ -324,6 +333,7 @@ mod tests {
         fn wait(&mut self, _timeout_ms: u32) -> Wake {
             match self.steps.pop_front() {
                 Some(Step::Wake(packets)) => {
+                    self.wake_end = Some(self.position + packets.iter().map(|p| p.skip + u64::from(p.frames)).sum::<u64>());
                     self.waiting = packets.into();
                     Wake::Event
                 }
@@ -366,9 +376,9 @@ mod tests {
                 device_position: self.position,
                 qpc_100ns: self.qpc_of(self.position),
                 // The position read after GetBuffer is the end of the data captured so far.
-                clock: self.clock_ok.then(|| Position {
-                    frames: self.position + u64::from(scripted.frames),
-                    qpc_100ns: self.qpc_of(self.position + u64::from(scripted.frames)),
+                clock: self.clock_ok.then(|| {
+                    let at = self.shared_clock.then_some(self.wake_end).flatten().unwrap_or(self.position + u64::from(scripted.frames));
+                    Position { frames: at, qpc_100ns: self.qpc_of(at) }
                 }),
             };
             let len = scripted.frames as usize * CHANNELS * 4;
@@ -513,15 +523,30 @@ mod tests {
     }
 
     #[test]
-    fn a_discontinuity_without_a_readable_position_uses_the_qpc_estimate() {
-        let mut device = Fake::new([Step::Wake(vec![normal(), lost(480), normal()])]);
-        device.clock_ok = false;
+    fn a_discontinuity_after_an_unreadable_position_uses_the_qpc_estimate() {
+        let unreliable = ScriptedPacket { timestamp_error: true, ..normal() };
+        let mut device = Fake::new([Step::Wake(vec![normal(), unreliable, lost(480), normal()])]);
         let config = config(None);
         let run = drive(&mut device, &config);
         assert_eq!(config.filled.load(Ordering::Relaxed), 480);
-        let filler: usize = run.seen[1..run.seen.len() - 2].iter().map(|s| s.frames).sum();
+        let filler: usize = run.seen[2..run.seen.len() - 2].iter().map(|s| s.frames).sum();
         assert_eq!(filler, 480);
-        assert!(run.seen[1..run.seen.len() - 2].iter().all(|s| s.all_zero));
+        assert!(run.seen[2..run.seen.len() - 2].iter().all(|s| s.all_zero));
+    }
+
+    #[test]
+    fn packets_drained_in_one_wake_with_a_gap_in_the_middle_fill_exactly_the_positional_gap() {
+        // The clock is read at the same instant for every packet of a wake, so a clock delta
+        // cannot see this gap's size; the packets' own positions can.
+        let mut device = Fake::new([Step::Wake(vec![normal(), normal(), normal(), lost(900), normal(), normal(), normal()])]);
+        device.shared_clock = true;
+        let config = config(None);
+        let run = drive(&mut device, &config);
+        assert_eq!(config.filled.load(Ordering::Relaxed), 900);
+        let filler: usize = run.seen[3..run.seen.len() - 4].iter().map(|s| s.frames).sum();
+        assert_eq!(filler, 900);
+        assert!(run.seen[3..run.seen.len() - 4].iter().all(|s| s.all_zero));
+        assert_eq!(run.seen[run.seen.len() - 4].position, Some(3 * u64::from(PERIOD) + 900));
     }
 
     #[test]

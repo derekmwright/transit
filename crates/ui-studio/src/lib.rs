@@ -475,6 +475,21 @@ impl StudioApp {
             self.status = reason.into();
             return Err(reason.into());
         }
+        if self.audio_devices.measuring.is_some()
+            && matches!(
+                id,
+                "transport.play"
+                    | "transport.toggle"
+                    | "transport.record"
+                    | "transport.half_speed"
+                    | "transport.play_selection"
+                    | "edit.play_timeline"
+            )
+        {
+            // Playback would bleed into the return the measurement is listening on.
+            self.status = crate::hardware_measure::REFUSED_TRANSPORT.into();
+            return Err(self.status.clone());
+        }
         if id == "ui.set" {
             return self.set_ui(&params);
         }

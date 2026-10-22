@@ -15,6 +15,12 @@ use std::time::{Duration, Instant};
 /// How long to wait for the audio thread to finish a measurement (it needs about 2.3 s of audio).
 const WAIT: Duration = Duration::from_secs(8);
 
+/// The refusal of a transport start while the window's measurement runs.
+pub(crate) const REFUSED_TRANSPORT: &str = "Stop the hardware insert measurement first";
+
+/// Why a measurement ended early when the audio device was re-opened under it.
+pub(crate) const CANCELLED_REOPEN: &str = "Measurement cancelled: the audio device was re-opened";
+
 fn message(error: &EngineError) -> String {
     match error {
         EngineError::BadParams(_, why) | EngineError::Disabled(_, why) => why.clone(),
