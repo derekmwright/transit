@@ -4,7 +4,7 @@
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use crate::convert::{ConvertSource, Wire};
-use crate::render_loop::{Exit, Fault, Held, Position, Wake, contain, fail, quality_of, relative_ns};
+use crate::render_loop::{Exit, Fault, Held, Wake, contain, fail, quality_of, relative_ns};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use transit_audio_backend::{Calibration, CaptureBlock, CaptureCallback, ErrorCallback, Format, HostOrigin, Stamp, StreamError};
@@ -31,9 +31,6 @@ pub(crate) struct Packet {
     pub(crate) device_position: u64,
     /// The QPC time of the packet's first frame, in 100 ns units.
     pub(crate) qpc_100ns: u64,
-    /// The clock service's position read right after `GetBuffer` (the callback instant), or
-    /// `None` when it could not be read.
-    pub(crate) clock: Option<Position>,
 }
 
 /// The calls the loop makes on a started capture client.
@@ -53,28 +50,33 @@ pub(crate) trait CaptureDevice {
 pub(crate) struct CaptureStamper {
     origin_qpc: u64,
     origin_ns: i64,
+    rate: u32,
     calibration: Option<Calibration>,
     last: Held,
 }
 
 impl CaptureStamper {
-    pub(crate) fn new(origin_qpc_100ns: u64, origin_ns: i64, calibration: Option<Calibration>) -> Self {
-        Self { origin_qpc: origin_qpc_100ns, origin_ns, calibration, last: Held::default() }
+    pub(crate) fn new(origin_qpc_100ns: u64, origin_ns: i64, rate: u32, calibration: Option<Calibration>) -> Self {
+        Self { origin_qpc: origin_qpc_100ns, origin_ns, rate, calibration, last: Held::default() }
     }
 
-    /// The callback instant is the position read after `GetBuffer`; the frame time is the QPC of the
-    /// packet's first frame, moved earlier by the calibrated round trip when there is one. A
+    /// In the stamps' own time, from the packet's QPC alone (the capture client's audio clock is not
+    /// read: it can report zero on real devices). The frame time is the QPC of the packet's first
+    /// frame, moved earlier by the calibrated round trip when there is one; the callback time is that
+    /// QPC plus the packet's duration, when the packet was complete and readable. A
     /// real discontinuity (discontinuity, which the caller has already cleared for the stream's first
-    /// packet, whose flag is expected and means no loss), a timestamp error or an unreadable clock gives
+    /// packet, whose flag is expected and means no loss), a timestamp error or a missing host time gives
     /// an invalid stamp (the clock fit restarts) and forgets the history.
     pub(crate) fn stamp(&mut self, packet: &Packet, discontinuity: bool, host_ns: Option<u64>) -> Stamp {
-        let (Some(clock), Some(host_ns)) = (packet.clock, host_ns) else { return self.invalid() };
+        let Some(host_ns) = host_ns else { return self.invalid() };
         if packet.timestamp_error || discontinuity || packet.frames == 0 {
             return self.invalid();
         }
-        let callback = relative_ns(clock.qpc_100ns, self.origin_qpc, self.origin_ns);
+        let first = relative_ns(packet.qpc_100ns, self.origin_qpc, self.origin_ns);
+        let duration = i64::try_from(u128::from(packet.frames) * 1_000_000_000 / u128::from(self.rate.max(1))).unwrap_or(i64::MAX);
+        let callback = first.saturating_add(duration);
         let round_trip = self.calibration.map_or(0, |c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
-        let frame = relative_ns(packet.qpc_100ns, self.origin_qpc, self.origin_ns).saturating_sub(round_trip);
+        let frame = first.saturating_sub(round_trip);
         let (callback, frame, host) = self.last.hold(callback, frame, host_ns, true);
         let (quality, offset_uncertainty_ns) = quality_of(self.calibration);
         Stamp { host_callback_ns: host, backend_callback_ns: callback, backend_frame_ns: frame, quality, offset_uncertainty_ns }
@@ -294,11 +296,6 @@ mod tests {
         /// Device frames delivered so far (the position of the next packet).
         position: u64,
         fail_read: Option<Fault>,
-        clock_ok: bool,
-        /// The device position when the wake happened, read once for every packet of the wake.
-        wake_end: Option<u64>,
-        /// Read the clock like the device: once per wake, the same for every packet drained in it.
-        shared_clock: bool,
         bytes: Vec<u8>,
         halts: u32,
         gets: u32,
@@ -314,9 +311,6 @@ mod tests {
                 lossy: None,
                 position: 0,
                 fail_read: None,
-                clock_ok: true,
-                wake_end: None,
-                shared_clock: false,
                 bytes: vec![0; 4 * CHANNELS * 4 * PERIOD as usize],
                 halts: 0,
                 gets: 0,
@@ -335,7 +329,6 @@ mod tests {
         fn wait(&mut self, _timeout_ms: u32) -> Wake {
             match self.steps.pop_front() {
                 Some(Step::Wake(packets)) => {
-                    self.wake_end = Some(self.position + packets.iter().map(|p| p.skip + u64::from(p.frames)).sum::<u64>());
                     self.waiting = packets.into();
                     Wake::Event
                 }
@@ -377,11 +370,6 @@ mod tests {
                 timestamp_error: scripted.timestamp_error,
                 device_position: self.position,
                 qpc_100ns: self.qpc_of(self.position),
-                // The position read after GetBuffer is the end of the data captured so far.
-                clock: self.clock_ok.then(|| {
-                    let at = self.shared_clock.then_some(self.wake_end).flatten().unwrap_or(self.position + u64::from(scripted.frames));
-                    Position { frames: at, qpc_100ns: self.qpc_of(at) }
-                }),
             };
             let len = scripted.frames as usize * CHANNELS * 4;
             // Sample k of the device is the float k / 1000 in each packet, so a test can see order.
@@ -405,7 +393,7 @@ mod tests {
         CaptureConfig {
             format: Format::new(RATE, CHANNELS as u16, SampleFormat::F32),
             wire: Wire::F32,
-            stamper: CaptureStamper::new(ORIGIN_QPC, 0, calibration),
+            stamper: CaptureStamper::new(ORIGIN_QPC, 0, RATE, calibration),
             origin: HostOrigin::default(),
             timeout_ms: 250,
             filled: Arc::new(AtomicU64::new(0)),
@@ -538,10 +526,8 @@ mod tests {
 
     #[test]
     fn packets_drained_in_one_wake_with_a_gap_in_the_middle_fill_exactly_the_positional_gap() {
-        // The clock is read at the same instant for every packet of a wake, so a clock delta
-        // cannot see this gap's size; the packets' own positions can.
+        // The gap's size comes from the packets' own positions and QPC times.
         let mut device = Fake::new([Step::Wake(vec![normal(), normal(), normal(), lost(900), normal(), normal(), normal()])]);
-        device.shared_clock = true;
         let config = config(None);
         let run = drive(&mut device, &config);
         assert_eq!(config.filled.load(Ordering::Relaxed), 900);
@@ -613,12 +599,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_clock_gives_invalid_stamps_and_keeps_capturing() {
-        let mut device = Fake::wakes(3);
-        device.clock_ok = false;
+    fn a_missing_host_time_gives_an_invalid_stamp() {
+        let mut stamper = CaptureStamper::new(ORIGIN_QPC, 0, RATE, None);
+        let packet =
+            Packet { frames: PERIOD, silent: false, discontinuity: false, timestamp_error: false, device_position: 0, qpc_100ns: ORIGIN_QPC };
+        assert_eq!(stamper.stamp(&packet, false, None).quality, Quality::Invalid);
+        assert_ne!(stamper.stamp(&packet, false, Some(1)).quality, Quality::Invalid);
+    }
+
+    #[test]
+    fn the_callback_is_one_packet_duration_after_the_frame_and_no_stamp_is_invalid() {
+        let mut device = Fake::wakes(10);
         let run = drive(&mut device, &config(None));
-        assert_eq!((run.exit, run.seen.len(), run.errors.len()), (Exit::Stopped, 3, 0));
-        assert!(run.seen.iter().all(|s| s.stamp.quality == Quality::Invalid));
+        let duration = i64::from(PERIOD) * 1_000_000_000 / i64::from(RATE);
+        assert_eq!(run.seen.len(), 10);
+        for seen in &run.seen {
+            assert_ne!(seen.stamp.quality, Quality::Invalid);
+            assert_eq!(seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns, duration);
+        }
     }
 
     #[test]
@@ -633,8 +631,8 @@ mod tests {
             assert!(b.backend_callback_ns >= a.backend_callback_ns);
         }
         for seen in &run.seen {
-            // The frame time is the packet's first frame; the callback is the read after it.
-            assert!(seen.stamp.backend_frame_ns <= seen.stamp.backend_callback_ns);
+            // The frame time is the packet's first frame; the callback is one packet duration later.
+            assert_eq!(seen.stamp.backend_callback_ns - seen.stamp.backend_frame_ns, period_ns);
         }
         assert_eq!(run.seen[0].stamp.backend_frame_ns, 0, "the first packet starts at the origin instant");
     }

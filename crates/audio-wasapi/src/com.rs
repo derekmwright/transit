@@ -623,8 +623,6 @@ impl RenderDevice for Live {
 struct LiveCapture {
     client: IAudioClient,
     capture: IAudioCaptureClient,
-    clock: IAudioClock2,
-    clock_frequency: u64,
     event: Event,
     stop: Arc<Event>,
     fmt: Fmt,
@@ -640,26 +638,12 @@ impl LiveCapture {
         // SAFETY: the client is initialized (event-driven); `SetEventHandle` takes a live event
         // handle that outlives the client (`event` is a field of `LiveCapture`); `GetService` asks
         // the initialized client for its services.
-        let (capture, clock, latency) = unsafe {
+        let (capture, latency) = unsafe {
             client.SetEventHandle(event.0).map_err(|e| open_error("SetEventHandle", &e))?;
             let capture = client.GetService::<IAudioCaptureClient>().map_err(|e| open_error("IAudioCaptureClient", &e))?;
-            let clock = client.GetService::<IAudioClock>().map_err(|e| open_error("IAudioClock", &e))?;
-            (capture, clock, client.GetStreamLatency().unwrap_or(0))
+            (capture, client.GetStreamLatency().unwrap_or(0))
         };
-        let clock_frequency = unsafe_frequency(&clock)?;
-        let clock = clock.cast::<IAudioClock2>().map_err(|e| open_error("IAudioClock2", &e))?;
-        Ok(Self {
-            client,
-            capture,
-            clock,
-            clock_frequency,
-            event,
-            stop,
-            fmt,
-            period_frames,
-            latency_100ns: latency,
-            calibration: params.request.calibration,
-        })
+        Ok(Self { client, capture, event, stop, fmt, period_frames, latency_100ns: latency, calibration: params.request.calibration })
     }
 
     /// Capture the `(QPC, Instant)` origin pair and start the stream.
@@ -667,7 +651,7 @@ impl LiveCapture {
         let (qpc_100ns, origin_ns) = origin_pair(origin)?;
         // SAFETY: `Start` on an initialized client whose event handle is set; it is called once.
         unsafe { self.client.Start() }.map_err(|e| open_error("Start", &e))?;
-        Ok(CaptureStamper::new(qpc_100ns, origin_ns, self.calibration))
+        Ok(CaptureStamper::new(qpc_100ns, origin_ns, self.fmt.rate, self.calibration))
     }
 }
 
@@ -726,7 +710,6 @@ impl CaptureDevice for LiveCapture {
                 timestamp_error: flags & BUFFER_TIMESTAMP_ERROR != 0,
                 device_position: position,
                 qpc_100ns: qpc,
-                clock: device_position(&self.clock, self.clock_frequency, self.fmt.rate).ok(),
             };
             let capture = &self.capture;
             // If `fill` unwinds, hand the packet back unread so the buffer is never left outstanding.
