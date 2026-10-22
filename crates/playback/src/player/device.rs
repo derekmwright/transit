@@ -1080,6 +1080,23 @@ impl Player {
         }
         trouble
     }
+    /// Whether the open device must be reopened because its driver asked for it, and why. Unlike
+    /// [`Self::trouble`] this is not said once: it holds for the life of this Player, which the
+    /// app replaces to reopen the device ([`crate::reopen`]). `None` for a silent runtime and for
+    /// any other trouble (a bug, a lost device).
+    pub fn reopen_cause(&self) -> Option<crate::reopen::ReopenCause> {
+        let fault = &self.fault;
+        if self.silent || fault.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        fault.reset.load(Ordering::Acquire).then_some(crate::reopen::ReopenCause::DriverReset)
+    }
+    /// Whether the native backend that serves the device has its host thread blocked in a driver
+    /// call (an ASIO driver's settings panel is open): a reopen now would be refused, so the app
+    /// waits for it. False for cpal and for a silent runtime.
+    pub fn host_blocked(&self, config: &AudioConfig) -> bool {
+        self.native_factory.as_ref().and_then(|native| native.backend(config.system.as_deref())).is_some_and(|backend| backend.host_blocked())
+    }
     pub fn open_input(&self, config: &AudioConfig) -> Result<record::Recorder, String> {
         let mut input = self.input.try_borrow_mut().map_err(|_| "input transition is busy")?;
         match &mut *input {
@@ -1368,7 +1385,7 @@ fn error_callback(
     move |error| {
         crate::mark_audio_thread();
         // A driver's reset request (ASIO) stops the output like a lost device, but is said as
-        // itself: the device is reopened by the user (the full reopen is ASIO slice d).
+        // itself: the app reopens the device ([`crate::reopen`], `Player::reopen_cause`).
         let reset = matches!(error, ab::StreamError::ResetRequested);
         if reset {
             fault.reset.store(true, Ordering::Release);

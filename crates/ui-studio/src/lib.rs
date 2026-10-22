@@ -265,6 +265,12 @@ pub struct StudioApp {
     /// Punch range to trim the take to (loop recording only in this UI).
     punch: Option<Range>,
     recorder_failed: bool,
+    /// When to reopen the device after its driver asked for it (ASIO reset), and what to say.
+    pub(crate) reopen: soundcraft_playback::reopen::Reopener,
+    /// Opens the replacement Player of an automatic reopen in tests (a scripted driver); the app
+    /// uses `Player::with_config`.
+    #[cfg(test)]
+    pub(crate) reopen_with: Option<Box<dyn Fn(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player>>,
     lost_shown: u64,
     take_plan: Option<soundcraft_engine::io::Recording>,
     pub ui: UiState,
@@ -371,6 +377,9 @@ impl StudioApp {
             test_approximate_start: false,
             punch: None,
             recorder_failed: false,
+            reopen: soundcraft_playback::reopen::Reopener::default(),
+            #[cfg(test)]
+            reopen_with: None,
             lost_shown: 0,
             take_plan: None,
             ui: UiState::default(),
@@ -776,6 +785,7 @@ impl StudioApp {
         }
         self.watch_output();
         self.watch_input();
+        self.step_reopen();
         self.save_good_audio();
         finish::step_bounce(self, ctx);
         import::step(self, ctx);

@@ -33,7 +33,8 @@ impl StudioApp {
     /// change of the engine's table to the audio thread and the preferences. Without a real
     /// device (`--no-audio`, the silent fallback) there is nothing to open or keep.
     pub(crate) fn sync_io(&mut self) {
-        let Some(player) = self.player.as_ref().filter(|p| !p.silent) else { return };
+        // A Player waiting to be reopened after a driver reset gets the table with its successor.
+        let Some(player) = self.player.as_ref().filter(|p| !p.silent && p.reopen_cause().is_none()) else { return };
         if self.io_adopt {
             let map = adopt(&self.ui.io_maps, (*player.io_map()).clone());
             self.engine.set_io_map(map);

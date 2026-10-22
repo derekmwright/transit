@@ -26,6 +26,7 @@ pub mod plan_bridge;
 pub mod player;
 pub mod publication;
 pub mod record;
+pub mod reopen;
 pub mod scheduling;
 pub mod telemetry;
 pub mod timeline_map;

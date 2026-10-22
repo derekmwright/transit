@@ -388,7 +388,10 @@ impl StudioApp {
         self.audio_devices.input_reported = None;
         let (opened, captured) = if self.player.is_some() || self.audio_devices.fake.is_some() {
             let captured = match self.reconnect_audio_using(true, soundcraft_playback::Player::with_config) {
-                Ok(captured) => captured,
+                Ok(captured) => {
+                    self.reopen.reconnected();
+                    captured
+                }
                 Err(error) => {
                     self.player_requests.fail(&mut self.status, error.clone());
                     return Err(error);
@@ -483,7 +486,9 @@ impl StudioApp {
         match devices::native_asio_control_panel(driver) {
             Ok(rx) => {
                 self.audio_devices.panel = Some(rx);
-                self.status = format!("“{driver}” driver settings are open. Reconnect after changing the buffer size or the rate.");
+                self.status = format!(
+                    "“{driver}” driver settings are open. A driver that asks for a reset is reopened when they close; otherwise Reconnect after changing the buffer size or the rate."
+                );
             }
             Err(e) => self.status = format!("ASIO driver settings: {e}"),
         }
@@ -495,7 +500,11 @@ impl StudioApp {
         match rx.try_recv() {
             Ok(Ok(())) => {
                 self.audio_devices.panel = None;
-                self.status = "ASIO driver settings closed. If you changed the buffer size or the rate, use Reconnect.".into();
+                self.status = if self.reopen.pending() {
+                    "ASIO driver settings closed. The driver asked for a reset: reopening the device.".into()
+                } else {
+                    "ASIO driver settings closed. If you changed the buffer size or the rate, use Reconnect.".into()
+                };
             }
             Ok(Err(e)) => {
                 self.audio_devices.panel = None;
@@ -1041,6 +1050,8 @@ fn opened_lines(app: &mut StudioApp, now: f64) -> Vec<String> {
         (None, None) => "Input open: none yet (it opens when a track is armed or monitored)".into(),
     });
     lines.extend(input.map(|s| crate::telemetry::backend_line(&s, true, input_rate)));
+    // After a driver reset: what the automatic reopen did and does next, with its counts.
+    lines.extend(app.reopen.status(app.audio_devices.panel.is_some()));
     lines
 }
 

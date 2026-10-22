@@ -1189,10 +1189,12 @@ fn a_driver_reset_request_stops_the_output_and_says_so_once() {
     let cfg = asio_config();
     let player = open_asio(&fake, &cfg);
     let mut recorder = player.open_input(&cfg).unwrap();
+    assert_eq!(player.reopen_cause(), None);
     assert!(fake.inject_error(ab::Direction::Output, ab::StreamError::ResetRequested));
     assert!(!player.is_playing());
     assert_eq!(player.trouble(), Some(OutputTrouble::ResetRequested));
     assert_eq!(player.trouble(), None, "said once");
+    assert_eq!(player.reopen_cause(), Some(crate::reopen::ReopenCause::DriverReset), "the cause holds: the app reopens the device");
     assert_eq!(player.callback_telemetry().device_lost_errors, 0, "a reset is not a lost device");
     assert!(fake.inject_error(ab::Direction::Input, ab::StreamError::ResetRequested));
     assert_eq!(recorder.trouble(), Some(crate::record::Trouble::Device(crate::RESET_REQUESTED_TEXT.into())));

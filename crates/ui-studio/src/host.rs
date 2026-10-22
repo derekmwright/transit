@@ -328,6 +328,11 @@ impl StudioApp {
         if self.engine.transport_requests.contains(&TransportRequest::ResetSession) {
             return false;
         }
+        // A Player whose driver asked to be reset is about to be replaced (`step_reopen`), with
+        // the session as it is then; its faulted runtime takes no more work.
+        if p.reopen_cause().is_some() {
+            return false;
+        }
         let session = self.engine.session_arc();
         if !self.restore_pending && self.last_rev == self.engine.revision && p.has_requested_session(&session) {
             return true;
@@ -757,6 +762,16 @@ impl StudioApp {
             OutputTrouble::ResetRequested => (soundcraft_playback::RESET_REQUESTED_TEXT.to_string(), "Use Audio › Reconnect Device."),
         };
         let (recording, playing) = (self.recording_active(), self.engine.transport.playing);
+        // A driver that asked to be reset is reopened by the app (`step_reopen`); a take in
+        // progress ends here and is kept, never spliced onto the reopened stream.
+        if let Some(cause) = p.reopen_cause() {
+            self.stop_for_reopen();
+            let now = self.last_frame.unwrap_or_default();
+            if self.reopen.trouble(cause, now) || recording || playing {
+                self.status = reopen_note(&self.reopen, recording, playing);
+            }
+            return;
+        }
         if recording || playing {
             self.stop_play();
         }
@@ -788,6 +803,15 @@ impl StudioApp {
             Trouble::Device(what) => {
                 self.close_input();
                 self.recorder_failed = true;
+                // The input's half of a driver reset: the device reopens with both directions.
+                if let Some(cause) = self.player.as_ref().and_then(Player::reopen_cause) {
+                    self.stop_for_reopen();
+                    let now = self.last_frame.unwrap_or_default();
+                    if self.reopen.trouble(cause, now) || recording {
+                        self.status = reopen_note(&self.reopen, recording, false);
+                    }
+                    return;
+                }
                 (what, "Reconnect it, then use Audio › Reconnect Device.")
             }
             Trouble::Disk(what) => (what, "Check the disk, then record again."),
@@ -802,9 +826,84 @@ impl StudioApp {
     /// Reopen audio with editors closed before teardown. Never interrupt a recording.
     pub fn reconnect_audio(&mut self) {
         match self.reconnect_audio_using(true, Player::with_config) {
-            Ok(false) => self.status = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.".into(),
-            Ok(true) => {}
+            Ok(captured) => {
+                self.reopen.reconnected();
+                if !captured {
+                    self.status = STATE_FROM_DOCUMENT.into();
+                }
+            }
             Err(error) => self.player_requests.fail(&mut self.status, error),
+        }
+    }
+
+    /// Stops the transport of a Player whose driver asked to be reset, for good: a take in
+    /// progress ends and is kept (`stop_play`), and since its faulted runtime acknowledges nothing
+    /// the transport stops here, and the requests it refused are not shown as the user's errors.
+    fn stop_for_reopen(&mut self) {
+        if self.recording_active() || self.engine.transport.playing {
+            self.stop_play();
+        }
+        self.complete_stop();
+        self.player_requests.reset();
+        self.player_requests.error = None;
+    }
+
+    /// The automatic reopen after a driver reset ([`soundcraft_playback::reopen`]): once the
+    /// attempt is due, and never while the driver's settings panel holds the driver or a take is
+    /// still being finished, the device is reopened with the same choices through the one reopen
+    /// path (`reconnect_audio_using`), which also takes the input again for monitoring and arming.
+    pub(crate) fn step_reopen(&mut self) {
+        let now = self.last_frame.unwrap_or_default();
+        // The cause holds for the life of the Player: a report another check consumed first
+        // still starts the reopen.
+        if let Some(cause) = self.player.as_ref().and_then(Player::reopen_cause)
+            && self.reopen.trouble(cause, now)
+        {
+            let (recording, playing) = (self.recording_active(), self.is_playing());
+            self.stop_for_reopen();
+            self.status = reopen_note(&self.reopen, recording, playing);
+        }
+        let cfg = self.ui.audio.clone();
+        let blocked = self.audio_devices.panel.is_some() || self.player.as_ref().is_some_and(|p| p.host_blocked(&cfg));
+        if !self.reopen.due(now, blocked) {
+            return;
+        }
+        if self.recording_active() {
+            // A take started since (on a runtime that took no work): it ends before the device goes.
+            self.stop_for_reopen();
+        }
+        #[cfg(test)]
+        let result = match self.reopen_with.take() {
+            Some(open) => {
+                let result = self.reconnect_audio_using(true, |session, cfg| open(session, cfg));
+                self.reopen_with = Some(open);
+                result
+            }
+            None => self.reconnect_audio_using(true, Player::with_config),
+        };
+        #[cfg(not(test))]
+        let result = self.reconnect_audio_using(true, Player::with_config);
+        let player = self.player.as_ref();
+        let opened = result.is_ok() && player.is_some_and(|p| !p.silent && p.reopen_cause().is_none());
+        self.reopen.attempted(opened, now);
+        let name = player.map_or_else(String::new, |p| p.device_name.clone());
+        let why = match &result {
+            Err(error) => error.clone(),
+            Ok(_) => player.and_then(Player::initial_error).unwrap_or("it did not open").to_owned(),
+        };
+        self.status = if opened {
+            format!("“{name}” reopened after the driver reset.")
+        } else if self.reopen.gave_up() {
+            format!(
+                "The device did not reopen after the driver reset ({why}), after {} attempts. Use Audio › Reconnect Device.",
+                soundcraft_playback::reopen::REOPEN_ATTEMPTS
+            )
+        } else {
+            format!("The device did not reopen after the driver reset yet ({why}); trying again.")
+        };
+        if matches!(result, Ok(false)) {
+            self.status.push(' ');
+            self.status.push_str(STATE_FROM_DOCUMENT);
         }
     }
 
@@ -1589,4 +1688,23 @@ fn rec_event(offset: Samples, e: &soundcraft_playback::midi_capture::CapturedEve
         Message::Control14 { .. } => return None,
     };
     Some(soundcraft_engine::midi_take::RecEvent { track: e.track, channel: e.channel, offset, msg })
+}
+
+/// Said when a reopen could not take the plug-ins' live state and used the document's.
+const STATE_FROM_DOCUMENT: &str = "Audio recovered from the document state; live plug-in state was unavailable after the audio fault.";
+
+/// The status line when a driver reset stops the device and the app reopens it.
+fn reopen_note(reopen: &soundcraft_playback::reopen::Reopener, recording: bool, playing: bool) -> String {
+    let next = if reopen.gave_up() {
+        format!("The device did not reopen after {} attempts; use Audio › Reconnect Device.", soundcraft_playback::reopen::REOPEN_ATTEMPTS)
+    } else {
+        "Reopening the device.".to_owned()
+    };
+    if recording {
+        format!("Recording ended: driver reset. The take is kept up to there. {next}")
+    } else if playing {
+        format!("Playback stopped: driver reset. {next}")
+    } else {
+        format!("Driver reset. {next}")
+    }
 }

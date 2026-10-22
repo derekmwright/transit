@@ -1111,6 +1111,183 @@ fn the_held_native_asio_input_shows_as_open_and_measure_is_enabled_on_it() {
     T::rect(&t.layout()["controls"], Some("Measure"), "hw_measure");
 }
 
+/// A native ASIO Player over the scripted duplex `driver` as the running device, with the window's
+/// stand-in devices gone (a reopen goes through the real reopen path) and every automatic reopen
+/// opening `reopen` (no device is listed or opened).
+fn asio_rig(
+    driver: &transit_audio_backend::fake::FakeBackend,
+    reopen: impl Fn(std::sync::Arc<soundcraft_model::Session>, &AudioConfig) -> soundcraft_playback::Player + 'static,
+) -> T {
+    let cfg =
+        AudioConfig { backend: Backend::NativeAsio, system: Some("ASIO".into()), output: Some("Focusrite USB ASIO".into()), ..Default::default() };
+    let mut t = T::new();
+    let player = soundcraft_playback::Player::open_fake_native_asio(t.app.engine.session_arc(), &cfg, driver).unwrap();
+    t.app.player = Some(player);
+    t.app.ui.audio = cfg;
+    t.app.audio_devices.fake = None;
+    t.app.reopen_with = Some(Box::new(reopen));
+    t
+}
+
+/// Delivers `error` to `direction`'s error callback from a thread of its own, as a driver does (the
+/// callback marks its thread as an audio thread, whose panics the engine's hook keeps quiet).
+fn inject(
+    driver: &transit_audio_backend::fake::FakeBackend,
+    direction: transit_audio_backend::Direction,
+    error: transit_audio_backend::StreamError,
+) -> bool {
+    std::thread::scope(|s| s.spawn(|| driver.inject_error(direction, error)).join().unwrap())
+}
+
+/// Runs `n` frames with the audio side running too: a block of the scripted driver per frame (on a
+/// thread of its own, as a driver calls) while the device runs, else a block of the device-free
+/// player a failed reopen left (the app's silent clock).
+fn run(t: &mut T, driver: &transit_audio_backend::fake::FakeBackend, n: usize) {
+    use transit_audio_backend as ab;
+    for _ in 0..n {
+        match &t.app.player {
+            Some(p) if p.silent => p.step_device_free(),
+            Some(p) if p.reopen_cause().is_none() => std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut data = [0.0f32; 512];
+                    driver.pump_render(256, ab::Stamp::INVALID, &mut ab::fake::SliceSink { data: &mut data, channels: 2 });
+                });
+            }),
+            _ => {}
+        }
+        t.frames(1);
+    }
+}
+
+fn scarlett_driver() -> transit_audio_backend::fake::FakeBackend {
+    use transit_audio_backend as ab;
+    ab::fake::FakeBackend::new(ab::Format::new(48_000, 2, ab::SampleFormat::I32)).named("ASIO", "Focusrite USB ASIO").with_capture(2, true)
+}
+
+/// The driver asks for a reset (its buffer size changed in its own panel): output and input are
+/// reopened with the same choices without user action, once the driver has settled.
+#[test]
+fn a_driver_reset_reopens_the_native_asio_output_and_input_without_user_action() {
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    let opens = driver.opens().len();
+    assert_eq!(opens, 2, "input and output");
+    t.app.add_track("audio").unwrap();
+    let track = t.app.engine.session().tracks[0].id;
+    t.app.engine.session_mut().track_mut(track).unwrap().mixer.input_monitor = true;
+    run(&mut t, &driver, 10);
+    assert!(t.app.recorder.is_some(), "a monitored track took the input");
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    assert!(inject(&driver, ab::Direction::Input, ab::StreamError::ResetRequested));
+    run(&mut t, &driver, 1);
+    assert_eq!(t.app.status, "Driver reset. Reopening the device.");
+    assert!(t.app.reopen.pending());
+    assert_eq!(driver.opens().len(), opens, "not before the driver settles");
+    run(&mut t, &driver, 20);
+    let reopened: Vec<ab::Direction> = driver.opens()[opens..].iter().map(|(d, _)| *d).collect();
+    assert_eq!(reopened, [ab::Direction::Input, ab::Direction::Output], "both reopened, the input first (ASIO's open order)");
+    assert!(driver.running(ab::Direction::Output) && driver.running(ab::Direction::Input));
+    let p = t.app.player.as_ref().unwrap();
+    assert!(!p.silent && p.reopen_cause().is_none(), "the new player runs");
+    assert!(t.app.recorder.as_mut().is_some_and(|r| r.trouble().is_none()), "and monitoring has the reopened input again");
+    assert_eq!(t.app.status, "“Focusrite USB ASIO” reopened after the driver reset.");
+    assert_eq!(t.app.reopen.status(false).as_deref(), Some("Recovery: driver reset, reopened automatically (resets 1, reopened 1)"));
+    run(&mut t, &driver, 60);
+    assert_eq!(driver.opens().len(), opens + 2, "once");
+}
+
+/// A reset while recording ends the take there and keeps it (it is never spliced onto the reopened
+/// stream), then the device reopens.
+#[test]
+fn a_driver_reset_while_recording_ends_the_take_keeps_it_and_then_reopens() {
+    use soundcraft_playback::record::start::Point;
+    use soundcraft_playback::timeline_map::Position;
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    let track = soundcraft_model::TrackId(t.app.run("track.new", json!({"kind": "midi"})).unwrap()["tracks"][0].as_u64().unwrap());
+    run(&mut t, &driver, 10);
+    t.app.take_plan = Some(soundcraft_engine::io::Recording {
+        start: 0,
+        pass: None,
+        punch: None,
+        rate: 48_000,
+        takes: Vec::new(),
+        midi_journal: None,
+        midi_placed: false,
+    });
+    t.app.engine.transport.recording = true;
+    let note = |frame, message| soundcraft_playback::midi_capture::CapturedEvent { frame, track, channel: 0, message, approximate: false };
+    let events = vec![
+        note(1_000, soundcraft_mix::Message::NoteOn { key: 60, velocity: 100, id: soundcraft_mix::NoteId::NONE }),
+        note(9_000, soundcraft_mix::Message::NoteOff { key: 60, velocity: 0, id: soundcraft_mix::NoteId::NONE }),
+    ];
+    let start = Point { host_ns: 0, output_frame: 0, position: Position { sample: 0, fraction: 0, denominator: 1 } };
+    t.app.finished_test_midi =
+        Some(soundcraft_playback::MidiTake { tracks: vec![track], start: Some(start), events, dropped: 0, device_rate: 48_000 });
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    run(&mut t, &driver, 1);
+    assert_eq!(t.app.status, "Recording ended: driver reset. The take is kept up to there. Reopening the device.");
+    assert_eq!(t.app.engine.session().track(track).unwrap().clips().len(), 1, "the take is kept");
+    run(&mut t, &driver, 30);
+    assert!(!t.app.recording_active());
+    assert_eq!(driver.opens().len(), 4, "then the device reopened");
+    assert_eq!(t.app.engine.session().track(track).unwrap().clips().len(), 1, "and nothing was spliced onto the take");
+    assert_eq!(t.app.reopen.reopened(), 1);
+}
+
+/// While the driver's settings panel holds the driver's host thread, the reopen waits for it (a
+/// reopen would be refused there), then runs.
+#[test]
+fn a_driver_reset_waits_for_the_settings_panel_to_close() {
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    driver.set_host_blocked(true);
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    run(&mut t, &driver, 120);
+    assert_eq!(driver.opens().len(), 2, "nothing reopened while the panel is open");
+    assert_eq!(t.app.reopen.attempt(), Some(1), "and no attempt used up");
+    assert!(t.app.reopen.status(true).unwrap().contains("waiting for the driver settings panel to close"));
+    driver.set_host_blocked(false);
+    run(&mut t, &driver, 2);
+    assert_eq!(driver.opens().len(), 4);
+    assert_eq!(t.app.reopen.reopened(), 1);
+}
+
+/// A device that does not come back is tried three times, with growing waits, then left to the
+/// user, who is told to reconnect.
+#[test]
+fn a_device_that_does_not_reopen_is_tried_three_times_then_left_to_reconnect() {
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&tries);
+    let mut t = asio_rig(&driver, move |session, _| {
+        counted.set(counted.get() + 1);
+        soundcraft_playback::Player::prepare_device_free(session).unwrap()
+    });
+    run(&mut t, &driver, 10);
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    run(&mut t, &driver, 20);
+    assert_eq!(tries.get(), 1);
+    assert!(t.app.status.contains("trying again"), "{}", t.app.status);
+    run(&mut t, &driver, 60);
+    assert_eq!(tries.get(), 2, "one second later");
+    run(&mut t, &driver, 170);
+    assert_eq!(tries.get(), 2, "the third waits three seconds");
+    run(&mut t, &driver, 20);
+    assert_eq!(tries.get(), 3);
+    assert!(t.app.reopen.gave_up());
+    assert!(t.app.status.ends_with("after 3 attempts. Use Audio › Reconnect Device."), "{}", t.app.status);
+    run(&mut t, &driver, 300);
+    assert_eq!(tries.get(), 3, "no more");
+}
+
 #[test]
 fn the_window_shows_the_backend_loop_lines_under_the_open_lines_from_a_scripted_snapshot() {
     use soundcraft_playback::telemetry::StreamStats;
