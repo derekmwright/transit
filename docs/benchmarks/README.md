@@ -22,8 +22,8 @@ Windows) taken at callback entry, as the backend reports it in `Stamp::host_call
 - **Xruns.** The trait reports none today, so an xrun is a sustained drift step: the arrival of each
   block is compared with when its frames were due (the first arrival after the warm-up plus the frames
   delivered since, at the nominal rate), the straight line of the device clock's rate error is removed
-  by least squares, and each step of the residual of more than half a period (median of the next
-  window against the median of the previous one, windows of 8 callbacks) counts once. Bursty delivery
+  by least squares, and each step of the residual of more than half a period (low percentile, p25, of the next
+  window against that of the previous one, windows of 8 callbacks) counts once. Bursty delivery
   (a two-period wait, then two callbacks back to back) is a spike that returns to the baseline and
   counts nothing; a skipped buffer leaves the stream behind wall time for good and counts one. The
   render stream also counts every callback whose body time exceeded the period, because on ASIO a

@@ -6,7 +6,7 @@
 //! lost. The detector therefore asks when each block was due (the first valid arrival after the
 //! warm-up plus the frames delivered since, at the nominal rate), takes the arrival's drift from
 //! that, removes the straight line of the device clock's rate error by least squares and counts
-//! each sustained upward step of the residual: a skipped buffer leaves the stream permanently one
+//! each sustained upward step of the residual (a low percentile of the next window against that of the previous one): a skipped buffer leaves the stream permanently one
 //! block behind wall time, a burst leaves a spike that returns to the baseline. On the render
 //! stream, callbacks whose body took longer than the period also count: on ASIO a host-side
 //! overrun does not change the callback cadence, so only the body time shows it.
@@ -20,6 +20,10 @@ pub const WARMUP_CALLBACKS: usize = 8;
 /// Callbacks in each window the drift detector compares (at least four periods, as every
 /// callback delivers one period).
 pub const DRIFT_WINDOW: usize = 8;
+/// The percentile of each window the drift detector compares (nearest rank: the second lowest of
+/// 8). A burst's catch-up callback sits on the baseline in every window, so a low percentile stays
+/// there however the bursts are grouped, while a lost buffer raises it by a full period.
+pub const LOW_PERCENTILE: f64 = 0.25;
 /// A step of the residual drift above this many periods counts as an xrun.
 pub const XRUN_STEP_PERIODS: f64 = 0.5;
 /// The longest round trip the pairing of clicks and detections accepts.
@@ -151,10 +155,10 @@ impl Stream {
         let sxx: f64 = x.iter().map(|x| (x - mx) * (x - mx)).sum();
         let slope = if sxx > 0.0 { x.iter().zip(&y).map(|(x, y)| (x - mx) * (y - my)).sum::<f64>() / sxx } else { 0.0 };
         let residual: Vec<f64> = x.iter().zip(&y).map(|(x, y)| y - my - slope * (x - mx)).collect();
-        let median = |window: &[f64]| percentile(&sorted(window.to_vec()), 0.5);
+        let low = |window: &[f64]| percentile(&sorted(window.to_vec()), LOW_PERCENTILE);
         let (w, mut steps, mut at) = (DRIFT_WINDOW, 0u64, DRIFT_WINDOW);
         while at + w <= residual.len() {
-            if median(&residual[at..at + w]) - median(&residual[at - w..at]) > period * XRUN_STEP_PERIODS {
+            if low(&residual[at..at + w]) - low(&residual[at - w..at]) > period * XRUN_STEP_PERIODS {
                 steps += 1;
                 at += w;
             } else {
@@ -384,6 +388,27 @@ mod tests {
             let s = stream(frames, 4000, |k, p| (k | 1) as f64 * p, |_| 0);
             assert_eq!(s.drift_steps(), 0, "{frames} frames");
         }
+    }
+
+    /// Arrival time of block `k` when blocks come in back-to-back runs of 1, 3, 2, 1, 3, ... blocks,
+    /// each run arriving when its last block is due (a wait as long as the run, frames keeping pace).
+    fn irregular_burst(k: u64, p: f64) -> f64 {
+        let (mut end, mut i) = (0u64, 0usize);
+        loop {
+            end += [1, 3, 2, 1, 3][i % 5];
+            if end > k {
+                return (end - 1) as f64 * p;
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn irregular_bursts_count_nothing_and_a_real_gap_inside_them_counts_once() {
+        let s = stream(32, 4000, irregular_burst, |_| 0);
+        assert_eq!(s.drift_steps(), 0);
+        let s = stream(32, 4000, |k, p| irregular_burst(k, p) + if k >= 2000 { p } else { 0.0 }, |_| 0);
+        assert_eq!(s.drift_steps(), 1);
     }
 
     #[test]
