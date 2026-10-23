@@ -34,7 +34,10 @@ Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../a
   submits a job that runs `soundcraft_mix::create_instance` (load, `initialize`, state restore,
   `prepare`) on the host thread, and polls the result once per frame. The compile takes the
   finished `NewInstance`; the plan is published and adopted exactly as before. Nothing on the
-  audio side changes: no new lock, no allocation, no wait.
+  audio side changes: no new lock, no allocation, no wait. An instance the compile asks for that
+  staging did not predict (a slot whose layout changed) is submitted too: that plan leaves the
+  slot vacant ("Loading…"), and when the instance is ready the same document is compiled again
+  with it (`PlanCompiler::retry_vacant`, `Handles::retry`).
 - **The forwarder:** the host thread wraps each instance (`Ctx::adopt`) in a `Hosted` forwarder.
   The audio thread calls `process` and the rest through it (one extra virtual call, no
   allocation: `crates/plugin-host/tests/audio_alloc.rs`).
@@ -42,8 +45,11 @@ Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../a
   the instance to its host thread, which destroys it there; if that thread is gone it is leaked.
 - **Editors and states:** the editor and state reader stay on the host thread. The UI holds
   proxies: open, close and parameter echoes are sent without waiting; edits and the window state
-  come back through shared state the host thread's 15 ms tick fills. A state read (Save,
-  autosave, device reopen) waits on the host thread, at most the 10 s timeout.
+  come back through shared state the host thread's 15 ms tick fills. A save (Save, autosave,
+  bounce, device reopen) waits for all state reads together at most 500 ms
+  (`DEFAULT_SAVE_DEADLINE`); a plug-in that has not answered by then (a long call, a modal
+  dialog; a thread inside one window message past 10 s answers at once) keeps its stored state
+  and the status line names it.
 - **Stuck plug-ins:** a job or tick that runs past 10 s, or a window message (a modal dialog) past
   120 s, wedges its thread and a fresh thread takes new creations. Only a creation that was stuck
   marks its slot "Not responding" (and compiles it empty). Instances that already lived on the
@@ -53,10 +59,21 @@ Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../a
 - **Main-thread rules:** the host thread is the instances' main thread (VST3 controller and
   views, CLAP `[main-thread]` calls, `request_callback`, `restartComponent` servicing) and pumps
   window messages (`transit_rt::gui_thread`); VST3 modules are entered and exited on it.
+- **Shutdown:** the host thread drops its job queue before its message queue (the COM apartment)
+  ends; a job sent later is leaked by its sender, never run.
+- **The stuck check** names the busy section it found overdue (a sequence number), so a call that
+  returns while the check marks it never leaves an idle thread marked wedged.
+- **Descriptions:** a hosted type's parameter table is read when its first instance is made and
+  built outside the registry lock. A command that needs the table of a type never made
+  (`mix.insert_param`) reads it on the host thread and waits at most 500 ms; past that it is
+  refused as still loading and the read carries on. Adding a plug-in with parameter values
+  reads it there too, waiting up to the 10 s request timeout.
+- **VST3 modules** are entered outside the loaded-module lock: a hung module entry blocks later
+  loads of that binary only (K38, closed).
 - **macOS** runs these jobs inline on the UI thread (AppKit), as before ADR 0018.
 
-Code that makes instances itself (offline bounce, freeze, stems, tests) is not routed through
-the host thread.
+Offline renders (bounce, stems, freeze) make, process and destroy their instances on the thread
+that builds the render, not on the host thread; ADR 0018 says why.
 
 ## First use allocates on macOS
 
