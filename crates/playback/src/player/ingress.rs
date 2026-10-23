@@ -1,13 +1,13 @@
 //! Native MIDI ingestion, independent of the UI pump. The worker owns only raw
 //! consumers and a bounded action producer, never devices, plug-ins or editors.
 //! Main retains the input handles; closing one invalidates its source first.
-use super::{ActionResult, PlayedNote, RuntimeControl, sources};
+use super::{ActionResult, PlayedMidi, PlayedNote, RuntimeControl, sources};
 use crate::action_lane::{self, NoteKind, Outcome};
 use soundcraft_mix::{EngineEpoch, EventOutcome, Message, NoteId, SlotBinding, Source};
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use transit_midi_io::{InputBoundary, InputConsumer, InputEvent};
 
@@ -58,13 +58,13 @@ pub struct Counters {
     pub latency_max_ns: u64,
 }
 
-/// The most notes held for the UI between its polls; the oldest are dropped past this.
+/// UI tap capacity, preallocated before the ingress thread starts.
 const TAP_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct Shared {
-    /// Notes admitted to any route, for the UI's step entry. Filled by the ingress thread, never by audio.
-    tap: Mutex<VecDeque<PlayedNote>>,
+    /// Overflow suppresses further tap writes until the UI discards the incomplete batch.
+    tap_lost: AtomicBool,
     stop: AtomicBool,
     finished: AtomicBool,
     offered: AtomicU64,
@@ -162,12 +162,14 @@ pub struct Worker {
     next_input: u64,
     shared: Arc<Shared>,
     thread: std::thread::JoinHandle<()>,
+    tap: RefCell<rtrb::Consumer<PlayedMidi>>,
 }
 impl Worker {
     pub fn start(lane: action_lane::Control<Packet, ActionResult>) -> std::io::Result<Self> {
         let (attach, receive) = mpsc::sync_channel(sources::PORTS);
         let shared = Arc::new(Shared::default());
-        let mut pump = Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::clone(&shared), echo: None };
+        let (tap, tap_receive) = rtrb::RingBuffer::new(TAP_CAPACITY);
+        let mut pump = Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::clone(&shared), echo: None, tap };
         let thread = std::thread::Builder::new().name("soundcraft-midi-ingress".into()).spawn(move || {
             let mut linger = 0u32;
             while !pump.shared.stop.load(Ordering::Acquire) {
@@ -183,7 +185,7 @@ impl Worker {
                 }
             }
         })?;
-        Ok(Self { attach, permits: Vec::with_capacity(sources::PORTS), next_input: 0, shared, thread })
+        Ok(Self { attach, permits: Vec::with_capacity(sources::PORTS), next_input: 0, shared, thread, tap: RefCell::new(tap_receive) })
     }
 
     /// Open the input with this runtime's HostOrigin before attaching. The caller
@@ -257,7 +259,31 @@ impl Worker {
 
     /// The notes played since the last call, oldest first.
     pub fn take_notes(&self) -> Vec<PlayedNote> {
-        self.shared.tap.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+        self.take_midi()
+            .into_iter()
+            .filter_map(|m| match m {
+                PlayedMidi::Note(n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ordered notes and controls; only the UI allocates or borrows the consumer.
+    pub fn take_midi(&self) -> Vec<PlayedMidi> {
+        let Ok(mut tap) = self.tap.try_borrow_mut() else { return Vec::new() };
+        let mut messages = Vec::new();
+        // Bound UI work as well: input may continue arriving while this frame drains.
+        for _ in 0..TAP_CAPACITY {
+            let Ok(message) = tap.pop() else { break };
+            messages.push(message);
+        }
+        if self.shared.tap_lost.load(Ordering::Acquire) {
+            while tap.pop().is_ok() {}
+            messages.clear();
+            messages.push(PlayedMidi::Reset);
+            self.shared.tap_lost.store(false, Ordering::Release);
+        }
+        messages
     }
 
     /// Independent diagnostic counters, not a coherent cancellation frontier.
@@ -294,19 +320,19 @@ struct Pump {
     cursor: usize,
     shared: Arc<Shared>,
     echo: Option<super::midi_out::Producer>,
+    tap: rtrb::Producer<PlayedMidi>,
 }
-impl Shared {
-    fn tap(&self, message: Message) {
-        let note = match message {
-            Message::NoteOn { key, velocity, .. } => PlayedNote { pitch: key, velocity, on: true },
-            Message::NoteOff { key, .. } => PlayedNote { pitch: key, velocity: 0, on: false },
+impl Pump {
+    fn tap(&mut self, message: Message) {
+        let message = match message {
+            Message::NoteOn { key, velocity, .. } => PlayedMidi::Note(PlayedNote { pitch: key, velocity, on: true }),
+            Message::NoteOff { key, .. } => PlayedMidi::Note(PlayedNote { pitch: key, velocity: 0, on: false }),
+            Message::Control { cc: 120 | 123, .. } => PlayedMidi::Reset,
+            Message::Control { cc, value } => PlayedMidi::Control { cc, value },
             _ => return,
         };
-        if let Ok(mut q) = self.tap.lock() {
-            if q.len() >= TAP_CAPACITY {
-                q.pop_front();
-            }
-            q.push_back(note);
+        if !self.shared.tap_lost.load(Ordering::Acquire) && self.tap.push(message).is_err() {
+            self.shared.tap_lost.store(true, Ordering::Release);
         }
     }
 }
@@ -455,14 +481,14 @@ impl Pump {
                 };
                 if self.lane.send_note(packet, if release { NoteKind::Off } else { NoteKind::On }).is_ok() {
                     self.shared.admitted.fetch_add(1, Ordering::Relaxed);
-                    if !tapped {
-                        tapped = true;
-                        self.shared.tap(message);
-                    }
+                    tapped = true;
                 } else {
                     self.shared.shed.fetch_add(1, Ordering::Relaxed);
                     permit.invalidate();
                 }
+            }
+            if tapped {
+                self.tap(message);
             }
         }
         worked

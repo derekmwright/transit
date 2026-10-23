@@ -233,6 +233,10 @@ impl Native {
         self.worker.take_notes()
     }
 
+    pub(super) fn take_midi(&self) -> Vec<super::PlayedMidi> {
+        self.worker.take_midi()
+    }
+
     pub(super) fn status(&self) -> Status {
         let mut status = self.status.clone();
         status.counts = self.worker.counters();

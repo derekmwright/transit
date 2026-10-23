@@ -24,10 +24,52 @@ fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
 }
 fn pump(lane: action_lane::Control<Packet, ActionResult>) -> (SyncSender<Update>, Pump) {
     let (send, receive) = mpsc::sync_channel(sources::PORTS);
-    (send, Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::default(), echo: None })
+    let (tap, _) = rtrb::RingBuffer::new(TAP_CAPACITY);
+    (send, Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::default(), echo: None, tap })
 }
 fn input(consumer: InputConsumer, permit: sources::Permit) -> Update {
     Update::Input(Input { id: 1, consumer, routes: vec![(permit, route())] })
+}
+
+#[test]
+fn step_tap_delivers_controls_and_notes_in_order_without_worker_heap_work() {
+    let (control, _) = bridge();
+    let (lane, _) = action_lane::pair_with_result(&control);
+    let (_, mut worker) = pump(lane);
+    let (tap, mut received) = rtrb::RingBuffer::new(TAP_CAPACITY);
+    worker.tap = tap;
+    let (_, heap) = measure(|| {
+        worker.tap(Message::Control { cc: 64, value: 127 });
+        worker.tap(Message::NoteOn { key: 21, velocity: 100, id: NoteId::NONE });
+        worker.tap(Message::NoteOff { key: 21, velocity: 64, id: NoteId::NONE });
+        worker.tap(Message::Control { cc: 65, value: 127 });
+        worker.tap(Message::Control { cc: 64, value: 0 });
+    });
+    assert!(heap.is_zero(), "tap producer must not allocate or free: {heap:?}");
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Control { cc: 64, value: 127 });
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Note(PlayedNote { pitch: 21, velocity: 100, on: true }));
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Note(PlayedNote { pitch: 21, velocity: 0, on: false }));
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Control { cc: 65, value: 127 });
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Control { cc: 64, value: 0 });
+    assert!(received.pop().is_err());
+}
+
+#[test]
+fn step_tap_overflow_suppresses_writes_until_the_ui_resets() {
+    let (control, _) = bridge();
+    let (lane, _) = action_lane::pair_with_result(&control);
+    let (_, mut worker) = pump(lane);
+    let (tap, mut received) = rtrb::RingBuffer::new(1);
+    worker.tap = tap;
+    worker.tap(Message::Control { cc: 64, value: 127 });
+    worker.tap(Message::Control { cc: 64, value: 0 });
+    assert!(worker.shared.tap_lost.load(Ordering::Acquire));
+    received.pop().unwrap();
+    worker.tap(Message::Control { cc: 65, value: 127 });
+    assert!(received.pop().is_err(), "suppress events while the incomplete batch is being discarded");
+    worker.shared.tap_lost.store(false, Ordering::Release);
+    worker.tap(Message::Control { cc: 65, value: 0 });
+    assert_eq!(received.pop().unwrap(), PlayedMidi::Control { cc: 65, value: 0 });
 }
 
 #[test]

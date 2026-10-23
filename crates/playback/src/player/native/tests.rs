@@ -213,6 +213,74 @@ fn an_idle_ingress_worker_wakes_on_the_input_callback_not_on_a_timer() {
 }
 
 #[test]
+fn idle_worker_taps_step_pedal_and_learnable_actions_without_delaying_routes() {
+    use crate::player::{PlayedMidi, PlayedNote};
+    let fake = Fake::default();
+    let key = fake.add_input("Step controls");
+    let mut session = Session::default();
+    track(&mut session, MidiInput::default());
+    let mut f = Fixture::new(session, fake.io());
+    f.ready(1, 1);
+    let backend = fake.input_port(&key).unwrap();
+    let expected = vec![
+        PlayedMidi::Control { cc: 64, value: 127 },
+        PlayedMidi::Note(PlayedNote { pitch: 21, velocity: 100, on: true }),
+        PlayedMidi::Note(PlayedNote { pitch: 21, velocity: 0, on: false }),
+        PlayedMidi::Control { cc: 65, value: 127 },
+        PlayedMidi::Control { cc: 64, value: 0 },
+    ];
+    let mut ages = Vec::new();
+    for n in 0..15u64 {
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(backend.deliver(n * 1000, &[0xb0, 64, 127, 0x90, 21, 100, 0x80, 21, 0, 0xb0, 65, 127, 0xb0, 64, 0]));
+        let mut received = Vec::new();
+        until(|| {
+            received.extend(f.native.take_midi());
+            received.len() >= expected.len()
+        });
+        assert_eq!(received, expected);
+        ages.push(f.native.status().counts.latency_last_ns);
+        assert_eq!(f.packets(5).len(), 5, "the tap does not consume routed packets");
+        f.tick();
+    }
+    ages.sort_unstable();
+    let median = Duration::from_nanos(ages[ages.len() / 2]);
+    eprintln!("step tap idle wake latency median {median:?}");
+    let bound = if cfg!(windows) { Duration::from_millis(2) } else { Duration::from_millis(5) };
+    assert!(median < bound, "idle input must wake promptly with the tap active: {median:?}");
+    f.finish();
+}
+
+#[test]
+fn step_tap_overflow_resets_the_ui_then_accepts_new_input() {
+    use crate::player::PlayedMidi;
+    let fake = Fake::default();
+    let key = fake.add_input("Step overflow");
+    let mut session = Session::default();
+    track(&mut session, MidiInput::default());
+    let mut f = Fixture::new(session, fake.io());
+    f.ready(1, 1);
+    let backend = fake.input_port(&key).unwrap();
+    for n in 0..6 {
+        for i in 0..64 {
+            assert!(backend.deliver(n * 64 + i, &[0xb0, 64, 127]));
+        }
+        f.packets(64);
+        f.tick();
+    }
+    assert_eq!(f.native.take_midi(), vec![PlayedMidi::Reset]);
+    assert!(backend.deliver(1000, &[0xb0, 64, 0]));
+    let mut messages = Vec::new();
+    until(|| {
+        messages.extend(f.native.take_midi());
+        !messages.is_empty()
+    });
+    assert_eq!(messages, vec![PlayedMidi::Control { cc: 64, value: 0 }]);
+    f.packets(1);
+    f.finish();
+}
+
+#[test]
 fn native_stop_cutoff_covers_every_route_and_retains_future_input() {
     let fake = Fake::default();
     let key = fake.add_input("Stop boundary");

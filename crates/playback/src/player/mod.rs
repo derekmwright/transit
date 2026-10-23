@@ -25,6 +25,14 @@ pub struct PlayedNote {
     pub on: bool,
 }
 
+/// Ordered UI input tap. `Reset` means input was lost; discard any pending step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayedMidi {
+    Note(PlayedNote),
+    Control { cc: u8, value: u8 },
+    Reset,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ingress;
 #[cfg(not(target_arch = "wasm32"))]

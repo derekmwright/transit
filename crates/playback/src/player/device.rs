@@ -999,6 +999,16 @@ impl Player {
         }
         Vec::new()
     }
+    /// Ordered note/control input for step entry. Shares its drain with `take_played_notes`.
+    pub fn take_played_midi(&self) -> Vec<super::PlayedMidi> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(midi) = self.midi.try_borrow()
+            && let Some(m) = midi.as_ref()
+        {
+            return m.take_midi();
+        }
+        Vec::new()
+    }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn midi_status(&self) -> Result<super::MidiStatus, PlayerError> {
         let midi = self.midi.try_borrow().map_err(|_| PlayerError::Busy)?;
