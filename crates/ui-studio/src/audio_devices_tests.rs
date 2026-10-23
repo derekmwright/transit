@@ -1349,7 +1349,8 @@ fn the_open_lines_end_with_the_workers_mmcss_state() {
     assert_eq!(priority_detail(P::Pending), " · MMCSS pending");
     assert_eq!(priority_detail(P::PromotionFailed), " · MMCSS refused");
     assert_eq!(priority_detail(P::Released), " · MMCSS released");
-    assert_eq!(priority_detail(P::Unobserved), "", "nothing where the backend observes none (a scripted driver, the driver's own registration)");
+    assert_eq!(priority_detail(P::DriverRegistered), " · MMCSS by driver", "the ASIO driver registered its own thread (error 1552)");
+    assert_eq!(priority_detail(P::Unobserved), "", "nothing where the backend observes none (a scripted driver, the host thread)");
     assert_eq!(priority_detail(P::NoWorker), "");
 }
 

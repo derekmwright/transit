@@ -185,9 +185,11 @@ impl Mmcss {
         match self.state.load(Ordering::Acquire) {
             REGISTERED | RELEASE => WorkerPriority::MmcssProAudio,
             FAILED => WorkerPriority::PromotionFailed,
-            // On the host thread, or in the driver's own MMCSS registration (its task and level
-            // are the driver's, not observed here).
-            HOST_THREAD | DRIVERS => WorkerPriority::Unobserved,
+            // The driver registered its thread itself (error 1552): its task and level are the
+            // driver's. This stays after the stop, since there is nothing of ours to revert.
+            DRIVERS => WorkerPriority::DriverRegistered,
+            // On the host thread: no registration was attempted.
+            HOST_THREAD => WorkerPriority::Unobserved,
             RELEASED => WorkerPriority::Released,
             RELEASE_FAILED => WorkerPriority::ReleaseFailed,
             _ => WorkerPriority::Pending,
@@ -213,10 +215,15 @@ pub(crate) mod testing {
     pub(crate) static REVERTED_ON: AtomicU32 = AtomicU32::new(0);
     /// The next registration fails (with error 5, access denied).
     pub(crate) static FAIL: AtomicBool = AtomicBool::new(false);
+    /// The next registration finds the thread already registered (error 1552, the driver's own).
+    pub(crate) static DRIVER_HOLDS: AtomicBool = AtomicBool::new(false);
 
     fn register() -> Result<usize, u32> {
         if FAIL.swap(false, Ordering::SeqCst) {
             return Err(5);
+        }
+        if DRIVER_HOLDS.swap(false, Ordering::SeqCst) {
+            return Err(super::ALREADY_REGISTERED);
         }
         REGISTERED_ON.store(crate::com::current_thread_id(), Ordering::SeqCst);
         Ok(0x1000 + REGISTERS.fetch_add(1, Ordering::SeqCst))
@@ -240,6 +247,7 @@ pub(crate) mod testing {
             thread.store(0, Ordering::SeqCst);
         }
         FAIL.store(false, Ordering::SeqCst);
+        DRIVER_HOLDS.store(false, Ordering::SeqCst);
     }
 }
 
@@ -317,8 +325,12 @@ mod tests {
         let m = Mmcss { host_thread: 1, ..m };
         m.arm();
         m.tend();
-        assert_eq!((m.priority(), m.error()), (WorkerPriority::Unobserved, 0), "not PromotionFailed, no error to log");
+        assert_eq!((m.priority(), m.error()), (WorkerPriority::DriverRegistered, 0), "not PromotionFailed, no error to log");
         assert_eq!(m.release(Duration::from_millis(5)), Released::Nothing);
+        assert_eq!(m.priority(), WorkerPriority::DriverRegistered, "still the driver's after the stop: nothing of ours was reverted");
+        // The next start tries again (the driver may run another thread then).
+        m.arm();
+        assert_eq!(m.priority(), WorkerPriority::Pending);
     }
 
     #[test]

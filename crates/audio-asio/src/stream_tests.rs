@@ -563,6 +563,25 @@ fn a_driver_that_does_not_call_at_the_stop_is_reverted_from_the_host_and_a_resta
 }
 
 #[test]
+fn a_buffer_switch_thread_the_driver_registered_itself_reads_driver_registered_before_and_after_the_stop() {
+    use crate::mmcss::testing as mmcss;
+    let _guard = lock();
+    mmcss::reset();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (capture, render, _, _) = duplex(&rig, 48_000, Some(64), &seen, vec![0.0; 2]);
+    mmcss::DRIVER_HOLDS.store(true, Ordering::SeqCst);
+    drive(&rig, 64, 0, 2, &[]);
+    assert_eq!((render.thread_priority(), capture.thread_priority()), (ab::WorkerPriority::DriverRegistered, ab::WorkerPriority::DriverRegistered));
+    render.stop().expect("stop render");
+    capture.stop().expect("stop capture");
+    assert_eq!(render.thread_priority(), ab::WorkerPriority::DriverRegistered, "the driver's registration is not ours to end");
+    assert_eq!((mmcss::REGISTERS.load(Ordering::SeqCst), mmcss::REVERTS.load(Ordering::SeqCst)), (0, 0));
+    assert_eq!(seen.render.lock().unwrap().len(), 2, "playback goes on");
+    drop((capture, render));
+}
+
+#[test]
 fn a_buffer_switch_that_finds_the_last_one_still_running_is_skipped_and_counted() {
     use std::sync::atomic::AtomicBool;
     let _guard = lock();

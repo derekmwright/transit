@@ -323,6 +323,10 @@ pub enum WorkerPriority {
     Released,
     /// Explicit release was attempted but the helper reported failure.
     ReleaseFailed,
+    /// The thread was already in an MMCSS task when the backend tried to register it: the driver
+    /// that owns the thread registered it itself (Windows refuses a second registration with error
+    /// 1552). Its task and level are the driver's, and the backend leaves them to it.
+    DriverRegistered,
 }
 
 /// The number of bins of a [`StreamStats`] histogram.

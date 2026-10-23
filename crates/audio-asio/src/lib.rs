@@ -337,8 +337,9 @@ impl ab::Stream for AsioStream {
 
     /// The callback runs on the driver's own thread, which its first buffer switch after a start
     /// registers with MMCSS "Pro Audio" ([`mmcss`]): `Pending` until then, `MmcssProAudio` (or
-    /// `PromotionFailed`) while it runs, `Released` after the stop; `Unobserved` when the driver
-    /// calls back on the host thread.
+    /// `PromotionFailed`) while it runs, `Released` after the stop; `DriverRegistered` (before and
+    /// after the stop) when the driver had registered that thread itself (error 1552);
+    /// `Unobserved` when the driver calls back on the host thread.
     fn thread_priority(&self) -> ab::WorkerPriority {
         self.mmcss.priority()
     }
@@ -885,7 +886,20 @@ mod hardware {
         assert!(c as f64 > expected * 0.8, "capture callbacks {c}");
         assert_eq!((tally.invalid.load(Relaxed), tally.errors.load(Relaxed)), (0, 0), "invalid stamps, stream errors");
         assert_eq!(rs.overloads, 0);
-        assert_eq!((running, stopped), (ab::WorkerPriority::MmcssProAudio, ab::WorkerPriority::Released), "MMCSS joined and left");
+        assert_mmcss(driver, running, stopped);
+    }
+
+    /// The buffer-switch thread either joined "Pro Audio" through us and left it at the stop, or
+    /// the driver had registered it itself (error 1552) and keeps it: both are success. Prints
+    /// which.
+    fn assert_mmcss(driver: &str, running: ab::WorkerPriority, stopped: ab::WorkerPriority) {
+        use ab::WorkerPriority as P;
+        match (running, stopped) {
+            (P::MmcssProAudio, P::Released) => println!("{driver}: MMCSS: registered by transit, released at the stop"),
+            (P::DriverRegistered, P::DriverRegistered) => println!("{driver}: MMCSS: the driver registered its own thread (error 1552)"),
+            (P::Unobserved, _) => panic!("{driver}: the driver called back on the host thread (no MMCSS attempt): {running:?}, {stopped:?}"),
+            other => panic!("{driver}: MMCSS while running and after the stop: {other:?}"),
+        }
     }
 
     #[test]

@@ -1074,13 +1074,15 @@ fn input_line(r: &soundcraft_playback::record::Recorder, native: bool) -> String
 
 /// The scheduling of a native stream's worker as its "open" line ends: " · MMCSS Pro Audio" (the
 /// WASAPI worker, the ASIO buffer-switch thread once it switched), " · MMCSS pending" before that,
-/// and so on; nothing where the backend observes none.
+/// " · MMCSS by driver" where the ASIO driver registered its own thread, and so on; nothing where
+/// the backend observes none.
 pub fn priority_detail(priority: soundcraft_playback::scheduling::WorkerPriority) -> String {
     use soundcraft_playback::scheduling::WorkerPriority as P;
     let text = match priority {
         P::Pending => "MMCSS pending",
         P::MmcssAudio => "MMCSS Audio",
         P::MmcssProAudio => "MMCSS Pro Audio",
+        P::DriverRegistered => "MMCSS by driver",
         P::RaisedPriority => "raised priority",
         P::PromotionFailed => "MMCSS refused",
         P::Released => "MMCSS released",

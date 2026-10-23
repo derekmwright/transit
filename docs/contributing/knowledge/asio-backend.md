@@ -372,13 +372,18 @@ Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` b
   thread; the host-thread revert is a deliberate best-effort deviation, checked safe by the slice
   d1 review's probe (known issue K33). Each handle is reverted at most once.
 - A thread the driver already registered itself is refused a second registration (error 1552):
-  that is the driver's, left to it and not reported as a failure.
+  that is the driver's, left to it and not reported as a failure. It reads `DriverRegistered`
+  ("MMCSS by driver") while it runs and after the stop, since there is nothing of ours to revert.
+  The Scarlett's hardware run of 2026-10-22 read `Unobserved`, which then covered both this case
+  and a callback on the host thread; the next run tells which (the Model 12 read `MmcssProAudio`).
 - `Stream::thread_priority` reports it: `Pending` before the first switch, `MmcssProAudio` while it
   runs, `PromotionFailed` when MMCSS refused (logged at the stop with the OS error; playback goes
-  on), `Released`/`ReleaseFailed` after the stop, `Unobserved` on the host thread or in the driver's
-  own registration. Audio Devices shows it on the Output open and Input open lines ("MMCSS Pro
-  Audio", "MMCSS released", ...). The ignored hardware stream tests print it and expect
-  `MmcssProAudio` while running and `Released` after.
+  on), `Released`/`ReleaseFailed` after the stop, `DriverRegistered` for the driver's own
+  registration, `Unobserved` only when no attempt was made (the driver called back on the host
+  thread). Audio Devices shows it on the Output open and Input open lines: "MMCSS Pro Audio",
+  "MMCSS by driver", "MMCSS pending", "MMCSS released", "MMCSS refused" (nothing for
+  `Unobserved`). The ignored hardware stream tests print it and accept `MmcssProAudio` then
+  `Released`, or `DriverRegistered` then `DriverRegistered`, and say which.
 - `raw-dylib` needs `dlltool` on the `windows-gnu` targets; transit builds MSVC only.
 - **Tests** use counting hooks (no test thread is really registered): `mmcss.rs` and
   `the_buffer_switch_thread_joins_mmcss_*`, `a_driver_that_does_not_call_at_the_stop_*` in
