@@ -12,6 +12,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      discord_test:
+        description: "Only post a test message to Discord (skips the build jobs)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,6 +31,7 @@ env:
 jobs:
   build:
     name: ${{ matrix.name }}
+    if: ${{ !inputs.discord_test }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -246,3 +252,54 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
+
+      # Posts the release to Discord through the DISCORD_WEBHOOK_URL repository secret. Never fails the
+      # release: a missing secret skips, and a Discord outage is only a warning (continue-on-error).
+      # The body is read back from the published release (generated notes included), cut at the
+      # checksums section, and passed to jq with --arg so it is never interpolated into JSON.
+      - name: Announce on Discord
+        continue-on-error: true
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no webhook, skipping"; exit 0; fi
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          body="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body | tr -d '\r' | awk 'tolower($0) ~ /checksum/ {exit} {print}')"
+          # What is new: the top-level bullets of the "## Highlights" section (split on lines, since
+          # the bullets may have no blank lines between them), whole bullets up to 1800 characters.
+          # Sub-bullets and wrapped continuation lines are dropped. Without a Highlights section,
+          # fall back to the first paragraph.
+          desc="$(printf '%s\n' "$body" | awk -v max=1800 '
+            /^## / { if (tolower($0) ~ /^## +highlights/) { inhl = 1; found = 1; next } else if (inhl) { inhl = 0 } }
+            inhl && /^[-*] / { if (!cut) { cand = (out == "" ? $0 : out "\n" $0); if (length(cand) > max) cut = 1; else out = cand } }
+            END { if (found) { print out; if (cut) print "…" } }')"
+          if [ -z "$desc" ]; then
+            desc="$(printf '%s\n' "$body" | awk -v max=1800 'BEGIN { RS = ""; ORS = "" } NR == 1 { print (length($0) > max ? substr($0, 1, max) "…" : $0); exit }')"
+          fi
+          desc="${desc}"$'\n\n'"Full notes and downloads: ${url}"
+          payload="$(jq -n --arg tag "$TAG" --arg url "$url" --arg desc "$desc" \
+            '{content: ("**transit " + $tag + " is out**"), embeds: [{title: ("transit " + $tag + " is out"), url: $url, description: $desc}]}')"
+          curl --fail-with-body --silent --show-error --max-time 20 \
+            -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"
+          echo "posted to Discord"
+
+  # Manual run with discord_test set: the build and publish jobs are skipped and only this runs.
+  discord-test:
+    if: ${{ inputs.discord_test }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Announce on Discord (test)
+        continue-on-error: true
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "no webhook, skipping"; exit 0; fi
+          payload="$(jq -n --arg url "https://github.com/${GITHUB_REPOSITORY}/releases" \
+            '{content: "Test post from the release workflow; ignore.", embeds: [{title: "transit release workflow test", url: $url, description: "Test post from the release workflow; ignore."}]}')"
+          curl --fail-with-body --silent --show-error --max-time 20 \
+            -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"
+          echo "posted to Discord"
