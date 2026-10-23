@@ -381,6 +381,12 @@ pub trait PluginEditor: Send {
     /// Tells the editor that a parameter changed elsewhere (generic editor, automation), so the
     /// GUI shows it. Values are in SoundCraft units.
     fn set_param(&mut self, _id: &str, _value: f32) {}
+    /// Why an earlier [`PluginEditor::open`] that was accepted failed later, once (an editor
+    /// driven on another thread opens asynchronously, ADR 0018). `None` for editors that open
+    /// at once (the default) or when nothing failed.
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Reads a plugin's state on the main (UI) thread while the instance processes on the audio
