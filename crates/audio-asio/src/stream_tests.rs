@@ -329,6 +329,39 @@ fn a_calibration_makes_both_streams_measured_and_moves_the_capture_frame() {
     drop((capture, render));
 }
 
+/// #20 review N1: a loop shorter than the driver's output figure (150 frames here) would place the
+/// input after its own callback. It is refused, not clamped: both directions keep the driver's
+/// figures (`BackendEstimate`); the stream's close logs it.
+#[test]
+fn an_impossible_calibration_is_refused_and_the_driver_figures_stay() {
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let ns = |frames: u64| (frames * 1_000_000_000 / 48_000) as i64;
+    let short = ab::Calibration { round_trip_ns: ns(100) as u64, uncertainty_ns: ns(2) as u64 };
+    let mut req_in = request(&rig, ab::Direction::Input, 48_000, Some(64));
+    let mut req_out = request(&rig, ab::Direction::Output, 48_000, Some(64));
+    req_in.calibration = Some(short);
+    req_out.calibration = Some(short);
+    let (capture, _) = rig.backend.open_capture(&rig.endpoint, &req_in, capture_cb(&seen), error_cb(&seen, ab::Direction::Input)).expect("in");
+    let (render, _) =
+        rig.backend.open_render(&rig.endpoint, &req_out, render_cb(&seen, vec![0.0; 2]), error_cb(&seen, ab::Direction::Output)).expect("out");
+    capture.start().expect("start");
+    render.start().expect("start");
+    drive(&rig, 64, 0, 3, &[]);
+    let (r, c) = (seen.render.lock().unwrap()[2].0, seen.capture.lock().unwrap()[2].0);
+    assert_eq!((r.quality, c.quality), (ab::Quality::BackendEstimate, ab::Quality::BackendEstimate), "not claimed Measured");
+    assert_eq!(c.backend_callback_ns - c.backend_frame_ns, ns(100), "the driver's input figure, not a clamp to the callback");
+    assert_eq!(r.backend_frame_ns - r.backend_callback_ns, ns(150));
+    // A possible loop handed while running is used again.
+    assert!(capture.set_calibration(Some(ab::Calibration { round_trip_ns: ns(300) as u64, uncertainty_ns: 0 })));
+    let before = seen.capture.lock().unwrap().len();
+    drive(&rig, 64, 3 * 64, 3, &[]);
+    let c = seen.capture.lock().unwrap()[before + 1].0;
+    assert_eq!((c.quality, c.backend_frame_ns - c.backend_callback_ns), (ab::Quality::Measured, ns(150) - ns(300)));
+    drop((capture, render));
+}
+
 /// K31: a calibration over native ASIO is the whole loop in sample positions. An output frame at
 /// position `p` and the input frame at `p + round trip` (where a cable brings it back) carry the
 /// same frame time, whatever the driver's `getLatencies` figures say (here 100 in, 150 out: a

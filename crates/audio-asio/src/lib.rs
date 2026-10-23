@@ -434,7 +434,8 @@ impl ab::Stream for AsioStream {
     }
 
     /// Takes effect at the next buffer switch (an atomic hand-off; never blocks or calls the host
-    /// thread). The next stamp of this direction is invalid.
+    /// thread). The next stamp of this direction is invalid. A loop shorter than the driver's output
+    /// figure is not used (the driver's figures are, and the stream's close logs a warning).
     fn set_calibration(&self, calibration: Option<ab::Calibration>) -> bool {
         self.owner.0.set_calibration(calibration);
         true
@@ -445,6 +446,13 @@ impl Drop for AsioStream {
     fn drop(&mut self) {
         if let Some(step) = self.system_time_step_ns() {
             log::debug!("ASIO: \"{}\" {}: the driver's systemTime moved in steps of at least {step} ns", self.name, self.what());
+        }
+        if self.owner.0.calibration_rejected() {
+            log::warn!(
+                "ASIO: \"{}\" {}: the calibration's loop was shorter than the driver's output latency, so it was not used (the driver's figures were); measure the loop again",
+                self.name,
+                self.what()
+            );
         }
         let (name, generation, direction) = (self.name.clone(), self.generation, self.direction);
         let label = format!("close {} of \"{}\"", self.what(), self.name);

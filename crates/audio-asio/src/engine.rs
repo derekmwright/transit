@@ -62,6 +62,9 @@ pub(crate) struct SideShared {
     calibration_ns: AtomicU64,
     calibration_bound_ns: AtomicU64,
     calibration_changed: AtomicBool,
+    /// A calibration was refused because its loop is shorter than the driver's output figure (the
+    /// input would be placed after its own callback): the stamps used the driver's figures.
+    calibration_rejected: AtomicBool,
     pub(crate) stats: LoopStats,
 }
 
@@ -79,6 +82,7 @@ impl SideShared {
             calibration_ns: AtomicU64::new(NO_CALIBRATION),
             calibration_bound_ns: AtomicU64::new(0),
             calibration_changed: AtomicBool::new(false),
+            calibration_rejected: AtomicBool::new(false),
             stats: LoopStats::new(events),
         }
     }
@@ -150,6 +154,12 @@ impl SideShared {
         self.calibration_ns.store(round_trip, Ordering::Relaxed);
         self.calibration_bound_ns.store(bound, Ordering::Relaxed);
         self.calibration_changed.store(true, Ordering::Release);
+    }
+
+    /// Whether a calibration of this direction was refused as impossible (control side, for a
+    /// warning).
+    pub(crate) fn calibration_rejected(&self) -> bool {
+        self.calibration_rejected.load(Ordering::Relaxed)
     }
 
     /// Callback side: the calibration set since the last call, if one was.
@@ -291,6 +301,19 @@ impl<C> Side<C> {
             self.invalidate = true;
             self.held.reset();
         }
+    }
+
+    /// The calibration the stamps can use with the driver's output figure `latency_out` (ns): a loop
+    /// shorter than it would place the input after its own callback, which only a stale or wrong
+    /// figure gives. It is refused (the driver's figures are used, `BackendEstimate`) and flagged,
+    /// not clamped, so the placement is never silently off by the difference.
+    fn usable_calibration(&self, latency_out: i64) -> Option<Calibration> {
+        let calibration = self.calibration?;
+        if i64::try_from(calibration.round_trip_ns).unwrap_or(i64::MAX) < latency_out {
+            self.shared.calibration_rejected.store(true, Ordering::Relaxed);
+            return None;
+        }
+        Some(calibration)
     }
 
     /// Marks `stamp` invalid when a discontinuity asked for it (once).
@@ -467,12 +490,12 @@ impl Engine {
             side.refresh_calibration();
             // Uncalibrated: the driver's input figure. Calibrated: the output figure minus the
             // measured loop, so the input frame of a click carries the time its output frame had.
-            let round_trip = side.calibration.map(|c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
-            let mut stamp =
-                stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, true, |callback| match round_trip {
-                    Some(round_trip) => callback.saturating_add(latency_out).saturating_sub(round_trip),
-                    None => callback.saturating_sub(latency_in),
-                });
+            let calibration = side.usable_calibration(latency_out);
+            let round_trip = calibration.map(|c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
+            let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, calibration, true, |callback| match round_trip {
+                Some(round_trip) => callback.saturating_add(latency_out).saturating_sub(round_trip),
+                None => callback.saturating_sub(latency_in),
+            });
             side.invalidated(&mut stamp);
             let mut source = PlanarSource { scratch: &mut side.scratch, planes: inputs, frames, wire: side.wire };
             let mut block = CaptureBlock::new(frames, stamp, side.format, &mut source);
@@ -491,7 +514,8 @@ impl Engine {
                     side.shared.stats.wake_late(late);
                 }
                 side.refresh_calibration();
-                let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, false, |callback| {
+                let calibration = side.usable_calibration(latency_out);
+                let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, calibration, false, |callback| {
                     callback.saturating_add(latency_out)
                 });
                 side.invalidated(&mut stamp);
