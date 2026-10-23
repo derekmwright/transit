@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>transit: an open-source DAW in Rust</title>
+<meta name="description" content="An open-source DAW in Rust. Cubase bones, Ableton manners. Native ASIO, measurable latency, plug-ins that cannot freeze the window.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="transit: an open-source DAW in Rust">
+<meta property="og:description" content="Cubase bones, Ableton manners.">
+<meta property="og:image" content="https://raw.githubusercontent.com/transit-audio/transit/main/site/assets/transit-wordmark-white-2172.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/transit-icon-dark-1024.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+  <picture>
+    <source srcset="assets/transit-wordmark-graphite.svg" media="(prefers-color-scheme: light)">
+    <img class="wordmark" src="assets/transit-wordmark-white.svg" alt="transit" width="420" height="120">
+  </picture>
+  <p class="tagline">An open-source DAW in Rust. Cubase bones, Ableton manners.</p>
+  <p class="cta">
+    <a class="btn primary" href="#downloads">Download</a>
+    <a class="btn" href="https://github.com/transit-audio/transit">GitHub</a>
+  </p>
+</header>
+
+<main>
+<section id="downloads">
+  <h2>Downloads</h2>
+  <p id="release-meta" class="muted">Loading the latest release...</p>
+  <ul id="assets" class="assets"></ul>
+  <noscript><p><a href="https://github.com/transit-audio/transit/releases/latest">Latest release on GitHub</a></p></noscript>
+</section>
+
+<section id="why">
+  <h2>Why transit</h2>
+  <div class="cards">
+    <article class="card"><h3>Native ASIO</h3><p>Talks to your driver directly, without the Steinberg SDK.</p></article>
+    <article class="card"><h3>Latency you can measure</h3><p>Round-trip numbers in the app, verified against the driver.</p></article>
+    <article class="card"><h3>Plug-ins stay in their lane</h3><p>Plug-ins load on their own thread and cannot freeze the window.</p></article>
+    <article class="card"><h3>Familiar ergonomics</h3><p>Ableton and Logic ergonomics on a measured engine.</p></article>
+  </div>
+</section>
+
+<section id="screenshots">
+  <h2>Screenshots</h2>
+  <figure><img src="assets/transit-arrange.png" alt="The transit arrange view" loading="lazy"><figcaption>Arrange: clips, tracks and the timeline.</figcaption></figure>
+  <figure><img src="assets/transit-mixer.png" alt="The transit mixer" loading="lazy"><figcaption>Mixer: channel strips, sends and metering.</figcaption></figure>
+  <figure><img src="assets/transit-pianoroll.png" alt="The transit piano roll" loading="lazy"><figcaption>Piano roll: MIDI editing with a grid that stays out of the way.</figcaption></figure>
+</section>
+
+<section id="join">
+  <h2>Join</h2>
+  <ul class="links">
+    <li><a href="https://discord.gg/7PPUBZqA66">Discord</a> <span class="muted">chat with the people building and testing it</span></li>
+    <li><a href="https://github.com/transit-audio/transit/issues/49">Testing thread</a> <span class="muted">report what works and what does not on your rig</span></li>
+    <li><a href="https://github.com/transit-audio/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22">Help wanted</a> <span class="muted">good places to start contributing</span></li>
+  </ul>
+</section>
+</main>
+
+<footer>
+  <p>MIT OR Apache-2.0. Forked from SoundCraft by storytold in October 2026.</p>
+  <p><a href="https://github.com/transit-audio/transit">github.com/transit-audio/transit</a></p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>
