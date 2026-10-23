@@ -15,6 +15,10 @@ const EDGE: f32 = 6.0;
 
 /// Width (points) of the loop handle's hot zone, measured back from a clip's right edge.
 const LOOP_ZONE_W: f32 = 20.0;
+/// Audio clips: the fade handle zones are this wide (from inside the trim edge) and this tall
+/// (from under the header strip), in each top corner of the body.
+pub const FADE_ZONE_W: f32 = 18.0;
+pub const FADE_ZONE_H: f32 = 14.0;
 
 /// Most repeats one loop drag shows or lays down (the engine caps `clip.loop_to` at the same).
 const MAX_LOOP_REPEATS: usize = 1000;
@@ -27,13 +31,21 @@ pub enum DragKind {
     TrimEnd,
     /// The loop handle: the upper right corner of the header strip (Logic's loop corner).
     Loop,
+    /// Audio clips: the fade handles in the top corners of the body, just under the header strip.
+    FadeIn,
+    FadeOut,
+    /// Alt-drag on an existing fade: bend its curvature (decided at the press, not by position).
+    FadeCurveIn,
+    FadeCurveOut,
 }
 
 /// What a press at `pos` on a clip drawn in `rect` (`[x0, y0, x1, y1]`) would do. The edges trim
 /// (`EDGE` wide, as before); the loop handle is the header strip's part of the last
-/// `LOOP_ZONE_W` points before the right-edge trim handle; everything else moves. Narrow clips
-/// shrink the edges and the loop zone so the middle still moves.
-pub fn zone(rect: R4, pos: Pos2) -> DragKind {
+/// `LOOP_ZONE_W` points before the right-edge trim handle; on an `audio` clip the top corners of
+/// the body, under the header strip and clear of the trim edges, are the fade handles
+/// (`FADE_ZONE_W` by `FADE_ZONE_H`); everything else moves. Narrow clips shrink the edges and the
+/// loop and fade zones so the middle still moves.
+pub fn zone(rect: R4, pos: Pos2, audio: bool) -> DragKind {
     let w = rect[2] - rect[0];
     let edge = EDGE.min(w / 4.0);
     if pos.x - rect[0] <= edge {
@@ -42,9 +54,24 @@ pub fn zone(rect: R4, pos: Pos2) -> DragKind {
         DragKind::TrimEnd
     } else if pos.y - rect[1] <= CLIP_NAME_H && rect[2] - pos.x <= LOOP_ZONE_W.min(w / 3.0) {
         DragKind::Loop
+    } else if audio && pos.y - rect[1] > CLIP_NAME_H && pos.y - rect[1] <= CLIP_NAME_H + FADE_ZONE_H && fade_w(w, edge) > 0.0 {
+        let zw = edge + fade_w(w, edge);
+        if pos.x - rect[0] <= zw {
+            DragKind::FadeIn
+        } else if rect[2] - pos.x <= zw {
+            DragKind::FadeOut
+        } else {
+            DragKind::Move
+        }
     } else {
         DragKind::Move
     }
+}
+
+/// The width of a fade zone on a clip `w` wide with trim edges `edge`: three parts of the room
+/// between the edges, so the two zones never meet.
+fn fade_w(w: f32, edge: f32) -> f32 {
+    FADE_ZONE_W.min((w - 2.0 * edge) / 3.0).max(0.0)
 }
 
 /// The repeats a loop drag lays down: back-to-back copies of length `len` from `from` up to `to`,
@@ -108,6 +135,7 @@ pub struct TrackRow {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ClipRect {
     pub id: u64,
+    pub audio: bool,
     pub track: u64,
     pub rect: R4,
     pub start: Samples,
@@ -174,6 +202,10 @@ pub struct ArrangeState {
     pub serial: u64,
     /// The menu bar's Track menu and its group entries as last drawn (slice 2c).
     pub bar_menu: Vec<crate::mixer::MenuItem>,
+    /// The shape menu a click on a fade opened (#63).
+    pub fade_menu: Option<crate::fades::Menu>,
+    /// The clip (and fade side under the pointer) a right click picked, for the clip context menu.
+    pub menu_target: Option<(ClipId, Option<crate::fades::Side>)>,
 }
 
 /// Timeline mapping: x ↔ samples, from the session's shared zoom (`edit.zoom`).
@@ -851,7 +883,7 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, g
         }
         DragKind::TrimStart => (clip, track, (start + dx).clamp(0, end - 1), end, false),
         DragKind::TrimEnd => (clip, track, start, (end + dx).max(start + 1), false),
-        DragKind::Loop => return None,
+        DragKind::Loop | DragKind::FadeIn | DragKind::FadeOut | DragKind::FadeCurveIn | DragKind::FadeCurveOut => return None,
     })
 }
 
@@ -862,19 +894,46 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
     let sel = &s.edit.selected_clips;
     let preview = drag_preview(app, ui, map, rows, tl, geo);
     let looping = loop_drag(app, ui, map);
+    let fading = crate::fades::drag(app, ui, map);
     let rh = geo.rh;
     let row_y = |t: TrackId| rows.iter().position(|r| r.id == t).map(|i| tl.min.y + geo.tops[i] - app.arrange.vscroll);
     for t in rows {
         let Some(y0) = row_y(t.id) else { continue };
         for c in t.clips() {
             let rect = Rect::from_min_max(pos2(map.x(c.start), y0 + 1.0), pos2(map.x(c.end()).max(map.x(c.start) + 2.0), y0 + rh - 1.0));
-            layout.clips.push(ClipRect { id: c.id.0, track: t.id.0, rect: r4(rect), start: c.start, end: c.end() });
+            layout.clips.push(ClipRect {
+                id: c.id.0,
+                audio: matches!(c.content, ClipContent::Audio { .. }),
+                track: t.id.0,
+                rect: r4(rect),
+                start: c.start,
+                end: c.end(),
+            });
             if rect.max.x < tl.min.x || rect.min.x > tl.max.x || rect.max.y < tl.min.y || rect.min.y > tl.max.y {
                 continue;
             }
             let moving = preview.is_some_and(|(id, _, _, _, copy)| id == c.id && !copy);
-            draw_clip(&p, s, map, tl, t, c, rect, sel.contains(&c.id), if moving { 0.35 } else { 1.0 });
+            let alpha = if moving { 0.35 } else { 1.0 };
+            match &fading {
+                // The fade being dragged, drawn live over the waveform.
+                Some(f) if f.clip == c.id => {
+                    let mut live = c.clone();
+                    match f.side {
+                        crate::fades::Side::In => live.fade_in = f.fade,
+                        crate::fades::Side::Out => live.fade_out = f.fade,
+                    }
+                    draw_clip(&p, s, map, tl, t, &live, rect, sel.contains(&c.id), alpha);
+                }
+                _ => draw_clip(&p, s, map, tl, t, c, rect, sel.contains(&c.id), alpha),
+            }
         }
+    }
+    // A crossfade drag across an abutting boundary: the band it would make.
+    if let Some(crate::fades::Live { plan: crate::fades::Plan::Cross { track, start, end }, .. }) = &fading
+        && let Some(y0) = row_y(*track)
+    {
+        let band = Rect::from_min_max(pos2(map.x(*start), y0 + 1.0), pos2(map.x(*end).max(map.x(*start) + 2.0), y0 + rh - 1.0));
+        p.rect_filled(band, crate::theme::RADIUS, TOKENS.accent.gamma_multiply(0.3));
     }
     // A loop drag: the cycles (or copies) it would add as ghosts in the clip color at reduced alpha, and
     // the part it would cut off shaded.
@@ -956,6 +1015,7 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
             ClipContent::Video { .. } => {}
         }
     }
+    crate::fades::draw(&p, c, map, rect, body, ink, selected);
     let stroke = if selected { Stroke::new(2.0, TOKENS.selection_outline) } else { Stroke::new(1.0, theme::darken(base, 0.45)) };
     p.rect_stroke(rect, crate::theme::RADIUS, stroke, StrokeKind::Inside);
 }
@@ -1056,7 +1116,7 @@ fn hit(layout: &Layout, pos: Pos2) -> (Option<(ClipId, TrackId, DragKind, Sample
         .iter()
         .rev()
         .find(|c| pos.x >= c.rect[0] && pos.x <= c.rect[2] && pos.y >= c.rect[1] && pos.y <= c.rect[3])
-        .map(|c| (ClipId(c.id), TrackId(c.track), zone(c.rect, pos), c.start, c.end));
+        .map(|c| (ClipId(c.id), TrackId(c.track), zone(c.rect, pos, c.audio), c.start, c.end));
     (clip, track)
 }
 
@@ -1069,6 +1129,8 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         match hit(layout, pos).0 {
             Some((_, _, DragKind::TrimStart | DragKind::TrimEnd, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
             Some((_, _, DragKind::Loop, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::Alias),
+            Some((_, _, DragKind::FadeIn, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe),
+            Some((_, _, DragKind::FadeOut, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw),
             Some(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
             None => {}
         }
@@ -1086,7 +1148,26 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         if !s.edit.selected_clips.contains(&clip) {
             app.click_clip(clip, false);
         }
+        // Alt on an existing fade bends it instead of copying or resizing.
+        let alt = ui.input(|i| i.modifiers.alt);
+        let kind = match crate::fades::hit(s, map, layout, press) {
+            Some((c, side)) if alt && c == clip && matches!(kind, DragKind::Move | DragKind::FadeIn | DragKind::FadeOut) => match side {
+                crate::fades::Side::In => DragKind::FadeCurveIn,
+                crate::fades::Side::Out => DragKind::FadeCurveOut,
+            },
+            _ => kind,
+        };
         app.arrange.gesture = Some(Gesture::Clip { clip, track, kind, press, start, end });
+    }
+    if resp.dragged()
+        && let Some(Gesture::Clip { kind, .. }) = &app.arrange.gesture
+    {
+        match kind {
+            DragKind::FadeIn => ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe),
+            DragKind::FadeOut => ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw),
+            DragKind::FadeCurveIn | DragKind::FadeCurveOut => ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical),
+            _ => {}
+        }
     }
     if resp.dragged() && matches!(app.arrange.gesture, Some(Gesture::Clip { kind: DragKind::Move, .. })) {
         let copy = ui.input(|i| drag_copies(i.modifiers));
@@ -1098,7 +1179,11 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     if resp.drag_stopped() {
         let preview = drag_preview(app, ui, map, rows, tl, geo);
         let looped = loop_drag(app, ui, map);
+        let fade = crate::fades::drag(app, ui, map);
         let gesture = app.arrange.gesture.take();
+        if let Some(f) = fade {
+            crate::fades::commit(app, &f);
+        }
         if let Some(l) = looped {
             commit_loop(app, &l);
         }
@@ -1111,9 +1196,22 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     {
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.command);
         match hit(layout, pos) {
-            (Some((clip, ..)), _) => app.click_clip(clip, additive),
+            (Some((clip, ..)), _) => {
+                app.click_clip(clip, additive);
+                // A click on a fade opens its shape menu.
+                app.arrange.fade_menu = match crate::fades::hit(s, map, layout, pos) {
+                    Some((c, side)) if c == clip && !additive => Some(crate::fades::Menu { clip, side, at: pos + vec2(8.0, 8.0) }),
+                    _ => None,
+                };
+            }
             (None, track) => app.click_empty(track, map.at(pos.x)),
         }
+    }
+    // Double-click a fade: back to the default shape and no bend.
+    let on_fade = if resp.double_clicked() { resp.interact_pointer_pos().and_then(|pos| crate::fades::hit(s, map, layout, pos)) } else { None };
+    if let Some((clip, side)) = on_fade {
+        app.arrange.fade_menu = None;
+        crate::fades::reset(app, clip, side);
     }
     if resp.double_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
@@ -1125,6 +1223,7 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     // Slice 3: double-click a MIDI clip to edit it in the piano roll; slice 6: double-click its
     // name strip to rename it.
     if resp.double_clicked()
+        && on_fade.is_none()
         && let Some(pos) = resp.interact_pointer_pos()
         && let (Some((clip, ..)), _) = hit(layout, pos)
     {
@@ -1140,7 +1239,38 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
             }
         }
     }
+    if resp.secondary_clicked()
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        app.arrange.menu_target = match hit(layout, pos).0 {
+            Some((clip, ..)) => {
+                if !s.edit.selected_clips.contains(&clip) {
+                    app.click_clip(clip, false);
+                }
+                Some((clip, crate::fades::hit(s, map, layout, pos).filter(|h| h.0 == clip).map(|h| h.1)))
+            }
+            None => None,
+        };
+    }
+    crate::fades::click_menu(app, ui);
     resp.context_menu(|ui| {
+        if let Some((clip, side)) = app.arrange.menu_target.filter(|(c, _)| s.find_clip(*c).is_some()) {
+            if let Some(side) = side
+                && crate::fades::shape_items(app, ui, clip, side)
+            {
+                ui.close();
+            }
+            if crate::fades::overlap(s, clip).is_some() {
+                let b = ui.button("Crossfade");
+                app.arrange.menu.retain(|m| m.label != "Crossfade");
+                app.arrange.menu.push(crate::mixer::MenuItem::at(ui, "Crossfade".into(), String::new(), b.rect));
+                if b.clicked() {
+                    crate::fades::crossfade(app, clip);
+                    ui.close();
+                }
+            }
+            ui.separator();
+        }
         if ui.button("Add Mono Audio Track").clicked() {
             let _ = app.add_audio_track("mono");
             ui.close();

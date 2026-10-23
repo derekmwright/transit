@@ -17,6 +17,7 @@ pub mod browser;
 pub mod builtin_editor;
 pub mod control;
 pub mod devices;
+pub mod fades;
 pub mod fine;
 pub mod finish;
 pub mod grid;
