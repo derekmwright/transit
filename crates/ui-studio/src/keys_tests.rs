@@ -815,6 +815,108 @@ impl T {
 const SIXTEENTH: i64 = soundcraft_time::TICKS_PER_QUARTER / 4;
 
 #[test]
+fn step_hold_commits_the_preview_length_as_one_undo_step() {
+    let mut t = T::open();
+    t.step_on();
+    let undo = t.undo_len();
+    let note = |pitch, on| soundcraft_playback::PlayedNote { pitch, velocity: if on { 90 } else { 0 }, on };
+    t.app.step_midi_at(note(60, true), 0);
+    t.app.step_midi_at(note(64, true), 20);
+    t.app.step_midi_at(note(60, false), 600);
+    assert!(t.notes().is_empty(), "preview must not edit the document");
+    t.app.step_midi_at(note(64, false), 1050);
+    let notes = t.notes();
+    assert_eq!(notes.len(), 2);
+    assert!(notes.iter().all(|n| n.length == 4 * SIXTEENTH));
+    assert_eq!(t.app.keys.step.cursor, 4 * SIXTEENTH);
+    assert_eq!(t.undo_len(), undo + 1);
+}
+
+#[test]
+fn clearing_live_input_discards_the_pending_step() {
+    let mut t = T::open();
+    t.step_on();
+    t.app.step_midi_at(soundcraft_playback::PlayedNote { pitch: 60, velocity: 90, on: true }, 0);
+    t.app.live_clear();
+    t.app.step_midi_at(soundcraft_playback::PlayedNote { pitch: 60, velocity: 0, on: false }, 1000);
+    assert!(t.notes().is_empty());
+    assert_eq!(t.app.keys.step.cursor, 0);
+}
+
+#[test]
+fn step_pedal_rests_repeat_and_sustain_chord_ties_are_undoable() {
+    use soundcraft_engine::step_input::StepBinding::{Cc, Note};
+    let mut t = T::open();
+    t.step_on();
+    t.app.step_message_at(Cc(64), 127, 0);
+    t.app.step_message_at(Cc(64), 0, 100);
+    assert_eq!(t.app.keys.step.cursor, SIXTEENTH);
+    t.app.step_message_at(Cc(64), 127, 200);
+    t.app.step_tick_at(700);
+    assert_eq!(t.app.keys.step.cursor, 3 * SIXTEENTH);
+    t.app.step_tick_at(1000);
+    assert_eq!(t.app.keys.step.cursor, 4 * SIXTEENTH);
+    t.app.step_message_at(Cc(64), 0, 1001);
+    assert!(t.notes().is_empty());
+    t.app.step_message_at(Note(60), 90, 1100);
+    t.app.step_message_at(Note(64), 80, 1110);
+    t.app.step_message_at(Note(60), 0, 1200);
+    t.app.step_message_at(Note(64), 0, 1210);
+    let undo = t.undo_len();
+    t.app.step_message_at(Cc(64), 127, 1300);
+    t.app.step_message_at(Note(60), 90, 1310);
+    t.app.step_message_at(Note(64), 80, 1320);
+    t.app.step_message_at(Note(60), 0, 1400);
+    t.app.step_message_at(Note(64), 0, 1410);
+    t.app.step_message_at(Cc(64), 0, 1450);
+    assert_eq!(t.notes().len(), 2, "tie extends, never duplicates the chord");
+    assert!(t.notes().iter().all(|n| n.length == 2 * SIXTEENTH && n.start == 4 * SIXTEENTH));
+    assert_eq!(t.app.keys.step.cursor, 6 * SIXTEENTH);
+    assert_eq!(t.undo_len(), undo + 1);
+    t.app.step_back();
+    assert!(t.notes().iter().all(|n| n.length == SIXTEENTH));
+    assert_eq!(t.app.keys.step.cursor, 5 * SIXTEENTH);
+    t.app.step_back();
+    assert!(t.notes().is_empty(), "after taking back the tie, take back the original chord");
+}
+
+#[test]
+fn step_learn_consumes_the_learning_press_and_back_key_and_persists_binding() {
+    use soundcraft_engine::step_input::{StepBinding, StepControl};
+    let mut t = T::open();
+    t.step_on();
+    t.tap(60, 90);
+    t.app.keys.step.input_cancel_for_learn(StepControl::Back);
+    t.app.step_message_at(StepBinding::Note(21), 100, 0);
+    t.app.step_message_at(StepBinding::Note(21), 0, 50);
+    assert_eq!(t.notes().len(), 1, "learning must not execute the new action");
+    t.app.step_message_at(StepBinding::Note(21), 100, 100);
+    t.app.step_message_at(StepBinding::Note(21), 0, 150);
+    assert!(t.notes().is_empty());
+    assert_eq!(t.app.keys.step.cursor, 0);
+    let saved = serde_json::to_value(&t.app.ui.keys).unwrap();
+    let back: crate::keys::KeysPrefs = serde_json::from_value(saved).unwrap();
+    assert_eq!(back.step_bindings.back, Some(StepBinding::Note(21)));
+    let old: crate::keys::KeysPrefs = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(old.step_bindings.rest, Some(StepBinding::Cc(64)));
+}
+
+#[test]
+fn played_midi_tap_controls_reach_the_step_editor_and_reset_discards_a_hold() {
+    use soundcraft_playback::{PlayedMidi, PlayedNote};
+    let mut t = T::open();
+    t.step_on();
+    t.app.live_played_midi(PlayedMidi::Control { cc: 64, value: 127 });
+    t.app.live_played_midi(PlayedMidi::Control { cc: 64, value: 0 });
+    assert_eq!(t.app.keys.step.cursor, SIXTEENTH);
+    t.app.live_played_midi(PlayedMidi::Note(PlayedNote { pitch: 60, velocity: 100, on: true }));
+    t.app.live_played_midi(PlayedMidi::Reset);
+    t.app.live_played_midi(PlayedMidi::Note(PlayedNote { pitch: 60, velocity: 0, on: false }));
+    assert!(t.notes().is_empty());
+    assert!(t.app.live_keys().is_empty());
+}
+
+#[test]
 fn step_toggles_from_the_toolbar_and_the_key_and_shows_a_cursor() {
     let mut t = T::open();
     assert!(!t.app.keys.layout.step_on);
@@ -854,7 +956,9 @@ fn keys_held_together_enter_one_chord_step() {
     t.played(64, 100, true);
     t.played(67, 90, true);
     t.played(60, 0, false);
+    assert!(t.notes().is_empty(), "a chord must wait for its last held key");
     t.played(64, 0, false);
+    assert!(t.notes().is_empty(), "lifting a second finger must not commit the chord");
     t.played(67, 0, false);
     let n = t.notes();
     assert_eq!(n.len(), 3);
@@ -1197,6 +1301,9 @@ fn fixed_step_velocity_overrides_the_played_velocity_and_played_follows_the_key(
     t.played(65, 20, true);
     t.played(67, 120, true);
     t.played(65, 0, false);
+    assert!(!t.notes().iter().any(|n| n.pitch == 65 || n.pitch == 67), "the chord is pending until its last release");
+    t.played(67, 0, false);
+    assert_eq!(t.notes().iter().filter(|n| n.pitch == 65 || n.pitch == 67).count(), 2);
     assert!(t.notes().iter().filter(|n| n.pitch == 65 || n.pitch == 67).all(|n| n.velocity == 80));
     // Back to Played.
     t.click(mid(t.app.keys.layout.step_velocity));

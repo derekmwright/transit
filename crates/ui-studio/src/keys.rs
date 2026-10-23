@@ -136,6 +136,9 @@ pub struct KeysPrefs {
     /// The velocity of step-entered notes when `step_fixed`.
     #[serde(deserialize_with = "read_velocity")]
     pub step_velocity: u8,
+    /// Hold threshold and repeat floor for step entry.
+    pub step_hold: soundcraft_engine::step_input::HoldPrefs,
+    pub step_bindings: soundcraft_engine::step_input::StepBindings,
     /// Explicit velocity for new notes and audition; note edits never change it.
     #[serde(deserialize_with = "read_velocity")]
     pub velocity: u8,
@@ -157,6 +160,8 @@ impl Default for KeysPrefs {
             grid: GridView::default(),
             step_fixed: false,
             step_velocity: 100,
+            step_hold: soundcraft_engine::step_input::HoldPrefs::default(),
+            step_bindings: soundcraft_engine::step_input::StepBindings::default(),
             velocity: 100,
         }
     }
@@ -449,6 +454,7 @@ impl StudioApp {
         if self.keys.clip != Some(clip) {
             self.keys.selection.clear();
             self.keys.fit = true;
+            self.keys.step = StepState::default();
         }
         self.keys.clip = Some(clip);
         self.keys.gesture = None;
@@ -476,6 +482,7 @@ impl StudioApp {
 
     /// Hide the piano roll; the panes shown before it come back.
     pub fn close_keys(&mut self) {
+        self.live_clear();
         self.ui.keys.show = false;
         self.keys.gesture = None;
         self.keys.active = false;
@@ -884,6 +891,18 @@ fn editor(app: &mut StudioApp, ui: &mut Ui) {
     paint_grid(ui, &s, &map, grid, ruler, &cv);
     let preview = preview(app, ui, &map, vel, &cv.notes);
     paint_notes(app, ui, &map, grid, vel, &cv.notes, cv.len, preview.as_ref(), &mut layout);
+    if let Some(chord) = app.step_preview() {
+        let length = app.step_len().saturating_mul(i64::from(chord.units));
+        let painter = ui.painter().with_clip_rect(grid);
+        for (pitch, velocity) in chord.notes {
+            let note = Note { pitch, velocity, release_velocity: 64, channel: 0, start: app.keys.step.cursor, length };
+            painter.rect_filled(map.note_rect(&note), crate::theme::RADIUS_SM, TOKENS.accent.gamma_multiply(0.55));
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    if app.step_active() && app.keys.step.pending() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+    }
     grid_input(app, ui, &map, grid, vel, &cv, now, &mut layout);
     lane_input(app, ui, &map, vel, &cv, &layout);
     paint_keyboard(app, ui, &map, keyboard);
@@ -1069,6 +1088,48 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     let label = if on { format!("Step {}", step::length_label(app.step_len())) } else { "Step".into() };
     p.text(b.center(), Align2::CENTER_CENTER, label, small.clone(), if on { theme::text_on(TOKENS.accent) } else { TOKENS.text_dim });
     layout.step = r4(b);
+    resp.context_menu(|ui| {
+        use soundcraft_engine::step_input::StepControl;
+        ui.label("Step input settings");
+        ui.horizontal(|ui| {
+            ui.label("Hold threshold (ms)");
+            ui.add(egui::DragValue::new(&mut app.ui.keys.step_hold.threshold_ms).range(1..=60_000));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Repeat floor (ms)");
+            ui.add(egui::DragValue::new(&mut app.ui.keys.step_hold.floor_ms).range(1..=1000));
+        });
+        ui.label("Sustain + the same notes ties the previous chord.");
+        for (label, action, binding) in [
+            ("Rest", StepControl::Rest, app.ui.keys.step_bindings.rest),
+            ("Step back", StepControl::Back, app.ui.keys.step_bindings.back),
+            ("Tie", StepControl::Tie, app.ui.keys.step_bindings.tie),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(format!("{label}: {}", binding.map(|b| format!("{b:?}")).unwrap_or_else(|| "Unassigned".into())));
+                if ui.button("Learn").clicked() {
+                    if !app.keys.step.on {
+                        app.step_toggle();
+                    }
+                    app.keys.step.input_cancel_for_learn(action);
+                }
+                if ui.button("Clear").clicked() {
+                    *match action {
+                        StepControl::Rest => &mut app.ui.keys.step_bindings.rest,
+                        StepControl::Back => &mut app.ui.keys.step_bindings.back,
+                        StepControl::Tie => &mut app.ui.keys.step_bindings.tie,
+                    } = None;
+                    app.live_clear();
+                }
+            });
+        }
+        if app.keys.step.learning.is_some() {
+            ui.label("Press a MIDI key, pad, or controller to learn.");
+            if ui.button("Cancel learn").clicked() {
+                app.keys.step.learning = None;
+            }
+        }
+    });
     if resp
         .on_hover_text(format!(
             "Step entry: notes played on the MIDI keyboard go in at the cursor ({}; rest {}, back {}, length 1-6)",
