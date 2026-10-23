@@ -118,8 +118,7 @@ impl Lane {
         } else {
             u8::try_from(slot).ok().filter(|s| *s < u8::MAX - 1)?
         };
-        // `AutoParam::parse` lowercases ids, so a lane can only address lowercase ones.
-        (param == param.to_ascii_lowercase()).then(|| (track, Lane::Plugin { slot, param: param.to_string() }))
+        Some((track, Lane::Plugin { slot, param: param.to_string() }))
     }
 
     /// The device a plug-in lane addresses.
@@ -165,7 +164,7 @@ impl Lane {
 
     fn info(&self, t: &Track) -> Option<&'static soundcraft_dsp::ParamInfo> {
         let Lane::Plugin { param, .. } = self else { return None };
-        soundcraft_dsp::plugin_info(&self.device(t)?.plugin)?.params.iter().find(|p| p.id == param)
+        device_info(&self.device(t)?.plugin)?.params.iter().find(|p| p.id == param)
     }
 
     /// The value the parameter has without automation.
@@ -292,6 +291,15 @@ impl Lane {
     }
 }
 
+/// A device's parameter table: a built-in's, or a hosted plug-in's from the host registries'
+/// cache. The cache is read only (no instantiation), so this never blocks the UI thread; a type
+/// is cached once any instance of it has loaded (a project's plug-ins do on open).
+pub fn device_info(plugin: &str) -> Option<&'static soundcraft_dsp::PluginInfo> {
+    soundcraft_dsp::plugin_info(plugin)
+        .or_else(|| plugin.starts_with(soundcraft_clap_host::ID_PREFIX).then(|| soundcraft_clap_host::cached_info(plugin)).flatten())
+        .or_else(|| plugin.starts_with(soundcraft_vst3_host::ID_PREFIX).then(|| soundcraft_vst3_host::cached_info(plugin)).flatten())
+}
+
 /// The lanes `t` can show, as (section, label, lane id): the mixer's, each send's, each device's.
 pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, String, String)> {
     let mut v = Vec::new();
@@ -314,16 +322,13 @@ pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, Stri
         .chain(t.mixer.inserts.iter().enumerate().filter_map(|(slot, ins)| Some((u8::try_from(slot).unwrap_or(0), ins.as_ref()?))));
     for (slot, ins) in devices {
         let dev = app.plugin_name(&ins.plugin, false);
-        let ids: Vec<(String, String)> = match soundcraft_dsp::plugin_info(&ins.plugin) {
+        let ids: Vec<(String, String)> = match device_info(&ins.plugin) {
             Some(info) => info.params.iter().map(|p| (p.id.to_string(), p.name.to_string())).collect(),
-            // A hosted plug-in: the parameters the document holds (L40).
-            None => ins.params.keys().map(|k| (k.clone(), k.clone())).collect(),
+            // A hosted plug-in whose table is not cached yet (never loaded this run): the
+            // parameters the document holds, by id.
+            None => ins.params.keys().map(|k| (k.clone(), format!("param {k}"))).collect(),
         };
         for (id, name) in ids {
-            // `AutoParam::parse` lowercases ids, so a lane can only address lowercase ones.
-            if id != id.to_ascii_lowercase() {
-                continue;
-            }
             v.push((dev.clone(), name, Lane::Plugin { slot, param: id }.id()));
         }
     }

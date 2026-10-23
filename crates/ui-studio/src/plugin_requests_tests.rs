@@ -7,11 +7,11 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const REQUESTS: &str = "clap:org.soundcraft.test.requests";
+pub(crate) const REQUESTS: &str = "clap:org.soundcraft.test.requests";
 
 /// Builds soundcraft-clap-host's fixture with its `requests` feature (a GUI-less CLAP effect)
 /// once and adds its folder to the CLAP search path.
-fn requests_fixture() {
+pub(crate) fn requests_fixture() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
         // Only the fixture folder: the first `create` runs a scan, which must not read the

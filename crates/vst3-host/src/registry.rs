@@ -490,6 +490,12 @@ pub fn instantiate_plugin(id: &str) -> Result<Vst3Plugin, Vst3Error> {
     Ok(p)
 }
 
+/// The description of `id` if it is already cached, without instantiating anything (never loads
+/// a plug-in binary, so it is safe on the UI thread). `None` for a type not loaded yet.
+pub fn cached_info(id: &str) -> Option<&'static PluginInfo> {
+    lock().infos.get(id).copied()
+}
+
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     parse_id(id)?;
     {

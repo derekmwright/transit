@@ -176,6 +176,9 @@ mod api {
     pub fn plugin_info(_id: &str) -> Option<&'static PluginInfo> {
         None
     }
+    pub fn cached_info(_id: &str) -> Option<&'static PluginInfo> {
+        None
+    }
     pub fn shutdown() {}
     pub fn adopt_main_thread() {}
     pub fn service_requests() -> Serviced {
@@ -419,6 +422,12 @@ pub fn service_requests() -> Serviced {
 /// to read its parameters; the result is cached (and leaked, see the crate docs).
 pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
     api::plugin_info(id)
+}
+
+/// Like [`plugin_info`], but only from the cache: it never instantiates the plug-in, so it never
+/// blocks. `None` until some instance of the type has been created.
+pub fn cached_info(id: &str) -> Option<&'static PluginInfo> {
+    api::cached_info(id)
 }
 
 #[cfg(test)]

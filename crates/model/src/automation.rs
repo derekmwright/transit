@@ -86,7 +86,8 @@ impl AutoParam {
     }
     /// Parse ids like `volume`, `pan`, `pan2`, `mute`, `send_a_level`, `plugin:a:threshold`.
     pub fn parse(s: &str) -> Option<AutoParam> {
-        let s = s.trim().to_ascii_lowercase();
+        let orig = s.trim();
+        let s = orig.to_ascii_lowercase();
         match s.as_str() {
             "volume" | "vol" => return Some(AutoParam::Volume),
             "pan" | "pan1" => return Some(AutoParam::Pan(0)),
@@ -104,9 +105,10 @@ impl AutoParam {
                 _ => None,
             };
         }
-        if let Some(rest) = s.strip_prefix("plugin:") {
-            let (slot, param) = rest.split_once(':')?;
-            let slot = if slot == "instrument" { Self::INSTRUMENT_SLOT } else { letter_slot(slot)? };
+        if s.starts_with("plugin:") {
+            // The prefix and slot are case-insensitive; the parameter id keeps its case.
+            let (slot, param) = orig["plugin:".len()..].split_once(':')?;
+            let slot = if slot.eq_ignore_ascii_case("instrument") { Self::INSTRUMENT_SLOT } else { letter_slot(slot)? };
             return Some(AutoParam::Plugin { slot, param: param.to_string() });
         }
         None
@@ -256,6 +258,18 @@ impl AutomationLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_ids_keep_their_case_and_lowercase_ids_still_parse() {
+        let p = AutoParam::parse("plugin:B:CutoffHz").unwrap();
+        assert_eq!(p, AutoParam::Plugin { slot: 1, param: "CutoffHz".into() });
+        assert_eq!(
+            AutoParam::parse("Plugin:Instrument:Mixed_Case").unwrap(),
+            AutoParam::Plugin { slot: AutoParam::INSTRUMENT_SLOT, param: "Mixed_Case".into() }
+        );
+        assert_eq!(AutoParam::parse("plugin:a:mid_gain").unwrap(), AutoParam::Plugin { slot: 0, param: "mid_gain".into() });
+        assert_eq!(AutoParam::parse("VOLUME"), Some(AutoParam::Volume));
+    }
 
     #[test]
     fn interpolation_and_steps() {

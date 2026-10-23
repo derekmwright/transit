@@ -1032,6 +1032,8 @@ impl StudioApp {
 #[cfg(test)]
 mod audio_devices_tests;
 #[cfg(test)]
+mod automation_picker_tests;
+#[cfg(test)]
 mod automation_tests;
 #[cfg(test)]
 mod browser_tests;
