@@ -9,6 +9,7 @@ struct T {
     app: StudioApp,
     ctx: egui::Context,
     time: f64,
+    shapes: Vec<egui::epaint::ClippedShape>,
 }
 
 impl T {
@@ -16,7 +17,7 @@ impl T {
         let mut app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
         app.ui.show_mixer = true;
         app.ui.show_devices = true;
-        let mut t = T { app, ctx: egui::Context::default(), time: 0.0 };
+        let mut t = T { app, ctx: egui::Context::default(), time: 0.0, shapes: Vec::new() };
         t.frames(3);
         t
     }
@@ -35,6 +36,7 @@ impl T {
                 app.logic(ui.ctx());
                 app.ui(ui);
             });
+            self.shapes = out.shapes;
             out.textures_delta.clear();
         }
     }
@@ -77,6 +79,19 @@ impl T {
             None => tr.instrument.as_ref(),
         };
         ins.and_then(|i| i.params.get(id).copied())
+    }
+
+    fn assert_preset_label(&self, tr: TrackId, expected: &str) {
+        fn contains(shape: &egui::Shape, rect: egui::Rect, expected: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => rect.contains(text.pos) && text.galley.text() == expected,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| contains(s, rect, expected)),
+                _ => false,
+            }
+        }
+        let [x0, y0, x1, y1] = self.window(tr).preset;
+        let rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+        assert!(self.shapes.iter().any(|s| contains(&s.shape, rect, expected)), "preset dropdown should show {expected}");
     }
 
     /// Click the focused track's editor button on card `card`.
@@ -247,11 +262,23 @@ fn a_factory_instrument_preset_applies_without_a_config_directory() {
     let (tr, _) = open_plugin(&mut t, "subtractive_synth");
     t.app.services.config_dir = None;
     assert_ne!(t.param(tr, None, "cutoff"), Some(1400.0));
+    let before = t.undo_len();
+    let previous = t.app.builtin_at((tr, soundcraft_mix::INSTRUMENT_SLOT)).unwrap();
     let preset = t.window(tr).preset;
     t.click(mid(preset), 1);
     // The menu has its Factory heading, Init, then Soft Pad.
     t.click(((preset[0] + preset[2]) / 2.0, preset[3] + 52.0), 1);
     assert_eq!(t.param(tr, None, "cutoff"), Some(1400.0));
+    assert_eq!(t.row(tr, "cutoff").value, info("subtractive_synth").param("cutoff").unwrap().format(1400.0));
+    t.assert_preset_label(tr, "Soft Pad");
+    assert_eq!(t.undo_len(), before + 1);
+    t.app.run("edit.undo", json!({})).unwrap();
+    t.frames(3);
+    assert_eq!(t.app.builtin_at((tr, soundcraft_mix::INSTRUMENT_SLOT)).unwrap(), previous);
+    t.assert_preset_label(tr, "<factory default>");
+    t.app.run("edit.redo", json!({})).unwrap();
+    t.frames(3);
+    t.assert_preset_label(tr, "Soft Pad");
 }
 
 /// A track with `plugin` open in its editor: an instrument for the synth, an insert otherwise.
@@ -353,6 +380,45 @@ fn a_user_preset_saves_loads_lists_and_deletes_as_one_undo_step() {
 }
 
 #[test]
+fn an_instrument_preset_name_survives_session_save_load_and_undo_restores_the_previous_name() {
+    let mut t = T::new();
+    let (tr, _) = open_plugin(&mut t, "subtractive_synth");
+    let key = (tr, soundcraft_mix::INSTRUMENT_SLOT);
+    let synth = info("subtractive_synth");
+    let factory = crate::presets::factory_for(synth.id);
+    let soft = &factory.iter().find(|(name, _)| *name == "Soft Pad").unwrap().1;
+    let bass = &factory.iter().find(|(name, _)| *name == "Bass").unwrap().1;
+    t.app.apply_preset(key, synth, "Soft Pad", soft);
+    let previous = t.app.builtin_at(key).unwrap();
+    let before = t.undo_len();
+    t.app.apply_preset(key, synth, "Bass", bass);
+    assert_eq!(t.undo_len(), before + 1);
+    t.app.run("edit.undo", json!({})).unwrap();
+    t.frames(3);
+    assert_eq!(t.app.builtin_at(key).unwrap(), previous);
+    t.assert_preset_label(tr, "Soft Pad");
+
+    let dir = temp_config("instrument-session");
+    let path = dir.join("preset.transit");
+    t.app.engine.execute("session.save_as", &json!({"path": path, "replace": true})).unwrap();
+    t.app.engine.execute("session.new", &json!({})).unwrap();
+    t.app.engine.execute("session.open", &json!({"path": path})).unwrap();
+    t.frames(3);
+    let loaded = t.app.builtin_at(key).unwrap();
+    assert_eq!(loaded.preset, "Soft Pad");
+    assert_eq!(loaded.params, previous.params);
+    t.assert_preset_label(tr, "Soft Pad");
+
+    // Older sessions may omit the existing optional preset field.
+    let mut old: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    old["tracks"][0]["instrument"].as_object_mut().unwrap().remove("preset");
+    let old = soundcraft_model::Session::from_json(&old.to_string()).unwrap();
+    assert_eq!(old.track(tr).unwrap().instrument.as_ref().unwrap().preset, "");
+    assert_eq!(old.track(tr).unwrap().instrument.as_ref().unwrap().params, previous.params);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn every_factory_preset_file_parses_belongs_to_its_plugin_and_applies_in_one_step() {
     use crate::presets;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/presets");
@@ -375,6 +441,8 @@ fn every_factory_preset_file_parses_belongs_to_its_plugin_and_applies_in_one_ste
             let before = t.undo_len();
             t.app.apply_preset((tr, slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT)), comp, &name, &p);
             assert_eq!(t.undo_len(), before + 1, "{plugin}/{name}: one undo step");
+            let key = (tr, slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT));
+            assert_eq!(t.app.builtin_at(key).unwrap().preset, name, "{plugin}/{name}: preset name");
             for (id, v) in presets::recall_values(comp, &p) {
                 assert_eq!(t.param(tr, slot, &id).unwrap_or(comp.param(&id).unwrap().default), v, "{plugin}/{name}: {id}");
             }

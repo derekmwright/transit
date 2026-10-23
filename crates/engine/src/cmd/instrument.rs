@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Instrument Parameter",
             [],
             None,
-            "{track?, param, value}: one parameter of an instrument track's built-in instrument (clamped into range)",
+            "{track?, param, value, preset?}: one parameter of an instrument track's built-in instrument (clamped into range); `preset` records the recalled preset name",
             has_selection,
             set_instrument_param
         ),
@@ -86,6 +86,9 @@ fn set_instrument_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let pi = info.param(&param).ok_or_else(|| bad(id, format!("`{}` has no parameter `{param}`", info.id)))?;
     let v = pi.clamp(value);
     ins.params.insert(param.clone(), v);
+    if let Some(name) = str_param(p, "preset") {
+        ins.preset = name.to_string();
+    }
     Ok(json!({"track": t, "param": param, "value": v}))
 }
 

@@ -137,7 +137,11 @@ impl StudioApp {
             for (id, v) in &values {
                 r = r.and(
                     self.engine
-                        .execute_merged("mix.instrument_param", &json!({"track": t.0, "param": id, "value": v}), &format!("preset:{}", t.0))
+                        .execute_merged(
+                            "mix.instrument_param",
+                            &json!({"track": t.0, "param": id, "value": v, "preset": name}),
+                            &format!("preset:{}", t.0),
+                        )
                         .map(|_| ()),
                 );
             }
