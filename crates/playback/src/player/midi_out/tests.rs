@@ -81,7 +81,10 @@ fn events_go_out_in_order_at_their_instant_plus_the_offset_and_never_from_the_au
     assert!(pushed);
     assert!(stats.is_zero(), "pushing allocated: {stats:?}");
     let sends = rig.wait_sent(4);
-    assert_eq!(sends.iter().map(|s| s.message.clone()).collect::<Vec<_>>(), [vec![0x90, 60, 100], vec![0x90, 64, 100], vec![0x80, 60, 64], vec![0x80, 64, 64]]);
+    assert_eq!(
+        sends.iter().map(|s| s.message.clone()).collect::<Vec<_>>(),
+        [vec![0x90, 60, 100], vec![0x90, 64, 100], vec![0x80, 60, 64], vec![0x80, 64, 64]]
+    );
     let origin = rig.origin.instant();
     for (send, at) in sends.iter().zip([base, base + 5_000_000, base + 10_000_000, base + 10_000_000]) {
         let due = origin + Duration::from_nanos(at + 15_000_000);

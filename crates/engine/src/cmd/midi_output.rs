@@ -37,7 +37,9 @@ fn port_param(value: &Value) -> Result<Option<MidiOutPort>> {
             let name = text(value, "name", 1024, false)?;
             let ordinal = match value.get("ordinal") {
                 None => 0,
-                Some(v) => v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| bad(ID, "port `ordinal` must be an integer in 0..4294967295"))?,
+                Some(v) => {
+                    v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or_else(|| bad(ID, "port `ordinal` must be an integer in 0..4294967295"))?
+                }
             };
             let id = if value.get("id").is_some() { text(value, "id", 4096, true)? } else { String::new() };
             Ok(Some(MidiOutPort { backend, name, ordinal, id }))

@@ -72,12 +72,12 @@ use std::sync::Arc;
 mod active;
 mod compile;
 mod events;
+mod external_midi;
 mod hardware;
 mod key;
 mod plan;
 #[cfg(test)]
 mod plan_tests;
-mod external_midi;
 mod scope;
 mod sink;
 

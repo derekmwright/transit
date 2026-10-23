@@ -1549,7 +1549,7 @@ mod rate_tests {
     }
 }
 mod calibrate;
-#[cfg(test)]
-mod tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod external_tests;
+#[cfg(test)]
+mod tests;

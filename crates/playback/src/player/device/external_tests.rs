@@ -78,8 +78,15 @@ fn a_looped_midi_track_plays_its_clip_to_the_port_off_the_audio_thread_and_stop_
     let messages: Vec<Vec<u8>> = sends.iter().map(|s| s.message.clone()).collect();
     // Lap 1: C, then C off and E at the eighth. The wrap ends E (it sounds across the loop end);
     // lap 2 starts C again. Stop releases what is held and resets the channel.
-    let expected_start: Vec<Vec<u8>> =
-        vec![vec![0x94, 60, 100], vec![0x84, 60, 64], vec![0x94, 64, 90], vec![0x84, 64, 64], vec![0x94, 60, 100], vec![0x84, 60, 64], vec![0x94, 64, 90]];
+    let expected_start: Vec<Vec<u8>> = vec![
+        vec![0x94, 60, 100],
+        vec![0x84, 60, 64],
+        vec![0x94, 64, 90],
+        vec![0x84, 64, 64],
+        vec![0x94, 60, 100],
+        vec![0x84, 60, 64],
+        vec![0x94, 64, 90],
+    ];
     assert_eq!(messages.get(..expected_start.len()), Some(&expected_start[..]), "{messages:x?}");
     assert_eq!(messages.get(messages.len() - 2..), Some(&[vec![0xB4, 64, 0], vec![0xB4, 123, 0]][..]), "{messages:x?}");
     assert!(messages.contains(&vec![0x84, 64, 64]));

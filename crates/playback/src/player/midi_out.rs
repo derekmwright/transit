@@ -136,12 +136,9 @@ impl Destination {
             .iter()
             .filter(|t| t.kind.is_midi() && !t.inactive)
             .filter_map(|t| match &t.midi_output {
-                soundcraft_model::MidiOutput::External { port, channel, .. } => Some(Self {
-                    track: t.id,
-                    port: port.clone(),
-                    channel: *channel,
-                    offset_ns: (f64::from(t.midi_output.offset_ms()) * 1e6) as i64,
-                }),
+                soundcraft_model::MidiOutput::External { port, channel, .. } => {
+                    Some(Self { track: t.id, port: port.clone(), channel: *channel, offset_ns: (f64::from(t.midi_output.offset_ms()) * 1e6) as i64 })
+                }
                 soundcraft_model::MidiOutput::Internal => None,
             })
             .take(MAX_DESTINATIONS)
@@ -558,7 +555,6 @@ impl Worker {
             return i;
         }
         // A port of another backend (a session from another OS) is kept and stays missing.
-        let foreign = port.backend != backend.as_str();
         let state = if foreign { DestinationState::Missing } else { DestinationState::Pending };
         self.ports.push(Port { key, label: label(port), handle: None, state, used: 0, foreign });
         self.ports.len() - 1

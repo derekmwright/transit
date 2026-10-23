@@ -7,7 +7,14 @@ use transit_midi_io::{InputConfig, fake::Fake};
 use transit_rt::testing::measure;
 
 fn route() -> Route {
-    Route { engine: EngineEpoch(1), target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: u16::MAX, lookahead: 128, deliver: true, echo: false }
+    Route {
+        engine: EngineEpoch(1),
+        target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT),
+        channels: u16::MAX,
+        lookahead: 128,
+        deliver: true,
+        echo: false,
+    }
 }
 fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
     plan_bridge::pair(

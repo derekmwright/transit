@@ -20,8 +20,11 @@ fn one_undo_step_sets_the_destination_on_several_tracks_and_it_round_trips() {
     let mut e = Engine::default();
     let (a, b, _) = tracks(&mut e);
     let before = e.undo_pushes();
-    e.execute("midi.output", &json!({"tracks": [a.0, b.0], "port": {"backend": "winmm", "name": "Synth OUT", "id": "usb-synth"}, "channel": 10, "offset_ms": -4.5}))
-        .unwrap();
+    e.execute(
+        "midi.output",
+        &json!({"tracks": [a.0, b.0], "port": {"backend": "winmm", "name": "Synth OUT", "id": "usb-synth"}, "channel": 10, "offset_ms": -4.5}),
+    )
+    .unwrap();
     let expected = MidiOutput::External { port: synth(), channel: MidiOutChannel::Channel(9), offset_ms: -4.5 };
     assert_eq!(e.undo_pushes(), before + 1);
     for t in [a, b] {
@@ -43,10 +46,16 @@ fn partial_changes_keep_the_other_fields_and_internal_resets() {
     let mut e = Engine::default();
     let (_, b, _) = tracks(&mut e);
     e.execute("midi.output", &json!({"track": b.0, "port": {"backend": "winmm", "name": "Synth OUT", "id": "usb-synth"}})).unwrap();
-    assert_eq!(e.session().track(b).unwrap().midi_output, MidiOutput::External { port: synth(), channel: MidiOutChannel::AsRecorded, offset_ms: 0.0 });
+    assert_eq!(
+        e.session().track(b).unwrap().midi_output,
+        MidiOutput::External { port: synth(), channel: MidiOutChannel::AsRecorded, offset_ms: 0.0 }
+    );
     e.execute("midi.output", &json!({"track": b.0, "channel": 2})).unwrap();
     e.execute("midi.output", &json!({"track": b.0, "offset_ms": 12})).unwrap();
-    assert_eq!(e.session().track(b).unwrap().midi_output, MidiOutput::External { port: synth(), channel: MidiOutChannel::Channel(1), offset_ms: 12.0 });
+    assert_eq!(
+        e.session().track(b).unwrap().midi_output,
+        MidiOutput::External { port: synth(), channel: MidiOutChannel::Channel(1), offset_ms: 12.0 }
+    );
     let other = json!({"backend": "winmm", "name": "Other"});
     e.execute("midi.output", &json!({"track": b.0, "port": other})).unwrap();
     assert!(matches!(
