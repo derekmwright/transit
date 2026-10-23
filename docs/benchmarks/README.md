@@ -184,7 +184,7 @@ cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --
 
 Native ASIO only: both ends are counted in the driver's sample positions. Defaults: note 60,
 velocity 100, 10 trials, 1500 ms gap, 1000 ms window (`--max-ms`), 1.0 ms fit residual limit
-(`--max-fit-residual-ms`). The gap must outlast the synth's release. On a Moog Model D a 750 ms gap
+(`--max-fit-residual-ms`). The gap must outlast the synth's release. On a Behringer Model D a 750 ms gap
 left the pre-send window at about -67 dBFS against a -86 dBFS floor.
 
 Method:
