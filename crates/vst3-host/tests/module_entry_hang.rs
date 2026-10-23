@@ -94,6 +94,8 @@ fn a_hung_module_entry_does_not_block_another_binarys_load() {
         .output()
         .unwrap();
     let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // The gate and the two fixture copies belong to this run only, and the child has ended.
+    let _ = std::fs::remove_dir_all(&root);
     assert!(out.status.success(), "child: {:?}\n{stdout}\n{stderr}", out.status);
     assert!(stdout.contains("1 passed"), "the child ran no test: {stdout}");
 }

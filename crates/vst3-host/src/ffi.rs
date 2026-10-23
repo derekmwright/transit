@@ -440,8 +440,10 @@ impl Bundle {
         // After every new module, so that the exits run before its static destructors.
         register_exit_hook();
         drop(claim);
-        // Entered while the module exits ran: it stays cached, so the exit handler (or the next
-        // shutdown call) still balances its entry, but hosting is over.
+        // Entered while the module exits ran: it stays cached, so a later exit call on its entry
+        // thread (the host thread's shutdown job, or the exit handler for a module-thread entry)
+        // still balances its entry; on a host thread that is wedged at shutdown it is leaked,
+        // never exited on another thread. Hosting is over either way.
         if MODULES_EXITED.load(Ordering::Acquire) {
             return Err(err("plugin hosting has shut down"));
         }
