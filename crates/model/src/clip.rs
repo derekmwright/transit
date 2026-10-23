@@ -92,6 +92,26 @@ pub enum ClipContent {
     Video { source: SourceId, offset: Samples },
 }
 
+/// A clip's loop range (ADR 0019): the part of the clip that repeats once playback reaches its
+/// end. Samples from the clip start, the unit of [`Clip::length`]; `start` may be negative after
+/// a start trim. A clip plays `0..end` once, then cycles `start..end` until its length runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipLoop {
+    pub start: Samples,
+    pub end: Samples,
+}
+
+impl ClipLoop {
+    /// One cycle's length (samples); a valid loop has `start < end`.
+    pub fn cycle(self) -> Samples {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.start < self.end && self.end > 0
+    }
+}
+
 /// A clip on a playlist.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clip {
@@ -136,6 +156,10 @@ pub struct Clip {
     /// `clip.unloop` still recognises the loop after the source's content is edited.
     #[serde(default)]
     pub loop_id: Option<u64>,
+    /// The loop range inside the clip (ADR 0019); `None` plays the clip once. While set, `length`
+    /// may exceed the source and the content cycles modulo the range.
+    #[serde(default)]
+    pub looping: Option<ClipLoop>,
 }
 
 fn one() -> f64 {
@@ -163,6 +187,7 @@ impl Clip {
             stretch: 1.0,
             group: None,
             loop_id: None,
+            looping: None,
         }
     }
 
@@ -219,6 +244,31 @@ impl Clip {
         }
     }
 
+    /// Where in the clip's content `rel` samples of clip time play: `rel` until the loop's end,
+    /// then the cycle. Integer math only, so the audio thread can call it every block.
+    pub fn content_pos(&self, rel: Samples) -> Samples {
+        match self.looping {
+            Some(l) if l.is_valid() && rel >= l.end => l.start.saturating_add((rel - l.start).rem_euclid(l.cycle())),
+            _ => rel,
+        }
+    }
+
+    /// The clip-time start of every cycle boundary in `from..to`: where cycle 1, 2, ... begin.
+    /// Empty for an unlooped clip. Draws the divider ticks.
+    pub fn cycle_starts(&self, from: Samples, to: Samples) -> impl Iterator<Item = Samples> + use<> {
+        let l = self.looping.filter(|l| l.is_valid());
+        let to = to.min(self.length);
+        let (first, step) = l.map_or((Samples::MAX, 1), |l| (l.end, l.cycle()));
+        let skip = if from > first { (from - first + step - 1) / step } else { 0 };
+        let first = first.saturating_add(skip.saturating_mul(step));
+        std::iter::successors(Some(first), move |x| x.checked_add(step)).take_while(move |x| *x < to)
+    }
+
+    /// Set the loop range, clamped to a valid one inside `0..length`; `None` clears it.
+    pub fn set_loop(&mut self, range: Option<ClipLoop>) {
+        self.looping = range.filter(|l| l.is_valid());
+    }
+
     /// Gain (linear) at `rel` samples from the clip start: clip gain × envelope × fades.
     pub fn gain_at(&self, rel: Samples) -> f32 {
         self.gain_at_with_fades(rel, self.fade_in, self.fade_out)
@@ -246,12 +296,19 @@ impl Clip {
     pub fn trim_start_to(&mut self, new_start: Samples) {
         let new_start = new_start.min(self.end() - 1);
         let delta = new_start - self.start;
+        // Trimming into a later cycle starts the clip at that cycle's phase, not further into the file.
+        let phase = if delta > 0 { self.content_pos(delta) } else { delta };
         if let ClipContent::Audio { offset, .. } | ClipContent::Video { offset, .. } = &mut self.content {
-            *offset = offset.saturating_add(delta);
+            *offset = offset.saturating_add(phase);
         }
         // MIDI note ticks are re-anchored by the engine, which knows the tempo map.
         self.length -= delta;
         self.start = new_start;
+        // Audio and video loops are in clip time, so they move with the start. A MIDI loop moves
+        // when the engine re-anchors its notes (the loop and the notes must shift together).
+        if !matches!(self.content, ClipContent::Midi { .. }) {
+            self.shift_loop(phase);
+        }
         if self.sync_point != 0 {
             self.sync_point = self.sync_point.saturating_sub(delta);
         }
@@ -263,6 +320,16 @@ impl Clip {
         }
         self.gain_env.retain(|&(t, _)| t >= delta);
         self.gain_env.iter_mut().for_each(|(t, _)| *t = t.saturating_sub(delta));
+    }
+
+    /// Move the loop range `delta` samples earlier (a start trim of `delta`); clears it if the trim
+    /// left no cycle.
+    pub fn shift_loop(&mut self, delta: Samples) {
+        if let Some(l) = &mut self.looping {
+            l.start = l.start.saturating_sub(delta);
+            l.end = l.end.saturating_sub(delta);
+        }
+        self.looping = self.looping.filter(|l| l.is_valid());
     }
 
     /// Move the end edge to `new_end`.
@@ -298,6 +365,11 @@ impl Clip {
             ClipContent::Midi { sequence } => bound_sequence(sequence),
         }
         self.clamp_fades();
+        if let Some(l) = &mut self.looping {
+            bound(&mut l.start);
+            bound(&mut l.end);
+        }
+        self.looping = self.looping.filter(|l| l.is_valid());
         self.fade_in.sanitize();
         self.fade_out.sanitize();
         truncate_chars(&mut self.name, MAX_NAME_CHARS);
@@ -347,6 +419,59 @@ pub(crate) fn db_to_gain(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn looped(start: Samples, end: Samples, length: Samples) -> Clip {
+        let mut c = Clip::audio(ClipId(1), "c", SourceId(1), 0, 0, length);
+        c.set_loop(Some(ClipLoop { start, end }));
+        c
+    }
+
+    #[test]
+    fn content_position_wraps_modulo_the_loop_range() {
+        let c = looped(100, 400, 2000);
+        assert_eq!(c.content_pos(0), 0);
+        assert_eq!(c.content_pos(399), 399);
+        assert_eq!(c.content_pos(400), 100, "the seam");
+        assert_eq!(c.content_pos(699), 399);
+        assert_eq!(c.content_pos(700), 100);
+        assert_eq!(c.content_pos(1999), 100 + (1999 - 100) % 300);
+        let mut plain = c.clone();
+        plain.set_loop(None);
+        assert_eq!(plain.content_pos(1999), 1999);
+        // An invalid range is no loop.
+        plain.set_loop(Some(ClipLoop { start: 5, end: 5 }));
+        assert!(plain.looping.is_none());
+    }
+
+    #[test]
+    fn cycle_starts_lists_the_seams_inside_the_length() {
+        let c = looped(0, 400, 1000);
+        assert_eq!(c.cycle_starts(0, 1000).collect::<Vec<_>>(), vec![400, 800]);
+        assert_eq!(c.cycle_starts(500, 1000).collect::<Vec<_>>(), vec![800]);
+        assert_eq!(c.cycle_starts(0, 600).collect::<Vec<_>>(), vec![400]);
+        let mut plain = c.clone();
+        plain.set_loop(None);
+        assert_eq!(plain.cycle_starts(0, 1000).count(), 0);
+    }
+
+    #[test]
+    fn a_start_trim_moves_the_audio_loop_and_an_old_clip_loads_unlooped() {
+        let mut c = looped(100, 400, 2000);
+        c.trim_start_to(150);
+        assert_eq!(c.looping, Some(ClipLoop { start: -50, end: 250 }));
+        assert_eq!(c.content_pos(250), -50, "the cycle restarts at the loop start");
+        c.trim_start_to(450);
+        // 450 is a whole cycle and 50 more into the loop: the clip now starts at the phase of
+        // content 150, not 300 further into the file.
+        assert_eq!(c.looping, Some(ClipLoop { start: -50, end: 250 }));
+        assert_eq!(c.source_offset(), 150);
+        assert_eq!(c.content_pos(0), 0);
+        let json = serde_json::to_value(Clip::audio(ClipId(2), "old", SourceId(1), 0, 0, 10)).unwrap();
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("looping");
+        let c: Clip = serde_json::from_value(old).unwrap();
+        assert_eq!(c.looping, None);
+    }
 
     #[test]
     fn fade_shapes_hit_endpoints() {
