@@ -55,3 +55,24 @@ change with the period and with the sample rate, so no single offset or per-peri
 measured click round trip at the configured period and rate is the ground truth. Calibration over ASIO
 should therefore measure the loop rather than model it, and the stamp-based path has a defect to fix or
 retire (ASIO slice d; see known issue K31).
+
+## Correction (2026-10-23, by sample position)
+
+The "Measured" column above is timed by callback arrival: the bench took the host time at which each
+block's callback arrived, and the Focusrite driver delivers callbacks in bursts at small buffers (known
+issue K26), so a block's arrival is not its sample position. Timing the same loop by the driver's sample
+position (the click counted by position in both directions, as the app's Calibration Measure does) gives:
+
+| Rate (Hz) | Period (frames) | Loop by sample position (frames) | Driver out + in (frames) | Position minus driver (frames) |
+|---|---:|---:|---:|---:|
+| 48000 | 64 | 333 | 328 | +5 |
+| 48000 | 128 | 647 | 648 | -1 |
+| 48000 | 256 | 1196 | 1192 | +4 |
+| 48000 | 512 | 2188 | 2184 | +4 |
+
+So by position the driver's figures agree with the loop within 1-5 frames at 48 kHz. The Reading bullets
+"over-reports at 64 and 256 ... under-reports at 32, 128 and 512" and "two modes at 128 and 512 frames",
+and the Conclusion's "cannot be corrected by a fixed model", describe the arrival-time table and do not
+hold by position. Without a Measure the app's placement on this interface is within about 5 frames;
+Measure (issue #20) refines that and guards against a driver whose loop shifts between starts. 44.1 kHz
+and 32 frames were not re-measured by position.

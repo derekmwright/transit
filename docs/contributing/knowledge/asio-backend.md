@@ -334,11 +334,14 @@ read 1239 frames, one buffer more. On drivers whose loop phase changes between s
 
 ## Loopback calibration (#20, K31)
 
-The drivers' `getLatencies` figures cannot be corrected by any fixed model: on the Scarlett the error
-changes sign with the buffer size (the driver over-reports at 64 and 256 frames and under-reports at 32,
-128 and 512) and moves with the rate ([the 2026-10-23 benchmark](../../benchmarks/2026-10-23-ryzen-5900x-scarlett-2i2-asio-reported-vs-measured.md)).
-So calibration over native ASIO measures the loop at the configured period and rate, and the driver
-figures are shown for reference only.
+By sample position the Scarlett 2i2's getLatencies sum matches the measured loop within 1-5 frames at
+48 kHz (64: 333 vs 328; 128: 647 vs 648; 256: 1196 vs 1192; 512: 2188 vs 2184). The sign-flipping error
+in the 2026-10-23 benchmark was an artifact of timing clicks by callback arrival (K26 bursts; see the
+correction appended to [that page](../../benchmarks/2026-10-23-ryzen-5900x-scarlett-2i2-asio-reported-vs-measured.md)).
+Measure refines placement by those few frames and catches a loop that came up a buffer off. Without a
+Measure the driver's figures are used, which on the Scarlett at 48 kHz are already within about 5 frames;
+they are unverified at 44.1 kHz and on other drivers, and on drivers whose loop shifts between starts
+(the Model 12) Measure is a guard as well as a refinement.
 
 - **What is measured.** A click (the hardware-insert probe's) plays on an output path and is found again
   on an input path through a cable. `crates/playback/src/loop_probe.rs` counts both by the driver's
@@ -357,15 +360,28 @@ figures are shown for reference only.
   stopped and the window's driver, rate and buffer are the open ones (otherwise it asks to Apply first).
   The result is kept in `ui.audio.calibrations` under the open key, saved with the preferences, and
   handed to the running streams (`Stream::set_calibration`: the next stamp is invalid, so the clock fit
-  restarts there). The line reads "calibrated: 1062 frames (22.1 ms) ±7 at 256 / 48 kHz (date)"; at
-  another buffer size or rate it reads "not calibrated at this buffer size and rate (measured at ...)"
-  and Measure times it again. Code: `Player::start_loop_calibration`, `hardware_measure.rs`
+  restarts there). The line reads "calibrated: 1196 frames (24.9 ms) ±7 at 256 / 48 kHz (date)"; at
+  another buffer size or rate it reads "not calibrated at the buffer size and rate the driver runs
+  (measured at ...)" and Measure checks it again. After a Measure the result also gives the driver's
+  figures (in plus out) and the difference, with a warning when they are more than a buffer apart (a
+  wrong cable or path, or a loop in another phase).
+- **Keyed on the buffer the driver runs.** A driver may run another buffer than the one asked for: the
+  default period runs its panel's size, and a fixed-size driver (the Model 12) runs its one size whatever
+  is asked. So the key's period is the achieved buffer: the Player looks the calibration up after the
+  open, when that is known, and hands it to both streams then; Measure stores under it; the bench's
+  `--settings` writes under it. A calibration measured with the panel at 64 therefore never applies after
+  the panel moves to 256 (test `an_asio_calibration_is_keyed_and_applied_by_the_buffer_the_driver_runs`).
+- **An impossible loop is refused.** A loop shorter than the driver's output figure would place the input
+  after its own callback; the engine then keeps the driver's figures (`BackendEstimate`) instead of
+  clamping, and the stream's close logs a warning (test
+  `an_impossible_calibration_is_refused_and_the_driver_figures_stay`). Code: `Player::start_loop_calibration`, `hardware_measure.rs`
   (`MeasureKind::Loop`). Tests: `a_loop_over_native_asio_is_measured_in_sample_positions_and_applied_to_the_running_streams`,
   `measure_on_the_asio_calibration_line_times_the_loop_and_stores_it_for_this_buffer_size`.
-- **Two phases.** At some buffer sizes a driver start lands the loop in one of two phases one period
-  apart (the Scarlett at 128 and 512 frames; the Model 12 between starts). Each Measure times the loop as
-  the driver runs now; the stored value is the median of its clicks and the spread shows a mixed run.
-  Measure again after a Reconnect or a driver reset if the loop may have come up in the other phase.
+- **Two phases.** On some drivers a start lands the loop in one of two phases one period apart (the
+  Model 12 between starts; not seen by position on the Scarlett). Each Measure times the loop as the
+  driver runs now; the stored value is the median of its clicks and the spread shows a mixed run, and the
+  comparison with the driver's figures warns when it is a buffer off. Measure again after a Reconnect or
+  a driver reset if the loop may have come up in the other phase.
 - **The bench.** `audio-bench --backend asio --loopback` prints the same figure ("app calibration ... by
   sample position") beside the driver's figures in frames, and `--settings` writes it under the `asio`
   key. Its table's "Round trip" column is timed by callback arrival, which a driver that delivers
@@ -373,11 +389,11 @@ figures are shown for reference only.
   against the positions; compare the two lines of one run.
 - **The stamp-time figure is retired over ASIO.** Before #20 the bench calibrated from the stamps' own
   frame times (capture frame time minus render frame time of each click). Over ASIO those are the
-  position plus the driver's figures, so that difference is the loop minus `getLatencies` (in plus out),
-  not the loop: a few frames where the driver under-reports (the "+4 frames" of the 2026-10-22 Scarlett
-  run), the loop where a phase shift added a buffer (the Model 12's 245 frames), and no pair at all where
-  the driver over-reports, because the pairing only accepts a click that left before it arrived. It is
-  not a defect of the pairing; it measures a residual that ASIO's stamps no longer need. Native WASAPI
+  position plus the driver's figures, so that difference is the residual loop − (in + out), a few frames
+  by position on the Scarlett (the "+4 frames" of the 2026-10-22 run) and about a buffer where a phase
+  shift added one (the Model 12's 245 frames); the pairing rejects a negative residual, so a run with a
+  slightly negative one paired nothing. It is not a defect of the pairing; it measures a residual that
+  ASIO's stamps no longer need. Native WASAPI
   keeps it, because there the stamps account for the device latency and the calibration is that
   residual.
 

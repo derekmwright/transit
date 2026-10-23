@@ -19,8 +19,9 @@
 //! buffer switch, a capture block's first frame was captured `getLatencies` input frames before it
 //! (the SDK's latencies count from the buffer switch and include the buffer). A calibration is the
 //! whole loop, measured by a click in sample positions (the output frame at position `p` comes
-//! back at input position `p + round trip`; known issue K31: the drivers' figures cannot be
-//! corrected by a fixed model). Under one, the capture frame time is the callback plus the output
+//! back at input position `p + round trip`; known issue K31: the driver's figures are close by
+//! position but unverified per driver and phase, and the measured loop replaces them). Under one,
+//! the capture frame time is the callback plus the output
 //! figure minus the round trip, so an output frame and the input frame it comes back as carry the
 //! same time and the input figure is not used. A calibration can be replaced while the stream
 //! runs ([`SideShared::set_calibration`]); the next stamp of that direction is then invalid.

@@ -37,8 +37,8 @@ impl Stamp {
 ///   (the output's presented frame to the input's captured frame of the same click).
 /// - **Native ASIO:** the whole loop, measured by a click in the driver's sample positions (the
 ///   output frame at position `p` comes back at input position `p` plus the round trip). The
-///   driver's `getLatencies` figures cannot be corrected by any fixed model (known issue K31), so
-///   a calibrated capture stamp is placed from the measured loop, not from them.
+///   driver's `getLatencies` figures are close by position but unverified per driver and phase
+///   (known issue K31); the measured loop replaces them for a calibrated capture stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Calibration {
     pub round_trip_ns: u64,

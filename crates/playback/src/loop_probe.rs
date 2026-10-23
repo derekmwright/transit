@@ -2,9 +2,9 @@
 //! hardware-insert probe ([`crate::hardware_probe`]), counted in the driver's sample positions
 //! instead of the plan's frames.
 //!
-//! The drivers' `getLatencies` figures cannot be corrected by any fixed model (the error flips
-//! sign with the buffer size and moves with the rate), so the app measures the loop at the
-//! configured period and rate. A cable from an output to an input carries the click back: the
+//! The driver's `getLatencies` figures are close by position but unverified per driver and phase
+//! (known issue K31); the measured loop replaces them, timed at the buffer the driver runs and the
+//! rate. A cable from an output to an input carries the click back: the
 //! render callback adds it to the device buffer at sample position `origin + t` and the capture
 //! callback records the input by position, so the lag of the click is the loop in device frames,
 //! the figure the ASIO stamps need (`transit-audio-asio` places a calibrated capture frame from

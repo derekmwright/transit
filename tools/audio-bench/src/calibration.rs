@@ -7,8 +7,9 @@
 //! in the stamps' own time (the delay the stamps do not account for); on native ASIO the click
 //! loop in the driver's sample positions, the figure the app's Calibration Measure stores (#20,
 //! known issue K31). The stamp-time figure is not a calibration over ASIO: it is the loop minus the
-//! driver's `getLatencies` figures, which the drivers misreport by an amount that changes sign with
-//! the buffer size, so it came out as a few frames, or as no pair at all when it was negative.
+//! driver's `getLatencies` figures (in plus out), a residual of a few frames by position on the
+//! Scarlett 2i2, and the pairing rejects a negative residual, so it came out as a few frames or as
+//! no pair at all.
 
 use crate::analysis::FrameTrip;
 use crate::probe::{CLICK_LEVEL, MIN_ENERGY_RATIO};
