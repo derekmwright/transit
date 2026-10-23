@@ -7,9 +7,10 @@
 //! scatter of about one buffer, 5.3 ms) never gets a map from it. This fit keeps the last
 //! [`HISTORY_NS`] of blocks and never fewer than [`KEEP_POINTS`] (when there are that many), takes
 //! equal or coarse arrival times, drops points far outside the scatter once and refits, and judges
-//! the line by its standard error at the send, not by the scatter. It is the same kind of map the
-//! app's MIDI output thread uses (a linear relation of host time and device sample position,
-//! [`Line::host_to_frame`] and [`Line::frame_to_host`]), with a longer window.
+//! the line by its standard error at the send, not by the scatter. It fits device sample position
+//! against capture-callback arrival time ([`Line::host_to_frame`] and [`Line::frame_to_host`]), the
+//! same reference as the app's ClockFitter input map, with a longer window. The app's MIDI output
+//! thread schedules on the output presentation map instead, which slice 3 of #71 has to reconcile.
 //!
 //! What the figures are:
 //! - **scatter**: the largest distance of a point from the line, in ns. How irregular the
@@ -59,6 +60,10 @@ pub struct PositionFit {
     /// Times the history was started over (a position going back, a clock jump, an invalid stamp).
     pub restarts: u64,
 }
+
+/// The timing reference line printed in both reports and carried in their JSON.
+pub const TIMING_REFERENCE: &str =
+    "capture-block arrival (includes input buffer and mean driver dispatch; same as the app's ClockFitter map and the published runs)";
 
 /// A fitted line: host time = `host0 + intercept + slope * (position - position0)`, centered.
 #[derive(Debug, Clone, Copy, PartialEq)]

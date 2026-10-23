@@ -4,7 +4,7 @@
 //! The bench schedules a pattern of note-ons at intended device sample positions P_i (a grid
 //! starting [`Settings::lead_ms`] after the scheduling instant), sends each at P_i minus the
 //! compensation, the deadline being the host time of that position by the position clock
-//! ([`crate::fit`], the same kind of map the app's MIDI output thread uses) and the wait the
+//! ([`crate::fit`]: device sample position against capture-callback arrival time, the same reference as the app's ClockFitter input map; the app's MIDI output thread schedules on the output presentation map, which slice 3 of #71 has to reconcile) and the wait the
 //! output thread's (sleep until [`SPIN_NS`] before the deadline, then yield). The return is
 //! captured by sample position, each onset O_i found as in `--midi-roundtrip`, and the placement
 //! error is E_i = O_i - P_i. With `--compensation` it runs the pattern twice: uncompensated (E is
@@ -158,6 +158,12 @@ pub struct Note {
     pub fit: SendFit,
 }
 
+/// Whether the fit's newest block sat further from the line than `limit_ns`: a change in the
+/// driver's dispatch delay the 2 s line has not followed yet. A warning only.
+pub(crate) fn fit_drift(fit: &SendFit, limit_ns: u64) -> bool {
+    fit.leave_last_out_ns.abs() > limit_ns as f64
+}
+
 impl Note {
     /// E = O - P, in samples.
     pub fn error(&self) -> i64 {
@@ -278,6 +284,7 @@ impl Report {
         let pattern = s.pattern_ms.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
         let mut lines = vec![
             "MIDI placement against the grid (note-ons scheduled at intended device positions P, sent at P minus the compensation; error E = onset - P)".to_string(),
+            format!("timing reference: {}", crate::fit::TIMING_REFERENCE),
             format!(
                 "MIDI \"{}\" channel {} note {} velocity {} -> \"{}\" input {}, {} Hz, buffer {buffer}, floor {} (lowest of the reference window {} and the pre-send windows), warm-up note {}",
                 self.midi_port,
@@ -344,6 +351,13 @@ impl Report {
                         self.ms(n.uncertainty() as f64)
                     ));
                 }
+                if fit_drift(&n.fit, b.max_fit_error_ns) {
+                    lines.push(format!(
+                        "warning: {what}: the clock fit's leave-last-out error is {:+.2} ms, above {:.2} ms: the driver's dispatch delay may have changed; E may carry the change",
+                        n.fit.leave_last_out_ns / 1e6,
+                        b.max_fit_error_ns as f64 / 1e6
+                    ));
+                }
                 lines.extend(
                     rt::pre_send_warning(&what, n.pre_send, self.floor, false).map(|w| w.replace("raise --gap-ms", "raise --pattern-spacing-ms")),
                 );
@@ -382,6 +396,7 @@ impl Report {
                             "threshold": n.threshold, "attack_peak": n.peak, "send_call_ns": n.send_call_ns,
                         });
                         rt::merge(&mut note, rt::fit_json(&n.fit));
+                        note["fit_drift_warning"] = serde_json::json!(fit_drift(&n.fit, self.settings.base.max_fit_error_ns));
                         note
                     })
                     .collect();
@@ -394,6 +409,7 @@ impl Report {
         let b = &self.settings.base;
         serde_json::json!({
             "measurement": "MIDI placement against the grid",
+            "timing_reference": crate::fit::TIMING_REFERENCE,
             "error": "onset position minus intended position, in device samples",
             "command": command, "date": date, "cpu": machine.cpu, "os": machine.os,
             "device": self.device, "midi_port": self.midi_port,
@@ -639,6 +655,28 @@ mod tests {
         assert!(s.check(48_000).unwrap_err().contains("at least 50 ms apart"));
         s.pattern_ms = vec![100, 0];
         assert!(s.check(48_000).is_err());
+    }
+
+    #[test]
+    fn a_dispatch_step_trips_the_fit_drift_warning_and_steady_arrivals_do_not() {
+        let at = |k: u64| 1_000_000_000 + k * 64 * 1_000_000_000 / 48_000;
+        let send_fit = |step_ns: u64| {
+            let mut pf = crate::fit::PositionFit::new(48_000);
+            for k in 0..400u64 {
+                pf.push(k * 64, 64, at(k) + if k == 399 { step_ns } else { 0 });
+            }
+            let line = pf.line().unwrap();
+            SendFit {
+                scatter_ns: line.scatter_ns,
+                sigma_ns: line.sigma_ns,
+                error_ns: 0.0,
+                leave_last_out_ns: line.leave_last_out_ns,
+                points: line.n,
+                app_offset: None,
+            }
+        };
+        assert!(fit_drift(&send_fit(2_000_000), 500_000), "{:?}", send_fit(2_000_000));
+        assert!(!fit_drift(&send_fit(0), 500_000), "{:?}", send_fit(0));
     }
 
     #[test]

@@ -12,8 +12,10 @@
 //! The send instant: the host time H (`HostOrigin`, QPC on Windows) read on the control thread
 //! right before the send call, mapped to the device's sample position by the bench's position
 //! clock ([`crate::fit`]): a least-squares line of the capture blocks' arrival time against their
-//! sample position over the last 2 s, the same kind of map the app's MIDI output thread uses (ADR
-//! 0017) with a longer window. The app's own fitter is fed the same blocks and reported beside it.
+//! sample position over the last 2 s, the same reference as the app's ClockFitter input map (device
+//! sample position against capture-callback arrival time) with a longer window. The app's MIDI
+//! output thread schedules on the output presentation map, which slice 3 of #71 has to reconcile.
+//! The app's own fitter is fed the same blocks and reported beside it.
 //! The position clock is used, not the presentation one: no audio output is in this chain. The
 //! input is recorded by sample position, so the onset is a position too, and both ends count the
 //! same driver counter. What is not measured is when the OS and the interface actually transmit
@@ -688,6 +690,7 @@ impl Report {
         let buffer = self.buffer.map_or("the driver's".to_string(), |b| b.to_string());
         let mut lines = vec![
             "MIDI-to-audio onset latency (MIDI delivery + synth response + audio input; not MIDI transport accuracy)".to_string(),
+            format!("timing reference: {}", crate::fit::TIMING_REFERENCE),
             format!(
                 "MIDI \"{}\" channel {} note {} velocity {} -> \"{}\" input {}, {} Hz, buffer {buffer}, floor {} (lowest of the reference window {} and {} pre-send windows), warm-up note {}",
                 self.midi_port,
@@ -805,6 +808,7 @@ impl Report {
         serde_json::json!({
             "measurement": "MIDI-to-audio onset latency",
             "includes": "MIDI delivery + synth response + audio input; not MIDI transport accuracy",
+            "timing_reference": crate::fit::TIMING_REFERENCE,
             "command": command, "date": date, "cpu": machine.cpu, "os": machine.os,
             "device": self.device, "midi_port": self.midi_port,
             "midi_channel": self.settings.channel + 1, "note": self.settings.note, "velocity": self.settings.velocity,
@@ -1251,6 +1255,8 @@ mod tests {
         assert_eq!(json["trials"][1]["pre_send_retried"], true);
         assert_eq!(json["trials"][0]["fit_points"], 375);
         assert_eq!(json["warmup_note"], true);
+        assert_eq!(json["timing_reference"], crate::fit::TIMING_REFERENCE);
+        assert!(text.contains("timing reference: capture-block arrival (includes input buffer and mean driver dispatch;"), "{text}");
     }
 
     #[test]

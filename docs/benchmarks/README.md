@@ -194,8 +194,10 @@ Method:
 - **Send instant.** The control thread reads the host clock (`HostOrigin`, QPC) right before the
   send call. The bench's position clock turns it into the device's sample position: a least-squares
   line of the capture blocks' arrival time against their first sample position, over the last 2 s of
-  blocks (never fewer than 32), with points far outside the spread dropped once. It is the same kind
-  of map the app's MIDI output thread uses (ADR 0017), over a longer window, so it converges where
+  blocks (never fewer than 32), with points far outside the spread dropped once. It is the same
+  reference as the app's ClockFitter input map (device sample position against capture-callback
+  arrival time), over a longer window; the app's MIDI output thread schedules on the output
+  presentation map, which slice 3 of #71 has to reconcile. It converges where
   the app's fitter (about 64 points, 2 ms residual limit) does not: the Scarlett 2i2 at buffer 256,
   whose buffers arrive with about one block of scatter. The app's fitter is fed the same blocks and
   printed beside it ("the app's clock map ... valid at k of n sends"). The warm-up waits for 1 s of
