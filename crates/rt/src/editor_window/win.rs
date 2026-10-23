@@ -651,16 +651,17 @@ impl EditorWindow {
         };
         let content = child(classes.content, WS_CLIPCHILDREN);
         let strip = if has_header { child(classes.header, 0) } else { std::ptr::null_mut() };
-        let Some(d) = data(hwnd) else {
-            // SAFETY: the live frame just made; destroying it frees its data.
-            unsafe { DestroyWindow(hwnd) };
-            return Err("cannot create the editor window".into());
-        };
         if content.is_null() || (has_header && strip.is_null()) {
-            // SAFETY: as above (its children go with it).
+            // SAFETY: the live frame just made (its children go with it); destroying it frees its
+            // data, and no reference to that data is held here.
             unsafe { DestroyWindow(hwnd) };
             return Err("cannot create the editor window's parts".into());
         }
+        let Some(d) = data(hwnd) else {
+            // SAFETY: as above.
+            unsafe { DestroyWindow(hwnd) };
+            return Err("cannot create the editor window".into());
+        };
         d.content.set(content);
         d.header.set(strip);
         set_content(hwnd, d, w as i32, h as i32);

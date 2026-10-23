@@ -23,7 +23,7 @@
 //! Nothing here panics. Other platforms have no such window: [`EditorWindow::new`] says so.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Height of the strip at 96 DPI, in pixels.
 pub const HEADER_HEIGHT: i32 = 30;
@@ -448,7 +448,8 @@ impl Follow {
 }
 
 /// When the host last resized a window (for [`Follow`]).
-fn since(at: Option<Instant>) -> Duration {
+#[cfg(any(windows, test))]
+fn since(at: Option<std::time::Instant>) -> Duration {
     at.map_or(Duration::MAX, |t| t.elapsed())
 }
 

@@ -95,6 +95,23 @@ fn set_live(app: &mut StudioApp, ctx: &egui::Context, t: TrackId, slot: usize, d
     assert!(finish(app, ctx, job).is_some(), "the fixture takes the state");
 }
 
+/// Runs frames until the live state is `want` (the session's parameters reach the plug-in a few
+/// blocks after a document change), at most 10 s.
+fn live_becomes(app: &mut StudioApp, ctx: &egui::Context, t: TrackId, slot: usize, want: &[u8], what: &str) {
+    let start = Instant::now();
+    loop {
+        let got = live(app, ctx, t, slot);
+        if got == want {
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "{what}: live state {got:?}, want {want:?} (status {:?})", app.status);
+        for _ in 0..3 {
+            frame(app, ctx);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Waits until no preset operation runs.
 fn settle(app: &mut StudioApp, ctx: &egui::Context) {
     frames_until(app, ctx, "the preset operation", |a| !a.plugin_header.any_busy());
@@ -139,6 +156,12 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
         let p = a.player.as_ref().unwrap();
         (0..2).all(|s| p.begin_save_state(t, s).is_ok())
     });
+    // The fixture's "GUI" makes an edit as it is set up (gain 0.9 normalized); once the session
+    // has recorded it, the session stores the gain, and a preset load must update that value too
+    // (or the session would push the old one over the preset).
+    frames_until(&mut app, &ctx, "the fixture's own edit recorded", |a| {
+        a.engine.session().tracks[0].mixer.inserts.iter().take(2).all(|i| i.as_ref().is_some_and(|i| i.params.contains_key("7")))
+    });
 
     let header = app.editor_header((t, 0)).expect("a header for the hosted insert");
     assert_eq!(header.title, "Drums \u{b7} Insert A \u{b7} Fixture Gain");
@@ -166,17 +189,25 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
     assert_eq!(app.engine.undo_label(), Some("Load Preset"));
     let ins = app.engine.session().tracks[0].mixer.inserts[0].clone().unwrap();
     assert_eq!((ins.preset.as_str(), ins.state_bytes().unwrap()), ("My Kit", state(0.75)), "the session holds it too");
+    let stored = ins.params["7"];
+    assert!((stored - 1.5).abs() < 1e-3, "the stored gain is the preset's (0.75 of 0..2), not the old edit's: {stored}");
+    // More blocks: the session's parameters do not undo the preset.
+    for _ in 0..10 {
+        frame(&mut app, &ctx);
+    }
+    assert_eq!(live(&mut app, &ctx, t, 0), state(0.75), "still the preset after the session's parameters were applied");
 
     // Undo: the session and the live plug-in go back to the state before the load.
     app.run("edit.undo", serde_json::json!({})).unwrap();
-    settle(&mut app, &ctx);
     frame(&mut app, &ctx);
     settle(&mut app, &ctx);
-    assert_eq!(live(&mut app, &ctx, t, 0), state(0.25), "undo gave the plug-in its earlier state back: {}", app.status);
+    live_becomes(&mut app, &ctx, t, 0, &state(0.25), "undo gives the plug-in its earlier state back");
+    let stored = app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params["7"];
+    assert!((stored - 0.5).abs() < 1e-3, "the session stores the restored state's gain, not the step's stale value: {stored}");
     app.run("edit.redo", serde_json::json!({})).unwrap();
     frame(&mut app, &ctx);
     settle(&mut app, &ctx);
-    assert_eq!(live(&mut app, &ctx, t, 0), state(0.75), "redo loads the preset again");
+    live_becomes(&mut app, &ctx, t, 0, &state(0.75), "redo loads the preset again");
 
     // Previous/next step through the user presets in name order.
     set_live(&mut app, &ctx, t, 0, state(0.5));

@@ -48,6 +48,18 @@ pub fn specs() -> Vec<CommandSpec> {
             view: false,
         },
         CommandSpec {
+            id: "plugin.state_values",
+            label: "Store Plug-in Values",
+            menu: &[],
+            shortcut: None,
+            params: "{track, slot, params: {id: value}} → {stored}. The values a hosted plug-in reports after its stored state was loaded into it live again (an undo or redo of a preset load): the parameters the session stores take them, so the session never pushes other values over that state. Not undoable and not journaled.",
+            enabled: has_tracks,
+            run: state_values,
+            journal: false,
+            undoable: false,
+            view: false,
+        },
+        CommandSpec {
             id: "plugin.preset_list",
             label: "List Plug-in Presets",
             menu: &[],
@@ -186,6 +198,16 @@ fn state_load(e: &mut Engine, p: &Value) -> Result<Value> {
     Ok(json!({"bytes": state.len()}))
 }
 
+fn state_values(e: &mut Engine, p: &Value) -> Result<Value> {
+    const CMD: &str = "plugin.state_values";
+    if p.get("params").is_none() {
+        return Err(bad(CMD, "`params` required"));
+    }
+    let ins = hosted(e, CMD, p)?;
+    let n = apply_params(CMD, ins, p)?;
+    Ok(json!({"stored": n}))
+}
+
 fn preset_list(_e: &mut Engine, p: &Value) -> Result<Value> {
     const CMD: &str = "plugin.preset_list";
     let plugin = str_param(p, "plugin").ok_or_else(|| bad(CMD, "`plugin` required"))?;
@@ -271,6 +293,12 @@ mod tests {
         assert!(e.take_state_restores().is_empty(), "once");
         e.execute("edit.redo", &json!({})).unwrap();
         assert_eq!(e.take_state_restores(), vec![(soundcraft_model::TrackId(t), 0)], "a redo restores the preset");
+        // The values the plug-in reports after the redo's live load: stored, without a step.
+        let steps = e.undo_history().len();
+        e.execute("plugin.state_values", &json!({"track": t, "slot": 0, "params": {"7": 0.25}})).unwrap();
+        assert_eq!(e.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params.get("7").copied(), Some(0.25));
+        assert_eq!(e.undo_history().len(), steps, "not undoable");
+
         // Delete.
         e.execute("plugin.preset_delete", &json!({"path": path.to_string_lossy()})).unwrap();
         assert!(!path.exists());

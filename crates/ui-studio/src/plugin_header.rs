@@ -429,7 +429,14 @@ impl StudioApp {
                 },
                 Step::Restore { ref mut job } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
-                    JobPoll::Ready(Some(_)) => {}
+                    JobPoll::Ready(Some(values)) => {
+                        // The undone (or redone) step's parameters may not match the state it
+                        // stored; the plug-in's own values after the load are the ones to keep.
+                        let p = json!({"track": key.0.0, "slot": slot_json(key.1), "params": values_json(&values)});
+                        if let Err(e) = self.engine.execute("plugin.state_values", &p) {
+                            log::warn!("cannot store the plug-in's values after a restore: {e}");
+                        }
+                    }
                     JobPoll::Ready(None) => self.status = "The plug-in refused its earlier state".into(),
                     JobPoll::Failed(e) => self.status = format!("Could not give the plug-in its earlier state: {e}"),
                 },
