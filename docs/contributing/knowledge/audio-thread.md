@@ -46,10 +46,12 @@ Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../a
 - **Editors and states:** the editor and state reader stay on the host thread. The UI holds
   proxies: open, close and parameter echoes are sent without waiting; edits and the window state
   come back through shared state the host thread's 15 ms tick fills. A save (Save, autosave,
-  bounce, device reopen) waits for all state reads together at most 500 ms
-  (`DEFAULT_SAVE_DEADLINE`); a plug-in that has not answered by then (a long call, a modal
-  dialog; a thread inside one window message past 10 s answers at once) keeps its stored state
-  and the status line names it.
+  bounce, device reopen) waits for each plug-in that is answering, however slowly (up to the
+  10 s timeout). A wedged thread, or one inside a window message for more than 10 s, answers at
+  once; one held by a modal dialog (a window message past 100 ms, `MODAL_AFTER`) is waited for
+  at most 500 ms per save in all (`DEFAULT_SAVE_DEADLINE`), except for a plug-in the session has
+  no state for yet, which is waited for as usual. A plug-in left out keeps its stored state and
+  the status line names it.
 - **Stuck plug-ins:** a job or tick that runs past 10 s, or a window message (a modal dialog) past
   120 s, wedges its thread and a fresh thread takes new creations. Only a creation that was stuck
   marks its slot "Not responding" (and compiles it empty). Instances that already lived on the
