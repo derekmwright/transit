@@ -56,12 +56,64 @@ fn in_mode(mut plan: ab::Plan, mode: ab::Mode) -> ab::Plan {
     plan
 }
 
+/// What a run's streams call: the callbacks it hands the backend, and the checks once a stream opened.
+pub trait Callbacks {
+    /// The render callback; `channel` is the 0-based `--out-ch`.
+    fn render(&self, channel: usize) -> ab::RenderCallback;
+    /// The capture callback; `channel` is the 0-based `--in-ch`.
+    fn capture(&self, channel: usize) -> ab::CaptureCallback;
+    /// The error callback of the render (`render`) or capture stream.
+    fn error(&self, render: bool) -> ab::ErrorCallback;
+    /// The render stream opened with `achieved` (before it starts).
+    fn render_opened(&self, achieved: &ab::Achieved) -> Result<(), String>;
+    /// The capture stream opened with `achieved` (before it starts).
+    fn capture_opened(&self, achieved: &ab::Achieved) -> Result<(), String>;
+}
+
+/// The probe's callbacks: stamps, counts and the click loop ([`crate::probe`]).
+struct Probe<'a> {
+    shared: &'a Arc<Shared>,
+    loopback: bool,
+}
+
+impl Callbacks for Probe<'_> {
+    fn render(&self, channel: usize) -> ab::RenderCallback {
+        render_callback(Arc::clone(self.shared), channel, self.loopback)
+    }
+    fn capture(&self, channel: usize) -> ab::CaptureCallback {
+        capture_callback(Arc::clone(self.shared), channel)
+    }
+    fn error(&self, render: bool) -> ab::ErrorCallback {
+        let shared = Arc::clone(self.shared);
+        Box::new(move |_| if render { shared.render.error() } else { shared.capture.error() })
+    }
+    fn render_opened(&self, achieved: &ab::Achieved) -> Result<(), String> {
+        if self.loopback {
+            self.shared.render_click.set(ClickTemplate::new(achieved.format.rate)?).map_err(|_| "render template already set".to_string())?;
+        }
+        Ok(())
+    }
+    fn capture_opened(&self, achieved: &ab::Achieved) -> Result<(), String> {
+        self.shared.capture_click.set(ClickTemplate::new(achieved.format.rate)?).map_err(|_| "capture template already set".to_string())
+    }
+}
+
 /// Open render (and capture with `loopback`), start them, call `drive` for the run, stop them.
 /// `drive` returns when the measurement time is over.
 pub fn run(
     backend: &dyn ab::Backend,
     request: &Request,
     shared: &Arc<Shared>,
+    drive: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Opened, String> {
+    run_with(backend, request, &Probe { shared, loopback: request.loopback }, drive)
+}
+
+/// [`run`] with any [`Callbacks`].
+pub fn run_with(
+    backend: &dyn ab::Backend,
+    request: &Request,
+    callbacks: &dyn Callbacks,
     drive: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<Opened, String> {
     if request.out_ch == 0 || request.in_ch == 0 {
@@ -90,19 +142,14 @@ pub fn run(
                 .map(|plan| in_mode(plan, request.in_mode.unwrap_or(request.mode)))
         })
         .transpose()?;
-    let error_callback = |shared: &Arc<Shared>, render: bool| -> ab::ErrorCallback {
-        let shared = Arc::clone(shared);
-        Box::new(move |_| if render { shared.render.error() } else { shared.capture.error() })
-    };
     let open_capture = |plan: &ab::Plan| -> Result<(Box<dyn ab::Stream>, ab::Achieved), String> {
-        let (stream, achieved) = open_first(&plan.attempts, |attempt| {
-            backend.open_capture(&plan.endpoint, attempt, capture_callback(Arc::clone(shared), in_index), error_callback(shared, false))
-        })
-        .map_err(|e| format!("open input: {e}"))?;
+        let (stream, achieved) =
+            open_first(&plan.attempts, |attempt| backend.open_capture(&plan.endpoint, attempt, callbacks.capture(in_index), callbacks.error(false)))
+                .map_err(|e| format!("open input: {e}"))?;
         if usize::from(achieved.format.channels) <= in_index {
             return Err(format!("the input opened with {} channels; --in-ch {} does not exist", achieved.format.channels, request.in_ch));
         }
-        shared.capture_click.set(ClickTemplate::new(achieved.format.rate)?).map_err(|_| "capture template already set".to_string())?;
+        callbacks.capture_opened(&achieved)?;
         Ok((stream, achieved))
     };
     // A duplex backend (ASIO) needs the input built first, on the output's own device. The native WASAPI
@@ -114,20 +161,13 @@ pub fn run(
         capture = Some(open_capture(&ab::Plan { endpoint: render_plan.endpoint.clone(), attempts: plan.attempts.clone() })?);
     }
     let (render, achieved) = open_first(&render_plan.attempts, |attempt| {
-        backend.open_render(
-            &render_plan.endpoint,
-            attempt,
-            render_callback(Arc::clone(shared), out_index, request.loopback),
-            error_callback(shared, true),
-        )
+        backend.open_render(&render_plan.endpoint, attempt, callbacks.render(out_index), callbacks.error(true))
     })
     .map_err(|e| format!("open output: {e}"))?;
     if usize::from(achieved.format.channels) <= out_index {
         return Err(format!("the output opened with {} channels; --out-ch {} does not exist", achieved.format.channels, request.out_ch));
     }
-    if request.loopback {
-        shared.render_click.set(ClickTemplate::new(achieved.format.rate)?).map_err(|_| "render template already set".to_string())?;
-    }
+    callbacks.render_opened(&achieved)?;
     if let (None, Some(plan)) = (&capture, &capture_plan) {
         capture = Some(open_capture(plan)?);
     }

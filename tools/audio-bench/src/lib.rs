@@ -10,6 +10,8 @@ pub mod analysis;
 pub mod calibration;
 pub mod cli;
 pub mod fake;
+pub mod midi_roundtrip;
+pub mod onset;
 pub mod probe;
 pub mod report;
 pub mod session;
@@ -150,6 +152,33 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         machine: report::machine(),
         date,
     })
+}
+
+/// `--midi-roundtrip`: open the MIDI output and the native ASIO device and measure the
+/// MIDI-to-audio onset latency ([`midi_roundtrip`]). `interrupted` (set by Ctrl+C) ends it early,
+/// releasing the note.
+pub fn run_midi_roundtrip(
+    config: &Config,
+    options: &midi_roundtrip::Options,
+    interrupted: &std::sync::atomic::AtomicBool,
+) -> Result<midi_roundtrip::Report, String> {
+    if config.kind != Kind::Asio {
+        return Err("--midi-roundtrip needs --backend asio: it places the note and the onset by the driver's sample positions".into());
+    }
+    let backend = asio_backend()?;
+    let request = resolve_asio_device(&config.request)?;
+    let io = transit_midi_io::MidiIo::new("audio-bench");
+    let mut port = midi_roundtrip::open_output(&io, &options.port)?;
+    let mut driver = midi_roundtrip::RealTime { origin: ab::HostOrigin::default(), interrupted };
+    midi_roundtrip::measure(backend.as_ref(), &request, &options.settings, &mut port, &mut driver)
+}
+
+/// `args` as one shell line (an argument with a space, a quote or nothing in it quoted).
+pub fn command_line(args: &[String]) -> String {
+    args.iter()
+        .map(|a| if a.is_empty() || a.contains([' ', '"', '\t']) { format!("\"{}\"", a.replace('"', "\\\"")) } else { a.clone() })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The cpal backend of the audio system named (else the default); an unavailable name is an error

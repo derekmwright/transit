@@ -1,6 +1,6 @@
 //! The command line.
 
-use crate::{Config, Kind, fake, session};
+use crate::{Config, Kind, fake, midi_roundtrip, session};
 use std::path::PathBuf;
 use transit_audio_backend as ab;
 
@@ -27,6 +27,18 @@ usage: audio-bench [options]
                          of this settings file (close the app first: it rewrites its audio block when it saves); on asio
                          it is the click loop by sample position, as the app's Calibration Measure stores it
   --list-devices         list the devices of --system and exit (opens no stream)
+  --buffer <frames>      the same as --period
+  MIDI-to-audio onset latency (--backend asio only; a hardware synth's MIDI in and its audio into an input):
+  --midi-roundtrip       send notes to --midi-out and time their onset on --in by the driver's sample positions
+                         (MIDI delivery + synth response + audio input; not MIDI transport accuracy)
+  --midi-out <name>      MIDI output port: its name or a unique part of it, any case
+  --midi-channel <1-16>  MIDI channel the synth listens on
+  --in <ch>[,<ch>]       1-based input channel(s) of the synth's audio, summed (`1`, or `1,2` for a stereo pair)
+  --note <0-127>         note to play (default 60); --velocity <1-127> (default 100)
+  --trials <n>           notes to time (default 10)
+  --gap-ms <ms>          silence after each note-off (default 750; longer than the synth's release)
+  --max-ms <ms>          an onset must come within this of the send (default 1000)
+  --json <path>          also write the result, every trial and the command line, as JSON
   fake mode only:
   --fake-delay <frames>  software loopback delay (default 144)
   --fake-jitter-us <us>  peak arrival jitter (default 100)
@@ -37,6 +49,11 @@ usage: audio-bench [options]
 #[derive(Debug)]
 pub enum Command {
     Run(Config),
+    /// `--midi-roundtrip`: the device and the MIDI options.
+    MidiRoundTrip {
+        config: Config,
+        midi: midi_roundtrip::Options,
+    },
     List(Option<String>),
     Help,
 }
@@ -44,6 +61,16 @@ pub enum Command {
 fn number<T: std::str::FromStr>(flag: &str, value: Option<String>) -> Result<T, String> {
     let value = value.ok_or_else(|| format!("{flag} needs a value"))?;
     value.parse().map_err(|_| format!("{flag}: `{value}` is not a valid number"))
+}
+
+/// `--in`: 1-based channels separated by commas (or `+`), as 0-based indices.
+fn channels(value: Option<String>) -> Result<Vec<u16>, String> {
+    let value = value.ok_or("--in needs an input channel")?;
+    let parsed: Option<Vec<u16>> = value.split([',', '+']).map(|c| c.trim().parse::<u16>().ok().and_then(|c| c.checked_sub(1))).collect();
+    match parsed {
+        Some(list) if !list.is_empty() => Ok(list),
+        _ => Err(format!("--in: `{value}` is not a list of 1-based input channels (`1`, or `1,2`)")),
+    }
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -64,6 +91,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     let (mut seconds, mut out, mut settings) = (20.0f64, None, None);
     let (mut delay, mut jitter, mut gap, mut burst) = (None, None, None::<Option<f64>>, false);
     let mut list = false;
+    let mut midi = false;
+    let (mut port, mut channel, mut inputs, mut json) = (None::<String>, None::<u8>, None::<Vec<u16>>, None);
+    let (mut note, mut velocity, mut trials, mut gap_ms, mut max) = (None::<u8>, None::<u8>, None::<u32>, None::<u32>, None::<u32>);
     while let Some(flag) = args.next() {
         let mut value = || args.next();
         match flag.as_str() {
@@ -93,7 +123,17 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                     other => return Err(format!("--in-mode: expected shared or exclusive, got {other:?}")),
                 })
             }
-            "--period" => request.period = Some(number(&flag, value())?),
+            "--period" | "--buffer" => request.period = Some(number(&flag, value())?),
+            "--midi-roundtrip" => midi = true,
+            "--midi-out" => port = Some(value().ok_or("--midi-out needs a port name")?),
+            "--midi-channel" => channel = Some(number(&flag, value())?),
+            "--in" => inputs = Some(channels(value())?),
+            "--note" => note = Some(number(&flag, value())?),
+            "--velocity" => velocity = Some(number(&flag, value())?),
+            "--trials" => trials = Some(number(&flag, value())?),
+            "--gap-ms" => gap_ms = Some(number(&flag, value())?),
+            "--max-ms" => max = Some(number(&flag, value())?),
+            "--json" => json = Some(PathBuf::from(value().ok_or("--json needs a path")?)),
             "--rate" => request.rate = number(&flag, value())?,
             "--seconds" => seconds = number(&flag, value())?,
             "--loopback" => request.loopback = true,
@@ -117,6 +157,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     }
     if list {
         return Ok(Command::List(system));
+    }
+    let midi_given = port.is_some() || channel.is_some() || inputs.is_some() || json.is_some();
+    if !midi && (midi_given || note.is_some() || velocity.is_some() || trials.is_some() || gap_ms.is_some() || max.is_some()) {
+        return Err("--midi-out, --midi-channel, --in, --note, --velocity, --trials, --gap-ms, --max-ms and --json need --midi-roundtrip".into());
     }
     if !(seconds.is_finite() && seconds > 0.0) {
         return Err("--seconds must be positive".into());
@@ -147,6 +191,34 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     }
     if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some() || burst) {
         return Err("--fake-* options need --backend fake".into());
+    }
+    if midi {
+        if kind != Kind::Asio {
+            return Err("--midi-roundtrip needs --backend asio: it places the note and the onset by the driver's sample positions".into());
+        }
+        if request.loopback || settings.is_some() || out.is_some() {
+            return Err("--midi-roundtrip does not take --loopback, --settings or --out (use --json)".into());
+        }
+        let port = port.ok_or("--midi-roundtrip needs --midi-out <port name>")?;
+        let channel = channel.ok_or("--midi-roundtrip needs --midi-channel <1-16>")?;
+        if !(1..=16).contains(&channel) {
+            return Err("--midi-channel counts 1 to 16".into());
+        }
+        let inputs = inputs.ok_or("--midi-roundtrip needs --in <input channel> (1-based; `1,2` sums a stereo pair)")?;
+        let mut settings = midi_roundtrip::Settings::new(channel - 1, inputs);
+        settings.note = note.unwrap_or(settings.note);
+        settings.velocity = velocity.unwrap_or(settings.velocity);
+        settings.trials = trials.unwrap_or(settings.trials);
+        settings.gap_ms = gap_ms.unwrap_or(settings.gap_ms);
+        settings.max_ms = max.unwrap_or(settings.max_ms);
+        if settings.note > 127 || !(1..=127).contains(&settings.velocity) {
+            return Err("--note counts 0 to 127 and --velocity 1 to 127".into());
+        }
+        if settings.trials == 0 || settings.max_ms == 0 {
+            return Err("--trials and --max-ms must be positive".into());
+        }
+        let config = Config { kind, system, request, seconds, fake: fake::Script::new(seconds), out, settings: None };
+        return Ok(Command::MidiRoundTrip { config, midi: midi_roundtrip::Options { port, settings, json } });
     }
     let mut script = fake::Script::new(seconds);
     script.delay_frames = delay.unwrap_or(script.delay_frames);
@@ -219,6 +291,32 @@ mod tests {
         let refused = parse_str("--backend asio --device Scarlett --in-device Other --loopback").unwrap_err();
         assert!(refused.contains("--in-device does not apply"), "{refused}");
         assert!(matches!(parse_str("--backend wasapi --in-device Mic --loopback"), Ok(Command::Run(_))), "the other backends keep it");
+    }
+
+    #[test]
+    fn the_midi_roundtrip_takes_a_port_a_channel_and_an_input() {
+        let Ok(Command::MidiRoundTrip { config, midi }) = parse_str(
+            "--midi-roundtrip --midi-out Minilogue --midi-channel 2 --in 1,2 --backend asio --device Scarlett --rate 44100 --buffer 256 --trials 5 --gap-ms 900 --json r.json",
+        ) else {
+            panic!("did not parse")
+        };
+        assert_eq!((config.kind, config.request.rate, config.request.period), (Kind::Asio, 44_100, Some(256)));
+        assert_eq!((midi.port.as_str(), midi.settings.channel, midi.settings.returns.as_slice()), ("Minilogue", 1, &[0u16, 1][..]));
+        assert_eq!((midi.settings.note, midi.settings.velocity, midi.settings.trials, midi.settings.gap_ms), (60, 100, 5, 900));
+        assert_eq!((midi.settings.max_ms, midi.json), (1000, Some(PathBuf::from("r.json"))));
+        let Ok(Command::MidiRoundTrip { midi, .. }) = parse_str("--midi-roundtrip --midi-out x --midi-channel 16 --in 3 --backend asio") else {
+            panic!("did not parse")
+        };
+        assert_eq!((midi.settings.channel, midi.settings.returns.as_slice(), midi.settings.gap_ms), (15, &[2u16][..], 750));
+        let base = "--midi-roundtrip --backend asio --midi-out x";
+        assert!(parse_str(&format!("{base} --in 1")).unwrap_err().contains("--midi-channel"));
+        assert!(parse_str(&format!("{base} --midi-channel 1")).unwrap_err().contains("--in"));
+        assert!(parse_str(&format!("{base} --midi-channel 17 --in 1")).unwrap_err().contains("1 to 16"));
+        assert!(parse_str(&format!("{base} --midi-channel 1 --in 0")).unwrap_err().contains("1-based"));
+        assert!(parse_str(&format!("{base} --midi-channel 1 --in 1 --velocity 0")).unwrap_err().contains("--velocity"));
+        assert!(parse_str(&format!("{base} --midi-channel 1 --in 1 --loopback")).unwrap_err().contains("--loopback"));
+        assert!(parse_str("--midi-roundtrip --backend wasapi --midi-out x --midi-channel 1 --in 1").unwrap_err().contains("--backend asio"));
+        assert!(parse_str("--backend asio --midi-out x").unwrap_err().contains("need --midi-roundtrip"));
     }
 
     #[test]
