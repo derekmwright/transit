@@ -53,10 +53,10 @@ native backend serves the device and `WASAPI`/`ASIO` for cpal; the saved I/O map
 system name (`WASAPI`, `ASIO`) and the device name (an ASIO driver's registry name) in both cases.
 Native WASAPI stamps are `BackendEstimate` (device position plus padding plus `GetStreamLatency`);
 native ASIO stamps are `BackendEstimate` from the driver's sample position plus its `getLatencies`
-figures, which over-report the measured loop on the reference interfaces (known issue K31), so a
-native ASIO placement is off by that excess until a calibration exists. Measure either with
-`audio-bench --backend wasapi|asio` before trusting them. Calibrations of native ASIO are keyed by
-mode `asio` (`devices::calibration_mode`); details in [asio-backend.md](asio-backend.md).
+figures, which no fixed model corrects (known issue K31), so a native ASIO placement is off by the
+driver's error until the loop is measured (the Calibration line's Measure in Audio Devices, or
+`audio-bench --backend asio --loopback --settings`). Calibrations of native ASIO are keyed by mode
+`asio` (`devices::calibration_mode`) and hold the whole loop; details in [asio-backend.md](asio-backend.md#loopback-calibration-20-k31).
 
 ## Native capture, duplex and what `Measured` means (ADR 0016 slice d)
 

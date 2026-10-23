@@ -9,8 +9,7 @@
 //! callback records the input by position, so the lag of the click is the loop in device frames,
 //! the figure the ASIO stamps need (`transit-audio-asio` places a calibrated capture frame from
 //! it). Counting positions, not the plan's frames, keeps the input ring's backlog (known issue
-//! K22) and the plan's resampling out of it: on the Scarlett at 64 frames the plan's probe reads
-//! about 326 frames where the loop is 294 to 300.
+//! K22) and the plan's resampling out of it, and counts in the stamps' own domain.
 //!
 //! The callbacks only read immutable parameters, store `f32` bits into a buffer allocated here
 //! and bump atomics; they never allocate or lock. The analysis (the matched filter of

@@ -27,7 +27,12 @@ silenced while it is open. What changes:
 - **Errors.** `AUDCLNT_E_DEVICE_IN_USE` is `OpenError::InUse` (another app holds it);
   `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED` is `OpenError::ExclusiveDisallowed` (the endpoint's Advanced
   settings forbid it); a gone endpoint is `DeviceNotAvailable`. No raw mode, no `AUTOCONVERTPCM`.
-- **Calibration.** A loopback calibration is keyed by mode (`"shared"` or `"exclusive"`); measure each.
+- **Calibration.** A loopback calibration is keyed by mode (`"shared"` or `"exclusive"`); measure each
+  with `audio-bench --backend wasapi --loopback --settings`. On WASAPI it is the delay the stamps do not
+  account for, measured in their own time (the device position already carries the stream latency), so
+  it is smaller than the click round trip the bench's table shows. Native ASIO stores the whole loop
+  instead, measured in the app by sample position: see
+  [asio-backend.md](asio-backend.md#loopback-calibration-20-k31).
 
 On Windows, native WASAPI gives any interface a dependable, calibrated stereo path with no SDK and no extra driver install. How many channels it sees is decided by the vendor's WDM driver: the TASCAM Model 12 registers one stereo playback and one stereo recording endpoint, so WASAPI shows 2 in and 2 out on it in every mode, and individual channels cannot be recorded over WASAPI. Multichannel and tracking-grade latency on Windows are the ASIO path (a native ASIO backend is in progress).
 

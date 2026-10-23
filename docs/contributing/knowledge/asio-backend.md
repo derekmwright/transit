@@ -189,10 +189,11 @@ request. An error that arrives on a driver thread is delivered to the owner's er
   `transit-audio-wasapi`).
 - **Frame time:** render presents its first frame `getLatencies` output frames after the buffer switch;
   capture captured its first frame `getLatencies` input frames before it (the SDK's latencies count from
-  the buffer switch and include the buffer).
+  the buffer switch and include the buffer). Under a calibration the capture frame time is the callback
+  plus the output figure minus the measured loop, and the input figure is not used: see
+  [Loopback calibration](#loopback-calibration-20-k31).
 - **Quality:** `BackendEstimate` with a valid position, `Measured` with `OpenRequest.calibration`
-  (applied as on WASAPI: the capture frame time moves earlier by the round trip, both streams claim the
-  bound), `Arrival` when the driver gives no valid position. The driver's `systemTime` is not used for
+  (both streams claim its bound), `Arrival` when the driver gives no valid position. The driver's `systemTime` is not used for
   stamps: it is a clock of the driver's choosing (cpal documents `timeGetTime`), and nothing shows it
   finer than a millisecond. The smallest step between consecutive callbacks' `systemTime`, an upper
   bound on its grain, is kept as a diagnostic (logged at debug level when a stream closes): 4 ms on the
@@ -221,7 +222,11 @@ driver-event tail reads "; overloads N, busy skips N, position jumps N, resets N
 
 `audio-bench --backend asio --device "<driver registry name>"` (build with `--features native-asio`;
 no SDK and no LLVM) measures the native backend through the trait, with `--period` as the buffer size
-asked of `createBuffers` and the usual `--loopback --out-ch --in-ch`. The cpal path (`--backend cpal
+asked of `createBuffers` and the usual `--loopback --out-ch --in-ch`. A loopback run also prints the
+driver-reported latencies in frames and ms, the calibration the app would store (the click loop by
+sample position at that period and rate), their difference, and, with `--settings`, what the file held
+for the key before the run, which `--settings` then replaces (see
+[Loopback calibration](#loopback-calibration-20-k31)). The cpal path (`--backend cpal
 --system ASIO`, `--features asio`) stays for comparison. The backend lines of an ASIO run always end
 with `overloads, busy skips, position jumps, resets`.
 
@@ -299,9 +304,10 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   `an_insert_on_the_last_channels_of_a_12_in_10_out_device_sends_and_returns_there`).
 - **What opened.** `Achieved` fills the Output open and Input open lines (buffer, `i24`/`i32`, the
   direction's `getLatencies` figure) and the load readout says `ASIO*` (cpal's ASIO host stays `ASIO`).
-- **Calibration** is keyed `(driver registry name, input None, mode "asio", rate, period)`. The bench
-  writes none yet (known issue K31: the drivers' `getLatencies` figures over-report the loopback, so a
-  stamp-time calibration finds no pair), so the Calibration line says the driver's figures are used.
+- **Calibration** is keyed `(driver registry name, input None, mode "asio", rate, period)` and is
+  measured in the app: the Calibration line's Measure (see
+  [Loopback calibration](#loopback-calibration-20-k31)). Without one the stamps use the driver's
+  `getLatencies` figures and the line says so.
 - **Input on demand.** An input that does not open with the output (`HeldInput::No`, native WASAPI
   without a pairing) opens through the native backend that serves the output, cpal only if that fails.
 - **Reset.** `StreamError::ResetRequested` stops the output like a lost device
@@ -325,6 +331,55 @@ backend error. The ADR 0015 hardware-insert click train through the Player
 (the probe's view includes the input ring, known issue K22), and 984 frames (22.3 ms) on the Model 12,
 output 2 to input 1, every click found; without clearing the input ring after the open the Model 12
 read 1239 frames, one buffer more. On drivers whose loop phase changes between starts, such as the Model 12 (974 or 1239 frames, one buffer apart), remeasure hardware inserts after a reconnect.
+
+## Loopback calibration (#20, K31)
+
+The drivers' `getLatencies` figures cannot be corrected by any fixed model: on the Scarlett the error
+changes sign with the buffer size (the driver over-reports at 64 and 256 frames and under-reports at 32,
+128 and 512) and moves with the rate ([the 2026-10-23 benchmark](../../benchmarks/2026-10-23-ryzen-5900x-scarlett-2i2-asio-reported-vs-measured.md)).
+So calibration over native ASIO measures the loop at the configured period and rate, and the driver
+figures are shown for reference only.
+
+- **What is measured.** A click (the hardware-insert probe's) plays on an output path and is found again
+  on an input path through a cable. `crates/playback/src/loop_probe.rs` counts both by the driver's
+  sample position (`RenderBlock`/`CaptureBlock::device_position`): the render callback adds the click at
+  position `origin + t`, the capture callback records the return by position, and the median lag over
+  eight clicks is the loop in device frames, with the spread (largest minus smallest lag) kept as its
+  bound (plus one frame of position granularity). Counting positions keeps the plan's input ring and its
+  resampling out of it, and it is the stamps' own domain.
+- **How the stamps use it.** A calibration over ASIO is the whole loop (`transit_audio_backend::Calibration`
+  says what it counts per backend). A calibrated capture frame time is the callback plus the output
+  figure minus the loop, so the output frame at position `p` and the input frame at `p` plus the loop
+  carry the same time, whatever the driver reports; recording placement goes through those stamps.
+  Test: `a_calibrated_input_frame_carries_the_time_of_the_output_frame_it_came_back_as`.
+- **In the app.** Audio Devices, Native ASIO: the Calibration line offers an Out path (the remembered one,
+  else Main's), an In path (the remembered one, else the first input) and Measure, while the transport is
+  stopped and the window's driver, rate and buffer are the open ones (otherwise it asks to Apply first).
+  The result is kept in `ui.audio.calibrations` under the open key, saved with the preferences, and
+  handed to the running streams (`Stream::set_calibration`: the next stamp is invalid, so the clock fit
+  restarts there). The line reads "calibrated: 1062 frames (22.1 ms) ±7 at 256 / 48 kHz (date)"; at
+  another buffer size or rate it reads "not calibrated at this buffer size and rate (measured at ...)"
+  and Measure times it again. Code: `Player::start_loop_calibration`, `hardware_measure.rs`
+  (`MeasureKind::Loop`). Tests: `a_loop_over_native_asio_is_measured_in_sample_positions_and_applied_to_the_running_streams`,
+  `measure_on_the_asio_calibration_line_times_the_loop_and_stores_it_for_this_buffer_size`.
+- **Two phases.** At some buffer sizes a driver start lands the loop in one of two phases one period
+  apart (the Scarlett at 128 and 512 frames; the Model 12 between starts). Each Measure times the loop as
+  the driver runs now; the stored value is the median of its clicks and the spread shows a mixed run.
+  Measure again after a Reconnect or a driver reset if the loop may have come up in the other phase.
+- **The bench.** `audio-bench --backend asio --loopback` prints the same figure ("app calibration ... by
+  sample position") beside the driver's figures in frames, and `--settings` writes it under the `asio`
+  key. Its table's "Round trip" column is timed by callback arrival, which a driver that delivers
+  callbacks in bursts (the Scarlett at 32 and 64 frames, known issue K26) shifts by up to a period
+  against the positions; compare the two lines of one run.
+- **The stamp-time figure is retired over ASIO.** Before #20 the bench calibrated from the stamps' own
+  frame times (capture frame time minus render frame time of each click). Over ASIO those are the
+  position plus the driver's figures, so that difference is the loop minus `getLatencies` (in plus out),
+  not the loop: a few frames where the driver under-reports (the "+4 frames" of the 2026-10-22 Scarlett
+  run), the loop where a phase shift added a buffer (the Model 12's 245 frames), and no pair at all where
+  the driver over-reports, because the pairing only accepts a click that left before it arrived. It is
+  not a defect of the pairing; it measures a residual that ASIO's stamps no longer need. Native WASAPI
+  keeps it, because there the stamps account for the device latency and the calibration is that
+  residual.
 
 ## Reset handling (slice d1)
 
@@ -425,10 +480,10 @@ Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` b
 
 ## Next (slice d2 and later)
 
-- **Calibration:** the stamp-time loopback calibration cannot pair clicks while the drivers'
-  `getLatencies` figures over-report the loop (known issue K31: the Focusrite driver always, the
-  Model 12 in the phase that measures 22 ms); the frame-time formulas need the measured offset before
-  `audio-bench --settings` can write an `asio` calibration and stamps reach `Measured` in the app.
+- **Calibration:** measured in the app since #20 ([Loopback calibration](#loopback-calibration-20-k31)).
+  Open: a loop that comes up in another phase after a reopen is not detected (Measure again), and the
+  probe looks for each click within 200 ms, so a loop longer than that (buffers of 4096 frames and up)
+  is not found.
 - A stream-only reopen inside the Player (known issue K32).
 - Slice (e): retiring cpal's ASIO path and `crates/asio-panel` (the cpal path's "Driver Control Panel").
 
