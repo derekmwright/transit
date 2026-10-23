@@ -122,6 +122,9 @@ pub struct AudioDevicesState {
     pub(crate) panel_opened: Option<String>,
     /// Channel names standing in for the open device's (tests without a player).
     pub(crate) fake_channel_names: Option<crate::audio_devices_io::ChannelNames>,
+    /// The ASIO driver the listing probed (the selected one, else the running one; `None`: none),
+    /// so choosing another driver lists again for it.
+    asio_listed_for: Option<Option<String>>,
 }
 
 /// The device loop's wake counter at the last sample, and the rate it gave.
@@ -452,16 +455,42 @@ impl StudioApp {
         }
     }
 
-    /// The devices to offer: the fake's, else the machine's (only with a player).
+    /// The devices to offer: the fake's, else the machine's (only with a player). The native ASIO
+    /// system names every installed driver and probes only [`Self::asio_selection`].
     fn listing(&mut self) -> Vec<AudioSystem> {
+        let selected = self.asio_selection();
+        self.audio_devices.asio_listed_for = Some(selected.clone());
         match (&mut self.audio_devices.fake, &self.player) {
             (Some(f), _) => {
                 f.enumerations += 1;
                 f.systems.clone()
             }
-            (None, Some(_)) => devices::audio_systems(),
+            (None, Some(_)) => {
+                let mut systems = devices::cpal_audio_systems();
+                systems.extend(devices::native_asio_system(selected.as_deref()));
+                systems
+            }
             (None, None) => Vec::new(),
         }
+    }
+
+    /// The ASIO driver the listing probes: the one chosen in the window when its system is ASIO,
+    /// else the native ASIO driver that runs; `None` probes none (names only).
+    pub(crate) fn asio_selection(&self) -> Option<String> {
+        let draft = &self.audio_devices.draft;
+        if draft.system.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(devices::ASIO_SYSTEM))
+            && let Some(output) = &draft.output
+        {
+            return Some(output.clone());
+        }
+        self.running_native_asio()
+    }
+
+    /// Whether the window shows the ASIO system and its choice moved off the driver the listing
+    /// probed (it lists again, probing the new one).
+    fn asio_selection_changed(&self) -> bool {
+        devices::is_asio_system(self.audio_devices.draft.system.as_deref())
+            && self.audio_devices.asio_listed_for.as_ref().is_some_and(|listed| *listed != self.asio_selection())
     }
 
     fn running_asio(&self) -> bool {
@@ -707,6 +736,10 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     if app.audio_devices.base.as_ref() != Some(&app.ui.audio) {
         app.audio_devices.draft = app.ui.audio.clone();
         app.audio_devices.base = Some(app.ui.audio.clone());
+    }
+    if app.audio_devices.systems.is_some() && app.audio_devices.fake.is_none() && app.asio_selection_changed() {
+        // Another ASIO driver was chosen: list again, probing that one.
+        app.audio_devices.forget_listing();
     }
     if app.audio_devices.systems.is_none() && app.audio_devices.panel.is_none() {
         app.audio_devices.systems = Some(app.listing());

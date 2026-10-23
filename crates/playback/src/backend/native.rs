@@ -84,38 +84,46 @@ pub fn system_from_endpoints(
     }
 }
 
-/// The ASIO system as the native backend lists it: every installed driver probed in turn through
-/// `Backend::endpoints` (the driver this process has open is queried in place, the others are named
-/// by the registry and offered with unknown counts), with the drivers that failed to load as
-/// diagnostics. While cpal's ASIO host holds a driver, nothing is probed (two loaded drivers in one
-/// process is what ASIO forbids): the registry names only.
+/// The ASIO system as the native backend lists it: every installed driver by its registry name,
+/// none of them instantiated, and only `selected` (the driver chosen in Audio Devices, else the one
+/// running) probed through the backend for its channels, rates and buffer range (the driver this
+/// process has open is queried in place); the others are offered with unknown counts. A selected
+/// driver that failed to load (or is not installed) is the one diagnostic. While cpal's ASIO host
+/// holds a driver nothing is probed (two loaded drivers in one process is what ASIO forbids): the
+/// registry names only. This can take seconds on a misbehaving driver: the app calls it off its UI
+/// thread.
 #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
-pub fn asio_system() -> AudioSystem {
+pub fn asio_system(selected: Option<&str>) -> AudioSystem {
     use transit_audio_asio::AsioBackend;
     let backend = match AsioBackend::shared() {
         Ok(backend) => backend,
         Err(e) => return system_from_endpoints(devices::ASIO_SYSTEM, &[], &[], &[], vec![format!("the native ASIO backend did not start: {e}")]),
     };
     let mut diagnostics = Vec::new();
-    let installed: Vec<String> = match backend.drivers() {
-        Ok(drivers) => drivers.into_iter().map(|d| d.name).collect(),
+    let installed: Vec<String> = match backend.driver_names() {
+        Ok(names) => names,
         Err(e) => {
             diagnostics.push(format!("the ASIO drivers could not be listed: {e}"));
             Vec::new()
         }
     };
-    if crate::backend::cpal::asio_device_held() {
+    let Some(selected) = selected.filter(|_| !crate::backend::cpal::asio_device_held()) else {
+        return system_from_endpoints(devices::ASIO_SYSTEM, &[], &[], &installed, diagnostics);
+    };
+    if !installed.iter().any(|n| n == selected) {
+        diagnostics.push(format!("{selected}: this ASIO driver is not installed"));
         return system_from_endpoints(devices::ASIO_SYSTEM, &[], &[], &installed, diagnostics);
     }
-    let mut list = |direction| {
-        ab::Backend::endpoints(&backend, direction).unwrap_or_else(|e| {
-            diagnostics.push(format!("the ASIO drivers could not be probed: {e}"));
-            Vec::new()
-        })
+    if let Err(e) = backend.probe(selected) {
+        log::info!("ASIO: listing \"{selected}\": {e}");
+    }
+    let described = |direction| -> Vec<ab::Endpoint> {
+        ab::Backend::endpoints(&backend, direction).unwrap_or_default().into_iter().filter(|e| e.name == selected).collect()
     };
-    let (outputs, inputs) = (list(ab::Direction::Output), list(ab::Direction::Input));
-    diagnostics.extend(backend.diagnostics().into_iter().filter(|d| !d.blocked).map(|d| d.to_string()));
-    diagnostics.dedup();
+    let (outputs, inputs) = (described(ab::Direction::Output), described(ab::Direction::Input));
+    if let Some(Err(problem)) = backend.probed(selected).filter(|p| p.as_ref().is_err_and(|d| !d.blocked)) {
+        diagnostics.push(problem.to_string());
+    }
     system_from_endpoints(devices::ASIO_SYSTEM, &outputs, &inputs, &installed, diagnostics)
 }
 

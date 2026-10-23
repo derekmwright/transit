@@ -54,6 +54,7 @@ fn rig(spec: FakeSpec) -> Rig {
 fn rig_watching(spec: FakeSpec, watchdog_floor: Duration) -> Rig {
     let (loader, observed) = FakeLoader::new(vec![(entry("Driver", 40), spec)]);
     let backend = AsioBackend::with_loader_watching(Box::new(loader), Slot::default(), Duration::from_secs(10), watchdog_floor).expect("backend");
+    backend.probe("Driver").expect("probe");
     let endpoint = backend.endpoints(ab::Direction::Output).expect("endpoints").remove(0);
     Rig { backend, observed, endpoint }
 }
@@ -992,5 +993,5 @@ fn a_loaded_handle_and_the_streams_share_the_driver() {
 fn the_factory_shares_one_backend_per_process() {
     let (a, b) = (AsioBackend::shared().expect("shared"), AsioBackend::shared().expect("shared"));
     assert!(Arc::ptr_eq(&a.host, &b.host), "one host thread");
-    assert!(Arc::ptr_eq(&a.last, &b.last), "one enumeration cache");
+    assert!(Arc::ptr_eq(&a.probes, &b.probes), "one probe cache");
 }

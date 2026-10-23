@@ -63,14 +63,16 @@ functions (`com::fake`), on the real host thread.
 
 ## What slice (a) covers
 
-- `endpoints()`: reads `HKLM\SOFTWARE\ASIO` (name, CLSID, description, `InprocServer32` path and
-  whether it exists), then loads, inits, queries and unloads each driver in turn: `getChannels`,
-  `getBufferSize`, `canSampleRate` at 44.1/48/88.2/96 kHz, `getSampleRate`, `getLatencies`, and
-  `getChannelInfo` for every channel. One `FormatRange` per accepted rate with the buffer range; an
+- `drivers()` reads `HKLM\SOFTWARE\ASIO` (name, CLSID, description, `InprocServer32` path and
+  whether it exists) and instantiates nothing. `probe(name)` loads, inits, queries and unloads one
+  driver: `getChannels`, `getBufferSize`, `canSampleRate` at 44.1/48/88.2/96 kHz, `getSampleRate`,
+  `getLatencies`, and `getChannelInfo` for every channel; the result is kept per driver, and
+  `endpoints()` lists the probed drivers (slice d2; slice a probed every driver in turn, which
+  `probe_all()` still does for the hardware listing test). One `FormatRange` per accepted rate with the buffer range; an
   unsupported sample type (MSB, DSD, mixed) lists no format, and the type stays in the `AsioEndpoint`
   handle. Endpoint id and name are the registry key name (what cpal used and configs saved).
 - Failures (no DLL, `CoCreateInstance`, `init` false, a query error) are `log::warn!`ed and kept in
-  `AsioBackend::diagnostics()`; `ab::Endpoint` has no diagnostic field.
+  `AsioBackend::diagnostics()` (and `probed(name)`); `ab::Endpoint` has no diagnostic field.
 - `AsioBackend::load(name)` keeps a driver loaded and initialized with no buffers: `channels`,
   `latencies`, `buffer_size`, `sample_rate`, `can_sample_rate`, `set_sample_rate`, `control_panel`,
   `refresh`, and `close` (or drop).
@@ -256,13 +258,16 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   `transit/native-asio`. Each system offers only its own native backend (`Backend::offered`); a native
   choice that does not serve a newly chosen system goes back to Auto. Without the feature the choice
   is not offered and a saved `NativeAsio` opens cpal.
-- **Listing.** With the feature, the ASIO system of the Audio Devices lists comes from this crate's
-  `Backend::endpoints` (registry names, probed channel counts, the standard rates and buffer range the
-  formats cover), whichever backend then opens it, not from cpal's ASIO host. Drivers that could not be
-  probed because this process holds another one are still offered by registry name with unknown
-  counts; drivers that failed to load are listed under the Output list as "Not loaded: <driver>:
-  <problem>" (`AsioBackend::diagnostics`, minus the `blocked` ones). While cpal's ASIO host holds a
-  driver nothing is probed (the registry names only), so two drivers are never loaded at once.
+- **Listing** (slice d2). With the feature, the ASIO system of the Audio Devices lists comes from this
+  crate, whichever backend then opens it, not from cpal's ASIO host: every installed driver by its
+  registry name, none instantiated, and only the selected driver (the window's Output choice, else
+  the native ASIO driver that runs) probed for its channel counts, rates and buffer range
+  (`devices::native_asio_system(selected)`); the others show their name only. Choosing another
+  driver lists again for it, and Apply and Reconnect probe it as they plan the open (a probe younger
+  than five seconds is reused). A selected driver that failed to load, or is not installed, is said
+  under the Output list as "Not loaded: <driver>: <problem>" (a driver blocked because this process
+  holds another one is not a failure). While cpal's ASIO host holds a driver nothing is probed (the
+  registry names only), so two drivers are never loaded at once.
 - **A driver that is gone.** A named driver is opened by its registry name only, never replaced:
   `plan_render`/`plan_capture` of a name that is not installed fail with the list of installed
   drivers, one that failed to load fails with its problem. The Player asks
@@ -412,7 +417,6 @@ Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` b
 
 ## Next (slice d2 and later)
 
-- **Listing:** probe only the selected driver, and list off the UI thread.
 - **Calibration:** the stamp-time loopback calibration cannot pair clicks while the drivers'
   `getLatencies` figures over-report the loop (known issue K31: the Focusrite driver always, the
   Model 12 in the phase that measures 22 ms); the frame-time formulas need the measured offset before

@@ -351,13 +351,34 @@ pub fn native_asio_control_panel(driver: &str) -> Result<std::sync::mpsc::Receiv
 
 /// Every audio system on this machine with its devices. Enumerating can take a moment (some
 /// systems probe each device): call it when the settings window opens, not every frame. In a build
-/// with the native ASIO backend, the ASIO system is listed through that backend's
-/// `Backend::endpoints` (each driver probed in turn, ASIO allowing one loaded driver), not cpal's
-/// ASIO host, whichever backend then opens it: the driver names are the same registry names.
+/// with the native ASIO backend, the ASIO system is listed through that backend
+/// ([`native_asio_system`], with no driver selected: the registry names only), not cpal's ASIO
+/// host, whichever backend then opens it: the driver names are the same registry names.
 pub fn audio_systems() -> Vec<AudioSystem> {
+    let mut systems = cpal_audio_systems();
+    systems.extend(native_asio_system(None));
+    systems
+}
+
+/// The ASIO system as the native ASIO backend lists it, `None` in a build without it: every
+/// installed driver by name, and only `selected` probed for its channels, rates and buffers (see
+/// `backend::native::asio_system`). Probing a misbehaving driver can take seconds (each host
+/// request waits at most ten): call it off the UI thread.
+pub fn native_asio_system(selected: Option<&str>) -> Option<AudioSystem> {
+    #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+    return Some(crate::backend::native::asio_system(selected));
+    #[cfg(not(all(windows, target_pointer_width = "64", feature = "native-asio")))]
+    {
+        let _ = selected;
+        None
+    }
+}
+
+/// The audio systems cpal lists (every one but the ASIO system in a build with the native ASIO
+/// backend, which [`native_asio_system`] lists).
+pub fn cpal_audio_systems() -> Vec<AudioSystem> {
     let default_id = cpal::default_host().id();
-    #[cfg_attr(not(all(windows, target_pointer_width = "64", feature = "native-asio")), allow(unused_mut))]
-    let mut systems: Vec<AudioSystem> = cpal::available_hosts()
+    cpal::available_hosts()
         .into_iter()
         .filter(|id| !(NATIVE_ASIO_COMPILED && id.name() == ASIO_SYSTEM))
         .filter_map(|id| {
@@ -375,10 +396,7 @@ pub fn audio_systems() -> Vec<AudioSystem> {
             }
             Some(AudioSystem { name: id.name().to_string(), is_default: id == default_id, outputs, inputs, diagnostics: Vec::new() })
         })
-        .collect();
-    #[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
-    systems.push(crate::backend::native::asio_system());
-    systems
+        .collect()
 }
 
 /// Adds the installed ASIO drivers cpal could not list. cpal loads each driver to describe it, and

@@ -6,9 +6,10 @@
 //!   compile-time layout assertions. No ASIO SDK download, no C++ and no bindgen in the build.
 //! - Every driver call happens on one dedicated STA host thread ([`host`]) that owns the driver
 //!   object and a hidden message-only window passed as `sysRef`.
-//! - [`AsioBackend::endpoints`] loads, initializes, queries and unloads each installed driver in
-//!   turn (one at a time: ASIO allows one loaded driver per process). A driver that cannot be
-//!   listed is reported by [`AsioBackend::diagnostics`] and a `log::warn!`, never dropped silently.
+//! - [`AsioBackend::drivers`] lists the installed drivers from the registry without loading any;
+//!   [`AsioBackend::probe`] loads, initializes, queries and unloads one (ASIO allows one loaded
+//!   driver per process), the one the app selects, and keeps what it found for the listing. A
+//!   driver that cannot be probed is reported by [`AsioBackend::diagnostics`] and a `log::warn!`.
 //! - [`AsioBackend::load`] keeps one driver loaded and initialized, with no buffers created, for
 //!   queries, the sample rate and the control panel; [`Loaded::close`] (or dropping it) releases it.
 //! - `open_render` and `open_capture` open the two directions of one driver's [`session`]: one
@@ -61,12 +62,12 @@ pub const SYSTEM: &str = "ASIO";
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a caller waits for a control panel call (some panels are modal).
 const PANEL_TIMEOUT: Duration = Duration::from_secs(600);
-/// An enumeration is reused for this long, so listing both directions loads each driver once.
+/// A driver's probe is reused this long, so a plan right after the listing loads it once.
 const ENUMERATION_REUSE: Duration = Duration::from_secs(5);
 
 /// Creates the native ASIO backend for the system named "ASIO": every call hands out the same
 /// process-wide backend ([`AsioBackend::shared`]), so repeated calls share one host thread and one
-/// enumeration cache instead of probing every driver again.
+/// per-driver probe cache.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AsioFactory;
 
@@ -93,18 +94,26 @@ pub struct AsioEndpoint {
     pub info: DriverInfo,
 }
 
-#[derive(Clone, Default)]
-struct Enumeration {
-    drivers: Vec<(DriverEntry, DriverInfo)>,
-    diagnostics: Vec<DriverDiagnostic>,
+/// What the last probe of one driver found ([`AsioBackend::probe`]).
+#[derive(Clone)]
+struct Probed {
+    at: Instant,
+    entry: DriverEntry,
+    result: Result<DriverInfo, DriverDiagnostic>,
 }
 
 /// The native ASIO audio system. `Send` and `Sync`: every driver call is a request to the host
-/// thread. Clones share the host thread and the enumeration cache.
+/// thread. Clones share the host thread and the per-driver probe cache.
+///
+/// Listing instantiates nothing: the registry names come from [`AsioBackend::drivers`], and a
+/// driver is loaded, queried and unloaded only when it is probed ([`AsioBackend::probe`], the
+/// driver the app selects) or planned (`plan_render`/`plan_capture` of it, which reuse a probe
+/// younger than five seconds). [`ab::Backend::endpoints`] lists the probed drivers.
 #[derive(Clone)]
 pub struct AsioBackend {
     host: Arc<Host>,
-    last: Arc<Mutex<Option<(Instant, Enumeration)>>>,
+    /// The last probe of each driver, in the order they were first probed.
+    probes: Arc<Mutex<Vec<Probed>>>,
 }
 
 impl AsioBackend {
@@ -135,7 +144,7 @@ impl AsioBackend {
     /// [`Self::with_loader`] with `watchdog_floor` as the shortest stall limit (tests that drive
     /// the callbacks by hand use a long one).
     fn with_loader_watching(loader: Box<dyn Loader>, slot: Slot, timeout: Duration, watchdog_floor: Duration) -> Result<Self, ab::OpenError> {
-        Ok(Self { host: Arc::new(Host::spawn_watching(loader, slot, timeout, watchdog_floor)?), last: Arc::new(Mutex::new(None)) })
+        Ok(Self { host: Arc::new(Host::spawn_watching(loader, slot, timeout, watchdog_floor)?), probes: Arc::default() })
     }
 
     /// The installed drivers from the registry, nothing loaded.
@@ -143,78 +152,114 @@ impl AsioBackend {
         self.host.call("list the ASIO drivers", |s| s.list())
     }
 
+    /// Probes the driver registered as `name`, and only it: loads, queries and unloads it (the
+    /// driver this process holds open is queried in place), and keeps what it found for the
+    /// listing ([`ab::Backend::endpoints`], [`AsioBackend::diagnostics`]) and the plans. A name
+    /// that is not installed is an error listing the installed drivers.
+    pub fn probe(&self, name: &str) -> Result<DriverInfo, ab::OpenError> {
+        let installed = self.drivers()?;
+        let Some(entry) = installed.iter().find(|e| e.name == name).cloned() else {
+            let names: Vec<String> = installed.into_iter().map(|e| e.name).collect();
+            return Err(ab::OpenError::DeviceNotAvailable(driver::not_installed(name, &names)));
+        };
+        self.probe_entry(&entry).map_err(|d| if d.blocked { ab::OpenError::InUse(d.problem) } else { ab::OpenError::DeviceNotAvailable(d.to_string()) })
+    }
+
+    /// What the last probe of `name` found, if it was probed: its report, or why it failed.
+    pub fn probed(&self, name: &str) -> Option<Result<DriverInfo, DriverDiagnostic>> {
+        self.probes.lock().unwrap_or_else(PoisonError::into_inner).iter().find(|p| p.entry.name == name).map(|p| p.result.clone())
+    }
+
     /// Loads, queries and unloads every installed driver, one at a time (a driver this backend
-    /// holds open is queried in place). Failures become [`AsioBackend::diagnostics`].
+    /// holds open is queried in place). Failures become [`AsioBackend::diagnostics`]. The app
+    /// never does this (it probes the selected driver only); the hardware listing test does.
     pub fn probe_all(&self) -> Result<Vec<(DriverEntry, DriverInfo)>, ab::OpenError> {
-        let enumeration = self.enumerate()?;
-        let drivers = enumeration.drivers.clone();
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), enumeration));
-        Ok(drivers)
-    }
-
-    /// The drivers the last enumeration could not list, with why.
-    pub fn diagnostics(&self) -> Vec<DriverDiagnostic> {
-        self.last.lock().unwrap_or_else(PoisonError::into_inner).as_ref().map(|(_, e)| e.diagnostics.clone()).unwrap_or_default()
-    }
-
-    fn enumerate(&self) -> Result<Enumeration, ab::OpenError> {
-        let mut out = Enumeration::default();
-        let entries = self.drivers()?;
+        let mut found = Vec::new();
         let mut blocked: Option<String> = None;
-        for entry in entries {
-            let mut in_use = false;
-            let problem = if let Some(stuck) = &blocked {
-                Some(format!("not probed: the host thread is blocked in {stuck}"))
-            } else if !entry.dll_exists {
-                Some(match &entry.dll {
-                    Some(dll) => format!("driver DLL not found: {dll}"),
-                    None => format!("no InprocServer32 registered for CLSID {}", entry.clsid_text),
-                })
-            } else {
-                let probe = entry.clone();
-                match self.host.call(&format!("probe of \"{}\"", entry.name), move |s| s.probe(&probe)) {
-                    Ok(info) => {
-                        for direction in [ab::Direction::Input, ab::Direction::Output] {
-                            let t = info.sample_type(direction);
-                            if info.channels(direction) > 0 && t.format().is_none() {
-                                log::info!("ASIO: \"{}\" {direction:?} sample type {} is not supported", entry.name, t.describe());
-                            }
-                        }
-                        out.drivers.push((entry.clone(), info));
-                        None
-                    }
-                    Err(e) => {
-                        if self.host.is_stuck() {
-                            blocked = Some(format!("the probe of \"{}\"", entry.name));
-                        }
-                        in_use = matches!(e, ab::OpenError::InUse(_));
-                        Some(e.to_string())
-                    }
-                }
-            };
-            if let Some(problem) = problem {
-                let diagnostic = DriverDiagnostic { driver: entry.name.clone(), problem, blocked: in_use };
-                if in_use {
-                    log::info!("ASIO: {diagnostic}");
-                } else {
+        for entry in self.drivers()? {
+            let result = match &blocked {
+                Some(stuck) => {
+                    let problem = format!("not probed: the host thread is blocked in {stuck}");
+                    let diagnostic = DriverDiagnostic { driver: entry.name.clone(), problem, blocked: false };
                     log::warn!("ASIO: {diagnostic}");
+                    self.remember(&entry, Err(diagnostic.clone()));
+                    Err(diagnostic)
                 }
-                out.diagnostics.push(diagnostic);
+                None => self.probe_entry(&entry),
+            };
+            match result {
+                Ok(info) => found.push((entry, info)),
+                Err(_) if blocked.is_none() && self.host.is_stuck() => blocked = Some(format!("the probe of \"{}\"", entry.name)),
+                Err(_) => {}
             }
         }
-        Ok(out)
+        Ok(found)
     }
 
-    /// The last enumeration if it is recent, else a new one.
-    fn recent(&self) -> Result<Enumeration, ab::OpenError> {
-        if let Some((at, e)) = self.last.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
-            && at.elapsed() < ENUMERATION_REUSE
-        {
-            return Ok(e.clone());
+    /// The probed drivers that could not be listed, with why.
+    pub fn diagnostics(&self) -> Vec<DriverDiagnostic> {
+        self.probes.lock().unwrap_or_else(PoisonError::into_inner).iter().filter_map(|p| p.result.clone().err()).collect()
+    }
+
+    /// Probes `entry` (see [`AsioBackend::probe`]) and keeps the result.
+    fn probe_entry(&self, entry: &DriverEntry) -> Result<DriverInfo, DriverDiagnostic> {
+        let result = if entry.dll_exists {
+            let probe = entry.clone();
+            match self.host.call(&format!("probe of \"{}\"", entry.name), move |s| s.probe(&probe)) {
+                Ok(info) => {
+                    for direction in [ab::Direction::Input, ab::Direction::Output] {
+                        let t = info.sample_type(direction);
+                        if info.channels(direction) > 0 && t.format().is_none() {
+                            log::info!("ASIO: \"{}\" {direction:?} sample type {} is not supported", entry.name, t.describe());
+                        }
+                    }
+                    Ok(info)
+                }
+                Err(e) => Err((e.to_string(), matches!(e, ab::OpenError::InUse(_)))),
+            }
+        } else {
+            let problem = match &entry.dll {
+                Some(dll) => format!("driver DLL not found: {dll}"),
+                None => format!("no InprocServer32 registered for CLSID {}", entry.clsid_text),
+            };
+            Err((problem, false))
+        };
+        let result = result.map_err(|(problem, blocked)| {
+            let diagnostic = DriverDiagnostic { driver: entry.name.clone(), problem, blocked };
+            if blocked {
+                log::info!("ASIO: {diagnostic}");
+            } else {
+                log::warn!("ASIO: {diagnostic}");
+            }
+            diagnostic
+        });
+        self.remember(entry, result.clone());
+        result
+    }
+
+    fn remember(&self, entry: &DriverEntry, result: Result<DriverInfo, DriverDiagnostic>) {
+        let probed = Probed { at: Instant::now(), entry: entry.clone(), result };
+        let mut probes = self.probes.lock().unwrap_or_else(PoisonError::into_inner);
+        match probes.iter_mut().find(|p| p.entry.name == entry.name) {
+            Some(slot) => *slot = probed,
+            None => probes.push(probed),
         }
-        let e = self.enumerate()?;
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), e.clone()));
-        Ok(e)
+    }
+
+    /// A successful probe of `entry` younger than [`ENUMERATION_REUSE`] (a plan right after the
+    /// listing probed it), else a new probe.
+    fn recent(&self, entry: &DriverEntry) -> Result<DriverInfo, DriverDiagnostic> {
+        let reused = self
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|p| p.entry.name == entry.name && p.at.elapsed() < ENUMERATION_REUSE)
+            .and_then(|p| p.result.clone().ok());
+        match reused {
+            Some(info) => Ok(info),
+            None => self.probe_entry(entry),
+        }
     }
 
     /// Loads and initializes the driver registered as `name` and keeps it loaded (no buffers)
@@ -232,7 +277,6 @@ impl AsioBackend {
                 entry.dll.as_deref().unwrap_or("no InprocServer32 registered")
             )));
         }
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let load = entry.clone();
         let info = self.host.call(&format!("load of \"{name}\""), move |s| s.load(&load))?;
         Ok(Loaded { host: Arc::clone(&self.host), name: name.to_owned(), info, open: true })
@@ -263,23 +307,25 @@ impl AsioBackend {
     }
 
     /// The endpoint of the driver named `device` (its registry name, exactly), else the first
-    /// driver with `direction` channels. A named driver that is not installed, failed to load or
-    /// has no `direction` channels is an error saying so: never another driver.
+    /// driver in registry order that loads with `direction` channels. Only the drivers asked about
+    /// are probed (a probe younger than five seconds is reused). A named driver that is not
+    /// installed, failed to load or has no `direction` channels is an error saying so: never
+    /// another driver.
     fn find(&self, direction: ab::Direction, device: Option<&str>) -> Result<ab::Endpoint, String> {
-        let endpoints = ab::Backend::endpoints(self, direction).map_err(|e| e.to_string())?;
-        let Some(wanted) = device else {
-            return endpoints.first().cloned().ok_or_else(|| format!("no ASIO driver offers {direction:?} channels"));
+        let installed = self.drivers().map_err(|e| e.to_string())?;
+        let usable = |entry: &DriverEntry| -> Result<ab::Endpoint, String> {
+            let info = self.recent(entry).map_err(|d| format!("ASIO driver \"{}\" could not be opened: {}", d.driver, d.problem))?;
+            if info.channels(direction) == 0 {
+                return Err(format!("ASIO driver \"{}\" has no {direction:?} channels", entry.name));
+            }
+            Ok(Self::endpoint(entry, &info, direction))
         };
-        if let Some(found) = endpoints.iter().find(|e| e.name == wanted || e.id == wanted) {
-            return Ok(found.clone());
+        if let Some(wanted) = device {
+            let names = || installed.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+            let entry = installed.iter().find(|e| e.name == wanted).ok_or_else(|| driver::not_installed(wanted, &names()))?;
+            return usable(entry);
         }
-        if let Some(missing) = self.missing_driver(wanted) {
-            return Err(missing);
-        }
-        match self.diagnostics().into_iter().find(|d| d.driver == wanted) {
-            Some(problem) => Err(format!("ASIO driver \"{wanted}\" could not be opened: {}", problem.problem)),
-            None => Err(format!("ASIO driver \"{wanted}\" has no {direction:?} channels")),
-        }
+        installed.iter().find_map(|entry| usable(entry).ok()).ok_or_else(|| format!("no ASIO driver offers {direction:?} channels"))
     }
 
     /// Opens one direction of the endpoint's driver (see [`session`] for the open-order rule).
@@ -507,12 +553,18 @@ impl ab::Backend for AsioBackend {
         SYSTEM
     }
 
-    /// The drivers with channels in `direction`, each probed (loaded, queried, unloaded) in turn.
-    /// A direction whose sample type is unsupported lists no formats; the type is in the
-    /// [`AsioEndpoint`] handle. Drivers that fail are in [`AsioBackend::diagnostics`].
+    /// The probed drivers ([`AsioBackend::probe`]) with channels in `direction`, in the order they
+    /// were first probed; listing instantiates no driver. A direction whose sample type is
+    /// unsupported lists no formats; the type is in the [`AsioEndpoint`] handle. Drivers whose
+    /// probe failed are in [`AsioBackend::diagnostics`].
     fn endpoints(&self, direction: ab::Direction) -> Result<Vec<ab::Endpoint>, ab::OpenError> {
-        let e = self.recent()?;
-        Ok(e.drivers.iter().filter(|(_, info)| info.channels(direction) > 0).map(|(entry, info)| Self::endpoint(entry, info, direction)).collect())
+        let probes = self.probes.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(probes
+            .iter()
+            .filter_map(|p| p.result.as_ref().ok().map(|info| (&p.entry, info)))
+            .filter(|(_, info)| info.channels(direction) > 0)
+            .map(|(entry, info)| Self::endpoint(entry, info, direction))
+            .collect())
     }
 
     fn host_blocked(&self) -> bool {
@@ -644,11 +696,20 @@ mod tests {
     fn enumeration_maps_drivers_to_endpoints_per_direction() {
         let (loader, observed) = FakeLoader::new(two_interfaces());
         let backend = backend(loader);
+        assert_eq!(backend.driver_names().unwrap(), ["Model Mixer ASIO Driver", "Focusrite USB ASIO"]);
+        assert!(backend.endpoints(ab::Direction::Output).expect("outputs").is_empty(), "nothing probed yet");
+        assert_eq!(observed.created.load(Ordering::Acquire), 0, "listing the names instantiates no driver");
+        backend.probe("Model Mixer ASIO Driver").expect("probe");
+        assert_eq!(observed.created.load(Ordering::Acquire), 1, "only the probed driver");
+        assert_eq!(backend.endpoints(ab::Direction::Output).expect("outputs").len(), 1, "the probed driver only");
+        backend.probe("Focusrite USB ASIO").expect("probe");
         let outputs = backend.endpoints(ab::Direction::Output).expect("outputs");
         let inputs = backend.endpoints(ab::Direction::Input).expect("inputs");
-        assert_eq!(observed.created.load(Ordering::Acquire), 2, "both directions came from one probe pass");
+        assert_eq!(observed.created.load(Ordering::Acquire), 2, "both directions came from the cache, no new probe");
         assert_eq!(observed.max_live.load(Ordering::Acquire), 1, "one driver loaded at a time");
         assert_eq!(observed.live.load(Ordering::Acquire), 0, "each unloaded after its probe");
+        assert!(backend.probed("Focusrite USB ASIO").is_some_and(|p| p.is_ok()));
+        assert!(backend.probed("Other").is_none());
         assert_eq!(outputs.len(), 2);
         let m = &outputs[0];
         assert_eq!((m.id.as_str(), m.name.as_str(), m.system.as_str()), ("Model Mixer ASIO Driver", "Model Mixer ASIO Driver", "ASIO"));
@@ -689,7 +750,8 @@ mod tests {
         let (mut loader, _) = FakeLoader::new(drivers);
         loader.create_fails.push("Unregistered".into());
         let backend = backend(loader);
-        let inputs = backend.endpoints(ab::Direction::Input).expect("enumeration does not fail");
+        assert_eq!(backend.probe_all().expect("enumeration does not fail").len(), 3);
+        let inputs = backend.endpoints(ab::Direction::Input).expect("listing");
         let names: Vec<&str> = inputs.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["Model Mixer ASIO Driver", "Focusrite USB ASIO", "Big Endian"]);
         let big = &inputs[2];
@@ -727,7 +789,8 @@ mod tests {
         assert_eq!(observed.panels.load(Ordering::Acquire), 1);
         let other = backend.load("Focusrite USB ASIO").err().expect("a second driver is refused");
         assert!(matches!(&other, ab::OpenError::InUse(t) if t.contains("Model Mixer ASIO Driver")), "{other:?}");
-        let outputs = backend.endpoints(ab::Direction::Output).expect("enumeration while one is open");
+        backend.probe_all().expect("enumeration while one is open");
+        let outputs = backend.endpoints(ab::Direction::Output).expect("listing");
         assert_eq!(outputs.len(), 1, "the open driver is listed, the other is not probed");
         assert!(backend.diagnostics()[0].problem.contains("one driver per process"));
         assert!(backend.diagnostics()[0].blocked, "not probed because another driver is open: not a failure of that driver");
@@ -743,11 +806,14 @@ mod tests {
 
     #[test]
     fn plans_offer_the_wished_rates_the_driver_accepts_then_its_current_rate() {
-        let (loader, _) = FakeLoader::new(two_interfaces());
+        let (loader, observed) = FakeLoader::new(two_interfaces());
         let backend = backend(loader);
         let wish = ab::OutputWish { device: Some("Focusrite USB ASIO".into()), rates: vec![96_000, 22_050], channels: 2, period: Some(64) };
         let plan = backend.plan_render(&wish).expect("plan");
         assert_eq!(plan.endpoint.name, "Focusrite USB ASIO");
+        assert_eq!(observed.created.load(Ordering::Acquire), 1, "a named plan probes that driver only");
+        backend.plan_render(&wish).expect("again");
+        assert_eq!(observed.created.load(Ordering::Acquire), 1, "a recent probe is reused");
         let rates: Vec<u32> = plan.attempts.iter().map(|a| a.format.rate).collect();
         assert_eq!(rates, [96_000, 48_000]);
         assert!(plan.attempts.iter().all(|a| a.period == ab::Period::Frames(64) && a.format.sample == ab::SampleFormat::I32));
@@ -882,12 +948,8 @@ mod hardware {
     fn stream_two_seconds(driver: &str, rate: u32, period: Option<u32>) {
         use std::sync::atomic::Ordering::Relaxed;
         let backend = AsioBackend::new().expect("backend");
-        let endpoint = backend
-            .endpoints(ab::Direction::Output)
-            .expect("endpoints")
-            .into_iter()
-            .find(|e| e.name == driver || e.name.starts_with(driver))
-            .unwrap_or_else(|| panic!("{driver} is listed"));
+        let name = resolve_driver_name(&backend.driver_names().expect("registry"), driver).unwrap_or_else(|e| panic!("{e}")).name;
+        let endpoint = backend.find(ab::Direction::Output, Some(&name)).unwrap_or_else(|e| panic!("{name}: {e}"));
         let info = endpoint.handle::<AsioEndpoint>().expect("handle").info.clone();
         let wish = ab::OutputWish { device: Some(endpoint.name.clone()), rates: vec![rate], channels: info.outputs, period };
         let render_request = backend.plan_render(&wish).expect("plan").attempts[0];
