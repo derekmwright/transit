@@ -98,6 +98,7 @@ cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --
 | S1 (discarded) | `--trials 10`, default fit residual limit (1.0 ms) |
 | S1b | none |
 | S2 | `--buffer 128` |
+| S4 | `--note 48`, `--trials 12`, buffer 64 |
 | S3 | `--buffer 256`: refused, see "Bench limitations found" |
 
 ### Results
@@ -108,11 +109,13 @@ Onset latency L per trial. Driver input latency is the driver's reported figure.
 |---|---:|---:|---|---|---|---|---|---|---|---|---|
 | S1b | 64 | 12 | 949.8 / 19.79 | 955.0 / 19.90 | 924 / 19.25 | 981 / 20.44 | 20.0 / 0.42 | none | 65 samples (1.35 ms) | 973.0 us (46.7 samples) | slow attack: trial 5 (1.35 ms) |
 | S2 | 128 | 12 | 1072.1 / 22.34 | 1068.5 / 22.26 | 1041 / 21.69 | 1121 / 23.35 | 24.3 / 0.51 | trial 10 | 67 samples (1.40 ms) | 1703.2 us (81.8 samples) | slow attack: trial 8 (1.40 ms) |
+| S4 (note 48) | 64 | 12 | 931.0 / 19.40 | 923.5 / 19.24 | 903 / 18.81 | 958 / 19.96 | 18.3 / 0.38 | none | 25 samples (0.52 ms) | 1063.0 us (51.0 samples) | none |
 | S1 (discarded) | 64 | 10 | 1231.1 / 25.65 | 990.5 / 20.64 | 955 / 19.90 | 3458 / 72.04 | 782.7 / 16.31 | trial 1 | 30 samples (0.62 ms) | 979.6 us (47.0 samples) | none |
 
 Peaks of the kept runs were -13.5 to -14.1 dBFS (S1b) and -13.5 to -13.9 dBFS (S2), with pre-send windows
-near -87 dBFS. S1b and S2 are the numbers to use. The planned note-48 run (S4) had no result when this page
-was written.
+near -87 dBFS. S4's attack peaks alternated between -12.6 and -20.6 dBFS, a level behavior of the synth also seen in the
+Model 12 note-48 run. S1b, S2 and S4 are the numbers to use. Note 48 against note 60 at buffer 64 differs by
+about 0.4 ms (931.0 against 949.8 samples), within one standard deviation.
 
 **Discarded run (S1).** The input was clipped: every attack peaked at -0.0 dBFS, and the pre-send window sat
 near -70 dBFS. Trial 1 came out at 3458 samples (72.04 ms), a first-trial outlier, which pulls the mean to
@@ -125,6 +128,7 @@ S1b. The run is kept here only as a record. The gain was lowered and the run rep
 |---|---|---:|---:|
 | S1b (64) | 188 / 3.92 | 761.8 | 15.87 |
 | S2 (128) | 300 / 6.25 | 772.1 | 16.09 |
+| S4 (64, note 48) | 188 / 3.92 | 743.0 | 15.48 |
 
 ### Cross-check against the Model 12
 
@@ -153,7 +157,7 @@ These came out of the Scarlett runs. They are for the next bench slice.
   The send-position uncertainty in the table is that residual.
 - **First-note effect on one run.** The one 72 ms trial of S1 was trial 1. It was the only discarded-run
   trial that far out, and it may be a start-of-run effect rather than clipping. It is not yet separated from
-  the clipping, so a warm-up trial may be needed.
+  the clipping, so a warm-up trial may be needed. S4's first trial (943 samples) showed no such effect.
 
 ## Implication for #71 (Model 12)
 
