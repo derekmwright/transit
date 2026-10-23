@@ -1,6 +1,6 @@
 # Attribution
 
-Every asset bundled with or committed to SoundCraft is listed here with its author, source and
+Every asset bundled with or committed to transit is listed here with its author, source and
 license. `cargo xtask assets` fails CI when a tracked asset file has no row.
 
 **Rule:** no Avid, Pro Tools, Adobe or other proprietary icons, images, sounds or presets — ever.

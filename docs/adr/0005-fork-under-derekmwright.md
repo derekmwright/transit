@@ -1,6 +1,6 @@
 # ADR 0005: Fork under derekmwright; offer fixes from the fork; keep `transit` local
 
-- **Status:** accepted
+- **Status:** superseded by [ADR 0014](0014-transit-gets-its-own-repository.md) (2026-10-21): transit has its own repository
 - **Date:** 2026-10-18
 
 ## Context

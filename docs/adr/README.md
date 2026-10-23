@@ -28,7 +28,7 @@ later replaced by this repository ([ADR 0014](0014-transit-gets-its-own-reposito
 | [0002](0002-evaluate-and-contribute-to-soundcraft-first.md) | Evaluate and contribute to SoundCraft before building | superseded in part by 0008 |
 | [0003](0003-integration-branch-that-only-merges.md) | `transit` integration branch that only merges; one fix per branch | accepted |
 | [0004](0004-search-open-prs-by-symptom-before-patching.md) | Search open PRs by symptom before patching | accepted |
-| [0005](0005-fork-under-derekmwright.md) | Fork under derekmwright; offer fixes from the fork; `transit` stays local (ended by 0014) | accepted |
+| [0005](0005-fork-under-derekmwright.md) | Fork under derekmwright; offer fixes from the fork; `transit` stays local | superseded by 0014 |
 | [0006](0006-adr-shape-for-our-decisions.md) | Run our side by the stabilization playbook; propose its footprint upstream, led by the escape record | accepted |
 | [0007](0007-per-plugin-suspension-not-a-global-engine-switch.md) | Hosted plug-ins are suspended per plug-in by their own signals (CLAP status, VST3 silence flags + tail), never by a global engine switch | accepted for transit; proposed upstream |
 | [0008](0008-fork-soundcraft-keep-the-engine-build-our-own-ux.md) | Fork SoundCraft, keep and refine its engine, build our own Logic/Ableton-style UX (one-week UI spike gates it) | accepted 2026-10-18 |

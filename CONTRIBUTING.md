@@ -29,7 +29,7 @@ Rules:
 - Do not add assets without a row in `ATTRIBUTION.md`.
 - The `soundcraft-*` crate names stay for now.
 
-transit is based on [SoundCraft](https://github.com/storytold/soundcraft). Engine fixes may also be
-offered upstream to SoundCraft as minimal diffs; if your change is an engine fix, say so in the PR.
+Engine fixes in inherited code may also be
+offered upstream as minimal diffs; if your change is an engine fix, say so in the PR.
 
 By contributing you agree that your work is licensed under MIT OR Apache-2.0, like the project.

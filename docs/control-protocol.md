@@ -1,6 +1,6 @@
 # Control protocol
 
-SoundCraft can be driven completely by other programs: scripts, test harnesses and AI agents.
+transit can be driven completely by other programs: scripts, test harnesses and AI agents.
 Every menu item, button, mouse gesture and keystroke maps to a **command** (or to synthetic
 input), and every command is reachable from:
 

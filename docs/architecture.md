@@ -12,7 +12,7 @@ L3  mix                                            (the plan renderer)
 L4  engine  playback                               (commands, undo, I/O · devices, Player)
 L5  automation                                     (control channel, MCP)
 L6  ui-studio (transit)   ui-egui (legacy)         (the user interface)
-    apps: transit (desktop), plus the upstream soundcraft apps
+    apps: transit (desktop), plus the inherited soundcraft apps
 ```
 
 Layer rules: [`layering.md`](contributing/knowledge/layering.md).

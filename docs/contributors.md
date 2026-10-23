@@ -1,8 +1,8 @@
 # Contributors in the About window
 
-**About ▸ Contributors** credits everyone who contributed to SoundCraft, and **About ▸ Models** credits
-the AI models named in `Co-Authored-By` trailers. This follows the shared craftrules standard
-[`standards/contributors.md`](https://github.com/storytold/craftrules/blob/main/standards/contributors.md);
+**About ▸ Contributors** credits everyone who contributed to transit and the SoundCraft code it inherited, and **About ▸ Models** credits
+the AI models named in `Co-Authored-By` trailers. This follows the craftrules standard inherited from upstream
+`standards/contributors.md` (not vendored here);
 this page is the local copy of the decision.
 
 ## Decision
@@ -21,9 +21,9 @@ this page is the local copy of the decision.
   first or last commit date. The name toggle cycles **Username → Display name → Real name**; a
   missing name falls back to `@username`. Alphabetical sorting is case-insensitive and ignores the `@`.
 
-## In SoundCraft
+## In transit
 
-- The About window is `about()` in `crates/ui-egui/src/panels.rs` (menu "About SoundCraft", command `window.about`).
+- The About window is `crates/ui-studio/src/about.rs` (Help > About transit); the legacy ui-egui window is `about()` in `crates/ui-egui/src/panels.rs`.
 
 ## Credit yourself
 

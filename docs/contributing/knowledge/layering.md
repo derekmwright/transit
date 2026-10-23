@@ -12,7 +12,7 @@ Crates form layers; a crate may depend only on its own layer or lower. The table
 | L4 | `engine` (commands, undo, I/O), `playback` (devices, Player) |
 | L5 | `automation` (control channel, MCP) |
 | L6 | `ui-studio` (transit's UI), `ui-egui` (legacy, kept for the upstream app) |
-| apps | `apps/transit`, plus the upstream `soundcraft*` apps (exempt from the table) |
+| apps | `apps/transit`, plus the inherited `soundcraft*` apps (exempt from the table) |
 
 ## Rules the check enforces
 

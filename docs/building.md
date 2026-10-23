@@ -26,7 +26,7 @@ transit keeps `ui.json`, `Autosave/` and `logs/` in its own settings folder:
 - Linux: `~/.config/transit` (or `$XDG_CONFIG_HOME/transit`)
 
 Set `TRANSIT_CONFIG_DIR` to use a different folder, for example to keep a test build away from your
-real settings. The plug-in scan cache is shared with SoundCraft (`SOUNDCRAFT_CONFIG_DIR` overrides).
+real settings. The plug-in scan cache is shared with the inherited soundcraft apps (`SOUNDCRAFT_CONFIG_DIR` overrides).
 
 ## Packaging
 
