@@ -21,6 +21,7 @@ pub mod midi_take;
 pub mod presets;
 pub mod retime;
 pub mod score;
+pub mod step_input;
 
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, Session, TrackId, ZoomState};

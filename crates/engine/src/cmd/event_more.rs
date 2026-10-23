@@ -90,7 +90,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Step Input...",
             ["Event", "MIDI Operations"],
             None,
-            "{track?, pitch?: 60 | pitches?: [..], velocities?: [..] (one per pitch), duration?: '1/8'|ticks, velocity?: 100, rest?: bool, advance?: true, at?: absolute ticks (default: the selection start), clip?: the clip to continue}",
+            "{track?, pitch?: 60 | pitches?: [..], velocities?: [..] (one per pitch), duration?: '1/8'|ticks, velocity?: 100, rest?: bool, tie?: bool (extend matching notes ending at at), advance?: true, at?: absolute ticks (default: the selection start), clip?: the clip to continue}",
             has_tracks,
             step_input
         ),
@@ -397,11 +397,12 @@ fn midi_target(e: &Engine, p: &Value, id: &str) -> Result<TrackId> {
 fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = "event.step_input";
     let t = midi_target(e, p, id)?;
-    let dur = note_ticks(p.get("duration"), TICKS_PER_QUARTER / 2);
+    let dur = p.get("duration").and_then(Value::as_i64).map(|v| v.max(1)).unwrap_or_else(|| note_ticks(p.get("duration"), TICKS_PER_QUARTER / 2));
     let vel = i64_or(p, "velocity", 100).clamp(1, 127) as u8;
     let rest = bool_or(p, "rest", false);
+    let tie = bool_or(p, "tie", false);
     let pitches: Vec<u8> = match p.get("pitches").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_i64).map(|x| x.clamp(0, 127) as u8).take(16).collect(),
+        Some(a) => a.iter().filter_map(Value::as_i64).map(|x| x.clamp(0, 127) as u8).take(128).collect(),
         None => vec![i64_or(p, "pitch", 60).clamp(0, 127) as u8],
     };
     let s = e.session_mut();
@@ -418,8 +419,11 @@ fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_i64).map(|x| x.clamp(1, 127) as u8).collect())
         .unwrap_or_default();
-    let end_tick = tick.saturating_add(dur);
+    let end_tick = tick.checked_add(dur).ok_or_else(|| bad(id, "step end is out of range"))?;
     let end = s.tempo.tick_to_samples(end_tick, sr);
+    if end <= at {
+        return Err(bad(id, "step duration is outside the session time range"));
+    }
     // Continue the clip under (or ending at) the insertion point, else start a new one.
     let wanted = p.get("clip").and_then(Value::as_u64).map(soundcraft_model::ClipId);
     let host = s.track(t).and_then(|tr| {
@@ -433,6 +437,9 @@ fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
     let host = match host {
         Some(h) => h,
         None => {
+            if tie {
+                return Err(bad(id, "no previous chord to tie"));
+            }
             let cid = s.new_clip_id();
             let name = s.track(t).map(|x| x.name.clone()).unwrap_or_default();
             crate::edit::place_clip(s, t, Clip::midi(cid, name, at, (end - at).max(1), soundcraft_midi::Sequence::default()));
@@ -444,8 +451,29 @@ fn step_input(e: &mut Engine, p: &Value) -> Result<Value> {
     let mut added = 0;
     if let Some(c) = s.find_clip_mut(host) {
         let base = tempo.samples_to_ticks(c.start, sr);
+        if end > c.end() && next_start.is_some_and(|next| end > next) {
+            return Err(bad(id, "the next clip starts before the step ends"));
+        }
         if let ClipContent::Midi { sequence } = &mut c.content {
-            if !rest {
+            if tie {
+                let previous: Vec<_> = sequence.notes.iter().enumerate().filter(|(_, n)| n.end() == tick - base).map(|(i, _)| i).collect();
+                let mut actual: Vec<_> = previous.iter().map(|i| sequence.notes[*i].pitch).collect();
+                let mut wanted = pitches.clone();
+                actual.sort_unstable();
+                actual.dedup();
+                wanted.sort_unstable();
+                wanted.dedup();
+                if previous.is_empty() || (!wanted.is_empty() && wanted != actual) {
+                    return Err(bad(id, "tie needs the same pitches as the previous chord"));
+                }
+                for i in &previous {
+                    sequence.notes[*i].length.checked_add(dur).ok_or_else(|| bad(id, "tied note length is out of range"))?;
+                }
+                for i in previous {
+                    sequence.notes[i].length += dur;
+                    added += 1;
+                }
+            } else if !rest {
                 for (i, pitch) in pitches.iter().enumerate() {
                     let velocity = velocities.get(i).copied().unwrap_or(vel);
                     sequence.notes.push(Note { pitch: *pitch, velocity, release_velocity: 64, channel: 0, start: tick - base, length: dur });
@@ -909,6 +937,33 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(e.session().find_clip(ClipId(cid)).unwrap().1.length, 36_000, "the clip grew to the step's end");
+    }
+
+    #[test]
+    fn step_tie_extends_matching_chord_and_rejects_mismatches_without_edits() {
+        let (mut e, t) = midi_engine();
+        let r = e.execute("event.step_input", &json!({"track": t.0, "at": 0, "pitches": [60, 64, 67], "duration": 240})).unwrap();
+        let cid = r["clip"].as_u64().unwrap();
+        let before = serde_json::to_value(e.session()).unwrap();
+        assert!(
+            e.execute("event.step_input", &json!({"track": t.0, "clip": cid, "at": 240, "pitches": [60], "duration": 240, "tie": true})).is_err()
+        );
+        assert_eq!(serde_json::to_value(e.session()).unwrap(), before);
+        e.execute("event.step_input", &json!({"track": t.0, "clip": cid, "at": 240, "pitches": [67, 60, 64], "duration": 480, "tie": true})).unwrap();
+        let ClipContent::Midi { sequence } = &e.session().find_clip(ClipId(cid)).unwrap().1.content else { panic!() };
+        assert_eq!(sequence.notes.len(), 3);
+        assert!(sequence.notes.iter().all(|n| n.start == 0 && n.length == 720));
+    }
+
+    #[test]
+    fn step_input_preserves_long_held_duration_and_all_chord_pitches() {
+        let (mut e, t) = midi_engine();
+        let pitches: Vec<_> = (40..60).collect();
+        let duration = TICKS_PER_QUARTER * 80;
+        let r = e.execute("event.step_input", &json!({"track": t.0, "at": 0, "pitches": pitches, "duration": duration})).unwrap();
+        let ClipContent::Midi { sequence } = &e.session().find_clip(ClipId(r["clip"].as_u64().unwrap())).unwrap().1.content else { panic!() };
+        assert_eq!(sequence.notes.len(), 20);
+        assert!(sequence.notes.iter().all(|n| n.length == duration));
     }
 
     #[test]
