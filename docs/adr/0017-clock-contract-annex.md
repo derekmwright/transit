@@ -1,4 +1,4 @@
-# ADR 0012 annex: clock domains and timestamp quality
+# ADR 0017: clock domains and timestamp quality
 
 - Date: 2026-10-18. Status: proposed for joint review.
 - Parent: [ADR 0012](0012-midi-device-layer.md), gates G4 and G6.

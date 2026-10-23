@@ -1,6 +1,6 @@
 # Clock domains
 
-Contract: [ADR 0012 clock annex](../../adr/0012-clock-contract-annex.md). Code:
+Contract: [ADR 0017 clock annex](../../adr/0017-clock-contract-annex.md). Code:
 `crates/playback/src/device_clock.rs` and `device_clock/`.
 
 | Coordinate | Meaning |
