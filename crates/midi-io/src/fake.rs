@@ -25,7 +25,7 @@
 //! unplug (an open connection keeps its now silent sink until dropped); [`Fake::input_port`]
 //! gives the [`FakeInputPort`] whose [`deliver`](FakeInputPort::deliver) plays the backend
 //! callback (it stays usable after the unplug, like a dying driver thread); [`Fake::sent`]
-//! returns what was sent to an output; [`Fake::key`] builds an id-less key.
+//! returns what was sent to an output ([`Fake::sends`] with instants and threads); [`Fake::key`] builds an id-less key.
 
 use crate::backend::{Backend, InputConnection, OutputConnection};
 use crate::port::{BackendId, Direction, PortKey, RawPort, resolve};
@@ -34,7 +34,19 @@ use crate::{MidiIo, MidiIoError};
 use std::sync::{Arc, Mutex, PoisonError};
 
 type Slot = Arc<Mutex<Option<InputSink>>>;
-type Sent = Arc<Mutex<Vec<Vec<u8>>>>;
+type Sent = Arc<Mutex<Vec<FakeSend>>>;
+
+/// One message a fake output received, with when and on which thread it was sent, so tests can
+/// check scheduling and that sends never happen on an audio thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeSend {
+    /// The bytes.
+    pub message: Vec<u8>,
+    /// When [`OutputHandle::send`](crate::OutputHandle::send) was called.
+    pub at: std::time::Instant,
+    /// The calling thread.
+    pub thread: std::thread::ThreadId,
+}
 
 struct Port<T> {
     raw: RawPort,
@@ -144,6 +156,12 @@ impl Fake {
         Self::push_output(&mut state, name, id)
     }
 
+    /// Plugs in an output with the given id, as a device that comes back after an unplug with
+    /// the same interface path, and returns its key.
+    pub fn add_output_with_id(&self, name: &str, id: &str) -> PortKey {
+        Self::push_output(&mut lock(&self.state), name, id.to_owned())
+    }
+
     /// Plugs in an output with no id and returns its key.
     pub fn add_output_anonymous(&self, name: &str) -> PortKey {
         Self::push_output(&mut lock(&self.state), name, String::new())
@@ -185,6 +203,12 @@ impl Fake {
     /// Everything sent to the output `key` names.
     #[must_use]
     pub fn sent(&self, key: &PortKey) -> Vec<Vec<u8>> {
+        self.sends(key).into_iter().map(|s| s.message).collect()
+    }
+
+    /// Everything sent to the output `key` names, with send instants and threads.
+    #[must_use]
+    pub fn sends(&self, key: &PortKey) -> Vec<FakeSend> {
         let state = lock(&self.state);
         resolve(&raws(&state.outputs), key).and_then(|i| state.outputs.get(i)).map(|p| lock(&p.data).clone()).unwrap_or_default()
     }
@@ -202,7 +226,7 @@ impl Drop for FakeInput {
 struct FakeOutput(Sent);
 impl OutputConnection for FakeOutput {
     fn send(&mut self, message: &[u8]) -> Result<(), MidiIoError> {
-        lock(&self.0).push(message.to_vec());
+        lock(&self.0).push(FakeSend { message: message.to_vec(), at: std::time::Instant::now(), thread: std::thread::current().id() });
         Ok(())
     }
 }
