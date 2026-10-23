@@ -288,6 +288,9 @@ pub struct StudioApp {
     pub ui: UiState,
     /// The status line.
     pub status: String,
+    /// The last plug-in state capture left plug-ins out (issue #56): the notice, for a status
+    /// that replaces it in the same action (a bounce starting).
+    state_notice: Option<String>,
     pub services: Services,
     pub autosave_dir: Option<std::path::PathBuf>,
     autosaver: Option<soundcraft_engine::autosave::Autosaver>,
@@ -400,6 +403,7 @@ impl StudioApp {
             take_plan: None,
             ui: UiState::default(),
             status: String::new(),
+            state_notice: None,
             services,
             autosave_dir: None,
             autosaver: None,

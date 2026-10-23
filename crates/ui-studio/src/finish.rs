@@ -470,7 +470,7 @@ impl StudioApp {
             Ok(job) => {
                 self.finish.job = Some(job);
                 self.finish.bounce_form = None;
-                self.status = format!("Bouncing to {}…", path.display());
+                self.status = self.with_state_notice(format!("Bouncing to {}…", path.display()));
                 Ok(())
             }
             Err(e) => {
@@ -509,7 +509,7 @@ impl StudioApp {
             }
             Ok(job) => {
                 self.finish.replace = Replace::No;
-                self.status = format!("Bouncing {} stems to {dir}...", job.files().len());
+                self.status = self.with_state_notice(format!("Bouncing {} stems to {dir}...", job.files().len()));
                 self.finish.path_job = Some(job);
                 self.finish.paths_request = Some(p);
                 self.finish.bounce_form = None;

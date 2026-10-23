@@ -14,8 +14,13 @@ soundcraft-vst3-host.workspace = true
 transit-rt.workspace = true
 log.workspace = true
 
+[features]
+# Test seams (`act_as_modal_dialog`); never enabled by the app.
+testing = []
+
 [dev-dependencies]
 transit-rt = { workspace = true, features = ["testing"] }
+transit-plugin-host = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

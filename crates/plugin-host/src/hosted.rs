@@ -1,12 +1,12 @@
 //! An instance adopted by its host thread ([`crate::Ctx::adopt`]): the forwarder the render graph
 //! holds, and the editor and state proxies the UI holds.
 
-use crate::{Host, Inner, Worker, lock};
+use crate::{Host, Inner, Status, Worker, lock};
 use soundcraft_dsp::event::PluginEvent;
 use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginStateReader, ProcessStatus, SampleSource, StateBusy, Transport};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the UI is told when the instance's host thread is wedged or gone.
 pub(crate) const NOT_RESPONDING: &str = "the plug-in is not responding (its host thread is stuck)";
@@ -271,19 +271,22 @@ impl PluginEditor for RemoteEditor {
 }
 
 /// The UI's state reader: a request to the host thread, waited for up to the timeout (the one
-/// place the UI waits on a plug-in, ADR 0018 section 6). A wedged or gone thread answers `None`
-/// at once. A save uses [`PluginStateReader::save_state_within`] with its own deadline instead.
+/// place the UI waits on a plug-in, ADR 0018 section 6). A wedged or gone thread answers at once.
+/// A save uses [`PluginStateReader::save_state_within`], which also gives up on a thread held by
+/// a modal dialog.
 struct RemoteState {
     token: Arc<Token>,
 }
 
 impl RemoteState {
-    /// Reads the state on the host thread, waiting at most `timeout`; `Err` when it did not
-    /// answer in time, its thread is wedged or gone, or the thread has been inside one window
-    /// message (a modal dialog) for longer than the request timeout: that one answers at once.
-    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
+    /// Reads the state on the host thread. `Err` at once when the thread is wedged or gone, or has
+    /// been inside one window message (a modal dialog) for longer than the request timeout; after
+    /// `busy` while the thread is inside a window message longer than [`crate::MODAL_AFTER`]; and
+    /// after the request timeout otherwise (a job that runs that long wedges the thread anyway).
+    fn read(&mut self, busy: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
         let worker = &self.token.worker;
-        if !worker.responsive() || worker.in_dispatch_longer_than(self.token.timeout) {
+        let timeout = self.token.timeout;
+        if !worker.responsive() || worker.in_dispatch_longer_than(timeout) {
             return Err(StateBusy);
         }
         if worker.is_current_thread() {
@@ -292,7 +295,20 @@ impl RemoteState {
         }
         let host = Host { inner: self.token.host.upgrade().ok_or(StateBusy)? };
         let key = self.token.key;
-        host.submit_to(worker, move |ctx| ctx.local(key).and_then(|l| l.state.as_mut()).and_then(|s| s.save_state())).wait(timeout).ok_or(StateBusy)
+        let pending = host.submit_to(worker, move |ctx| ctx.local(key).and_then(|l| l.state.as_mut()).and_then(|s| s.save_state()));
+        let start = Instant::now();
+        loop {
+            match pending.poll() {
+                Status::Ready(state) => return Ok(state),
+                Status::Failed | Status::Stuck => return Err(StateBusy),
+                Status::Waiting { .. } => {}
+            }
+            let waited = start.elapsed();
+            if !worker.responsive() || waited >= timeout || (waited >= busy && worker.in_dispatch_longer_than(crate::MODAL_AFTER)) {
+                return Err(StateBusy);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -301,7 +317,7 @@ impl PluginStateReader for RemoteState {
         self.read(self.token.timeout).ok().flatten()
     }
 
-    fn save_state_within(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
-        self.read(timeout.min(self.token.timeout))
+    fn save_state_within(&mut self, busy: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
+        self.read(busy)
     }
 }

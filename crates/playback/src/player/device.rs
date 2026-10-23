@@ -1020,12 +1020,14 @@ impl Player {
     pub fn capture_states_for_reopen(&self, expected: &Arc<Session>) -> Result<Option<PluginStates>, PlayerError> {
         self.owner()?.capture_states_for_reopen(expected)
     }
-    /// The plug-ins the last [`Self::capture_states`] could not read within the save deadline
-    /// (issue #56): their stored states were kept. Each capture replaces the list; this takes it.
+    /// The plug-ins the last [`Self::capture_states`] (or reopen capture) left out, issue #56:
+    /// their thread was stuck, or held by a modal dialog past the save deadline, so their stored
+    /// states were kept. Each capture replaces the list; this takes it.
     pub fn take_unrefreshed_states(&self) -> Vec<String> {
         self.owner().map(|mut owner| owner.take_unrefreshed_states()).unwrap_or_default()
     }
-    /// How long one state capture waits for plug-ins in all (default 500 ms).
+    /// How long one state capture waits, in all, for plug-ins held by a modal dialog (default
+    /// 500 ms). A plug-in that is answering is waited for, however slowly.
     pub fn set_save_deadline(&self, deadline: std::time::Duration) {
         if let Ok(mut owner) = self.owner() {
             owner.set_save_deadline(deadline);

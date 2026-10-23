@@ -14,8 +14,10 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use transit_plugin_host::{Ctx, Host, Pending, Status};
 
-/// How long one save waits for every plug-in's state in all (issue #56). A plug-in that has not
-/// answered by then keeps its stored state and the status line names it.
+/// How long one save waits, in all, for plug-ins whose thread is held by a modal dialog (issue
+/// #56). Such a plug-in that has not answered by then keeps its stored state and the status line
+/// names it; a wedged thread's plug-ins answer at once. A plug-in that is answering is waited for
+/// however long it takes (up to the host's request timeout).
 pub const DEFAULT_SAVE_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Makes one instance for a spec, on whichever thread runs it (the plug-in host thread for hosted
@@ -50,6 +52,9 @@ struct Entry {
     key_input: bool,
     /// The plug-in's name, for the status line.
     name: &'static str,
+    /// The session holds a state for it: restored at creation, or captured since. Until then a
+    /// save waits for its read even while its thread is held by a modal dialog (issue #56).
+    stored: bool,
 }
 
 /// Where a third-party instance the next plan needs is on its way to being made.
@@ -150,7 +155,7 @@ impl Handles {
                 _ if deferred(&spec.id) => self.make_later(spec, factory),
                 _ => factory(spec),
             }?;
-            self.capture((spec.track, spec.slot, generation), made)
+            self.capture_stored((spec.track, spec.slot, generation), made, spec.state.is_some())
         });
         self.refresh(&mut control.sessions);
     }
@@ -356,7 +361,12 @@ impl Handles {
 
     /// Take every possibly-panicking handle before committing the entry. On a factory
     /// unwind, local resources die on main and there is no partial visible binding.
-    pub fn capture(&mut self, binding: SlotBinding, mut made: NewInstance) -> Option<NewInstance> {
+    pub fn capture(&mut self, binding: SlotBinding, made: NewInstance) -> Option<NewInstance> {
+        self.capture_stored(binding, made, false)
+    }
+
+    /// [`Self::capture`]; `stored`: the session holds a state for this instance (it was restored).
+    pub fn capture_stored(&mut self, binding: SlotBinding, mut made: NewInstance, stored: bool) -> Option<NewInstance> {
         let key = (binding.0, binding.2);
         if self.entries.contains_key(&key) {
             return None;
@@ -365,7 +375,7 @@ impl Handles {
         let state = made.plugin.state_reader();
         let key_input = made.plugin.has_key_input();
         let name = made.plugin.info().name;
-        self.entries.insert(key, Entry { editor, state, refused: made.refused_state, key_input, name });
+        self.entries.insert(key, Entry { editor, state, refused: made.refused_state, key_input, name, stored });
         Some(made)
     }
 
@@ -444,9 +454,12 @@ impl Handles {
             editor.set_param(id, value);
         }
     }
-    /// Reads every live plug-in's state for a save, waiting at most the save deadline in all
-    /// (issue #56): a plug-in whose thread is inside a long call or a modal dialog is left out,
-    /// so the caller keeps its stored state, and is named by [`Self::take_unrefreshed`].
+    /// Reads every live plug-in's state for a save (issue #56). A plug-in that is answering is
+    /// waited for, however slowly. One whose thread is wedged is left out at once; one whose
+    /// thread is held by a modal dialog is waited for at most what is left of the save deadline,
+    /// shared by all of them, unless the session holds no state for it yet (then it is waited for
+    /// like the others: it would otherwise be saved with none). A plug-in left out keeps its
+    /// stored state and is named by [`Self::take_unrefreshed`].
     pub fn capture_states(&mut self) -> PluginStates {
         let deadline = Instant::now() + self.save_deadline;
         let mut unrefreshed = Vec::new();
@@ -458,9 +471,13 @@ impl Handles {
                 if entry.refused {
                     return None;
                 }
-                let left = deadline.saturating_duration_since(Instant::now());
-                match entry.state.as_mut()?.save_state_within(left) {
-                    Ok(state) => Some((track, slot, state?)),
+                let busy = if entry.stored { deadline.saturating_duration_since(Instant::now()) } else { Duration::MAX };
+                match entry.state.as_mut()?.save_state_within(busy) {
+                    Ok(state) => {
+                        let state = state?;
+                        entry.stored = true;
+                        Some((track, slot, state))
+                    }
                     Err(StateBusy) => {
                         log::warn!("{}: state not read within the save deadline; its stored state is kept", entry.name);
                         unrefreshed.push(entry.name.to_owned());
@@ -478,7 +495,8 @@ impl Handles {
         std::mem::take(&mut self.unrefreshed)
     }
 
-    /// How long one save waits for plug-in states in all ([`DEFAULT_SAVE_DEADLINE`]).
+    /// How long one save waits, in all, for plug-ins held by a modal dialog
+    /// ([`DEFAULT_SAVE_DEADLINE`]).
     pub fn set_save_deadline(&mut self, deadline: Duration) {
         self.save_deadline = deadline;
     }

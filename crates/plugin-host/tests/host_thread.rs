@@ -140,6 +140,10 @@ fn a_state_read_from_a_wedged_thread_answers_at_once() {
     let t = Instant::now();
     assert_eq!(plugin.state_reader().unwrap().save_state(), None);
     assert!(t.elapsed() < FRAME_BUDGET, "the wedged thread was waited for");
+    // A save's read (issue #56) gives up at once too, however long it may wait for a dialog.
+    let t = Instant::now();
+    assert_eq!(plugin.state_reader().unwrap().save_state_within(Duration::from_secs(60)), Err(soundcraft_dsp::StateBusy));
+    assert!(t.elapsed() < FRAME_BUDGET, "the wedged thread was waited for by a save");
     let mut editor = plugin.editor().unwrap();
     assert!(editor.open().unwrap_err().contains("not responding"));
     drop(release);

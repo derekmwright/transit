@@ -45,6 +45,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one window-message dispatch (a modal dialog) may run before its thread counts as
 /// wedged.
 pub const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// A window-message dispatch that has run this long holds a modal dialog (a plug-in's file
+/// dialog or message box): a save stops waiting for the plug-ins on that thread after its short
+/// deadline instead of the request timeout (issue #56).
+pub const MODAL_AFTER: Duration = Duration::from_millis(100);
 /// How often the host thread services plug-in requests and editor `idle` calls.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(15);
 
@@ -368,6 +372,16 @@ impl<T> Drop for Pending<T> {
         {
             drop(cell.take());
         }
+    }
+}
+
+/// Holds the calling job's busy section as a window-message dispatch, the way a plug-in's modal
+/// dialog holds the thread (a test seam: the job then stands in for the dialog).
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn act_as_modal_dialog(ctx: &Ctx) {
+    if let Some(worker) = &ctx.worker {
+        worker.dispatching.store(true, Ordering::Release);
     }
 }
 

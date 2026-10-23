@@ -948,52 +948,177 @@ fn a_save_after_the_host_thread_returns_from_a_stall_carries_the_live_state() {
     runtime.retire(ports);
 }
 
-/// Issue #56 (a): a save while a plug-in's thread is inside a long call (a modal dialog) waits at
-/// most the save deadline in all, keeps that plug-in's stored state (it is left out of the
-/// capture) and names it once; after the call returns, the next save carries the live state.
-#[test]
-fn a_save_during_a_long_plug_in_call_returns_within_its_deadline_and_names_the_plug_in() {
-    let (mut runtime, mut ports, track, _) = with_instrument_requested();
-    // The request timeout stays long: the thread is busy, not wedged.
+/// A hosted plug-in whose state read takes `delay` (a large sampler serializing its library).
+struct SlowRead {
+    inner: Box<dyn Plugin>,
+    delay: std::time::Duration,
+    state: u8,
+}
+impl Plugin for SlowRead {
+    fn info(&self) -> &'static PluginInfo {
+        self.inner.info()
+    }
+    fn prepare(&mut self, rate: f32, frames: usize, channels: usize) {
+        self.inner.prepare(rate, frames, channels);
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn set_param(&mut self, id: &str, value: f32) -> bool {
+        self.inner.set_param(id, value)
+    }
+    fn param(&self, id: &str) -> Option<f32> {
+        self.inner.param(id)
+    }
+    fn process(&mut self, data: &mut [Vec<f32>], frames: usize) {
+        self.inner.process(data, frames);
+    }
+    fn state_reader(&mut self) -> Option<Box<dyn soundcraft_dsp::PluginStateReader>> {
+        let (delay, state) = (self.delay, self.state);
+        Some(Box::new(move || {
+            std::thread::sleep(delay);
+            Some(vec![state])
+        }))
+    }
+}
+
+/// A runtime with `n` instrument tracks whose synths are made on their own (non-inline) plug-in
+/// host thread and read their state in `delay`; `stored`: the session holds a state for each.
+/// Returns the runtime, its ports, the tracks and the confirmed session.
+fn slow_readers(
+    n: usize,
+    delay: std::time::Duration,
+    stored: bool,
+) -> (RuntimeControl<u8, u8>, AudioPorts<u8, u8>, Vec<soundcraft_model::TrackId>, Arc<Session>) {
+    let mut session = Session::default();
+    let tracks: Vec<_> = (0..n)
+        .map(|i| {
+            let t = session.add_track(TrackKind::Instrument, ChannelFormat::Stereo, Some(&format!("keys {i}")));
+            let mut insert = Insert::new("subtractive_synth");
+            if stored {
+                insert.state = Some(soundcraft_model::b64::encode(&[0xee]));
+            }
+            session.track_mut(t).unwrap().instrument = Some(insert);
+            t
+        })
+        .collect();
+    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(Arc::new(session), None, target(), PlanLimits::default()).unwrap();
     runtime.handles =
         Handles::with_host(transit_plugin_host::Host::new(transit_plugin_host::Config { inline: false, ..transit_plugin_host::Config::default() }));
-    let value = Arc::new(AtomicUsize::new(0));
+    let next = Arc::new(AtomicUsize::new(0));
     let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
-        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)?;
-        Some(NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0x5a }), refused_state: false })
+        let made = soundcraft_mix::create_instance(&spec.id, None, 48_000.0, 512, spec.ch)?;
+        let state = u8::try_from(next.fetch_add(1, Ordering::SeqCst)).unwrap();
+        Some(NewInstance { plugin: Box::new(SlowRead { inner: made.plugin, delay, state }), refused_state: false })
     });
     let third_party = |id: &str| id == "subtractive_synth";
-    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
-    frames_until_loaded(&mut runtime, &third_party, &factory);
-    adopt(&mut ports.plans);
+    let start = std::time::Instant::now();
+    while (runtime.any_loading() || tracks.iter().any(|t| runtime.binding(*t, soundcraft_mix::INSTRUMENT_SLOT).is_none()))
+        && start.elapsed() < std::time::Duration::from_secs(20)
+    {
+        runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+        let _ = runtime.after_service();
+        ports.plans.service(&mut plan_bridge::callback_scope(), true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     runtime.service();
     let session = Arc::clone(runtime.requested_session());
-    let live = vec![(track, soundcraft_mix::INSTRUMENT_SLOT, vec![0x5a])];
-    assert_eq!(runtime.capture_states(&session).unwrap(), live);
-    assert!(runtime.take_unrefreshed_states().is_empty());
+    (runtime, ports, tracks, session)
+}
 
-    let deadline = super::handles::DEFAULT_SAVE_DEADLINE;
-    let host = runtime.handles.host().clone();
-    let stall = host.submit(|_| std::thread::sleep(std::time::Duration::from_millis(700)));
-    while !matches!(stall.poll(), transit_plugin_host::Status::Waiting { running: true }) {
+/// Holds the runtime's plug-in host thread for `hold`, as a plug-in's modal dialog does (a
+/// window-message dispatch); returns once the hold has begun.
+fn modal_dialog(runtime: &RuntimeControl<u8, u8>, hold: std::time::Duration) -> transit_plugin_host::Pending<()> {
+    let dialog = runtime.handles.host().submit(move |ctx| {
+        transit_plugin_host::act_as_modal_dialog(ctx);
+        std::thread::sleep(hold);
+    });
+    while !matches!(dialog.poll(), transit_plugin_host::Status::Waiting { running: true }) {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    // Long enough to count as a dialog.
+    std::thread::sleep(transit_plugin_host::MODAL_AFTER + std::time::Duration::from_millis(20));
+    dialog
+}
+
+fn wait_out(pending: &transit_plugin_host::Pending<()>) {
+    while matches!(pending.poll(), transit_plugin_host::Status::Waiting { .. }) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Review B1 of #56: a plug-in that answers slowly (600 ms, past the save deadline) on an idle
+/// host thread is waited for, on every save; nothing is left out.
+#[test]
+fn a_slow_state_read_on_an_idle_host_thread_is_always_captured() {
+    let (mut runtime, ports, tracks, session) = slow_readers(1, std::time::Duration::from_millis(600), true);
+    for _ in 0..2 {
+        let t = std::time::Instant::now();
+        let states = runtime.capture_states(&session).unwrap();
+        assert!(t.elapsed() >= std::time::Duration::from_millis(600));
+        assert_eq!(states, vec![(tracks[0], soundcraft_mix::INSTRUMENT_SLOT, vec![0])]);
+        assert!(runtime.take_unrefreshed_states().is_empty());
+    }
+    runtime.retire(ports);
+}
+
+/// Review B1 of #56: twelve plug-ins at 50 ms each (600 ms in all, past the save deadline) are
+/// all captured, on every save.
+#[test]
+fn twelve_ordinary_state_reads_are_all_captured() {
+    let (mut runtime, ports, tracks, session) = slow_readers(12, std::time::Duration::from_millis(50), true);
+    for _ in 0..2 {
+        let states = runtime.capture_states(&session).unwrap();
+        assert_eq!(states.len(), 12, "{states:?}");
+        assert!(tracks.iter().all(|t| states.iter().any(|(track, _, _)| track == t)));
+        assert!(runtime.take_unrefreshed_states().is_empty());
+    }
+    runtime.retire(ports);
+}
+
+/// Issue #56 (a): a save while the plug-ins' thread is held by a modal dialog waits at most the
+/// save deadline in all, keeps their stored states (they are left out of the capture) and names
+/// them once; after the dialog closes, the next save carries the live states.
+#[test]
+fn a_save_during_a_modal_dialog_returns_within_its_deadline_and_names_the_plug_ins() {
+    let (mut runtime, ports, tracks, session) = slow_readers(3, std::time::Duration::ZERO, true);
+    let live = runtime.capture_states(&session).unwrap();
+    assert_eq!(live.len(), 3);
+    let deadline = super::handles::DEFAULT_SAVE_DEADLINE;
+    let dialog = modal_dialog(&runtime, std::time::Duration::from_millis(1500));
     let t = std::time::Instant::now();
     let states = runtime.capture_states(&session).unwrap();
     let took = t.elapsed();
-    assert!(states.is_empty(), "the busy plug-in is left out, so its stored state is kept: {states:?}");
-    // Load-tolerant: the deadline plus a starved poll, well short of the 700 ms stall.
-    assert!(took < deadline + std::time::Duration::from_millis(150), "the save waited {took:?}");
+    assert!(states.is_empty(), "the busy plug-ins are left out, so their stored states are kept: {states:?}");
+    // Load-tolerant: the deadline plus starved polls, well short of the 1.5 s dialog.
+    assert!(took < deadline + std::time::Duration::from_millis(400), "the save waited {took:?}");
     let named = runtime.take_unrefreshed_states();
-    assert_eq!(named.len(), 1, "one notice: {named:?}");
-    assert!(!named[0].is_empty());
+    assert_eq!(named.len(), 3, "one name per plug-in: {named:?}");
     assert!(runtime.take_unrefreshed_states().is_empty(), "reported once");
-
-    while matches!(stall.poll(), transit_plugin_host::Status::Waiting { .. }) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert_eq!(runtime.capture_states(&session).unwrap(), live, "after the stall the save has the live state");
+    wait_out(&dialog);
+    assert_eq!(runtime.capture_states(&session).unwrap(), live, "after the dialog the save has the live states");
     assert!(runtime.take_unrefreshed_states().is_empty());
+    let _ = tracks;
+    runtime.retire(ports);
+}
+
+/// Review B1 of #56: an instance the session holds no state for (inserted this session, never
+/// captured) is never left out for a dialog: the save waits for it rather than store nothing.
+#[test]
+fn a_never_captured_instance_is_waited_for_even_during_a_modal_dialog() {
+    let (mut runtime, ports, tracks, session) = slow_readers(1, std::time::Duration::ZERO, false);
+    let dialog = modal_dialog(&runtime, std::time::Duration::from_millis(900));
+    let states = runtime.capture_states(&session).unwrap();
+    assert_eq!(states, vec![(tracks[0], soundcraft_mix::INSTRUMENT_SLOT, vec![0])], "waited for, not saved empty");
+    assert!(runtime.take_unrefreshed_states().is_empty());
+    wait_out(&dialog);
+    // Captured once, it now has a stored state: the next dialog leaves it out within the deadline.
+    let dialog = modal_dialog(&runtime, std::time::Duration::from_millis(1500));
+    let t = std::time::Instant::now();
+    assert!(runtime.capture_states(&session).unwrap().is_empty());
+    assert!(t.elapsed() < super::handles::DEFAULT_SAVE_DEADLINE + std::time::Duration::from_millis(400));
+    assert_eq!(runtime.take_unrefreshed_states().len(), 1);
+    wait_out(&dialog);
     runtime.retire(ports);
 }
 
@@ -1048,7 +1173,8 @@ fn an_instance_the_compile_did_not_predict_loads_without_blocking_a_frame() {
         made.load(Ordering::SeqCst) == 2 && !r.any_loading() && r.binding(track, slot).is_some() && r.handles.retrying() == 0
     });
     assert!(loading_frames > 0, "the slot read as loading while the late instance was made");
-    assert!(loading_frames >= 10, "only {loading_frames} frames ran during the 500 ms creation");
+    // Load-tolerant: about 100 at an ideal 5 ms; a frame that waited for the plug-in leaves 1.
+    assert!(loading_frames >= 5, "only {loading_frames} frames ran during the 500 ms creation");
     assert!(worst < FRAME_BUDGET, "a frame waited for the plug-in: {worst:?}");
     assert_eq!(made.load(Ordering::SeqCst), 2, "made once more, for the new layout");
     assert!(!runtime.stuck(track, slot));

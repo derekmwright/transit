@@ -394,11 +394,13 @@ pub trait PluginEditor: Send {
 pub trait PluginStateReader: Send {
     /// What [`Plugin::save_state`] would return; `None` once the instance is gone.
     fn save_state(&mut self) -> Option<Vec<u8>>;
-    /// [`Self::save_state`], giving up after `timeout`: `Err(StateBusy)` when the plug-in did not
-    /// answer in time (its thread is inside a long call or a modal dialog), so the caller keeps
-    /// the state it stored before. Readers that answer at once (the default) ignore the timeout.
-    fn save_state_within(&mut self, timeout: std::time::Duration) -> Result<Option<Vec<u8>>, StateBusy> {
-        let _ = timeout;
+    /// [`Self::save_state`] for a save that must not hang on a plug-in that cannot answer:
+    /// `Err(StateBusy)` at once when the plug-in's thread is stuck, and after at most `busy` while
+    /// that thread is held by a modal dialog (a long window-message dispatch); the caller then
+    /// keeps the state it stored before. A plug-in that is answering, however slowly, is waited
+    /// for as [`Self::save_state`] waits. Readers that answer at once (the default) ignore `busy`.
+    fn save_state_within(&mut self, busy: std::time::Duration) -> Result<Option<Vec<u8>>, StateBusy> {
+        let _ = busy;
         Ok(self.save_state())
     }
 }

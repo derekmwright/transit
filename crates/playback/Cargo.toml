@@ -58,6 +58,7 @@ native-asio = ["dep:transit-audio-asio"]
 asio = ["cpal/asio", "soundcraft-asio-panel/asio"]
 
 [dev-dependencies]
+transit-plugin-host = { workspace = true, features = ["testing"] }
 transit-rt = { workspace = true, features = ["testing"] }
 serde_json.workspace = true
 

@@ -380,20 +380,36 @@ impl StudioApp {
         let states = p.capture_states(&self.engine.session_arc());
         let busy = p.take_unrefreshed_states();
         self.store_plugin_states(states)?;
-        // A plug-in inside a long call or a modal dialog did not answer within the save
-        // deadline: its stored state goes into the save (issue #56).
-        if !busy.is_empty() {
-            self.status = format!("State of {} not refreshed: plug-in busy", busy.join(", "));
-        }
+        self.note_unrefreshed(busy);
         Ok(())
+    }
+
+    /// Plug-ins a capture left out (stuck, or held by a modal dialog): their stored state goes
+    /// into the save, the render or the reopened device (issue #56). The status line says so;
+    /// [`Self::state_notice`] keeps it for a status that replaces this one in the same action.
+    fn note_unrefreshed(&mut self, busy: Vec<String>) {
+        self.state_notice = (!busy.is_empty()).then(|| format!("State of {} not refreshed: plug-in busy", busy.join(", ")));
+        if let Some(notice) = &self.state_notice {
+            self.status = notice.clone();
+        }
+    }
+
+    /// `status`, followed by the notice of plug-ins the last capture left out, if any (once).
+    pub(crate) fn with_state_notice(&mut self, status: String) -> String {
+        match self.state_notice.take() {
+            Some(notice) => format!("{status} ({notice})"),
+            None => status,
+        }
     }
 
     fn preserve_audio_state(&mut self) -> Result<bool, String> {
         let Some(player) = &self.player else { return Ok(true) };
         let states = player.capture_states_for_reopen(&self.engine.session_arc());
+        let busy = player.take_unrefreshed_states();
         let states = self.player_requests.result(&mut self.status, states).ok_or_else(|| self.status.clone())?;
         let Some(states) = states else { return Ok(false) };
         self.store_plugin_states(Ok(states))?;
+        self.note_unrefreshed(busy);
         Ok(true)
     }
 

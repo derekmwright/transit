@@ -4624,6 +4624,7 @@ dependencies = [
  "soundcraft-clap-host",
  "soundcraft-dsp",
  "soundcraft-vst3-host",
+ "transit-plugin-host",
  "transit-rt",
 ]
 

@@ -406,12 +406,12 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         Err(PlayerError::SessionPending)
     }
-    /// The plug-ins the last state capture could not read within the save deadline (their
-    /// stored states were kept), once.
+    /// The plug-ins the last state capture left out (their thread was stuck, or held by a modal
+    /// dialog past the save deadline; their stored states were kept), once.
     pub fn take_unrefreshed_states(&mut self) -> Vec<String> {
         self.handles.take_unrefreshed()
     }
-    /// How long one state capture waits for plug-ins in all.
+    /// How long one state capture waits, in all, for plug-ins held by a modal dialog.
     pub fn set_save_deadline(&mut self, deadline: std::time::Duration) {
         self.handles.set_save_deadline(deadline);
     }
