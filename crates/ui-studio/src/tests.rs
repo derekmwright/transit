@@ -2161,6 +2161,15 @@ fn a_bare_audio_track_is_mono_on_input_one() {
 }
 
 #[test]
+fn add_track_midi_makes_a_focused_midi_track() {
+    let mut app = app();
+    let r = app.add_track("midi");
+    let t = new_audio(&mut app, r);
+    assert_eq!(app.engine.session().track(t).unwrap().kind, soundcraft_model::TrackKind::Midi);
+    assert_eq!(app.ui.focus_track, Some(t));
+}
+
+#[test]
 fn the_menu_makes_mono_and_stereo_audio_tracks() {
     let mut app = app();
     let r = app.add_audio_track("mono");

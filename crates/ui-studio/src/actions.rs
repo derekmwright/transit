@@ -495,7 +495,8 @@ impl StudioApp {
         Ok(r)
     }
 
-    /// Add a track (Add Track): `audio` or `instrument`. It becomes the cursor's track. An audio
+    /// Add a track (Add Track): `audio`, `instrument` or `midi` (a bare MIDI track with no
+    /// instrument; it can feed an external port). It becomes the cursor's track. An audio
     /// track is mono, the engine's default and the common case (a guitar or a mic).
     pub fn add_track(&mut self, kind: &str) -> Result<Value, String> {
         if kind == "audio" {

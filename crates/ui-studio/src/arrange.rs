@@ -141,6 +141,7 @@ pub struct Layout {
     pub recording: Vec<RecordingLane>,
     pub add_audio: R4,
     pub add_instrument: R4,
+    pub add_midi: R4,
     /// Transport bar buttons (`play`, `stop`, `record`, `rtz`, `cycle`).
     pub transport: std::collections::BTreeMap<String, R4>,
     /// The icon each transport button shows (its Lucide name, e.g. `play`).
@@ -318,6 +319,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let below = tl.min.y + geo.total() - app.arrange.vscroll + 8.0;
     let add_a = Rect::from_min_size(pos2(list.min.x + 8.0, below), vec2((hw - 24.0) / 2.0, 22.0));
     let add_i = Rect::from_min_size(pos2(add_a.max.x + 8.0, below), add_a.size());
+    let add_m = Rect::from_min_size(pos2(add_a.min.x, below + 30.0), add_a.size());
     if add_a.min.y < list.max.y {
         let clip = ui.painter().with_clip_rect(list);
         // Audio adds a mono track (the common case: one guitar or mic); its chevron picks mono or stereo.
@@ -349,9 +351,16 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         if resp.clicked() {
             let _ = app.add_track("instrument");
         }
+        let resp = ui.interact(add_m.intersect(list), ui.id().with("add_midi"), Sense::click());
+        clip.rect_filled(add_m, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        crate::icons::paint_labeled(&clip, add_m, false, crate::icons::Icon::Plus, 12.0, "MIDI", FontId::proportional(12.0), TOKENS.text);
+        if resp.clicked() {
+            let _ = app.add_track("midi");
+        }
     }
     layout.add_audio = r4(add_a);
     layout.add_instrument = r4(add_i);
+    layout.add_midi = r4(add_m);
     ui.painter().line_segment([pos2(list.max.x, full.min.y), pos2(list.max.x, full.max.y)], Stroke::new(1.0, TOKENS.line));
 
     grid_and_ruler(app, ui, &s, map, ruler, tl);
@@ -1116,6 +1125,10 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         }
         if ui.button("Add Instrument Track").clicked() {
             let _ = app.add_track("instrument");
+            ui.close();
+        }
+        if ui.button("Add MIDI Track").clicked() {
+            let _ = app.add_track("midi");
             ui.close();
         }
         ui.separator();

@@ -121,6 +121,10 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         let _ = app.add_track("instrument");
                         ui.close();
                     }
+                    if ui.button("Add MIDI Track").clicked() {
+                        let _ = app.add_track("midi");
+                        ui.close();
+                    }
                     if ui.button("Add FX Channel").clicked() {
                         let _ = app.add_fx_channel();
                         ui.close();
