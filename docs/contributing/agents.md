@@ -19,8 +19,11 @@ that has worked, so you can reproduce it with any agent or model. Nothing here i
 - **Cheapest tier:** docs, issue housekeeping, periodic checks.
 - **Mid tier:** scoped, well-briefed code tasks and merge chains.
 - **Strongest tier:** engine, `unsafe`, FFI and threading work, and every refutation review of such work.
+- **The coordinator itself** runs on the strongest model available, since it makes every judgment call:
+  what to build, how to brief, what a review finding means, and when a result is good enough to merge.
 
-As of October 2026 the maintainers use Haiku, Sonnet and Opus class models respectively.
+As of October 2026 the maintainers use Haiku, Sonnet and Opus class models for the three tiers, with
+Fable running the coordinator.
 
 ## Briefing a worker
 
