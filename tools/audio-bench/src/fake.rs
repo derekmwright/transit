@@ -78,8 +78,10 @@ pub fn drive(fake: &FakeBackend, request: &Request, period: u32, script: &Script
     line.extend(std::iter::repeat_n(0.0, script.delay_frames as usize));
     let format = ab::Format::new(request.rate, request.in_ch.max(2), ab::SampleFormat::F32);
     for k in 0..blocks {
+        // Both directions count one device position, as a native ASIO driver's sample position.
+        let position = Some(k * period_frames);
         let mut sink = SliceSink { data: &mut render, channels: out_channels };
-        if !fake.pump_render(period as usize, stamp(arrival(k, 1)), &mut sink) {
+        if !fake.pump_render_at(period as usize, stamp(arrival(k, 1)), position, &mut sink) {
             return Err("the fake render stream is not running".into());
         }
         if request.loopback {
@@ -88,7 +90,7 @@ pub fn drive(fake: &FakeBackend, request: &Request, period: u32, script: &Script
                 frame[in_index] = line.pop_front().unwrap_or(0.0);
             }
             let mut source = SliceSource { data: &capture, channels: in_channels };
-            if !fake.pump_capture(period as usize, stamp(arrival(k, 2)), format, &mut source) {
+            if !fake.pump_capture_at(period as usize, stamp(arrival(k, 2)), position, format, &mut source) {
                 return Err("the fake capture stream is not running".into());
             }
         }

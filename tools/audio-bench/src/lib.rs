@@ -57,6 +57,18 @@ pub struct Config {
 /// The period the fake mode pumps when none is requested.
 pub const FAKE_DEFAULT_PERIOD: u32 = 64;
 
+/// The round trip a run of `kind` calibrates with, as the app would: on native ASIO the click
+/// loop in the driver's sample positions (what the app's Calibration Measure stores; #20, known
+/// issue K31), on native WASAPI and the fake backend the round trip in the stamps' own time;
+/// none on cpal, whose two streams do not stamp one clock.
+pub fn app_trip(kind: Kind, measurements: &analysis::Measurements) -> Option<analysis::FrameTrip> {
+    match kind {
+        Kind::Asio => measurements.position_trip,
+        Kind::Wasapi | Kind::Fake => measurements.frame_trip,
+        Kind::Cpal => None,
+    }
+}
+
 /// Run one measurement and return its table row.
 pub fn run(config: &Config) -> Result<report::Row, String> {
     let shared = probe::Shared::new(config.request.rate, config.seconds);
@@ -103,21 +115,20 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
     let measurements = analysis::measure(&shared, opened.render_rate, opened.capture_rate);
     let date = report::today();
     // Frame times of the two streams are comparable only when one backend stamps both (the native
-    // one, in the shared host origin); a cpal run measures no calibration.
-    let calibration = (config.kind != Kind::Cpal && opened.capture_rate == Some(opened.render_rate))
-        .then_some(measurements.frame_trip)
+    // one, in the shared host origin); a cpal run measures no calibration. Over native ASIO the
+    // calibration is the loop by sample position ([`app_trip`]).
+    let calibration = (opened.capture_rate == Some(opened.render_rate))
+        .then(|| app_trip(config.kind, &measurements))
         .flatten()
         .map(|trip| calibration::figures(&trip, opened.render_rate, &measurements.input_peaks));
+    let mut stored_calibration = None;
     if let Some(path) = &config.settings {
-        let figures = calibration.clone().ok_or("--settings needs a native loopback run (--backend wasapi --loopback) at one rate")??;
-        let record = calibration::record(
-            &figures,
-            &opened.device,
-            config.request.in_device.as_deref(),
-            config.request.mode,
-            config.request.period.unwrap_or(0),
-            &date,
-        );
+        let figures = calibration.clone().ok_or("--settings needs a native loopback run (--backend wasapi or asio, --loopback) at one rate")??;
+        // On ASIO the input is the driver's own: the app's key names none.
+        let input = if config.kind == Kind::Asio { None } else { config.request.in_device.as_deref() };
+        let mode = calibration::mode_key(config.kind, config.request.mode);
+        let record = calibration::record(&figures, &opened.device, input, mode, config.request.period.unwrap_or(0), &date);
+        stored_calibration = Some(calibration::stored(path, &record));
         calibration::merge_settings(path, &record)?;
     }
     Ok(report::Row {
@@ -128,6 +139,7 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         mode: (config.request.mode == ab::Mode::Exclusive).then(|| report::exclusive_note(&opened.render)),
         measurements,
         calibration,
+        stored_calibration,
         render_stats: opened.render_stats,
         capture_stats: opened.capture_stats,
         render_achieved: Some(opened.render),

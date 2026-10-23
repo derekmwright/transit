@@ -9,6 +9,8 @@ use transit_audio_backend as ab;
 
 /// Arrival value of a callback whose stamp was invalid.
 pub const INVALID_ARRIVAL: u64 = u64::MAX;
+/// Position value of a block the backend gave no device position for.
+pub const NO_POSITION: u64 = u64::MAX;
 /// Capacity of the detector ring: a power of two above the longest click (rate / 1000 + 1).
 pub const DETECTOR_CAP: usize = 512;
 /// The first click, in milliseconds after the first render callback.
@@ -66,6 +68,9 @@ pub struct CallbackLog {
     pub frame_ns: Log,
     pub frames: Log,
     pub cpu_ns: Log,
+    /// The device frame position of each block ([`NO_POSITION`] where the backend gives none):
+    /// the native ASIO backend's sample position, which both directions share.
+    pub position: Log,
     pub errors: AtomicU64,
     pub invalid: AtomicU64,
 }
@@ -77,11 +82,12 @@ impl CallbackLog {
             frame_ns: Log::new(capacity),
             frames: Log::new(capacity),
             cpu_ns: Log::new(capacity),
+            position: Log::new(capacity),
             errors: AtomicU64::new(0),
             invalid: AtomicU64::new(0),
         }
     }
-    fn record(&self, stamp: &ab::Stamp, frames: usize, cpu_ns: u64) {
+    fn record(&self, stamp: &ab::Stamp, frames: usize, cpu_ns: u64, position: Option<u64>) {
         let valid = stamp.quality != ab::Quality::Invalid;
         if !valid {
             self.invalid.fetch_add(1, Ordering::Relaxed);
@@ -90,6 +96,7 @@ impl CallbackLog {
         self.frame_ns.push(stamp.backend_frame_ns as u64);
         self.frames.push(frames as u64);
         self.cpu_ns.push(cpu_ns);
+        self.position.push(position.unwrap_or(NO_POSITION));
     }
     /// The error callback of the stream.
     pub fn error(&self) {
@@ -205,7 +212,7 @@ pub fn render_callback(shared: Arc<Shared>, channel: usize, loopback: bool) -> a
     let (mut position, mut next) = (0u64, u64::MAX);
     Box::new(move |block| {
         let started = Instant::now();
-        let (stamp, frames, channels) = (block.stamp, block.frames, usize::from(block.channels).max(1));
+        let (stamp, frames, channels, device_position) = (block.stamp, block.frames, usize::from(block.channels).max(1), block.device_position);
         let click = if loopback { shared.render_click.get() } else { None };
         if let (Some(click), true) = (click, next == u64::MAX) {
             next = click.start(0);
@@ -220,7 +227,7 @@ pub fn render_callback(shared: Arc<Shared>, channel: usize, loopback: bool) -> a
             done += chunk.len() / channels;
         });
         position += frames as u64;
-        shared.render.record(&stamp, frames, shared.body_ns(started));
+        shared.render.record(&stamp, frames, shared.body_ns(started), device_position);
     })
 }
 
@@ -271,7 +278,7 @@ pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallb
     let (mut position, mut detector) = (0u64, Detector::new());
     Box::new(move |block| {
         let started = Instant::now();
-        let (stamp, frames, channels) = (block.stamp, block.frames, usize::from(block.channels).max(1));
+        let (stamp, frames, channels, device_position) = (block.stamp, block.frames, usize::from(block.channels).max(1), block.device_position);
         let click = shared.capture_click.get();
         let base = position;
         let tracked = channels.min(MAX_PEAK_CHANNELS);
@@ -296,6 +303,6 @@ pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallb
         for (slot, peak) in shared.input_peaks.iter().zip(&peaks[..tracked]) {
             slot.fetch_max(peak.to_bits(), Ordering::Relaxed);
         }
-        shared.capture.record(&stamp, frames, shared.body_ns(started));
+        shared.capture.record(&stamp, frames, shared.body_ns(started), device_position);
     })
 }

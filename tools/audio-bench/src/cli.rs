@@ -23,8 +23,9 @@ usage: audio-bench [options]
   --out-ch <n>           1-based output channel of the cable (default 1)
   --in-ch <n>            1-based input channel of the cable (default 1)
   --out <path.md>        write the table here (rows are appended when the table is there)
-  --settings <ui.json>   with --loopback on --backend wasapi: merge the measured calibration into audio.calibrations of this
-                         settings file (close the app first: it rewrites its audio block when it saves)
+  --settings <ui.json>   with --loopback on --backend wasapi or asio: merge the measured calibration into audio.calibrations
+                         of this settings file (close the app first: it rewrites its audio block when it saves); on asio
+                         it is the click loop by sample position, as the app's Calibration Measure stores it
   --list-devices         list the devices of --system and exit (opens no stream)
   fake mode only:
   --fake-delay <frames>  software loopback delay (default 144)
@@ -138,16 +139,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if request.in_device.is_some() && kind == Kind::Asio {
         return Err("--in-device does not apply to --backend asio: capture opens on the --device driver (one ASIO driver per process)".into());
     }
-    if settings.is_some() && kind == Kind::Asio {
-        return Err("--settings needs --backend wasapi: a native ASIO calibration is not written yet (the Focusrite driver's getLatencies \
-                    over-reports, see the known issues)"
-            .into());
-    }
     if settings.is_some() && !request.loopback {
         return Err("--settings needs --loopback: a calibration is a measured round trip".into());
     }
     if settings.is_some() && kind == Kind::Cpal {
-        return Err("--settings needs --backend wasapi: the frame times of cpal streams are not comparable".into());
+        return Err("--settings needs --backend wasapi or asio: the frame times of cpal streams are not comparable".into());
     }
     if kind != Kind::Fake && (delay.is_some() || jitter.is_some() || gap.is_some() || burst) {
         return Err("--fake-* options need --backend fake".into());
@@ -218,7 +214,8 @@ mod tests {
         assert!(parse_str("--backend asio --system WASAPI").is_err());
         assert!(matches!(parse_str("--backend asio --system ASIO"), Ok(Command::Run(_))));
         assert!(parse_str("--backend asio --mode exclusive").unwrap_err().contains("one mode"));
-        assert!(parse_str("--backend asio --loopback --settings ui.json").unwrap_err().contains("--backend wasapi"));
+        let Ok(Command::Run(c)) = parse_str("--backend asio --loopback --settings ui.json") else { panic!("an ASIO loop writes its calibration") };
+        assert_eq!(c.settings.as_deref(), Some(std::path::Path::new("ui.json")));
         let refused = parse_str("--backend asio --device Scarlett --in-device Other --loopback").unwrap_err();
         assert!(refused.contains("--in-device does not apply"), "{refused}");
         assert!(matches!(parse_str("--backend wasapi --in-device Mic --loopback"), Ok(Command::Run(_))), "the other backends keep it");

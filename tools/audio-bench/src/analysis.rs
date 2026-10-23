@@ -11,7 +11,7 @@
 //! stream, callbacks whose body took longer than the period also count: on ASIO a host-side
 //! overrun does not change the callback cadence, so only the body time shows it.
 
-use crate::probe::{CallbackLog, INVALID_ARRIVAL, Shared, click_start};
+use crate::probe::{CallbackLog, INVALID_ARRIVAL, NO_POSITION, Shared, click_start};
 use std::sync::atomic::Ordering;
 
 /// Callbacks at the start of a stream that are left out of the jitter figures: drivers deliver
@@ -71,6 +71,9 @@ pub struct Measurements {
     pub round_trip: Option<RoundTrip>,
     /// The round trip in the stamps' own time, when a capture stream ran (see [`FrameTrip`]).
     pub frame_trip: Option<FrameTrip>,
+    /// The round trip in device frame positions, when a capture stream ran and both streams
+    /// reported positions of one counter (native ASIO's sample position; see [`position_trips`]).
+    pub position_trip: Option<FrameTrip>,
     /// Calls of the backends' error callbacks (render plus capture).
     pub backend_errors: u64,
     /// Callbacks with an invalid stamp, and log entries lost to a full log.
@@ -112,6 +115,8 @@ pub struct Stream {
     pub frame_ns: Vec<i64>,
     pub frames: Vec<u64>,
     pub cpu_ns: Vec<u64>,
+    /// The device position of each block ([`NO_POSITION`] where none was given).
+    pub position: Vec<u64>,
     pub rate: u32,
 }
 
@@ -122,6 +127,7 @@ impl Stream {
             frame_ns: log.frame_ns.snapshot().into_iter().map(|bits| bits as i64).collect(),
             frames: log.frames.snapshot(),
             cpu_ns: log.cpu_ns.snapshot(),
+            position: log.position.snapshot(),
             rate,
         }
     }
@@ -193,6 +199,14 @@ impl Stream {
         let valid = *self.arrival_ns.get(block)? != INVALID_ARRIVAL;
         (valid && at < starts[block] + self.frames[block])
             .then(|| *self.frame_ns.get(block).unwrap_or(&0) as f64 + (at - starts[block]) as f64 * 1e9 / f64::from(self.rate))
+    }
+    /// The device position of stream frame `at`, in ns at the nominal rate (so it pairs like the
+    /// other clocks): its block's position plus the offset in it. A block with no position has none.
+    fn position_ns(&self, starts: &[u64], at: u64) -> Option<f64> {
+        let block = starts.partition_point(|s| *s <= at).checked_sub(1)?;
+        let position = *self.position.get(block)?;
+        (position != NO_POSITION && at < starts[block] + self.frames[block])
+            .then(|| (position + (at - starts[block])) as f64 * 1e9 / f64::from(self.rate.max(1)))
     }
     /// First stream frame of each block.
     fn starts(&self) -> Vec<u64> {
@@ -279,6 +293,26 @@ pub fn frame_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> Fra
     }
 }
 
+/// The loopback round trip in device positions: per click, the capture position of the detected
+/// click minus the render position of the emitted click, in ns at the nominal rate. This is the
+/// loop the app's Calibration Measure stores over native ASIO (both directions count the driver's
+/// one sample position); `None` unless both streams gave positions and the rates agree.
+pub fn position_trips(render: &Stream, capture: &Stream, detections: &[u64]) -> Option<FrameTrip> {
+    let positioned = |s: &Stream| !s.position.is_empty() && s.position.iter().all(|p| *p != NO_POSITION);
+    if render.rate != capture.rate || !positioned(render) || !positioned(capture) {
+        return None;
+    }
+    let (clicks, trips) = pair_clicks(render, capture, detections, Stream::position_ns);
+    let ns = |ms: f64| ms * 1e6;
+    Some(FrameTrip {
+        clicks,
+        paired: trips.len(),
+        min_ns: ns(trips.first().copied().unwrap_or(0.0)),
+        median_ns: ns(percentile(&trips, 0.5)),
+        p95_ns: ns(percentile(&trips, 0.95)),
+    })
+}
+
 /// All figures of a run. `capture_rate` is `Some` when a capture stream ran.
 pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> Measurements {
     let render = Stream::read(&shared.render, render_rate);
@@ -289,6 +323,7 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
     let frames = sorted(render.frames.iter().map(|f| *f as f64).collect());
     let round_trip = capture.as_ref().map(|capture| round_trips(&render, capture, &shared.detections.snapshot()));
     let frame_trip = capture.as_ref().map(|capture| frame_trips(&render, capture, &shared.detections.snapshot()));
+    let position_trip = capture.as_ref().and_then(|capture| position_trips(&render, capture, &shared.detections.snapshot()));
     let errors = shared.render.errors.load(Ordering::Relaxed) + shared.capture.errors.load(Ordering::Relaxed);
     let invalid = shared.render.invalid.load(Ordering::Relaxed) + shared.capture.invalid.load(Ordering::Relaxed);
     let dropped = [&shared.render, &shared.capture].iter().map(|l| l.arrival_ns.dropped()).sum::<u64>() + shared.detections.dropped();
@@ -306,6 +341,7 @@ pub fn measure(shared: &Shared, render_rate: u32, capture_rate: Option<u32>) -> 
         cpu_us: cpu,
         round_trip,
         frame_trip,
+        position_trip,
         backend_errors: errors,
         invalid_stamps: invalid,
         dropped,
@@ -339,6 +375,7 @@ mod tests {
             frame_ns: vec![0; 3],
             frames: vec![10, 20, 10],
             cpu_ns: vec![0; 3],
+            position: vec![500, 510, NO_POSITION],
             rate: 1_000_000_000,
         };
         let starts = stream.starts();
@@ -347,6 +384,8 @@ mod tests {
         assert_eq!(stream.host_ns(&starts, 15), Some(2005.0));
         assert_eq!(stream.host_ns(&starts, 31), None, "invalid block");
         assert_eq!(stream.host_ns(&starts, 99), None, "past the end");
+        assert_eq!(stream.position_ns(&starts, 15), Some(515.0), "the block's position plus the offset");
+        assert_eq!(stream.position_ns(&starts, 31), None, "no position");
     }
 
     /// Blocks of `frames` at 48 kHz, arriving at `arrive(k)` ns, with body time `cpu`.
@@ -357,6 +396,7 @@ mod tests {
             frame_ns: vec![0; blocks as usize],
             frames: vec![frames; blocks as usize],
             cpu_ns: (0..blocks).map(cpu).collect(),
+            position: vec![NO_POSITION; blocks as usize],
             rate: 48_000,
         }
     }

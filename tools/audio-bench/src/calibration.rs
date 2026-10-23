@@ -1,12 +1,19 @@
-//! Loopback calibration (ADR 0016 slice d): from the round trip the harness measured in the
-//! stamps' own time to the record `audio.calibrations` of `ui.json` keeps, and the merge into that
-//! file. The Player looks the record up by device, input, mode, rate and period and hands it to
-//! both streams, which then report `Measured` stamps.
+//! Loopback calibration (ADR 0016 slice d): from the round trip the harness measured to the record
+//! `audio.calibrations` of `ui.json` keeps, and the merge into that file. The Player looks the
+//! record up by device, input, mode, rate and period and hands it to both streams, which then
+//! report `Measured` stamps.
+//!
+//! What is measured depends on the backend ([`crate::app_trip`]): on native WASAPI the round trip
+//! in the stamps' own time (the delay the stamps do not account for); on native ASIO the click
+//! loop in the driver's sample positions, the figure the app's Calibration Measure stores (#20,
+//! known issue K31). The stamp-time figure is not a calibration over ASIO: it is the loop minus the
+//! driver's `getLatencies` figures, which the drivers misreport by an amount that changes sign with
+//! the buffer size, so it came out as a few frames, or as no pair at all when it was negative.
 
 use crate::analysis::FrameTrip;
 use crate::probe::{CLICK_LEVEL, MIN_ENERGY_RATIO};
 use soundcraft_playback::LoopbackCalibration;
-use soundcraft_playback::devices::{MODE_EXCLUSIVE, MODE_SHARED};
+use soundcraft_playback::devices::{MODE_ASIO, MODE_EXCLUSIVE, MODE_SHARED};
 use std::path::Path;
 use transit_audio_backend::Mode;
 
@@ -94,19 +101,25 @@ pub fn figures(trip: &FrameTrip, rate: u32, peaks: &[f32]) -> Result<Figures, St
     Ok(Figures { rate, round_trip_frames: median.round() as u32, spread_frames: spread as u32, paired: trip.paired, clicks: trip.clicks })
 }
 
-/// The `mode` key the Player's settings use for `mode`.
-pub fn mode_key(mode: Mode) -> &'static str {
-    if mode == Mode::Exclusive { MODE_EXCLUSIVE } else { MODE_SHARED }
+/// The `mode` key the Player's settings use for a run of `kind` in `mode`: `asio` on native ASIO
+/// (one mode), else the WASAPI mode.
+pub fn mode_key(kind: crate::Kind, mode: Mode) -> &'static str {
+    match (kind, mode) {
+        (crate::Kind::Asio, _) => MODE_ASIO,
+        (_, Mode::Exclusive) => MODE_EXCLUSIVE,
+        _ => MODE_SHARED,
+    }
 }
 
 /// The record for `ui.json`: keyed by the output `device`, the paired `input` as named on the
-/// command line (the app's `input_pairing`), the `mode` the streams opened in, the requested
-/// `period` (0 for the driver's default) and the rate measured.
-pub fn record(figures: &Figures, device: &str, input: Option<&str>, mode: Mode, period: u32, measured_at: &str) -> LoopbackCalibration {
+/// command line (the app's `input_pairing`; none on ASIO, whose input is the driver's own), the
+/// `mode` key ([`mode_key`]), the requested `period` (0 for the driver's default) and the rate
+/// measured.
+pub fn record(figures: &Figures, device: &str, input: Option<&str>, mode: &str, period: u32, measured_at: &str) -> LoopbackCalibration {
     LoopbackCalibration {
         device: device.to_owned(),
         input: input.map(str::to_owned),
-        mode: mode_key(mode).to_owned(),
+        mode: mode.to_owned(),
         rate: figures.rate,
         period,
         round_trip_frames: figures.round_trip_frames,
@@ -135,6 +148,20 @@ pub fn merge_settings(path: &Path, calibration: &LoopbackCalibration) -> Result<
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })
+}
+
+/// The calibration the settings file at `path` holds under the key of `calibration` (the one
+/// the app would use for this device pair, mode, rate and period), `None` when the file or the
+/// entry is missing or unreadable.
+pub fn stored(path: &Path, calibration: &LoopbackCalibration) -> Option<LoopbackCalibration> {
+    let bytes = std::fs::read(path).ok().filter(|b| b.len() <= MAX_SETTINGS_BYTES)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("audio")?
+        .get("calibrations")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| serde_json::from_value::<LoopbackCalibration>(entry.clone()).ok().filter(|e| e.same_key(calibration)))
 }
 
 /// `calibration` merged into the settings document `value`.
@@ -204,8 +231,9 @@ mod tests {
     #[test]
     fn merging_replaces_the_same_key_and_keeps_everything_else() {
         let f = Figures { rate: 48_000, round_trip_frames: 480, spread_frames: 3, paired: 8, clicks: 8 };
-        let a = record(&f, "Speakers", Some("Line"), Mode::Shared, 128, "2026-10-21");
-        let exclusive = record(&f, "Speakers", Some("Line"), Mode::Exclusive, 128, "2026-10-21");
+        let a = record(&f, "Speakers", Some("Line"), mode_key(crate::Kind::Wasapi, Mode::Shared), 128, "2026-10-21");
+        let exclusive = record(&f, "Speakers", Some("Line"), mode_key(crate::Kind::Wasapi, Mode::Exclusive), 128, "2026-10-21");
+        assert_eq!(mode_key(crate::Kind::Asio, Mode::Exclusive), "asio", "ASIO has one mode");
         assert_eq!((a.mode.as_str(), exclusive.mode.as_str()), ("shared", "exclusive"));
         assert!(!a.same_key(&exclusive), "a shared and an exclusive calibration are different keys");
         let other = LoopbackCalibration { period: 64, ..a.clone() };
@@ -233,9 +261,12 @@ mod tests {
         let path = dir.join("ui.json");
         std::fs::write(&path, r#"{"theme":"dark","audio":{"output":"Speakers","buffer_size":128},"zoom":[1,2]}"#).unwrap();
         let f = Figures { rate: 48_000, round_trip_frames: 480, spread_frames: 3, paired: 8, clicks: 8 };
-        let cal = record(&f, "Speakers", None, Mode::Shared, 128, "2026-10-21");
+        let cal = record(&f, "Speakers", None, MODE_SHARED, 128, "2026-10-21");
+        assert_eq!(stored(&path, &cal), None, "nothing stored under the key yet");
         merge_settings(&path, &cal).unwrap();
         merge_settings(&path, &cal).unwrap();
+        assert_eq!(stored(&path, &cal).as_ref(), Some(&cal), "what the app would use now");
+        assert_eq!(stored(&path, &LoopbackCalibration { period: 64, ..cal.clone() }), None, "another key");
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!((doc["theme"].as_str(), doc["zoom"].clone()), (Some("dark"), serde_json::json!([1, 2])));
         let audio: soundcraft_playback::AudioConfig = serde_json::from_value(doc["audio"].clone()).unwrap();

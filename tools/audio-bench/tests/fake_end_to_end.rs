@@ -216,3 +216,18 @@ fn the_fake_run_exports_a_snapshot_per_stream() {
     assert!(lines[0].starts_with("render backend: wakes 1500, "), "{}", lines[0]);
     assert!(lines[1].starts_with("capture backend: wakes 1500, "), "{}", lines[1]);
 }
+
+/// #20, K31: over native ASIO the calibration the app would store is the click loop in the
+/// driver's sample positions. The fake stamps the arrival as its frame time, so with jitter the
+/// stamp-time trip moves while the position trip stays exact, and the selection names it.
+#[test]
+fn the_asio_calibration_is_the_loop_by_sample_position_and_ignores_stamp_jitter() {
+    for (period, delay) in [(64, 297), (256, 1_065), (128, 582)] {
+        let m = measure(&config(period, 3.0, true, script(100, None, delay)));
+        let trip = audio_bench::app_trip(Kind::Asio, &m).expect("both streams gave positions");
+        let f = audio_bench::calibration::figures(&trip, 48_000, &m.input_peaks).expect("clicks were found");
+        assert_eq!((f.round_trip_frames, f.spread_frames), (delay, 1), "period {period}: {f:?}");
+        assert_eq!(audio_bench::app_trip(Kind::Fake, &m), m.frame_trip, "the fake and WASAPI keep the stamp-time trip");
+        assert_eq!(audio_bench::app_trip(Kind::Cpal, &m), None);
+    }
+}

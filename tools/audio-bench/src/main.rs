@@ -16,6 +16,9 @@ fn main() -> ExitCode {
             for line in rows[0].stats_lines() {
                 println!("{line}");
             }
+            for line in rows[0].asio_calibration_lines() {
+                println!("{line}");
+            }
             match &rows[0].calibration {
                 Some(Ok(figures)) => {
                     println!("{}", figures.describe());

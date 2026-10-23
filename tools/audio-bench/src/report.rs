@@ -24,8 +24,12 @@ pub struct Row {
     /// for shared mode.
     pub mode: Option<String>,
     pub measurements: Measurements,
-    /// The loopback calibration of a native run (`--loopback` on `--backend wasapi`), when it was measurable.
+    /// The loopback calibration of a native run (`--loopback` on `--backend wasapi` or `asio`), when
+    /// it was measurable: the figure the app would store ([`crate::app_trip`]).
     pub calibration: Option<Result<crate::calibration::Figures, String>>,
+    /// With `--settings`: what the file held under this run's key before the run merged its own
+    /// (`Some(None)`: nothing).
+    pub stored_calibration: Option<Option<soundcraft_playback::LoopbackCalibration>>,
     /// The device-loop counters of the render and capture streams, when the backend keeps them.
     pub render_stats: Option<ab::StreamStats>,
     pub capture_stats: Option<ab::StreamStats>,
@@ -58,6 +62,64 @@ impl Row {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    /// The calibration lines a native ASIO loopback run prints (#20, known issue K31), so the
+    /// driver's figures and the measured loop can be compared and tabulated: the driver-reported
+    /// latencies in frames and ms, the loop the app would store at this period and rate, the
+    /// difference, and what the settings file held for the key before this run. Empty for the
+    /// other backends.
+    pub fn asio_calibration_lines(&self) -> Vec<String> {
+        if self.backend != "asio" {
+            return Vec::new();
+        }
+        let rate = self.measurements.rate;
+        let frames = |d: std::time::Duration| (d.as_secs_f64() * f64::from(rate)).round() as u64;
+        let ms = |n: u64| n as f64 * 1000.0 / f64::from(rate.max(1));
+        let mut lines = Vec::new();
+        let (out, inp) = (self.render_achieved.and_then(|a| a.latency).map(frames), self.capture_achieved.and_then(|a| a.latency).map(frames));
+        let period = self.requested.map_or_else(|| "driver buffer".to_string(), |p| p.to_string());
+        let at = format!("{period} / {rate} Hz");
+        match (out, inp) {
+            (Some(out), Some(inp)) => lines.push(format!(
+                "driver-reported latency: out {out} fr ({:.2} ms) + in {inp} fr ({:.2} ms) = {} fr ({:.2} ms)",
+                ms(out),
+                ms(inp),
+                out + inp,
+                ms(out + inp)
+            )),
+            (Some(out), None) => lines.push(format!("driver-reported latency: out {out} fr ({:.2} ms); no input", ms(out))),
+            _ => {}
+        }
+        match &self.calibration {
+            Some(Ok(f)) => {
+                lines.push(format!(
+                    "app calibration (the click loop by sample position at {at}): {} fr ({:.2} ms) +-{} fr, {} of {} clicks",
+                    f.round_trip_frames,
+                    ms(u64::from(f.round_trip_frames)),
+                    f.spread_frames,
+                    f.paired,
+                    f.clicks
+                ));
+                if let (Some(out), Some(inp)) = (out, inp) {
+                    let difference = i64::try_from(u64::from(f.round_trip_frames)).unwrap_or(i64::MAX) - i64::try_from(out + inp).unwrap_or(i64::MAX);
+                    lines.push(format!("measured minus driver-reported: {difference:+} fr"));
+                }
+            }
+            Some(Err(why)) => lines.push(format!("app calibration at {at}: none ({why}); the app would use the driver's figures")),
+            None => lines.push(format!(
+                "app calibration at {at}: none (no loopback, or the driver gave no sample positions); the app would use the driver's figures"
+            )),
+        }
+        match &self.stored_calibration {
+            Some(Some(c)) => lines.push(format!(
+                "stored before this run: {} fr +-{} fr ({}); replaced by this run's",
+                c.round_trip_frames, c.spread_frames, c.measured_at
+            )),
+            Some(None) => lines.push("stored before this run: none for this key".to_string()),
+            None => {}
+        }
+        lines
     }
 
     /// The per-channel input peaks, when a loopback run detected no click at all: printed whether or
@@ -121,7 +183,10 @@ impl Row {
 fn opened_figures(achieved: Option<&ab::Achieved>) -> String {
     let Some(a) = achieved else { return String::new() };
     let buffer = a.buffer_frames.map(|n| format!("; buffer {n} fr"));
-    let latency = a.latency.map(|d| format!("; latency {:.1} ms", d.as_secs_f64() * 1000.0));
+    let latency = a.latency.map(|d| {
+        let frames = (d.as_secs_f64() * f64::from(a.format.rate)).round();
+        format!("; latency {:.1} ms ({frames:.0} fr)", d.as_secs_f64() * 1000.0)
+    });
     let sample = format!("{:?}", a.format.sample).to_lowercase();
     let sample = a.format.valid_bits.map_or(sample.clone(), |bits| format!("{sample}/{bits}"));
     let format = Some(format!("; fmt {sample} {} Hz", a.format.rate));
@@ -270,12 +335,14 @@ mod tests {
                 cpu_us: Percentiles { p50: 1.5, p95: 2.4, max: 9.0 },
                 round_trip,
                 frame_trip: None,
+                position_trip: None,
                 backend_errors: 0,
                 invalid_stamps: 0,
                 dropped: 0,
                 input_peaks: Vec::new(),
             },
             calibration: None,
+            stored_calibration: None,
             render_stats: None,
             capture_stats: None,
             render_achieved: None,
@@ -294,7 +361,38 @@ mod tests {
         a.latency = Some(std::time::Duration::from_micros(12_500));
         r.render_achieved = Some(a);
         let line = &r.stats_lines()[0];
-        assert!(line.starts_with("render backend: wakes 0") && line.ends_with("; buffer 128 fr; latency 12.5 ms; fmt f32 48000 Hz"), "{line}");
+        assert!(
+            line.starts_with("render backend: wakes 0") && line.ends_with("; buffer 128 fr; latency 12.5 ms (600 fr); fmt f32 48000 Hz"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_asio_run_prints_the_driver_figures_in_frames_beside_the_loop_the_app_would_store() {
+        let mut r = row(true);
+        assert!(r.asio_calibration_lines().is_empty(), "only native ASIO runs");
+        r.backend = "asio".into();
+        r.requested = Some(256);
+        let opened = |latency_us: u64| {
+            let mut a = ab::Achieved::requested(ab::Format::new(48_000, 2, ab::SampleFormat::I32), ab::Period::Frames(256));
+            a.latency = Some(std::time::Duration::from_micros(latency_us));
+            a
+        };
+        // The Scarlett at 256 frames: 12.9 + 11.9 ms reported, 1062 frames measured.
+        (r.render_achieved, r.capture_achieved) = (Some(opened(12_896)), Some(opened(11_896)));
+        r.calibration = Some(Ok(crate::calibration::Figures { rate: 48_000, round_trip_frames: 1_062, spread_frames: 7, paired: 16, clicks: 16 }));
+        r.stored_calibration = Some(None);
+        assert_eq!(
+            r.asio_calibration_lines(),
+            [
+                "driver-reported latency: out 619 fr (12.90 ms) + in 571 fr (11.90 ms) = 1190 fr (24.79 ms)",
+                "app calibration (the click loop by sample position at 256 / 48000 Hz): 1062 fr (22.12 ms) +-7 fr, 16 of 16 clicks",
+                "measured minus driver-reported: -128 fr",
+                "stored before this run: none for this key",
+            ]
+        );
+        r.calibration = None;
+        assert!(r.asio_calibration_lines()[1].ends_with("the app would use the driver's figures"), "{:?}", r.asio_calibration_lines());
     }
 
     #[test]
