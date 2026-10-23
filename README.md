@@ -16,7 +16,7 @@ layer and egui UI. transit began in October 2026 as a fork of
 credited in About and in NOTICE.
 
 > [!NOTE]
-> transit is alpha software under active development; the current pre-release is [v0.2.0-alpha.1](https://github.com/derekmwright/transit/releases/tag/v0.2.0-alpha.1) (see [Downloads](#downloads)). transit checks once a day for a newer release with one anonymous request to GitHub and tells you; turn it off in the Help menu or with `TRANSIT_NO_UPDATE_CHECK=1` ([details](docs/building.md#the-update-check)). The current priority is core engine
+> transit is alpha software under active development; the current release is [v0.2.0](https://github.com/derekmwright/transit/releases/tag/v0.2.0) (see [Downloads](#downloads)). transit checks once a day for a newer release with one anonymous request to GitHub and tells you; turn it off in the Help menu or with `TRANSIT_NO_UPDATE_CHECK=1` ([details](docs/building.md#the-update-check)). The current priority is core engine
 > correctness, stability and performance, measured on real hardware, ahead of new features.
 > Expect rough edges in the UI and some missing features; the audio engine, recording alignment
 > and device handling get fixed first, following [the engineering principles](docs/principles.md).
@@ -26,7 +26,7 @@ credited in About and in NOTICE.
 
 ## Downloads
 
-The current pre-release is [v0.2.0-alpha.1](https://github.com/derekmwright/transit/releases/tag/v0.2.0-alpha.1).
+The current release is [v0.2.0](https://github.com/derekmwright/transit/releases/tag/v0.2.0). The files are `transit-v0.2.0-windows-x86_64.msi` and `.zip`, `transit-v0.2.0-macos-arm64.dmg` and `.tar.gz`, and `transit-v0.2.0-linux-x86_64.tar.gz`.
 
 - **Windows (x86_64):** one download, the `.zip` (portable) or the `.msi` (installer; it registers `.transit` and `.transitz`). It has native WASAPI and native ASIO.
 - **macOS (Apple silicon):** the `.dmg`; open it and drag `transit.app` to Applications.
@@ -77,6 +77,16 @@ same way. The second is transit's native WASAPI backend and the third is ASIO, b
 File it with the [measurement issue template](https://github.com/derekmwright/transit/issues/new?template=measurement.md)
 or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo names none yet. -->
 
+### Help wanted by platform
+
+Most development happens on Windows. If you run Linux or macOS, the issues below need someone with your machine:
+
+- Linux: [help wanted, platform:linux](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Alinux)
+- macOS: [help wanted, platform:macos](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Amacos)
+- Everything marked help wanted: [all help wanted issues](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+
+Issues labeled good first issue are scoped and documented enough to start with. Hardware reports (interface, driver, buffer, measured round trip) are welcome on any platform: open an issue with the numbers.
+
 ### Other ways to help
 
 - Try the latest release and report what breaks, with the steps to make it happen.
@@ -111,6 +121,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 
 - Hosts CLAP and VST3 plug-ins, with their own editor windows, saved state, and reported latency.
 - The device card shows Loading while a heavy plug-in instantiates.
+- Plug-ins load on a host thread, so a slow or stuck plug-in no longer freezes the UI: its slot reads "Loading…" while it instantiates and "Not responding" if it stops answering.
 - Plug-in browser with a background scan and your own search folders.
 - Built-in instruments: Subtractive Synth, Drum Synth, Sampler. All built-ins open an editor window: parameter rows, Sampler load or drop, Drum Synth by pad.
 - Built-in panels with knobs, and bespoke layouts for Compressor, Gate, EQ, Synth and Plate; factory and user presets; a scope and a gain-reduction display on the dynamics panels. Moving a plug-in knob while a lane is armed (Write, Latch, Touch) records into it.
@@ -122,9 +133,11 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
-- MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass. With a loop on, each lap is committed as a stacked take and recording continues; stopping mid-lap keeps the partial lap, and the status line reports the take count. Held notes are cut at the loop end; resuming them in the next lap is planned.
+- MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass. With a loop on, each lap is committed as a stacked take and recording continues; stopping mid-lap keeps the partial lap, and the status line reports the take count. Held notes are cut at the loop end and resume at the start of the next lap.
 - A MIDI take journal is written during the pass and kept until an autosave that holds the recording lands; after a crash, the next launch recovers it as a `<Track>_recovered` clip. Record works without a validated device clock: alignment is approximate, a take recorded that way says so, and when recording cannot start you get a plain-English reason.
 - A hosted plug-in that re-sends an unchanged parameter value no longer registers an automation touch; only a real change does.
+- Update check: once a day, one anonymous request to GitHub; turn it off in the Help menu or with `TRANSIT_NO_UPDATE_CHECK=1`.
+- The window and taskbar show the transit icon and identity.
 
 ### Audio devices
 
@@ -134,6 +147,8 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 - Native ASIO backend (build with the `native-asio` feature; no Steinberg SDK and no LLVM): choose Audio system ASIO, then Backend > Native ASIO. It lists every installed driver and says which failed to load, opens every channel of the interface (all 12 inputs and 10 outputs of the TASCAM Model 12, named as the driver names them), plays, records and runs hardware inserts duplex, shows the buffer, sample format and latency the driver reports, and opens the driver's own settings (Driver settings). About 6 ms round trip on the Scarlett 2i2 at 64 samples. A driver reset request stops playback with a message to reconnect.
 - Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated". Over native ASIO the Calibration line in Audio Devices has a Measure button: a click through a cable from an output to an input times the loop at the current buffer size and rate, recordings are placed from it, and the driver's own latency figures are shown beside it (until then they are used; on the Scarlett 2i2 at 48 kHz they are within about 5 frames of the measured loop). Shared mode is not a low-latency path (about 248 ms round trip on the Scarlett 2i2); exclusive mode measured about 223 ms there (and about 276 ms, often silent, on a Model 12), and ASIO about 23 ms, so ASIO remains the tracking path on that interface.
 - Tracks, buses and sends route to any output path, with latency aligned across them.
+- Native ASIO recovers from a driver reset request (the driver changing its buffer size or sample rate) and reopens the device, and its audio thread runs at MMCSS Pro Audio priority.
+- The Calibration Measure button works per driver, sample rate and buffer size, and keeps a result for each combination.
 
 ### Sessions and rendering
 
@@ -151,6 +166,7 @@ or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo
 - One renderer: playback and offline render both use the plan renderer; the legacy renderer is gone.
 - Offline render and playback are checked against each other by golden tests.
 - Every edit is a named command, which is what makes undo and the command catalog uniform.
+- Assistant access (the control server and MCP tools) addresses positions as bar|beat and can add chords.
 
 ## Status
 
