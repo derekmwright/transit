@@ -23,7 +23,7 @@ fn session(fake: &Fake) -> (Session, TrackId, transit_midi_io::PortKey) {
     let key = fake.add_output("Synth OUT");
     let mut s = Session::default();
     let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
-    let ppq = i64::from(soundcraft_time::TICKS_PER_QUARTER);
+    let ppq = soundcraft_time::TICKS_PER_QUARTER;
     // Playback does not depend on the sequence crate; the clip's sequence comes from its JSON.
     let seq = serde_json::from_value(serde_json::json!({"notes": [
         {"pitch": 60, "velocity": 100, "release_velocity": 64, "channel": 4, "start": 0, "length": ppq / 2},

@@ -94,7 +94,7 @@ mod tests {
     fn session(channel: MidiOutChannel) -> (Session, soundcraft_model::TrackId) {
         let mut s = Session::default();
         let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
-        let ppq = i64::from(soundcraft_time::TICKS_PER_QUARTER);
+        let ppq = soundcraft_time::TICKS_PER_QUARTER;
         let mut seq = Sequence::default();
         // At 120 bpm and 48 kHz a quarter is 24 000 samples.
         seq.notes.push(Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 2, start: 0, length: ppq });
