@@ -1,6 +1,7 @@
 # MIDI input
 
-Decision: [ADR 0012](../../adr/0012-midi-device-layer.md); clocks: `clocks.md`.
+Decision: [ADR 0012](../../adr/0012-midi-device-layer.md); clocks: `clocks.md`; sending to a
+hardware port: `midi-output.md`.
 
 ## Path
 

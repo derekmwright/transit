@@ -14,6 +14,7 @@ the ADRs. A new topic gets a new file and a row here.
 | [`routing.md`](routing.md) | Outputs, inputs, device channel maps, the route graph. |
 | [`sidechain.md`](sidechain.md) | Insert keys and key taps. |
 | [`midi.md`](midi.md) | Live MIDI input, step entry, note delivery. |
+| [`midi-output.md`](midi-output.md) | External MIDI destinations: the output thread, send timing, note safety. |
 | [`recording.md`](recording.md) | Record start, takes, input capture. |
 | [`session-format.md`](session-format.md) | Anything saved in a `.transit` file. |
 | [`commands.md`](commands.md) | User actions, undo, the control channel. |
