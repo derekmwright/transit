@@ -1341,6 +1341,38 @@ fn a_device_that_does_not_reopen_is_tried_three_times_then_left_to_reconnect() {
     assert!(t.app.reopen.status(false).unwrap().ends_with("use Reconnect (resets 1, stalls 0, reopened 0)"));
 }
 
+/// N10: a session change that needs the device reopened (another sample rate) replaces the Player;
+/// when the new one runs, a reopen that had given up is cleared there too.
+#[test]
+fn a_session_change_reopen_that_succeeds_clears_a_reopen_that_gave_up() {
+    use transit_audio_backend as ab;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&tries);
+    let mut t = asio_rig(&driver, move |session, cfg| {
+        counted.set(counted.get() + 1);
+        if counted.get() <= 3 {
+            soundcraft_playback::Player::prepare_device_free(session).unwrap()
+        } else {
+            soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap()
+        }
+    });
+    run(&mut t, &driver, 10);
+    assert!(inject(&driver, ab::Direction::Output, ab::StreamError::ResetRequested));
+    for frames in [20, 60, 190] {
+        run(&mut t, &driver, frames);
+    }
+    assert_eq!(tries.get(), 3);
+    assert!(t.app.reopen.gave_up());
+    t.app.engine.session_mut().sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
+    run(&mut t, &driver, 2);
+    assert_eq!(tries.get(), 4, "the session change reopened the device");
+    assert!(t.app.player.as_ref().is_some_and(|p| !p.silent), "the new Player runs");
+    assert!(!t.app.reopen.gave_up(), "and the gave-up state is cleared");
+    assert!(!t.app.reopen.pending());
+}
+
 #[test]
 fn the_open_lines_end_with_the_workers_mmcss_state() {
     use crate::audio_devices::priority_detail;

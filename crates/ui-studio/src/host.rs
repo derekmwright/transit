@@ -343,9 +343,14 @@ impl StudioApp {
         }
         let result = if self.restore_pending { p.replace_session(session) } else { p.update_session(session) };
         if matches!(result, Err(soundcraft_playback::PlayerError::NeedsReopen { .. })) {
-            if let Err(error) = self.reconnect_audio_using(false, Player::with_config) {
+            if let Err(error) = self.reconnect_with_player(false) {
                 self.player_requests.fail(&mut self.status, error);
                 return false;
+            }
+            // A device that opens again here clears a reopen that gave up (or is pending), as
+            // Reconnect and Apply do: the new Player runs.
+            if self.player.as_ref().is_some_and(|p| !p.silent && p.reopen_cause().is_none()) {
+                self.reopen.reconnected();
             }
             if self.player.as_ref().is_some_and(|p| p.has_requested_session(&self.engine.session_arc())) {
                 self.restore_pending = false;
@@ -896,17 +901,7 @@ impl StudioApp {
             // A take started since (on a runtime that took no work): it ends before the device goes.
             self.stop_for_reopen();
         }
-        #[cfg(test)]
-        let result = match self.reopen_with.take() {
-            Some(open) => {
-                let result = self.reconnect_audio_using(true, |session, cfg| open(session, cfg));
-                self.reopen_with = Some(open);
-                result
-            }
-            None => self.reconnect_audio_using(true, Player::with_config),
-        };
-        #[cfg(not(test))]
-        let result = self.reconnect_audio_using(true, Player::with_config);
+        let result = self.reconnect_with_player(true);
         let player = self.player.as_ref();
         let opened = result.is_ok() && player.is_some_and(|p| !p.silent && p.reopen_cause().is_none());
         self.reopen.attempted(opened, now);
@@ -930,6 +925,18 @@ impl StudioApp {
             self.status.push(' ');
             self.status.push_str(STATE_FROM_DOCUMENT);
         }
+    }
+
+    /// [`Self::reconnect_audio_using`] with the Player the app opens (in tests, the scripted one
+    /// `reopen_with` holds, when set).
+    fn reconnect_with_player(&mut self, preserve: bool) -> Result<bool, String> {
+        #[cfg(test)]
+        if let Some(open) = self.reopen_with.take() {
+            let result = self.reconnect_audio_using(preserve, |session, cfg| open(session, cfg));
+            self.reopen_with = Some(open);
+            return result;
+        }
+        self.reconnect_audio_using(preserve, Player::with_config)
     }
 
     pub(crate) fn reconnect_audio_using(
