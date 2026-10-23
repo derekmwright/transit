@@ -239,3 +239,22 @@ fn inline_mode_runs_on_the_calling_thread_and_keeps_the_instance_unwrapped() {
     drop(plugin);
     assert_eq!(log.thread_of("destroy"), Some(std::thread::current().id()));
 }
+
+/// Issue #36: closing the app while a plug-in is being created does not hang. The creation is
+/// not stuck yet (the timeout is long), and shutdown still returns within its own bound.
+#[test]
+fn shutdown_during_a_creation_returns_within_its_bound() {
+    let host = host(Duration::from_secs(60));
+    let (release, hang) = mpsc::channel::<()>();
+    let creating = host.submit(move |_| {
+        let _ = hang.recv();
+    });
+    while !matches!(creating.poll(), Status::Waiting { running: true }) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let t = Instant::now();
+    assert!(!host.shutdown(Duration::from_millis(500)), "the busy thread did not finish");
+    assert!(t.elapsed() < Duration::from_secs(2), "shutdown waited {:?}", t.elapsed());
+    assert!(matches!(host.submit(|_| ()).poll(), Status::Failed), "no new requests after shutdown");
+    drop(release);
+}
