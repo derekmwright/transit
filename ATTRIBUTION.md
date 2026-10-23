@@ -46,6 +46,7 @@ and, at runtime, the operating system's own UI fonts when available (never redis
 | `assets/brand/transit-wordmark-graphite.svg` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
 | `assets/brand/transit-wordmark-white-2172.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
 | `assets/brand/transit-wordmark-graphite-2172.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
+| `assets/brand/social-preview-1280x640.png` | @derekmwright | GitHub social preview (wordmark on charcoal with tagline; derived from the wordmark PNG) | MIT OR Apache-2.0 |
 | `docs/images/transit-wordmark-dark.png` | @derekmwright | transit wordmark | MIT OR Apache-2.0 |
 | `apps/transit/assets/fonts/inter/Inter-Regular.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
 | `apps/transit/assets/fonts/inter/Inter-Medium.ttf` | The Inter Project Authors | Inter 4.1, https://github.com/rsms/inter | SIL OFL 1.1 (`apps/transit/assets/fonts/inter/OFL.txt`); modified: tabular figures (tnum) and ss02 frozen as defaults with opentype-feature-freezer; family renamed Inter Tab |
