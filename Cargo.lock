@@ -4504,6 +4504,7 @@ dependencies = [
  "soundcraft-engine",
  "soundcraft-playback",
  "soundcraft-ui-egui",
+ "transit-rt",
  "transit-ui-studio",
  "winresource",
 ]

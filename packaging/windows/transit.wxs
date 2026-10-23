@@ -53,7 +53,11 @@
         <File Id="TransitExe" Source="$(var.BinDir)\transit.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="transit"
               Description="transit DAW" WorkingDirectory="INSTALLFOLDER" Advertise="yes"
-              Icon="TransitIcon.ico" IconIndex="0" />
+              Icon="TransitIcon.ico" IconIndex="0">
+            <!-- Must equal APP_USER_MODEL_ID in apps/transit/src/main.rs (a test checks): the taskbar
+                 groups and caches the icon by this ID, so the shortcut and the process agree. -->
+            <ShortcutProperty Key="System.AppUserModel.ID" Value="dev.derekmwright.transit" />
+          </Shortcut>
         </File>
 
         <!-- .transit: transit's session format (MIME type unchanged); transit is its default app. -->

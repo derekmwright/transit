@@ -26,6 +26,7 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "
 egui.workspace = true
 serde_json.workspace = true
 log.workspace = true
+transit-rt.workspace = true
 soundcraft-automation.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -30,6 +30,9 @@
 
 pub mod handoff;
 
+mod shell;
+pub use shell::set_app_user_model_id;
+
 /// Test support: counts OS promotion attempts and heap allocations ([`testing::CountingAlloc`]).
 /// Not in release builds (feature `testing`).
 #[cfg(any(test, feature = "testing"))]

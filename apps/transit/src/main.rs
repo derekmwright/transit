@@ -270,6 +270,11 @@ fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
     if w.is_finite() && h.is_finite() && w >= 960.0 && h >= 600.0 { [w.min(16_384.0), h.min(16_384.0)] } else { [1600.0, 1000.0] }
 }
 
+/// The explicit AppUserModelID: Windows groups taskbar buttons and caches their icon by it. The same
+/// string is the main window's app id and the `System.AppUserModel.ID` of the MSI's Start Menu
+/// shortcut (`packaging/windows/transit.wxs`; a test keeps the two equal).
+const APP_USER_MODEL_ID: &str = "dev.derekmwright.transit";
+
 /// The window, Dock, taskbar and Alt-Tab icon. macOS gets Apple's icon grid (transparent margin);
 /// elsewhere the full tile. Regenerate with `packaging/icons.sh`.
 fn app_icon() -> egui::IconData {
@@ -335,14 +340,22 @@ fn main() -> eframe::Result {
     let mut prefs = loaded.unwrap_or_else(|| UiState { window_maximized: true, ..UiState::default() });
     START_MAXIMIZED.store(prefs.window_maximized, std::sync::atomic::Ordering::Relaxed);
     prefs.window_maximized = false;
+    // Before the first window exists, so the taskbar button is created under our ID and icon.
+    if !transit_rt::set_app_user_model_id(APP_USER_MODEL_ID) && cfg!(windows) {
+        log::warn!("could not set the AppUserModelID");
+    }
+    // Every native window of ours carries the icon: the main one below, the separate Mix window
+    // (a second viewport) through the registered copy.
+    let icon = Arc::new(app_icon());
+    soundcraft_ui_egui::mix_window::set_window_icon(icon.clone());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_icon(app_icon())
+            .with_icon(icon)
             .with_title("transit")
             .with_inner_size(sane_window_size(prefs.window_size))
             .with_min_inner_size([960.0, 600.0])
             .with_drag_and_drop(true)
-            .with_app_id("dev.derekmwright.transit"),
+            .with_app_id(APP_USER_MODEL_ID),
         ..Default::default()
     };
     // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
@@ -394,7 +407,22 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::sane_window_size;
+    use super::{APP_USER_MODEL_ID, app_icon, sane_window_size};
+
+    #[test]
+    fn app_icon_decodes_to_a_square_rgba_image() {
+        let icon = app_icon();
+        assert!(icon.width >= 128 && icon.width == icon.height, "{}x{}", icon.width, icon.height);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        assert!(icon.rgba.chunks(4).any(|p| p[3] > 0), "fully transparent icon");
+    }
+
+    #[test]
+    fn msi_shortcut_carries_the_same_app_user_model_id() {
+        let wxs = include_str!("../../../packaging/windows/transit.wxs");
+        assert!(wxs.contains("System.AppUserModel.ID"), "the Start Menu shortcut sets no AppUserModelID");
+        assert!(wxs.contains(&format!("Value=\"{APP_USER_MODEL_ID}\"")), "the MSI's AppUserModelID differs from the app's");
+    }
 
     #[test]
     fn nonsense_window_sizes_fall_back() {

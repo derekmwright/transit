@@ -15,6 +15,24 @@ pub fn strip_width(narrow: bool) -> f32 {
     if narrow { 64.0 } else { 98.0 }
 }
 
+/// The icon every native window carries, set once by the app (the main window gets it from its
+/// own options). A viewport created without one shows the default icon in the title bar and taskbar.
+static WINDOW_ICON: std::sync::OnceLock<std::sync::Arc<egui::IconData>> = std::sync::OnceLock::new();
+
+/// Registers the icon for windows this crate opens (the separate Mix window).
+pub fn set_window_icon(icon: std::sync::Arc<egui::IconData>) {
+    let _ = WINDOW_ICON.set(icon);
+}
+
+/// A viewport builder for a window of ours: title, size and the app icon.
+fn window_builder(title: String) -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default().with_title(title);
+    match WINDOW_ICON.get() {
+        Some(icon) => builder.with_icon(icon.clone()),
+        None => builder,
+    }
+}
+
 pub fn show(app: &mut SoundApp, ui: &mut Ui) {
     crate::docking::show(app, ui, crate::MainWindow::Mix);
 }
@@ -24,7 +42,7 @@ pub fn show(app: &mut SoundApp, ui: &mut Ui) {
 /// Backends without multiple windows show it as a floating egui window instead.
 pub fn show_separate(app: &mut SoundApp, ctx: &egui::Context) {
     let title = format!("{}  —  Mix", app.engine.session().name);
-    let builder = egui::ViewportBuilder::default().with_title(title).with_inner_size([1100.0, 720.0]).with_min_inner_size([480.0, 320.0]);
+    let builder = window_builder(title).with_inner_size([1100.0, 720.0]).with_min_inner_size([480.0, 320.0]);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("soundcraft.mix"), builder, |ui, _class| {
         ui.set_style(ui.ctx().global_style());
         if std::mem::take(&mut app.focus_mix) {
