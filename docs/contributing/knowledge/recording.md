@@ -27,7 +27,9 @@ A lost take is a merge-blocking defect. Treat every change here as high risk.
   clip under the pass, duplicates the playlist when several clips are in the way, and makes one
   playlist per loop pass. A recording that started before the loop end and ran past it while
   Cycle was on is cut at each wrap into one clip per lap; a note held across the loop end is cut
-  there and its tail is not continued into the next lap.
+  there and resumes at offset zero in the next lap with the same pitch and velocity, repeating
+  at each wrap until the real release. Each loop lap stays exactly loop-length; a release exactly
+  at the loop end produces no remainder. Journal recovery uses the same rule.
 - **MIDI take journal:** `crates/engine/src/midi_journal.rs`. The control thread appends each drained event (newline JSON, header with the latch and plan first, flushed every 250 ms and at Stop) to `<Audio Files>/<session>_<stamp>.midijournal`, never the audio thread; a clean Stop deletes it.
   A crash leaves it named in the autosave's `recording.json`; the next launch's recovery prompt rebuilds `<Track>_recovered` through `midi_take::build`, and Discard deletes it.
 

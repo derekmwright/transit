@@ -12,8 +12,8 @@
 //! - **Loop record:** each pass is its own clip on its own playlist (a take lane), as audio does.
 //! - **Transport wrap:** a recording that started inside the cycle and ran past its end (Cycle on,
 //!   Loop Record off) is cut at each wrap the same way: a clip per pass, never discarded.
-//!   A note held across the loop end is cut at the wrap: its tail is not continued into the next
-//!   pass, which starts clean.
+//!   A note held across the loop end is cut at each wrap and resumes at offset zero in the next
+//!   pass with the same pitch and velocity until its release. Each loop lap stays loop-length.
 //! - **Nothing played:** no clip.
 
 use crate::Engine;
@@ -93,8 +93,8 @@ pub struct Built {
 }
 
 /// Pair and convert `events` into per-track, per-pass sequences. Events outside the cut are
-/// dropped, a note released after its pass is closed at the pass end, and a note still held at
-/// Stop ends at the stop sample. Passes (or tracks) with no notes produce nothing.
+/// dropped, a note held across a pass end is split and continued into each following pass until
+/// its release, and a note still held at Stop ends there. Passes (or tracks) with no notes produce nothing.
 pub fn build(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut: &Cut) -> Vec<Built> {
     build_wrapping(tempo, sr, events, cut, None)
 }
@@ -163,6 +163,9 @@ pub fn build_wrapping(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut
             let range = cut.punch.map_or(Range::new(cut.start, end), |p| Range::new(p.start.max(cut.start), p.end.min(end)));
             vec![Segment { window: Range::new(0, stop.saturating_add(1)), range, origin: cut.start }]
         };
+        // Held notes survive wraps: (channel, pitch, start offset, velocity).
+        // The earliest matching note-on wins, including notes carried from a previous lap.
+        let mut held: Vec<(u8, u8, Samples, u8)> = Vec::new();
         for (k, seg) in segments.into_iter().enumerate() {
             let Segment { window, range, origin } = seg;
             if range.is_empty() {
@@ -172,11 +175,13 @@ pub fn build_wrapping(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut
             let base = tempo.samples_to_ticks(range.start, sr);
             let tick = |sample: Samples| tempo.samples_to_ticks(sample.clamp(range.start, range.end), sr) - base;
             let mut sequence = Sequence::default();
-            // Held notes: (channel, pitch, start sample, velocity); the earliest matching on wins.
-            let mut held: Vec<(u8, u8, Samples, u8)> = Vec::new();
             let close = |sequence: &mut Sequence, held_note: (u8, u8, Samples, u8), end: Samples, release: u8| {
                 let (channel, pitch, started, velocity) = held_note;
-                let (a, b) = (tick(started), tick(end));
+                // A release exactly at the wrap closes the previous lap without a new note.
+                if started < window.start && end == origin {
+                    return;
+                }
+                let (a, b) = (tick(at(started.max(window.start))), tick(end));
                 sequence.notes.push(Note { pitch, velocity, release_velocity: release, channel, start: a, length: (b - a).max(1) });
             };
             for e in mine.iter().filter(|e| window.contains(e.offset)) {
@@ -185,7 +190,7 @@ pub fn build_wrapping(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut
                     continue;
                 }
                 match e.msg {
-                    Msg::NoteOn { pitch, velocity } => held.push((e.channel, pitch, sample, velocity.clamp(1, 127))),
+                    Msg::NoteOn { pitch, velocity } => held.push((e.channel, pitch, e.offset, velocity.clamp(1, 127))),
                     Msg::NoteOff { pitch, velocity } => {
                         if let Some(i) = held.iter().position(|h| h.0 == e.channel && h.1 == pitch) {
                             let note = held.remove(i);
@@ -225,8 +230,8 @@ pub fn build_wrapping(tempo: &TempoMap, sr: SampleRate, events: &[RecEvent], cut
                     }
                 }
             }
-            // Still held at Stop (or at the pass end): no note is left open.
-            for note in held {
+            // Close this lap, retaining held notes so the next lap resumes them at offset zero.
+            for &note in &held {
                 close(&mut sequence, note, range.end, 64);
             }
             if sequence.notes.is_empty() {
@@ -419,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_passes_split_by_the_loop_length_and_a_note_crossing_the_wrap_ends_at_it() {
+    fn loop_passes_split_by_the_loop_length_and_a_note_crossing_the_wrap_continues() {
         let (tempo, sr) = tempo();
         // Loop of two beats (48,000 samples) starting at 96,000; two passes.
         let events = [on(0, 60), off(24_000, 60), on(40_000, 62), off(60_000, 62), on(60_000, 64), off(72_000, 64)];
@@ -435,7 +440,77 @@ mod tests {
             vec![(60, 0, TICKS_PER_QUARTER), (62, TICKS_PER_QUARTER * 40_000 / 24_000, TICKS_PER_QUARTER * 2 - TICKS_PER_QUARTER * 40_000 / 24_000)]
         );
         let second: Vec<_> = built[1].sequence.notes.iter().map(|n| (n.pitch, n.start, n.length)).collect();
-        assert_eq!(second, vec![(64, TICKS_PER_QUARTER / 2, TICKS_PER_QUARTER / 2)]);
+        assert_eq!(second, vec![(62, 0, TICKS_PER_QUARTER / 2), (64, TICKS_PER_QUARTER / 2, TICKS_PER_QUARTER / 2)]);
+    }
+
+    fn assert_held_note_laps(release: Samples, expected: &[(i64, i64)]) {
+        let (tempo, sr) = tempo();
+        let events = [ev(36_000, Msg::NoteOn { pitch: 67, velocity: 103 }), off(release, 67)];
+        // Exercise both explicit loop recording and ordinary recording across transport wraps.
+        for pass in [Some(48_000), None] {
+            let c = Cut { start: 96_000, pass, punch: None, stop: 0 };
+            let built = build_wrapping(&tempo, sr, &events, &c, Some(Range::new(96_000, 144_000)));
+            assert_eq!(built.len(), expected.len(), "pass={pass:?}, release={release}");
+            for (k, (b, &(start, length))) in built.iter().zip(expected).enumerate() {
+                assert_eq!((b.track, b.pass, b.range), (T, k, Range::new(96_000, 144_000)));
+                assert_eq!(b.sequence.notes.len(), 1);
+                let n = b.sequence.notes[0];
+                assert_eq!((n.pitch, n.velocity, n.channel, n.start, n.length), (67, 103, 0, start, length));
+            }
+        }
+    }
+
+    #[test]
+    fn a_note_held_across_one_wrap_resumes_at_zero_in_the_next_lap() {
+        let q = TICKS_PER_QUARTER;
+        assert_held_note_laps(60_000, &[(q * 3 / 2, q / 2), (0, q / 2)]);
+    }
+
+    #[test]
+    fn a_note_held_across_two_wraps_resumes_in_both_following_laps() {
+        let q = TICKS_PER_QUARTER;
+        assert_held_note_laps(108_000, &[(q * 3 / 2, q / 2), (0, q * 2), (0, q / 2)]);
+    }
+
+    #[test]
+    fn a_note_released_exactly_at_a_loop_end_has_no_remainder() {
+        let q = TICKS_PER_QUARTER;
+        assert_held_note_laps(48_000, &[(q * 3 / 2, q / 2)]);
+        assert_held_note_laps(96_000, &[(q * 3 / 2, q / 2), (0, q * 2)]);
+    }
+
+    #[test]
+    fn journal_recovery_resumes_a_held_note_across_two_wraps() {
+        use crate::midi_journal::{Header, Latch, Record, Writer, recover};
+
+        for pass in [Some(48_000), None] {
+            let (mut e, t) = midi_engine();
+            let range = Range::new(96_000, 144_000);
+            e.session_mut().edit.loop_playback = true;
+            e.session_mut().edit.loop_range = range;
+            let latch = Latch { output_frame: 10_000, position: range.start, device_rate: 48_000, session_rate: 48_000 };
+            let header = Header::new(latch, &plan(range.start, pass), Some(range), vec![t]);
+            let path = std::env::temp_dir().join(format!("transit-midi-wrap-{}-{pass:?}.midijournal", std::process::id()));
+            let mut writer = Writer::new(path.clone());
+            let records = [
+                Record { frame: 46_000, track: t, channel: 2, approximate: false, msg: Msg::NoteOn { pitch: 67, velocity: 103 } },
+                Record { frame: 118_000, track: t, channel: 2, approximate: false, msg: Msg::NoteOff { pitch: 67, velocity: 75 } },
+            ];
+            writer.append(&header, &records, records.len()).unwrap();
+            writer.flush().unwrap();
+            let ids = recover(&mut e, &path).unwrap();
+            writer.discard();
+            assert_eq!(ids.len(), 3);
+            let q = TICKS_PER_QUARTER;
+            for (id, (start, length, release)) in ids.iter().zip([(q * 3 / 2, q / 2, 64), (0, q * 2, 64), (0, q / 2, 75)]) {
+                let clip = e.session().track(t).unwrap().playlists.iter().flat_map(|p| &p.clips).find(|c| c.id == *id).unwrap();
+                assert_eq!(clip.range(), range);
+                let ClipContent::Midi { sequence } = &clip.content else { panic!("not MIDI") };
+                assert_eq!(sequence.notes.len(), 1);
+                let n = sequence.notes[0];
+                assert_eq!((n.pitch, n.velocity, n.channel, n.start, n.length, n.release_velocity), (67, 103, 2, start, length, release));
+            }
+        }
     }
 
     #[test]
