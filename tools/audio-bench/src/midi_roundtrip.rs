@@ -10,17 +10,23 @@
 //! latency" is printed as an estimate of delivery plus synth response, no more.
 //!
 //! The send instant: the host time H (`HostOrigin`, QPC on Windows) read on the control thread
-//! right before the send call, mapped to the device's sample position by a [`ClockFitter`] (the
-//! clock map the app's MIDI output thread uses, ADR 0017) fitted to the capture blocks' (sample
-//! position, position system time, arrival) triples, the native ASIO backend's own clock. The
-//! position clock is used, not the presentation one: no audio output is in this chain. The input
-//! is recorded by sample position, so the onset is a position too, and both ends count the same
-//! driver counter. Sample-accurate in the scheduling sense: what is not measured is when the OS
-//! and the interface actually transmit the bytes.
+//! right before the send call, mapped to the device's sample position by the bench's position
+//! clock ([`crate::fit`]): a least-squares line of the capture blocks' arrival time against their
+//! sample position over the last 2 s, the same kind of map the app's MIDI output thread uses (ADR
+//! 0017) with a longer window. The app's own fitter is fed the same blocks and reported beside it.
+//! The position clock is used, not the presentation one: no audio output is in this chain. The
+//! input is recorded by sample position, so the onset is a position too, and both ends count the
+//! same driver counter. What is not measured is when the OS and the interface actually transmit
+//! the bytes.
+//!
+//! Before the first trial the bench plays one unmeasured warm-up note (`--no-warmup` skips it).
+//! The noise floor is the lowest of the reference window and every trial's pre-send window, and
+//! each trial's onset is found again against it at the end.
 //!
 //! The callbacks only store atomics into storage allocated before the streams start: no
 //! allocation, no lock. Analysis and every MIDI send run on the control thread.
 
+use crate::fit::{self, PositionFit};
 use crate::onset;
 use crate::session::{self, Callbacks, Request};
 use soundcraft_playback::device_clock::{ClockFitter, ClockKey, Observation};
@@ -32,14 +38,16 @@ use transit_audio_backend as ab;
 pub const FLOOR_MS: u32 = 100;
 /// The clock map and the input must be running within this time of the streams' start.
 pub const WARMUP_MS: u64 = 3000;
-/// Seconds of input the position ring holds beyond the onset window.
-const RING_SECONDS: u32 = 4;
+/// How long the unmeasured warm-up note is held.
+pub const WARMUP_NOTE_MS: u64 = 200;
+/// Seconds of input the position ring holds beyond the measured window.
+pub(crate) const RING_SECONDS: u32 = 4;
 /// Capture blocks the control thread can fall behind by before blocks are lost to the clock map.
 const BLOCKS: usize = 4096;
 /// The control thread's poll interval.
-const POLL_NS: u64 = 1_000_000;
+pub(crate) const POLL_NS: u64 = 1_000_000;
 /// Extra time past the onset window before a silent input counts as stalled.
-const STALL_MS: u64 = 2000;
+pub(crate) const STALL_MS: u64 = 2000;
 /// Defaults of the command line.
 pub const DEFAULT_NOTE: u8 = 60;
 pub const DEFAULT_VELOCITY: u8 = 100;
@@ -48,17 +56,18 @@ pub const DEFAULT_GAP_MS: u32 = 1500;
 pub const DEFAULT_MAX_MS: u32 = 1000;
 /// A trial further than this many standard deviations from the mean is listed as an outlier.
 pub const OUTLIER_SIGMAS: f64 = 2.0;
-/// The default limit of the clock map's fit residual at a send (`--max-fit-residual-ms`), in ns.
-/// A trial above it is skipped. A real driver's position times jitter (the TASCAM Model 12's
-/// fit at about 0.5 ms), so this is a sanity limit, not an accuracy claim: the residual is
-/// reported as the send position's uncertainty.
-pub const DEFAULT_MAX_FIT_RESIDUAL_NS: u64 = 1_000_000;
-/// A pre-send window more than this many times the floor (+6 dB) gets a warning.
-pub const PRE_SEND_WARN_FACTOR: f32 = 2.0;
+/// The default limit of the clock fit's standard error at a send (`--max-fit-error-ms`), in ns.
+/// A send above it is skipped. A sanity limit: a driver whose buffers arrive one block apart at
+/// buffer 256 (5.3 ms of scatter) fits to about 0.3 ms over the 2 s history.
+pub const DEFAULT_MAX_FIT_ERROR_NS: u64 = 500_000;
+/// The warm-up waits for a clock fit over at least this much history.
+pub const WARMUP_FIT_SPAN_NS: u64 = 1_000_000_000;
+/// A pre-send window more than this many times the floor (+6 dB) gets a warning (and a retry).
+pub const PRE_SEND_WARN_FACTOR: f32 = onset::QUIET_FACTOR;
 /// An onset this far after its threshold crossing gets a slow-attack warning, in ms.
 pub const SLOW_ATTACK_MS: f64 = 1.0;
 
-const NONE: u64 = u64::MAX;
+pub(crate) const NONE: u64 = u64::MAX;
 
 /// The `--midi-roundtrip` command line: the port (a name or a unique part of one), what to play,
 /// and where to write the JSON result.
@@ -81,10 +90,12 @@ pub struct Settings {
     pub gap_ms: u32,
     /// The sanity window: an onset must come within this time of the send.
     pub max_ms: u32,
-    /// The clock map's fit residual above which a trial is skipped, in ns.
-    pub max_fit_residual_ns: u64,
+    /// The clock fit's standard error at the send above which a trial is skipped, in ns.
+    pub max_fit_error_ns: u64,
     /// 0-based input channels of the return, summed (one for mono, two for a stereo pair).
     pub returns: Vec<u16>,
+    /// Play one unmeasured note before the first trial (`--no-warmup` turns it off).
+    pub warmup: bool,
 }
 
 impl Settings {
@@ -97,12 +108,13 @@ impl Settings {
             trials: DEFAULT_TRIALS,
             gap_ms: DEFAULT_GAP_MS,
             max_ms: DEFAULT_MAX_MS,
-            max_fit_residual_ns: DEFAULT_MAX_FIT_RESIDUAL_NS,
+            max_fit_error_ns: DEFAULT_MAX_FIT_ERROR_NS,
             returns,
+            warmup: true,
         }
     }
 
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         if self.channel > 15 || self.note > 127 || !(1..=127).contains(&self.velocity) {
             return Err("MIDI channel 1-16, note 0-127 and velocity 1-127".into());
         }
@@ -110,6 +122,11 @@ impl Settings {
             return Err("--trials, --max-ms and --in need at least one".into());
         }
         Ok(())
+    }
+
+    /// The return channels, 1-based, as printed.
+    pub(crate) fn returns_label(&self) -> String {
+        self.returns.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join("+")
     }
 }
 
@@ -133,8 +150,9 @@ impl MidiSink for transit_midi_io::OutputHandle {
 pub trait Driver {
     /// Host time H now, in the origin of the streams' stamps.
     fn now_ns(&mut self) -> u64;
-    /// Let about `ns` pass while the streams run. An error (Ctrl+C) ends the measurement; every
-    /// note is released on the way out.
+    /// Let about `ns` pass while the streams run (a wait at or under [`crate::placement::SPIN_NS`]
+    /// yields instead of sleeping, as the MIDI output thread does before a deadline). An error
+    /// (Ctrl+C) ends the measurement; every note is released on the way out.
     fn wait(&mut self, ns: u64) -> Result<(), String>;
 }
 
@@ -180,6 +198,10 @@ impl Interrupt {
     fn note_released(&self) {
         self.note_on.store(false, Ordering::SeqCst);
     }
+
+    pub(crate) fn release_failed(&self) -> bool {
+        self.release_failed.load(Ordering::SeqCst)
+    }
 }
 
 /// Real time: [`ab::HostOrigin`] (the origin the backends stamp in) and sleeps, ended by a stop
@@ -197,7 +219,11 @@ impl Driver for RealTime<'_> {
         if self.interrupt.stopped() {
             return Err("interrupted".into());
         }
-        std::thread::sleep(std::time::Duration::from_nanos(ns.min(10_000_000)));
+        if ns <= crate::placement::SPIN_NS {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_nanos(ns.min(10_000_000)));
+        }
         if self.interrupt.stopped() { Err("interrupted".into()) } else { Ok(()) }
     }
 }
@@ -219,19 +245,19 @@ pub fn open_output(io: &transit_midi_io::MidiIo, wanted: &str) -> Result<transit
 
 /// Holds the note: note-on and note-off, and on drop (every exit path, an error or Ctrl+C
 /// included) the note-off and All Notes Off on the channel, so no note is left sounding.
-struct Notes<'a> {
-    midi: &'a mut dyn MidiSink,
-    interrupt: &'a Interrupt,
-    channel: u8,
-    note: u8,
+pub(crate) struct Notes<'a> {
+    pub(crate) midi: &'a mut dyn MidiSink,
+    pub(crate) interrupt: &'a Interrupt,
+    pub(crate) channel: u8,
+    pub(crate) note: u8,
 }
 
 impl Notes<'_> {
-    fn on(&mut self, velocity: u8) -> Result<(), String> {
+    pub(crate) fn on(&mut self, velocity: u8) -> Result<(), String> {
         self.interrupt.arm_note()?;
         self.midi.send(&[0x90 | self.channel, self.note, velocity])
     }
-    fn off(&mut self) -> Result<(), String> {
+    pub(crate) fn off(&mut self) -> Result<(), String> {
         self.midi.send(&[0x80 | self.channel, self.note, 0])?;
         self.interrupt.note_released();
         Ok(())
@@ -252,34 +278,38 @@ impl Drop for Notes<'_> {
 }
 
 /// What the callbacks share with the control thread. Allocated before the streams start.
-struct Streams {
+pub(crate) struct Streams {
+    /// The rate the ring was sized for.
+    asked_rate: u32,
     /// The return by sample position: `f32` bits at `position % len`.
     ring: Box<[AtomicU32]>,
     /// The first position recorded, [`NONE`] before any.
-    captured_from: AtomicU64,
+    pub(crate) captured_from: AtomicU64,
     /// One past the last position recorded (0 before any).
-    captured_end: AtomicU64,
+    pub(crate) captured_end: AtomicU64,
     /// Capture blocks for the clock map: host, position time, frame count and position.
     blocks: Box<[[AtomicU64; 4]]>,
     blocks_written: AtomicU64,
     no_position: AtomicBool,
     returns: Box<[u16]>,
-    render: OnceLock<ab::Achieved>,
-    capture: OnceLock<ab::Achieved>,
-    errors: AtomicU64,
+    pub(crate) render: OnceLock<ab::Achieved>,
+    pub(crate) capture: OnceLock<ab::Achieved>,
+    pub(crate) errors: AtomicU64,
 }
 
 impl Streams {
-    fn new(rate: u32, settings: &Settings) -> Self {
-        let len = u64::from(rate) * u64::from(RING_SECONDS) + u64::from(rate) * u64::from(settings.max_ms) / 1000;
+    /// A ring of `ring_ms` of input at `rate`.
+    pub(crate) fn new(rate: u32, returns: &[u16], ring_ms: u64) -> Self {
+        let len = u64::from(rate) * ring_ms / 1000;
         Self {
+            asked_rate: rate,
             ring: (0..len).map(|_| AtomicU32::new(0)).collect(),
             captured_from: AtomicU64::new(NONE),
             captured_end: AtomicU64::new(0),
             blocks: (0..BLOCKS).map(|_| std::array::from_fn(|_| AtomicU64::new(0))).collect(),
             blocks_written: AtomicU64::new(0),
             no_position: AtomicBool::new(false),
-            returns: settings.returns.clone().into_boxed_slice(),
+            returns: returns.to_vec().into_boxed_slice(),
             render: OnceLock::new(),
             capture: OnceLock::new(),
             errors: AtomicU64::new(0),
@@ -288,7 +318,7 @@ impl Streams {
 
     /// Positions `from..to` of the return. An error when they are not all recorded or the ring has
     /// overwritten some (the control thread fell behind).
-    fn read(&self, from: u64, to: u64) -> Result<Vec<f32>, String> {
+    pub(crate) fn read(&self, from: u64, to: u64) -> Result<Vec<f32>, String> {
         let len = self.ring.len() as u64;
         let fits = |end: u64| to <= end && end.saturating_sub(from) <= len && from >= self.captured_from.load(Ordering::Acquire);
         if !fits(self.captured_end.load(Ordering::Acquire)) {
@@ -362,23 +392,44 @@ impl Callbacks for Arc<Streams> {
     }
 }
 
-/// The position clock on the control thread: the capture blocks fitted as the app fits a stream.
-struct Clock {
+/// The clock fit's figures at one send.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SendFit {
+    /// Largest distance of a block from the line (not a bound on the send's offset), ns.
+    pub scatter_ns: f64,
+    /// Standard deviation of the blocks about the line, ns.
+    pub sigma_ns: f64,
+    /// The line's standard error at the send position, ns: the send position's uncertainty.
+    pub error_ns: f64,
+    /// The newest block against the line fitted without it, ns.
+    pub leave_last_out_ns: f64,
+    /// Blocks in the line.
+    pub points: usize,
+    /// The app's clock map (ClockFitter, fed the same blocks) minus the bench's position at the
+    /// send, in samples; None while the app's map is not valid.
+    pub app_offset: Option<i64>,
+}
+
+/// The position clock on the control thread: the capture blocks fitted by the bench
+/// ([`PositionFit`]) and, for comparison, by the app's fitter.
+pub(crate) struct Clock {
     fitter: ClockFitter,
     key: ClockKey,
+    pub(crate) fit: PositionFit,
     read: u64,
     rate: u32,
-    lost: u64,
+    pub(crate) lost: u64,
+    pub(crate) blocks: u64,
 }
 
 impl Clock {
-    fn new(rate: u32) -> Self {
+    pub(crate) fn new(rate: u32) -> Self {
         let key = ClockKey { generation: 1, domain: 1, direction: ab::Direction::Input };
-        Self { fitter: ClockFitter::new(key), key, read: 0, rate, lost: 0 }
+        Self { fitter: ClockFitter::new(key), key, fit: PositionFit::new(rate), read: 0, rate, lost: 0, blocks: 0 }
     }
 
     /// Feed the blocks the capture callback published since the last call.
-    fn drain(&mut self, streams: &Streams) -> Result<(), String> {
+    pub(crate) fn drain(&mut self, streams: &Streams) -> Result<(), String> {
         if streams.no_position.load(Ordering::Relaxed) {
             return Err("the driver gives no sample positions; this measurement needs them (--backend asio)".into());
         }
@@ -393,9 +444,13 @@ impl Clock {
             // A slot the callback lapped while it was read is dropped, not fitted.
             if streams.blocks_written.load(Ordering::Acquire).saturating_sub(self.read) >= BLOCKS as u64 {
                 self.lost += 1;
-            } else if values[0] != NONE {
+            } else if values[0] == NONE {
+                // An invalid stamp: the driver's position anchor moved.
+                self.fit.restart();
+            } else {
+                self.blocks += 1;
                 let backend = values[1] as i64;
-                // The position clock: the block's first position at its position time.
+                // The app's position clock: the block's first position at its position time.
                 let stamp = ab::Stamp {
                     host_callback_ns: values[0],
                     backend_callback_ns: backend,
@@ -405,26 +460,43 @@ impl Clock {
                 };
                 let frames = u32::try_from(values[2]).unwrap_or(u32::MAX);
                 let _ = self.fitter.observe(Observation { key: self.key, first_frame: values[3], frames, nominal_rate: self.rate, stamp });
+                self.fit.push(values[3], values[2], values[0]);
             }
             self.read += 1;
         }
         Ok(())
     }
 
-    /// The clock map's fit residual now, in ns.
-    fn residual(&self) -> Result<f64, String> {
-        Ok(self.fitter.map().ok_or("the clock map is not valid (the position clock did not fit)")?.residual_ns)
+    /// The bench's line, or why there is none.
+    pub(crate) fn line(&self) -> Result<fit::Line, String> {
+        self.fit.line().map_err(|f| format!("the position clock did not fit: {f}"))
     }
 
-    /// The sample position at host time `host_ns`, and the map's fit residual in ns.
-    fn position_at(&self, host_ns: u64) -> Result<(u64, f64), String> {
-        let map = self.fitter.map().ok_or("the clock map is not valid (the position clock did not fit)")?;
-        let position = map.host_to_frame(self.key, host_ns, host_ns).map_err(|e| format!("the send instant is outside the clock map ({e:?})"))?;
-        Ok((position, map.residual_ns))
+    /// The sample position at host time `host_ns`, and the fit's figures there.
+    pub(crate) fn position_at(&self, host_ns: u64) -> Result<(u64, SendFit), String> {
+        let line = self.line()?;
+        let position = line.host_to_frame(host_ns)?;
+        let app_offset = self.fitter.map().and_then(|m| m.host_to_frame(self.key, host_ns, host_ns).ok()).map(|a| a as i64 - position as i64);
+        Ok((
+            position,
+            SendFit {
+                scatter_ns: line.scatter_ns,
+                sigma_ns: line.sigma_ns,
+                error_ns: line.error_at_ns(position),
+                leave_last_out_ns: line.leave_last_out_ns,
+                points: line.n,
+                app_offset,
+            },
+        ))
+    }
+
+    /// The host time of sample position `frame` by the bench's line.
+    pub(crate) fn frame_to_host(&self, frame: u64) -> Result<u64, String> {
+        Ok(self.line()?.frame_to_host(frame))
     }
 }
 
-fn frames_of(rate: u32, ms: u64) -> u64 {
+pub(crate) fn frames_of(rate: u32, ms: u64) -> u64 {
     u64::from(rate) * ms / 1000
 }
 
@@ -443,8 +515,10 @@ pub struct Trial {
     pub peak: f32,
     /// Time the send call took, in ns (inside L, since the instant is read before the call).
     pub send_call_ns: u64,
-    /// The clock map's fit residual at the send, in ns.
-    pub fit_residual_ns: f64,
+    /// The clock fit at the send.
+    pub fit: SendFit,
+    /// The pre-send window was above the floor and the trial waited another gap.
+    pub retried: bool,
 }
 
 impl Trial {
@@ -491,6 +565,73 @@ pub fn summarize(latencies: &[u64]) -> Option<Summary> {
     Some(Summary { n, mean, median, min, max, std_dev, outliers })
 }
 
+/// The lines on the clock fit both modes print: its scatter (not a bound), the send position's
+/// standard error, the leave-last-out error and the app's map beside the bench's.
+pub(crate) fn fit_lines(rate: u32, fits: &[SendFit], max_fit_error_ns: u64) -> Vec<String> {
+    let samples = |ns: f64| ns * f64::from(rate) / 1e9;
+    let max = |f: fn(&SendFit) -> f64| fits.iter().map(f).fold(0.0f64, f64::max);
+    let (scatter, sigma, error, loo) = (max(|f| f.scatter_ns), max(|f| f.sigma_ns), max(|f| f.error_ns), max(|f| f.leave_last_out_ns.abs()));
+    let points = fits.iter().map(|f| f.points).min().unwrap_or(0);
+    let mut lines = vec![
+        format!(
+            "clock-fit scatter (not a bound on the send offset): up to {:.1} us ({:.1} samples), standard deviation up to {:.1} us, over at least {points} capture blocks (the last {} s, at least {})",
+            scatter / 1000.0,
+            samples(scatter),
+            sigma / 1000.0,
+            fit::HISTORY_NS / 1_000_000_000,
+            fit::KEEP_POINTS
+        ),
+        format!(
+            "send-position uncertainty from the clock fit: standard error at the send up to +-{:.1} us ({:.2} samples); leave-last-out prediction error up to {:.1} us ({:.1} samples); a send above {:.2} ms standard error is skipped",
+            error / 1000.0,
+            samples(error),
+            loo / 1000.0,
+            samples(loo),
+            max_fit_error_ns as f64 / 1e6
+        ),
+    ];
+    let valid: Vec<i64> = fits.iter().filter_map(|f| f.app_offset).collect();
+    let largest = valid.iter().map(|d| d.unsigned_abs()).max();
+    lines.push(match largest {
+        Some(d) => format!(
+            "the app's clock map (ClockFitter, the same blocks): valid at {} of {} sends, at most {d} samples from the bench fit",
+            valid.len(),
+            fits.len()
+        ),
+        None => format!(
+            "the app's clock map (ClockFitter, the same blocks): valid at 0 of {} sends (its window or its 2 ms residual limit refuses this driver's arrivals)",
+            fits.len()
+        ),
+    });
+    lines
+}
+
+/// The detector's lines both modes print: its late-side uncertainty and its bias.
+pub(crate) fn detector_lines(rate: u32, envelope_window: usize, widths: &[u64]) -> Vec<String> {
+    let ms = |samples: f64| samples * 1000.0 / f64::from(rate.max(1));
+    let worst = widths.iter().copied().max().unwrap_or(0);
+    let mean = widths.iter().sum::<u64>() as f64 / widths.len().max(1) as f64;
+    let lag = envelope_window.saturating_sub(1);
+    vec![
+        format!(
+            "detector uncertainty (late side only: onset after the floor-threshold crossing; the true start before the crossing is not bounded): mean {mean:.1} samples, max {worst} samples ({:.2} ms)",
+            ms(worst as f64)
+        ),
+        format!(
+            "detector onset bias: late, by the attack's rise to 10% of its peak plus up to {lag} samples ({:.2} ms) of envelope lag; included in L, nothing subtracted",
+            ms(lag as f64)
+        ),
+    ]
+}
+
+/// The JSON of one send's fit.
+pub(crate) fn fit_json(fit: &SendFit) -> serde_json::Value {
+    serde_json::json!({
+        "fit_scatter_ns": fit.scatter_ns, "fit_sigma_ns": fit.sigma_ns, "fit_error_ns": fit.error_ns,
+        "fit_leave_last_out_ns": fit.leave_last_out_ns, "fit_points": fit.points, "app_clock_offset_samples": fit.app_offset,
+    })
+}
+
 /// A measurement's result.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -502,12 +643,14 @@ pub struct Report {
     pub buffer: Option<u32>,
     /// The driver's reported input latency, in samples.
     pub input_latency: Option<u64>,
-    /// The reference noise floor (envelope peak), taken before the first note.
+    /// The noise floor (envelope peak): the lowest of the reference window and the pre-send windows.
     pub floor: f32,
+    /// The reference window's envelope peak, taken before the first note.
+    pub reference_floor: f32,
     pub trials: Vec<Trial>,
     /// The detector's envelope window, in samples: the onset lags the attack by up to one less.
     pub envelope_window: usize,
-    /// Trials skipped because the clock fit's residual was above the limit (no note was sent).
+    /// Trials skipped because the clock fit's standard error was above the limit (no note was sent).
     pub skipped: u32,
     /// Stream error callbacks and capture blocks lost to the clock map during the run.
     pub stream_errors: u64,
@@ -529,42 +672,45 @@ impl Report {
         Some(self.summary()?.mean - self.input_latency? as f64)
     }
 
-    /// The largest clock fit residual at a send, in ns.
-    pub fn fit_residual_max_ns(&self) -> f64 {
-        self.trials.iter().map(|t| t.fit_residual_ns).fold(0.0f64, f64::max)
+    /// The largest standard error of the clock fit at a send, in ns.
+    pub fn fit_error_max_ns(&self) -> f64 {
+        self.trials.iter().map(|t| t.fit.error_ns).fold(0.0f64, f64::max)
     }
 
-    /// [`Report::fit_residual_max_ns`] in samples: the send position's uncertainty.
+    /// [`Report::fit_error_max_ns`] in samples: the send position's uncertainty.
     pub fn send_uncertainty_samples(&self) -> f64 {
-        self.fit_residual_max_ns() * f64::from(self.rate) / 1e9
+        self.fit_error_max_ns() * f64::from(self.rate) / 1e9
     }
 
     /// The report as printed.
     pub fn lines(&self) -> Vec<String> {
         let s = &self.settings;
-        let returns = s.returns.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join("+");
         let buffer = self.buffer.map_or("the driver's".to_string(), |b| b.to_string());
         let mut lines = vec![
             "MIDI-to-audio onset latency (MIDI delivery + synth response + audio input; not MIDI transport accuracy)".to_string(),
             format!(
-                "MIDI \"{}\" channel {} note {} velocity {} -> \"{}\" input {returns}, {} Hz, buffer {buffer}, floor {}",
+                "MIDI \"{}\" channel {} note {} velocity {} -> \"{}\" input {}, {} Hz, buffer {buffer}, floor {} (lowest of the reference window {} and {} pre-send windows), warm-up note {}",
                 self.midi_port,
                 s.channel + 1,
                 s.note,
                 s.velocity,
                 self.device,
+                s.returns_label(),
                 self.rate,
-                onset::dbfs(self.floor)
+                onset::dbfs(self.floor),
+                onset::dbfs(self.reference_floor),
+                self.trials.len(),
+                if s.warmup { "sent, not measured" } else { "off" }
             ),
         ];
         for (k, t) in self.trials.iter().enumerate() {
             lines.push(format!(
-                "trial {:>2}: {} samples ({:.2} ms), onset {} samples after the threshold crossing, fit residual {:.1} us, pre-send {}, threshold {}, attack peak {}",
+                "trial {:>2}: {} samples ({:.2} ms), onset {} samples after the threshold crossing, fit error +-{:.1} us, pre-send {}, threshold {}, attack peak {}",
                 k + 1,
                 t.latency(),
                 self.ms(t.latency() as f64),
                 t.uncertainty(),
-                t.fit_residual_ns / 1000.0,
+                t.fit.error_ns / 1000.0,
                 onset::dbfs(t.pre_send),
                 onset::dbfs(t.threshold),
                 onset::dbfs(t.peak)
@@ -591,18 +737,7 @@ impl Report {
                 m.outliers.iter().map(|k| format!("trial {k}")).collect::<Vec<_>>().join(", ")
             };
             lines.push(format!("outliers (beyond {OUTLIER_SIGMAS} std dev): {outliers}"));
-            let widths: Vec<u64> = self.trials.iter().map(Trial::uncertainty).collect();
-            let worst = widths.iter().copied().max().unwrap_or(0);
-            let mean = widths.iter().sum::<u64>() as f64 / widths.len().max(1) as f64;
-            lines.push(format!(
-                "detector uncertainty (late side only: onset after the floor-threshold crossing; the true start before the crossing is not bounded): mean {mean:.1} samples, max {worst} samples ({:.2} ms)",
-                self.ms(worst as f64)
-            ));
-            let lag = self.envelope_window.saturating_sub(1);
-            lines.push(format!(
-                "detector onset bias: late, by the attack's rise to 10% of its peak plus up to {lag} samples ({:.2} ms) of envelope lag; included in L, nothing subtracted",
-                self.ms(lag as f64)
-            ));
+            lines.extend(detector_lines(self.rate, self.envelope_window, &self.trials.iter().map(Trial::uncertainty).collect::<Vec<_>>()));
             for (k, t) in self.trials.iter().enumerate() {
                 if self.ms(t.uncertainty() as f64) > SLOW_ATTACK_MS {
                     lines.push(format!(
@@ -612,31 +747,19 @@ impl Report {
                     ));
                 }
             }
-            let residual = self.fit_residual_max_ns();
-            lines.push(format!(
-                "send-position uncertainty from the clock fit: +-{:.1} us ({:.1} samples), the largest fit residual at a send (trials above {:.2} ms are skipped)",
-                residual / 1000.0,
-                self.send_uncertainty_samples(),
-                self.settings.max_fit_residual_ns as f64 / 1e6
-            ));
+            lines.extend(fit_lines(self.rate, &self.trials.iter().map(|t| t.fit).collect::<Vec<_>>(), s.max_fit_error_ns));
         }
         for (k, t) in self.trials.iter().enumerate() {
-            if t.pre_send > self.floor * PRE_SEND_WARN_FACTOR {
-                let above = if self.floor > 0.0 { format!("{:.1} dB above", 20.0 * (t.pre_send / self.floor).log10()) } else { "above".to_string() };
-                lines.push(format!(
-                    "warning: trial {}'s pre-send level {} is {above} the noise floor {}: the previous release may still be sounding; raise --gap-ms",
-                    k + 1,
-                    onset::dbfs(t.pre_send),
-                    onset::dbfs(self.floor)
-                ));
+            if let Some(line) = pre_send_warning(&format!("trial {}", k + 1), t.pre_send, self.floor, t.retried) {
+                lines.push(line);
             }
         }
         if self.skipped > 0 {
             lines.push(format!(
-                "skipped: {} of {} trials (fit residual above {:.2} ms; no note sent)",
+                "skipped: {} of {} trials (clock fit standard error above {:.2} ms; no note sent)",
                 self.skipped,
-                self.settings.trials,
-                self.settings.max_fit_residual_ns as f64 / 1e6
+                s.trials,
+                s.max_fit_error_ns as f64 / 1e6
             ));
         }
         match (self.input_latency, self.delivery_estimate()) {
@@ -668,14 +791,17 @@ impl Report {
             .iter()
             .enumerate()
             .map(|(k, t)| {
-                serde_json::json!({
+                let mut trial = serde_json::json!({
                     "trial": k + 1, "send_position": t.send, "onset_position": t.onset, "threshold_crossing_position": t.crossing,
                     "latency_samples": t.latency(), "latency_ms": self.ms(t.latency() as f64), "detector_uncertainty_samples": t.uncertainty(),
-                    "pre_send_envelope_peak": t.pre_send, "threshold": t.threshold, "attack_peak": t.peak, "send_call_ns": t.send_call_ns,
-                    "fit_residual_ns": t.fit_residual_ns,
-                })
+                    "pre_send_envelope_peak": t.pre_send, "pre_send_retried": t.retried, "threshold": t.threshold, "attack_peak": t.peak,
+                    "send_call_ns": t.send_call_ns,
+                });
+                merge(&mut trial, fit_json(&t.fit));
+                trial
             })
             .collect();
+        let fits: Vec<SendFit> = self.trials.iter().map(|t| t.fit).collect();
         serde_json::json!({
             "measurement": "MIDI-to-audio onset latency",
             "includes": "MIDI delivery + synth response + audio input; not MIDI transport accuracy",
@@ -683,29 +809,65 @@ impl Report {
             "device": self.device, "midi_port": self.midi_port,
             "midi_channel": self.settings.channel + 1, "note": self.settings.note, "velocity": self.settings.velocity,
             "inputs": self.settings.returns.iter().map(|c| c + 1).collect::<Vec<_>>(),
-            "gap_ms": self.settings.gap_ms, "max_ms": self.settings.max_ms,
-            "rate": self.rate, "buffer": self.buffer, "noise_floor_envelope_peak": self.floor,
+            "gap_ms": self.settings.gap_ms, "max_ms": self.settings.max_ms, "warmup_note": self.settings.warmup,
+            "rate": self.rate, "buffer": self.buffer,
+            "noise_floor_envelope_peak": self.floor, "reference_floor_envelope_peak": self.reference_floor,
             "envelope_window_samples": self.envelope_window,
             "detector": "onset late by the attack's rise to 10% of its peak plus up to envelope_window_samples - 1; included in the latency, nothing subtracted",
             "effective_compensation_offset": summary,
             "driver_input_latency_samples": self.input_latency,
             "estimated_delivery_plus_synth_samples": self.delivery_estimate(),
             "trials": trials,
-            "max_fit_residual_ns": self.settings.max_fit_residual_ns,
-            "fit_residual_max_ns": self.fit_residual_max_ns(),
-            "send_position_uncertainty_ns": self.fit_residual_max_ns(),
+            "max_fit_error_ns": self.settings.max_fit_error_ns,
+            "fit_error_max_ns": self.fit_error_max_ns(),
+            "fit_scatter_max_ns": fits.iter().map(|f| f.scatter_ns).fold(0.0f64, f64::max),
+            "fit_scatter_note": "clock-fit scatter, not a bound on the send offset",
+            "fit_leave_last_out_max_ns": fits.iter().map(|f| f.leave_last_out_ns.abs()).fold(0.0f64, f64::max),
+            "send_position_uncertainty_ns": self.fit_error_max_ns(),
             "send_position_uncertainty_samples": self.send_uncertainty_samples(),
-            "skipped_fit_residual": self.skipped,
+            "skipped_fit_error": self.skipped,
             "stream_errors": self.stream_errors, "lost_blocks": self.lost_blocks,
         })
     }
 }
 
+/// Add `extra`'s fields to the object `into`.
+pub(crate) fn merge(into: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(into), serde_json::Value::Object(extra)) = (into.as_object_mut(), extra) {
+        into.extend(extra);
+    }
+}
+
+/// The warning for a pre-send window more than 6 dB above the floor.
+pub(crate) fn pre_send_warning(what: &str, pre_send: f32, floor: f32, retried: bool) -> Option<String> {
+    if pre_send <= floor * PRE_SEND_WARN_FACTOR {
+        return None;
+    }
+    let above = if floor > 0.0 { format!("{:.1} dB above", 20.0 * (pre_send / floor).log10()) } else { "above".to_string() };
+    let retried = if retried { " (waited another gap first)" } else { "" };
+    Some(format!(
+        "warning: {what}'s pre-send level {} is {above} the noise floor {}{retried}: the previous release may still be sounding; its threshold was raised over it; raise --gap-ms",
+        onset::dbfs(pre_send),
+        onset::dbfs(floor)
+    ))
+}
+
+/// The threshold and the refinement's guard of a send whose pre-send window peaked at `pre`,
+/// over the noise floor `floor`: the floor's threshold, raised over a pre-send window more than
+/// 6 dB above the floor (a release still sounding must not count as the onset).
+pub(crate) fn levels(floor: f32, pre: f32) -> Result<(f32, f32), String> {
+    let base = onset::threshold(onset::Floor { peak: floor, rms: 0.0 })?;
+    let raised = pre > floor * PRE_SEND_WARN_FACTOR;
+    let threshold = if raised { base.max(pre * onset::FLOOR_FACTOR) } else { base };
+    let level = if raised { pre } else { floor };
+    Ok((threshold, (level * onset::QUIET_FACTOR).min(threshold)))
+}
+
 /// Open `request`'s device duplex through `backend`, then play `settings.trials` notes into
-/// `midi` and time each one's onset on the return. Any trial without an onset, a return not at its
-/// noise floor before a send, a stalled input or an error from `driver` ends the run with an
-/// error; the note is released on every path. A stop requested through `interrupt` before a
-/// note-on refuses that note.
+/// `midi` and time each one's onset on the return. Any trial without an onset, a return not quiet
+/// before a send, a stalled input or an error from `driver` ends the run with an error; the note
+/// is released on every path. A stop requested through `interrupt` before a note-on refuses that
+/// note.
 pub fn measure(
     backend: &dyn ab::Backend,
     request: &Request,
@@ -715,7 +877,8 @@ pub fn measure(
     interrupt: &Interrupt,
 ) -> Result<Report, String> {
     settings.check()?;
-    let streams = Arc::new(Streams::new(request.rate, settings));
+    let ring_ms = u64::from(RING_SECONDS) * 1000 + u64::from(settings.max_ms);
+    let streams = Arc::new(Streams::new(request.rate, &settings.returns, ring_ms));
     let highest = settings.returns.iter().copied().max().unwrap_or(0);
     let request = Request { loopback: true, in_ch: highest.saturating_add(1), out_ch: 1, ..request.clone() };
     let midi_port = midi.name();
@@ -724,7 +887,7 @@ pub fn measure(
         outcome = Some(trials(&streams, settings, &midi_port, &mut *midi, &mut *driver, interrupt)?);
         Ok(())
     })?;
-    let (floor, trials, skipped, lost_blocks) = outcome.ok_or("the measurement did not run")?;
+    let done = outcome.ok_or("the measurement did not run")?;
     let rate = opened.render_rate;
     let input_latency = opened.capture.and_then(|c| c.latency).map(|d| (d.as_secs_f64() * f64::from(rate)).round() as u64);
     Ok(Report {
@@ -734,17 +897,18 @@ pub fn measure(
         rate,
         buffer: opened.render.period.frames(),
         input_latency,
-        floor,
-        trials,
+        floor: done.floor,
+        reference_floor: done.reference_floor,
+        trials: done.trials,
         envelope_window: onset::window(rate),
-        skipped,
+        skipped: done.skipped,
         stream_errors: streams.errors.load(Ordering::Relaxed),
-        lost_blocks,
+        lost_blocks: done.lost_blocks,
     })
 }
 
 /// Wait `ns` while the clock keeps fitting.
-fn pass(driver: &mut dyn Driver, clock: &mut Clock, streams: &Streams, ns: u64) -> Result<(), String> {
+pub(crate) fn pass(driver: &mut dyn Driver, clock: &mut Clock, streams: &Streams, ns: u64) -> Result<(), String> {
     let until = driver.now_ns().saturating_add(ns);
     loop {
         clock.drain(streams)?;
@@ -755,27 +919,31 @@ fn pass(driver: &mut dyn Driver, clock: &mut Clock, streams: &Streams, ns: u64) 
     }
 }
 
-/// The trials, on the control thread while the streams run: the reference floor and the trials.
-fn trials(
+/// The streams are running with a clock map: rate, envelope window, clock and reference floor.
+pub(crate) struct Started {
+    pub(crate) rate: u32,
+    pub(crate) w: usize,
+    pub(crate) floor_frames: u64,
+    pub(crate) clock: Clock,
+    pub(crate) reference: onset::Floor,
+}
+
+/// The warm-up shared by both modes: the rates, a ring that holds `window_ms`, a clock fit and a
+/// reference floor; then the unmeasured warm-up note when `settings.warmup` (released before
+/// this returns; the caller waits a gap before its first send).
+pub(crate) fn start(
     streams: &Streams,
     settings: &Settings,
-    port: &str,
-    midi: &mut dyn MidiSink,
+    window_ms: u64,
     driver: &mut dyn Driver,
-    interrupt: &Interrupt,
-) -> Result<(f32, Vec<Trial>, u32, u64), String> {
-    // First, so that every exit below releases the note.
-    let mut notes = Notes { midi, interrupt, channel: settings.channel, note: settings.note };
+    notes: &mut Notes<'_>,
+) -> Result<Started, String> {
     let rate = streams.render.get().map(|a| a.format.rate).ok_or("the output did not open")?;
     if streams.capture.get().map(|a| a.format.rate) != Some(rate) {
         return Err("the input did not open at the output's rate".into());
     }
-    let window_ms = u64::from(settings.max_ms) + u64::from(onset::PEAK_MS) + u64::from(FLOOR_MS);
     if frames_of(rate, window_ms + 1000) > streams.ring.len() as u64 {
-        return Err(format!(
-            "the device opened at {rate} Hz, above the {} Hz asked; pass --rate {rate}",
-            streams.ring.len() as u64 / u64::from(RING_SECONDS)
-        ));
+        return Err(format!("the device opened at {rate} Hz, above the {} Hz asked; pass --rate {rate}", streams.asked_rate));
     }
     let w = onset::window(rate);
     let floor_frames = frames_of(rate, u64::from(FLOOR_MS));
@@ -786,60 +954,146 @@ fn trials(
         clock.drain(streams)?;
         let from = streams.captured_from.load(Ordering::Acquire);
         let end = streams.captured_end.load(Ordering::Acquire);
-        if clock.fitter.map().is_some() && from != NONE && end.saturating_sub(from) >= floor_frames {
+        let line = clock.line();
+        if line.as_ref().is_ok_and(|l| l.span_ns >= WARMUP_FIT_SPAN_NS) && from != NONE && end.saturating_sub(from) >= floor_frames {
             break;
         }
         if driver.now_ns().saturating_sub(started) > WARMUP_MS * 1_000_000 {
-            return Err(format!(
-                "no clock map and input after {WARMUP_MS} ms (clock fit: {:?}); the driver may not be running",
-                clock.fitter.counts()
-            ));
+            return Err(match line {
+                _ if clock.blocks == 0 => format!("no capture blocks after {WARMUP_MS} ms; the driver may not be running"),
+                Err(why) => format!("no clock map after {WARMUP_MS} ms: {why}"),
+                Ok(_) => format!("no input after {WARMUP_MS} ms"),
+            });
         }
         driver.wait(POLL_NS)?;
     }
     let end = streams.captured_end.load(Ordering::Acquire);
     let reference = onset::noise_floor(&streams.read(end - floor_frames, end)?, w);
-    let threshold = onset::threshold(reference)?;
-    let guard = (reference.peak * onset::QUIET_FACTOR).min(threshold);
-    let (mut out, mut skipped) = (Vec::new(), 0u32);
+    onset::threshold(reference)?;
+    if settings.warmup {
+        // The warm-up note: the synth's (or the port's) first-note behavior stays out of the trials.
+        notes.on(settings.velocity).map_err(|e| format!("warm-up note: {e}"))?;
+        pass(driver, &mut clock, streams, WARMUP_NOTE_MS * 1_000_000)?;
+        notes.off().map_err(|e| format!("warm-up note: {e}"))?;
+    }
+    Ok(Started { rate, w, floor_frames, clock, reference })
+}
+
+/// The pre-send window ending now: its floor, the floor lowered to it, and when it is more than
+/// 6 dB above the floor, a wait of another `gap_ns` and a second reading (`retried`). A window
+/// louder than the onset threshold's ceiling is refused.
+pub(crate) fn pre_send(
+    streams: &Streams,
+    started: &mut Started,
+    floor: &mut f32,
+    gap_ns: Option<u64>,
+    driver: &mut dyn Driver,
+    what: &str,
+) -> Result<(onset::Floor, bool), String> {
+    let read = |streams: &Streams, frames: u64, w: usize| -> Result<onset::Floor, String> {
+        let end = streams.captured_end.load(Ordering::Acquire);
+        Ok(onset::noise_floor(&streams.read(end.saturating_sub(frames), end)?, w))
+    };
+    let mut pre = read(streams, started.floor_frames, started.w)?;
+    *floor = floor.min(pre.peak);
+    let mut retried = false;
+    if let Some(gap_ns) = gap_ns
+        && pre.peak > *floor * PRE_SEND_WARN_FACTOR
+    {
+        eprintln!(
+            "{what}: the return before the note ({}) is more than 6 dB above the noise floor ({}); waiting another gap",
+            onset::dbfs(pre.peak),
+            onset::dbfs(*floor)
+        );
+        pass(driver, &mut started.clock, streams, gap_ns)?;
+        pre = read(streams, started.floor_frames, started.w)?;
+        *floor = floor.min(pre.peak);
+        retried = true;
+    }
+    onset::not_sounding(pre)?;
+    Ok((pre, retried))
+}
+
+/// What a trial captured: enough to find its onset again against the run's final floor.
+struct Capture {
+    send: u64,
+    base: u64,
+    from: usize,
+    samples: Vec<f32>,
+    pre: onset::Floor,
+    /// The threshold the trial ran with (its final one is never above it).
+    threshold: f32,
+    send_call_ns: u64,
+    fit: SendFit,
+    retried: bool,
+}
+
+/// What the trials found.
+struct Done {
+    floor: f32,
+    reference_floor: f32,
+    trials: Vec<Trial>,
+    skipped: u32,
+    lost_blocks: u64,
+}
+
+/// The trials, on the control thread while the streams run: the reference floor, the warm-up
+/// note and the trials.
+fn trials(
+    streams: &Streams,
+    settings: &Settings,
+    port: &str,
+    midi: &mut dyn MidiSink,
+    driver: &mut dyn Driver,
+    interrupt: &Interrupt,
+) -> Result<Done, String> {
+    // First, so that every exit below releases the note.
+    let mut notes = Notes { midi, interrupt, channel: settings.channel, note: settings.note };
+    let window_ms = u64::from(settings.max_ms) + u64::from(onset::PEAK_MS) + u64::from(FLOOR_MS);
+    let mut started = start(streams, settings, window_ms, driver, &mut notes)?;
+    let (rate, w) = (started.rate, started.w);
+    let peak_len = usize::try_from(frames_of(rate, u64::from(onset::PEAK_MS))).unwrap_or(usize::MAX);
+    let gap_ns = u64::from(settings.gap_ms) * 1_000_000;
+    let mut floor = started.reference.peak;
+    let (mut captures, mut skipped) = (Vec::new(), 0u32);
     for k in 1..=settings.trials {
         let fail = |e: String| format!("trial {k}: {e}");
-        if k > 1 {
-            pass(driver, &mut clock, streams, u64::from(settings.gap_ms) * 1_000_000)?;
+        if k > 1 || settings.warmup {
+            pass(driver, &mut started.clock, streams, gap_ns)?;
         }
-        clock.drain(streams)?;
+        started.clock.drain(streams)?;
         // The send position is only as good as the clock fit: above the limit, skip the trial
         // before any note is sent.
-        let residual = clock.residual().map_err(fail)?;
-        if residual > settings.max_fit_residual_ns as f64 {
+        let (_, now_fit) = started.clock.position_at(driver.now_ns()).map_err(fail)?;
+        if now_fit.error_ns > settings.max_fit_error_ns as f64 {
             skipped += 1;
-            eprintln!("trial {k}: skipped, the clock fit's residual is {:.3} ms", residual / 1e6);
+            eprintln!("trial {k}: skipped, the clock fit's standard error is {:.3} ms", now_fit.error_ns / 1e6);
             if u64::from(skipped) * 2 > u64::from(settings.trials) {
                 return Err(format!(
-                    "{skipped} of {} trials skipped: the position clock's fit residual ({:.3} ms) is above --max-fit-residual-ms {:.2}; the driver's position times are irregular",
+                    "{skipped} of {} trials skipped: the position clock's standard error ({:.3} ms, scatter {:.3} ms) is above --max-fit-error-ms {:.2}; the driver's arrival times are irregular",
                     settings.trials,
-                    residual / 1e6,
-                    settings.max_fit_residual_ns as f64 / 1e6
+                    now_fit.error_ns / 1e6,
+                    now_fit.scatter_ns / 1e6,
+                    settings.max_fit_error_ns as f64 / 1e6
                 ));
             }
             continue;
         }
-        let end = streams.captured_end.load(Ordering::Acquire);
-        let pre = onset::noise_floor(&streams.read(end - floor_frames, end).map_err(fail)?, w);
-        onset::at_floor(reference, pre).map_err(fail)?;
+        let (pre, retried) = pre_send(streams, &mut started, &mut floor, Some(gap_ns), driver, &format!("trial {k}")).map_err(fail)?;
+        let (threshold, _) = levels(floor, pre.peak).map_err(fail)?;
+        started.clock.drain(streams)?;
         let sent = driver.now_ns();
         notes.on(settings.velocity).map_err(fail)?;
         let send_call_ns = driver.now_ns().saturating_sub(sent);
-        let (send, fit_residual_ns) = clock.position_at(sent).map_err(fail)?;
+        let (send, fit) = started.clock.position_at(sent).map_err(fail)?;
         // The scan keeps one envelope window of samples before the send.
         let base = send.saturating_sub(w as u64);
         let stop = send + frames_of(rate, u64::from(settings.max_ms));
-        let peak_len = usize::try_from(frames_of(rate, u64::from(onset::PEAK_MS))).unwrap_or(usize::MAX);
         let deadline = sent.saturating_add((u64::from(settings.max_ms) + STALL_MS) * 1_000_000);
         let mut samples: Vec<f32> = Vec::new();
         let (from, mut scanned, mut crossing) = ((send - base) as usize, (send - base) as usize, None);
         loop {
-            clock.drain(streams)?;
+            started.clock.drain(streams)?;
             let want = crossing.map_or(stop, |c: usize| base + (c + peak_len) as u64);
             let to = streams.captured_end.load(Ordering::Acquire).min(want);
             let have = base + samples.len() as u64;
@@ -859,35 +1113,44 @@ fn trials(
             driver.wait(POLL_NS)?;
         }
         notes.off().map_err(fail)?;
-        let Some(c) = crossing else {
+        if crossing.is_none() {
             let heard = samples.get(from..).map_or(0.0, |s| onset::noise_floor(s, w).peak);
-            let returns = settings.returns.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join("+");
             return Err(fail(format!(
-                "no onset within {} ms of the note-on: the return peaked at {} against a threshold of {} (floor {}). Check that the synth plays on MIDI channel {} from \"{port}\", that its audio reaches input {returns}, and its level",
+                "no onset within {} ms of the note-on: the return peaked at {} against a threshold of {} (floor {}). Check that the synth plays on MIDI channel {} from \"{port}\", that its audio reaches input {}, and its level",
                 settings.max_ms,
                 onset::dbfs(heard),
                 onset::dbfs(threshold),
-                onset::dbfs(reference.peak),
+                onset::dbfs(floor),
                 settings.channel + 1,
+                settings.returns_label(),
             )));
-        };
-        let found = onset::refine(&samples, from, c, w, peak_len, guard);
-        out.push(Trial {
-            send,
-            onset: base + found.at as u64,
-            crossing: base + found.crossing as u64,
-            pre_send: pre.peak,
-            threshold,
-            peak: found.peak,
-            send_call_ns,
-            fit_residual_ns,
-        });
+        }
+        captures.push(Capture { send, base, from, samples, pre, threshold, send_call_ns, fit, retried });
     }
     drop(notes);
-    if interrupt.release_failed.load(Ordering::SeqCst) {
+    if interrupt.release_failed() {
         return Err("releasing the note failed: check that the synth is silent".into());
     }
-    Ok((reference.peak, out, skipped, clock.lost))
+    // The onsets again, against the lowest floor of the run (never above the trial's own threshold).
+    let mut out = Vec::new();
+    for (k, c) in captures.into_iter().enumerate() {
+        let (threshold, guard) = levels(floor, c.pre.peak).map_err(|e| format!("trial {}: {e}", k + 1))?;
+        let threshold = threshold.min(c.threshold);
+        let crossing = onset::first_crossing(&c.samples, c.from, w, threshold).ok_or_else(|| format!("trial {}: the onset was lost", k + 1))?;
+        let found = onset::refine(&c.samples, c.from, crossing, w, peak_len, guard.min(threshold));
+        out.push(Trial {
+            send: c.send,
+            onset: c.base + found.at as u64,
+            crossing: c.base + found.crossing as u64,
+            pre_send: c.pre.peak,
+            threshold,
+            peak: found.peak,
+            send_call_ns: c.send_call_ns,
+            fit: c.fit,
+            retried: c.retried,
+        });
+    }
+    Ok(Done { floor, reference_floor: started.reference.peak, trials: out, skipped, lost_blocks: started.clock.lost })
 }
 
 #[cfg(test)]
@@ -937,9 +1200,13 @@ mod tests {
         assert!(interrupt.ctrl_c());
     }
 
+    fn fit(error_ns: f64, app_offset: Option<i64>) -> SendFit {
+        SendFit { scatter_ns: 2_600_000.0, sigma_ns: 1_500_000.0, error_ns, leave_last_out_ns: -900_000.0, points: 375, app_offset }
+    }
+
     #[test]
-    fn a_pre_send_level_above_the_floor_and_the_fit_residual_are_reported() {
-        let trial = |pre_send: f32, fit_residual_ns: f64| Trial {
+    fn a_pre_send_level_above_the_floor_and_the_fit_figures_are_reported() {
+        let trial = |pre_send: f32, error_ns: f64, retried: bool| Trial {
             send: 1000,
             onset: 2000,
             crossing: 1999,
@@ -947,7 +1214,8 @@ mod tests {
             threshold: 0.001,
             peak: 0.1,
             send_call_ns: 0,
-            fit_residual_ns,
+            fit: fit(error_ns, None),
+            retried,
         };
         let report = Report {
             device: "d".into(),
@@ -957,21 +1225,46 @@ mod tests {
             buffer: Some(256),
             input_latency: Some(300),
             floor: 0.00005,
-            trials: vec![trial(0.00005, 467_700.0), trial(0.00043, 496_700.0)],
+            reference_floor: 0.0005,
+            trials: vec![trial(0.00005, 46_770.0, false), trial(0.00043, 49_670.0, true)],
             envelope_window: 11,
             skipped: 1,
             lost_blocks: 0,
             stream_errors: 0,
         };
         let text = report.lines().join("\n");
-        assert!(text.contains("warning: trial 2's pre-send level -67.3 dBFS is 18.7 dB above the noise floor -86.0 dBFS"), "{text}");
+        assert!(
+            text.contains("warning: trial 2's pre-send level -67.3 dBFS is 18.7 dB above the noise floor -86.0 dBFS (waited another gap first)"),
+            "{text}"
+        );
         assert!(!text.contains("warning: trial 1"), "{text}");
-        assert!(text.contains("send-position uncertainty from the clock fit: +-496.7 us (21.9 samples)"), "{text}");
+        assert!(text.contains("floor -86.0 dBFS (lowest of the reference window -66.0 dBFS and 2 pre-send windows), warm-up note sent"), "{text}");
+        assert!(text.contains("clock-fit scatter (not a bound on the send offset): up to 2600.0 us"), "{text}");
+        assert!(text.contains("standard error at the send up to +-49.7 us (2.19 samples); leave-last-out prediction error up to 900.0 us"), "{text}");
+        assert!(text.contains("valid at 0 of 2 sends"), "{text}");
         assert!(text.contains("skipped: 1 of 10 trials"), "{text}");
         let json = report.json("c", "d", &crate::report::Machine { cpu: "c".into(), os: "o".into() });
-        assert_eq!(json["fit_residual_max_ns"], 496_700.0);
-        assert_eq!(json["skipped_fit_residual"], 1);
-        assert_eq!(json["max_fit_residual_ns"], 1_000_000);
+        assert_eq!(json["fit_error_max_ns"], 49_670.0);
+        assert_eq!(json["fit_scatter_max_ns"], 2_600_000.0);
+        assert_eq!(json["skipped_fit_error"], 1);
+        assert_eq!(json["max_fit_error_ns"], 500_000);
+        assert_eq!(json["trials"][1]["pre_send_retried"], true);
+        assert_eq!(json["trials"][0]["fit_points"], 375);
+        assert_eq!(json["warmup_note"], true);
+    }
+
+    #[test]
+    fn the_app_map_beside_the_bench_fit() {
+        let lines = fit_lines(48_000, &[fit(1000.0, Some(2)), fit(1000.0, Some(-3)), fit(1000.0, None)], 500_000);
+        assert!(lines[2].contains("valid at 2 of 3 sends, at most 3 samples from the bench fit"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_threshold_rises_over_a_ringing_pre_send_window_only() {
+        let (quiet, _) = levels(0.0005, 0.0006).unwrap();
+        assert_eq!(quiet, 0.002, "the floor's threshold");
+        let (ringing, guard) = levels(0.0005, 0.004).unwrap();
+        assert_eq!((ringing, guard), (0.016, 0.008));
     }
 
     #[test]

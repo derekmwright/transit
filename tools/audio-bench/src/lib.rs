@@ -10,8 +10,10 @@ pub mod analysis;
 pub mod calibration;
 pub mod cli;
 pub mod fake;
+pub mod fit;
 pub mod midi_roundtrip;
 pub mod onset;
+pub mod placement;
 pub mod probe;
 pub mod report;
 pub mod session;
@@ -171,6 +173,23 @@ pub fn run_midi_roundtrip(
     let mut port = midi_roundtrip::open_output(&io, &options.port)?;
     let mut driver = midi_roundtrip::RealTime { origin: ab::HostOrigin::default(), interrupt };
     midi_roundtrip::measure(backend.as_ref(), &request, &options.settings, &mut port, &mut driver, interrupt)
+}
+
+/// `--placement`: open the MIDI output and the native ASIO device and place a note pattern with
+/// and without the compensation ([`placement`]). A stop requested through `interrupt` (Ctrl+C)
+/// ends it early, releasing the note.
+pub fn run_placement(config: &Config, options: &placement::Options, interrupt: &midi_roundtrip::Interrupt) -> Result<placement::Report, String> {
+    if config.kind != Kind::Asio {
+        return Err("--placement needs --backend asio: it schedules the notes and places the onsets by the driver's sample positions".into());
+    }
+    // Refused before any device or port opens.
+    options.settings.check(config.request.rate)?;
+    let backend = asio_backend()?;
+    let request = resolve_asio_device(&config.request)?;
+    let io = transit_midi_io::MidiIo::new("audio-bench");
+    let mut port = midi_roundtrip::open_output(&io, &options.port)?;
+    let mut driver = midi_roundtrip::RealTime { origin: ab::HostOrigin::default(), interrupt };
+    placement::measure(backend.as_ref(), &request, &options.settings, &mut port, &mut driver, interrupt)
 }
 
 /// `args` as one shell line (an argument with a space, a quote or nothing in it quoted).

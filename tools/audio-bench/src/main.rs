@@ -1,38 +1,59 @@
 use audio_bench::cli::{Command, USAGE, parse};
 use audio_bench::midi_roundtrip::Interrupt;
-use audio_bench::{calibration, command_line, list_devices, report, run, run_midi_roundtrip};
+use audio_bench::{calibration, command_line, list_devices, report, run, run_midi_roundtrip, run_placement};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-/// `--midi-roundtrip`: install the Ctrl+C handler, measure, print, write the JSON. The handler
-/// only sets flags: the first press stops the run, which releases the note; a further press ends
-/// the process at once only while no note-on is outstanding ([`Interrupt::ctrl_c`]).
-fn midi_roundtrip(
-    config: &audio_bench::Config,
-    midi: &audio_bench::midi_roundtrip::Options,
-    args: &[String],
-    interrupt: &Arc<Interrupt>,
-) -> Result<(), String> {
+/// The MIDI modes' Ctrl+C handler. It only sets flags: the first press stops the run, which
+/// releases the note; a further press ends the process at once only while no note-on is
+/// outstanding ([`Interrupt::ctrl_c`]).
+fn install_ctrl_c(interrupt: &Arc<Interrupt>) -> Result<(), String> {
     let handler = Arc::clone(interrupt);
     ctrlc::set_handler(move || {
         if handler.ctrl_c() {
             std::process::exit(130);
         }
     })
-    .map_err(|e| format!("the Ctrl+C handler could not be installed, so a note could be left sounding: {e}"))?;
+    .map_err(|e| format!("the Ctrl+C handler could not be installed, so a note could be left sounding: {e}"))
+}
+
+/// Print a MIDI mode's report lines and the command, and write its JSON where asked.
+fn finish(lines: Vec<String>, json: impl FnOnce(&str) -> serde_json::Value, path: Option<&std::path::Path>, args: &[String]) -> Result<(), String> {
     let command = format!("cargo run -p audio-bench --features native-asio --release -- {}", command_line(args));
-    let report = run_midi_roundtrip(config, midi, interrupt)?;
-    for line in report.lines() {
+    for line in lines {
         println!("{line}");
     }
     println!("command: {command}");
-    if let Some(path) = &midi.json {
-        let json = report.json(&command, &report::today(), &report::machine());
-        let text = serde_json::to_string_pretty(&json).map_err(|e| format!("JSON: {e}"))?;
+    if let Some(path) = path {
+        let text = serde_json::to_string_pretty(&json(&command)).map_err(|e| format!("JSON: {e}"))?;
         std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
         eprintln!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// `--midi-roundtrip`: install the Ctrl+C handler, measure, print, write the JSON.
+fn midi_roundtrip(
+    config: &audio_bench::Config,
+    midi: &audio_bench::midi_roundtrip::Options,
+    args: &[String],
+    interrupt: &Arc<Interrupt>,
+) -> Result<(), String> {
+    install_ctrl_c(interrupt)?;
+    let report = run_midi_roundtrip(config, midi, interrupt)?;
+    finish(report.lines(), |command| report.json(command, &report::today(), &report::machine()), midi.json.as_deref(), args)
+}
+
+/// `--placement`: install the Ctrl+C handler, place the pattern, print, write the JSON.
+fn placement(
+    config: &audio_bench::Config,
+    options: &audio_bench::placement::Options,
+    args: &[String],
+    interrupt: &Arc<Interrupt>,
+) -> Result<(), String> {
+    install_ctrl_c(interrupt)?;
+    let report = run_placement(config, options, interrupt)?;
+    finish(report.lines(), |command| report.json(command, &report::today(), &report::machine()), options.json.as_deref(), args)
 }
 
 fn main() -> ExitCode {
@@ -45,6 +66,7 @@ fn main() -> ExitCode {
         }
         Command::List(system) => list_devices(system.as_deref()).map(|text| print!("{text}")),
         Command::MidiRoundTrip { config, midi } => midi_roundtrip(&config, &midi, &args, &interrupt),
+        Command::Placement { config, placement: options } => placement(&config, &options, &args, &interrupt),
         Command::Run(config) => {
             let row = run(&config)?;
             let rows = [row];

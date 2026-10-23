@@ -73,14 +73,15 @@ pub fn threshold(reference: Floor) -> Result<f32, String> {
     Ok((reference.peak * FLOOR_FACTOR).max(MIN_THRESHOLD))
 }
 
-/// Whether the window before a send (`pre`) is at the `reference` noise floor; why not otherwise.
-pub fn at_floor(reference: Floor, pre: Floor) -> Result<(), String> {
-    let limit = (reference.peak * QUIET_FACTOR).max(MIN_THRESHOLD / 2.0);
-    if pre.peak > limit {
+/// Whether the window before a send (`pre`) is quiet enough to measure over: a window louder
+/// than [`MAX_FLOOR`] is a release still sounding (or something else playing). A window merely
+/// above the floor is measured with a raised threshold and a warning (`crate::midi_roundtrip`).
+pub fn not_sounding(pre: Floor) -> Result<(), String> {
+    if pre.peak > MAX_FLOOR {
         return Err(format!(
-            "the return before the note is above the noise floor (envelope peak {}, floor {}): the previous note's release is still sounding or something else plays; use the synth's shortest release, raise --gap-ms",
+            "the return before the note is above the noise floor (envelope peak {}, above {}): the previous note's release is still sounding or something else plays; use the synth's shortest release, raise --gap-ms",
             dbfs(pre.peak),
-            dbfs(reference.peak)
+            dbfs(MAX_FLOOR)
         ));
     }
     Ok(())
@@ -157,7 +158,7 @@ mod tests {
         for (i, x) in trial.iter_mut().enumerate().skip(300) {
             *x += 0.5 * ((i - 300) as f32 / 200.0).min(1.0) * if i.is_multiple_of(2) { 1.0 } else { -1.0 };
         }
-        at_floor(reference, noise_floor(&trial[..300], w)).unwrap();
+        not_sounding(noise_floor(&trial[..300], w)).unwrap();
         assert_eq!(first_crossing(&trial[..300], 0, w, level), None, "the noise alone never crosses");
         let crossing = first_crossing(&trial, 0, w, level).unwrap();
         assert!((300..330).contains(&crossing), "threshold crossing at {crossing}");
@@ -191,8 +192,8 @@ mod tests {
         assert_eq!(first_crossing(&[0.0005, -0.0009, 0.0011], 0, 1, MIN_THRESHOLD), Some(2));
         let loud = threshold(noise_floor(&noise(480, 0.3, 3), 4)).unwrap_err();
         assert!(loud.contains("not quiet"), "{loud}");
-        let reference = noise_floor(&noise(480, 0.002, 5), 4);
-        let ringing = at_floor(reference, noise_floor(&noise(480, 0.02, 6), 4)).unwrap_err();
+        not_sounding(noise_floor(&noise(480, 0.02, 6), 4)).unwrap();
+        let ringing = not_sounding(noise_floor(&noise(480, 0.4, 6), 4)).unwrap_err();
         assert!(ringing.contains("above the noise floor") && ringing.contains("--gap-ms"), "{ringing}");
         assert_eq!(first_crossing(&[0.0, f32::NAN], 0, 1, 0.5), Some(1), "a broken sample is not silence");
         assert_eq!(dbfs(0.0), "-inf dBFS");
