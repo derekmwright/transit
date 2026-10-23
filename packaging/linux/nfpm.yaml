@@ -14,7 +14,7 @@ section: sound
 priority: optional
 maintainer: ${TRANSIT_MAINTAINER}
 vendor: Derek Wright
-homepage: https://github.com/derekmwright/transit
+homepage: https://github.com/transit-audio/transit
 license: MIT OR Apache-2.0
 description: |-
   transit DAW: a native digital audio workstation. Record, edit and mix

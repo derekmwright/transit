@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/derekmwright/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/derekmwright/transit/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/transit-audio/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/transit-audio/transit/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
 A desktop DAW in pure Rust with Ableton/Logic-style ergonomics and its own audio engine, device
@@ -16,7 +16,7 @@ layer and egui UI. transit began in October 2026 as a fork of
 credited in About and in NOTICE.
 
 > [!NOTE]
-> transit is alpha software under active development; the current release is [v0.2.0](https://github.com/derekmwright/transit/releases/tag/v0.2.0) (see [Downloads](#downloads)). transit checks once a day for a newer release with one anonymous request to GitHub and tells you; turn it off in the Help menu or with `TRANSIT_NO_UPDATE_CHECK=1` ([details](docs/building.md#the-update-check)). The current priority is core engine
+> transit is alpha software under active development; the current release is [v0.2.0](https://github.com/transit-audio/transit/releases/tag/v0.2.0) (see [Downloads](#downloads)). transit checks once a day for a newer release with one anonymous request to GitHub and tells you; turn it off in the Help menu or with `TRANSIT_NO_UPDATE_CHECK=1` ([details](docs/building.md#the-update-check)). The current priority is core engine
 > correctness, stability and performance, measured on real hardware, ahead of new features.
 > Expect rough edges in the UI and some missing features; the audio engine, recording alignment
 > and device handling get fixed first, following [the engineering principles](docs/principles.md).
@@ -26,7 +26,7 @@ credited in About and in NOTICE.
 
 ## Downloads
 
-The current release is [v0.2.0](https://github.com/derekmwright/transit/releases/tag/v0.2.0). The files are `transit-v0.2.0-windows-x86_64.msi` and `.zip`, `transit-v0.2.0-macos-arm64.dmg` and `.tar.gz`, and `transit-v0.2.0-linux-x86_64.tar.gz`.
+The current release is [v0.2.0](https://github.com/transit-audio/transit/releases/tag/v0.2.0). The files are `transit-v0.2.0-windows-x86_64.msi` and `.zip`, `transit-v0.2.0-macos-arm64.dmg` and `.tar.gz`, and `transit-v0.2.0-linux-x86_64.tar.gz`.
 
 - **Windows (x86_64):** one download, the `.zip` (portable) or the `.msi` (installer; it registers `.transit` and `.transitz`). It has native WASAPI and native ASIO.
 - **macOS (Apple silicon):** the `.dmg`; open it and drag `transit.app` to Applications.
@@ -74,16 +74,16 @@ same way. The second is transit's native WASAPI backend and the third is ASIO, b
 - The table row the bench prints, and the `render backend:` and `capture backend:` lines under it.
 - The interface, driver version, OS build and CPU, and whether all the clicks were detected.
 
-File it with the [measurement issue template](https://github.com/derekmwright/transit/issues/new?template=measurement.md)
+File it with the [measurement issue template](https://github.com/transit-audio/transit/issues/new?template=measurement.md)
 or wherever you find us. <!-- TODO(owner): add the Discord invite here; the repo names none yet. -->
 
 ### Help wanted by platform
 
 Most development happens on Windows. If you run Linux or macOS, the issues below need someone with your machine:
 
-- Linux: [help wanted, platform:linux](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Alinux)
-- macOS: [help wanted, platform:macos](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Amacos)
-- Everything marked help wanted: [all help wanted issues](https://github.com/derekmwright/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
+- Linux: [help wanted, platform:linux](https://github.com/transit-audio/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Alinux)
+- macOS: [help wanted, platform:macos](https://github.com/transit-audio/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+label%3Aplatform%3Amacos)
+- Everything marked help wanted: [all help wanted issues](https://github.com/transit-audio/transit/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 
 Issues labeled good first issue are scoped and documented enough to start with. Hardware reports (interface, driver, buffer, measured round trip) are welcome on any platform: open an issue with the numbers.
 

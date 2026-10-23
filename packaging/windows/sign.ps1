@@ -57,7 +57,7 @@ if (-not $haveCert -and -not $haveAzure) {
 }
 
 $script:SignTool = Find-SignTool
-$common = @('sign', '/v', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'transit', '/du', 'https://github.com/derekmwright/transit')
+$common = @('sign', '/v', '/fd', 'SHA256', '/td', 'SHA256', '/d', 'transit', '/du', 'https://github.com/transit-audio/transit')
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "transit-sign-$PID"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 

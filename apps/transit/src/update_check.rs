@@ -7,7 +7,7 @@ use std::time::Duration;
 use transit_ui_studio::update::{UpdateCheck, UpdateNotice, UpdateOutcome};
 
 /// The releases list (pre-releases included while the project is in alpha).
-pub const RELEASES_URL: &str = "https://api.github.com/repos/derekmwright/transit/releases?per_page=5";
+pub const RELEASES_URL: &str = "https://api.github.com/repos/transit-audio/transit/releases?per_page=5";
 
 /// `TRANSIT_NO_UPDATE_CHECK=1` (any non-empty value other than `0`) turns the check off.
 pub fn disabled_by_env() -> bool {
@@ -43,7 +43,7 @@ pub fn newest_newer(current: &Version, releases: &serde_json::Value) -> Option<U
             .get("html_url")
             .and_then(|u| u.as_str())
             .filter(|u| u.starts_with("https://"))
-            .map_or_else(|| format!("https://github.com/derekmwright/transit/releases/tag/{tag}"), str::to_string);
+            .map_or_else(|| format!("https://github.com/transit-audio/transit/releases/tag/{tag}"), str::to_string);
         best = Some((v.clone(), UpdateNotice { version: v.to_string(), url }));
     }
     best.map(|(_, n)| n)

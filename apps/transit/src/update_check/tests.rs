@@ -45,7 +45,7 @@ fn fake(status: &str, body: &str) -> Fake {
 }
 
 const NEWER: &str = r#"[
-  {"tag_name":"v0.2.0-alpha.2","html_url":"https://github.com/derekmwright/transit/releases/tag/v0.2.0-alpha.2","draft":false},
+  {"tag_name":"v0.2.0-alpha.2","html_url":"https://github.com/transit-audio/transit/releases/tag/v0.2.0-alpha.2","draft":false},
   {"tag_name":"v0.2.0-alpha.1","html_url":"https://example.invalid/old"},
   {"tag_name":"nightly","html_url":"https://example.invalid/nightly"}
 ]"#;
@@ -85,7 +85,7 @@ fn malformed_tags_drafts_and_non_lists_are_skipped() {
     ]);
     let n = newest_newer(&v("0.2.0"), &list).unwrap();
     assert_eq!(n.version, "0.3.0");
-    assert_eq!(n.url, "https://github.com/derekmwright/transit/releases/tag/v0.3.0", "a non-https link is replaced by the tag page");
+    assert_eq!(n.url, "https://github.com/transit-audio/transit/releases/tag/v0.3.0", "a non-https link is replaced by the tag page");
     assert_eq!(newest_newer(&v("0.2.0"), &serde_json::json!({"message": "rate limited"})), None);
 }
 

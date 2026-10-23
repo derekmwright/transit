@@ -33,9 +33,9 @@
     <Icon Id="TransitIcon.ico" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="TransitIcon.ico" />
     <Property Id="ARPCOMMENTS" Value="transit $(var.FullVersion)" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/derekmwright/transit" />
-    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/derekmwright/transit" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/derekmwright/transit/issues" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/transit-audio/transit" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/transit-audio/transit" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/transit-audio/transit/issues" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="transit" />

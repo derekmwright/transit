@@ -117,7 +117,7 @@ jobs:
           Do not pass --settings unless you are calibrating transit on this machine.
           "No click detected" means a wrong cable, channel or level.
           Send the table row and the backend lines via the measurement issue template:
-          https://github.com/derekmwright/transit/issues/new/choose
+          https://github.com/transit-audio/transit/issues/new/choose
           "@
           $bench | Set-Content -Encoding utf8 "$d/BENCH-README.txt"
           @"
@@ -210,7 +210,7 @@ jobs:
           Do not pass --settings unless you are calibrating transit on this machine.
           "No click detected" means a wrong cable, channel or level.
           Send the table row and the backend lines via the measurement issue template:
-          https://github.com/derekmwright/transit/issues/new/choose
+          https://github.com/transit-audio/transit/issues/new/choose
           EOF
           tar -czf "$d.tar.gz" "$d"
       - uses: actions/upload-artifact@v4

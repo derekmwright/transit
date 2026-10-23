@@ -10,8 +10,8 @@ const CREDIT: &str = "Forked from SoundCraft by storytold, October 2026";
 const CREDIT_LINK: &str = "github.com/storytold/soundcraft";
 const CREDIT_URL: &str = "https://github.com/storytold/soundcraft";
 /// transit's own repository, linked above the lineage lines.
-const REPO_LINK: &str = "github.com/derekmwright/transit";
-const REPO_URL: &str = "https://github.com/derekmwright/transit";
+const REPO_LINK: &str = "github.com/transit-audio/transit";
+const REPO_URL: &str = "https://github.com/transit-audio/transit";
 const LICENSES: &str = "MIT OR Apache-2.0";
 /// Wordmark width in points.
 const WORDMARK_W: f32 = 260.0;

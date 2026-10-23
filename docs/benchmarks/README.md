@@ -157,7 +157,7 @@ Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpa
 
 Hardware numbers from other machines are the most useful addition to this folder. See
 [How to help](../../README.md#how-to-help) for what to run and send, and file results with the
-[measurement issue template](https://github.com/derekmwright/transit/issues/new?template=measurement.md).
+[measurement issue template](https://github.com/transit-audio/transit/issues/new?template=measurement.md).
 
 ### Measured on
 

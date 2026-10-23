@@ -99,7 +99,7 @@ This enables flexible routing comparable to REAPER while maintaining an approach
 
 ### Known architectural limitation
 
-The current compiler separates ordinary tracks from auxes/folders during execution. Some otherwise valid sidechain dependencies, such as a bus feeding a compressor sidechain on an ordinary track, cannot execute because the source is scheduled after the destination. This is tracked in [issue #1](https://github.com/derekmwright/transit/issues/1).
+The current compiler separates ordinary tracks from auxes/folders during execution. Some otherwise valid sidechain dependencies, such as a bus feeding a compressor sidechain on an ordinary track, cannot execute because the source is scheduled after the destination. This is tracked in [issue #1](https://github.com/transit-audio/transit/issues/1).
 
 ### Tracking priorities
 
