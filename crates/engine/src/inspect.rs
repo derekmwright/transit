@@ -13,6 +13,9 @@ fn clip_json(e: &Engine, c: &Clip) -> Value {
         "start_time": fmt(c.start), "gain_db": c.gain_db, "muted": c.muted,
         "fade_in": c.fade_in.len, "fade_out": c.fade_out.len, "locked": c.edit_locked || c.time_locked,
     });
+    if let Some(l) = c.looping {
+        v["loop"] = json!({"start": l.start, "end": l.end});
+    }
     match &c.content {
         ClipContent::Audio { source, offset } => {
             v["source"] = json!(source);

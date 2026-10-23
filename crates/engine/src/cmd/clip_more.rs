@@ -282,7 +282,7 @@ fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soundcraft_model::{ChannelFormat, SourceId, TrackKind};
+    use soundcraft_model::{ChannelFormat, ClipLoop, SourceId, TrackKind};
 
     fn engine_with(clips: &[(Samples, Samples, Samples)]) -> (Engine, TrackId, Vec<ClipId>) {
         let mut s = Session::default();
@@ -340,6 +340,92 @@ mod tests {
         e.execute("clip.unloop", &json!({"clip": id.0, "mode": "flatten"})).unwrap();
         assert_eq!(e.session().track(t).unwrap().clips().len(), 3);
         assert!(e.session().track(t).unwrap().clips().iter().all(|c| c.loop_id.is_none() && c.group.is_none()));
+    }
+
+    fn spans(e: &Engine, t: TrackId) -> Vec<(Samples, Samples)> {
+        e.session().track(t).unwrap().clips().iter().map(|c| (c.start, c.end())).collect()
+    }
+
+    fn the_clip(e: &Engine, id: ClipId) -> Clip {
+        e.session().find_clip(id).unwrap().1.clone()
+    }
+
+    #[test]
+    fn loop_to_loops_the_whole_clip_then_resizes_it_in_one_undo_step() {
+        let (mut e, t, ids) = engine_with(&[(100, 100, 0)]);
+        let depth = e.undo_history().len();
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 450})).unwrap();
+        assert_eq!(e.undo_history().len(), depth + 1, "one undo step");
+        assert_eq!(spans(&e, t), vec![(100, 450)], "one clip, no copies");
+        let c = the_clip(&e, ids[0]);
+        assert_eq!(c.looping, Some(ClipLoop { start: 0, end: 100 }));
+        assert_eq!(c.content_pos(250), 50);
+        // Shorter, still looped; then back to the first cycle: unlooped and cut to it.
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 330})).unwrap();
+        assert_eq!(spans(&e, t), vec![(100, 330)]);
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 150})).unwrap();
+        assert_eq!(spans(&e, t), vec![(100, 200)]);
+        assert_eq!(the_clip(&e, ids[0]).looping, None);
+        assert!(e.undo());
+        assert_eq!(spans(&e, t), vec![(100, 330)]);
+        assert!(the_clip(&e, ids[0]).looping.is_some());
+    }
+
+    #[test]
+    fn loop_to_on_an_unlooped_clip_never_shortens_it() {
+        let (mut e, t, ids) = engine_with(&[(0, 100, 0)]);
+        let depth = e.undo_history().len();
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 40})).unwrap();
+        assert_eq!(spans(&e, t), vec![(0, 100)]);
+        assert_eq!(the_clip(&e, ids[0]).looping, None);
+        let _ = depth;
+    }
+
+    #[test]
+    fn loop_to_stops_at_the_next_clip() {
+        let (mut e, t, ids) = engine_with(&[(0, 100, 0), (320, 50, 0)]);
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 900})).unwrap();
+        assert_eq!(spans(&e, t), vec![(0, 320), (320, 370)]);
+    }
+
+    #[test]
+    fn loop_to_independent_makes_plain_copies_with_a_trimmed_tail() {
+        let (mut e, t, ids) = engine_with(&[(0, 100, 0)]);
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 250, "independent": true})).unwrap();
+        assert_eq!(spans(&e, t), vec![(0, 100), (100, 200), (200, 250)]);
+        assert!(e.session().track(t).unwrap().clips().iter().all(|c| c.loop_id.is_none() && c.looping.is_none()));
+    }
+
+    #[test]
+    fn set_loop_and_clear_loop_validate_undo_and_keep_a_cycle() {
+        let (mut e, t, ids) = engine_with(&[(0, 600, 0)]);
+        // The source (SourceId 9) is not in the pool, so the range is not checked against a file.
+        e.execute("clip.set_loop", &json!({"clip": ids[0].0, "start": 100, "end": 300})).unwrap();
+        assert_eq!(the_clip(&e, ids[0]).looping, Some(ClipLoop { start: 100, end: 300 }));
+        assert!(e.execute("clip.set_loop", &json!({"clip": ids[0].0, "start": 300, "end": 100})).is_err());
+        e.execute("clip.clear_loop", &json!({"clip": ids[0].0})).unwrap();
+        assert_eq!((the_clip(&e, ids[0]).looping, spans(&e, t)), (None, vec![(0, 300)]));
+        assert!(e.execute("clip.clear_loop", &json!({"clip": ids[0].0})).is_err(), "nothing to clear");
+        assert!(e.undo());
+        assert_eq!(spans(&e, t), vec![(0, 600)]);
+        assert!(e.undo());
+        assert_eq!(the_clip(&e, ids[0]).looping, None);
+    }
+
+    #[test]
+    fn a_split_inside_a_later_cycle_keeps_the_phase() {
+        let (mut e, t, ids) = engine_with(&[(0, 100, 10)]);
+        e.execute("clip.loop_to", &json!({"clip": ids[0].0, "to": 400})).unwrap();
+        e.session_mut().edit.selected_clips = vec![ids[0]];
+        let before: Vec<Samples> = (0..400).map(|r| the_clip(&e, ids[0]).content_pos(r)).collect();
+        e.execute("edit.separate", &json!({"tracks": [t.0], "at": 250})).unwrap();
+        let clips = e.session().track(t).unwrap().clips().to_vec();
+        assert_eq!(clips.len(), 2);
+        let right = &clips[1];
+        assert_eq!((right.start, right.end()), (250, 400));
+        for r in 0..150 {
+            assert_eq!(right.content_pos(r) + right.source_offset(), before[250 + r as usize] + 10, "rel {r}");
+        }
     }
 
     #[test]

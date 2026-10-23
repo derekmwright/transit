@@ -15,6 +15,9 @@ const KNOWN_UNREACHED: &[&str] = &[
     "edit.paste_clip_effects",
     "edit.paste_clip_gain",
     "edit.squash_undo", // studio UI composite helper; old UI has no composite steps
+    "clip.clear_loop",  // assistant/control-first (ADR 0019): the studio UI unloops by dragging the loop handle back
+    "clip.loop_to",     // studio UI only (the loop handle on a clip header in the arrangement); the old UI has no such drag
+    "clip.set_loop",    // assistant/control-first (ADR 0019): the studio UI loops through the loop handle
     "event.midi_note",
     "file.bounce_paths", // studio UI only (Bounce dialog, "Stems by output path"); the old UI has no named I/O paths
     "file.bounce_stems",

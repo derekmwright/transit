@@ -193,8 +193,12 @@ fn move_clip(c: &mut Clip, at: &dyn Fn(Samples) -> Samples) {
     if c.sync_point != 0 {
         c.sync_point = rel(c.sync_point);
     }
+    if let Some(l) = &mut c.looping {
+        (l.start, l.end) = (rel(l.start), rel(l.end));
+    }
     c.start = start;
     c.trim_end_to(start + end);
+    c.looping = c.looping.filter(|l| l.is_valid());
 }
 
 /// Put back the material a tempo gesture started from (see `Engine::execute_merged`), so each

@@ -37,6 +37,10 @@ pub fn split_clip(clip: &Clip, at: Samples, new_id: ClipId, t: TimeCtx<'_>) -> O
     if at <= clip.start || at >= clip.end() {
         return None;
     }
+    // A looped MIDI clip cannot be cut yet: the halves would lose the loop's notes (ADR 0019).
+    if clip.looping.is_some() && matches!(clip.content, ClipContent::Midi { .. }) {
+        return None;
+    }
     let mut left = clip.clone();
     let mut right = clip.clone();
     right.id = new_id;
@@ -67,7 +71,10 @@ pub(crate) fn rebase_midi_start(clip: &mut Clip, old_start: Samples, t: TimeCtx<
         if delta == 0 {
             return;
         }
-        sequence.notes.retain(|n| n.start >= delta);
+        // A looped clip keeps the notes it cut off the front: later cycles still play them.
+        if clip.looping.is_none() {
+            sequence.notes.retain(|n| n.start >= delta);
+        }
         sequence.ctrls.retain(|c| c.tick >= delta);
         for n in &mut sequence.notes {
             n.start -= delta;
@@ -418,7 +425,7 @@ pub fn heal(s: &mut Session, track: TrackId, range: Range) -> usize {
                 (ClipContent::Audio { source: a, offset: oa }, ClipContent::Audio { source: b, offset: ob }) => a == b && oa + prev.length == *ob,
                 _ => false,
             };
-            if contiguous && same && (prev.gain_db - c.gain_db).abs() < 1e-6 {
+            if contiguous && same && prev.looping.is_none() && c.looping.is_none() && (prev.gain_db - c.gain_db).abs() < 1e-6 {
                 prev.length += c.length;
                 prev.fade_out = c.fade_out;
                 healed += 1;
@@ -727,14 +734,24 @@ pub fn trim_clip(s: &mut Session, id: ClipId, start: Option<Samples>, end: Optio
     let t = TimeCtx::of(s);
     let mut c = old.clone();
     if let Some(at) = start {
-        c.trim_start_to(at.max(file(&c).map_or(lo, |(f, _)| lo.max(f))));
+        let mut to = at.max(file(&c).map_or(lo, |(f, _)| lo.max(f)));
+        // A looped MIDI clip is cut only within its first pass (its notes shift with the loop).
+        if let (Some(l), ClipContent::Midi { .. }) = (c.looping, &c.content) {
+            to = to.min(old.start.saturating_add(l.end.max(1) - 1));
+        }
+        c.trim_start_to(to);
+        if matches!(c.content, ClipContent::Midi { .. }) {
+            c.shift_loop(c.start - old.start);
+        }
         rebase_midi_start(&mut c, old.start, t);
         if shuffle {
             c.start = old.start;
         }
     }
     if let Some(at) = end {
-        c.trim_end_to(at.min(file(&c).map_or(hi, |(_, f)| hi.min(f))));
+        // A looped clip is not bounded by its file: it repeats.
+        let limit = if c.looping.is_some() { hi } else { file(&c).map_or(hi, |(_, f)| hi.min(f)) };
+        c.trim_end_to(at.min(limit));
     }
     let pl = s.track_mut(track).and_then(|t| t.playlist_mut())?;
     *pl.clip_mut(id)? = c.clone();

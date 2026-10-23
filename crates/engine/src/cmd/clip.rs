@@ -3,6 +3,7 @@
 use super::*;
 use crate::cmd;
 use serde_json::json;
+use soundcraft_model::{ClipContent, ClipLoop};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -65,6 +66,25 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             Ok(json!({}))
         }),
+        cmd!(
+            "clip.loop_to",
+            "Loop To",
+            [],
+            None,
+            "{clip, to: position, independent?: bool} - the loop handle: sets the clip's arrangement length to `to`, cycling its content (an unlooped clip is first looped over its whole length); at or before the first cycle's end it unloops. independent = lay plain copies up to `to` instead (a trimmed last copy)",
+            always,
+            loop_to
+        ),
+        cmd!(
+            "clip.set_loop",
+            "Set Loop",
+            [],
+            None,
+            "{clips?, start?: samples, end?: samples} - loops the part of the clip from `start` to `end` (clip time, default the whole clip); the clip keeps its length and cycles the range once playback reaches `end`",
+            always,
+            set_loop
+        ),
+        cmd!("clip.clear_loop", "Clear Loop", [], None, "{clips?} - plays the clip once again, cut to its first pass", always, clear_loop),
         cmd!("clip.loop", "Loop...", ["Clip"], Some("Cmd+Alt+L"), "{clips?, count?: n, length?: samples}", has_selection, loop_clips),
         cmd!("clip.rename", "Rename...", ["Clip"], Some("Cmd+Alt+Shift+R"), "{clip?, name}", has_selection, rename),
         cmd!("clip.gain", "Clip Gain", [], None, "{clips?, db | delta_db}", has_selection, gain),
@@ -312,6 +332,133 @@ fn loop_clips(e: &mut Engine, p: &Value) -> Result<Value> {
         }
     }
     Ok(json!({"loops": made}))
+}
+
+/// The handle's command (ADR 0019): set the arrangement length of the clip's loop to `to`.
+/// An unlooped clip is first looped over its whole length. At or before the end of the first
+/// cycle the loop is removed and the clip is cut to that cycle. `independent` lays Repeat copies
+/// (no loop) back to back after the clip up to `to`, the last one trimmed there.
+fn loop_to(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = "clip.loop_to";
+    let Some(&clip) = clip_ids_param(e, p).first() else { return Err(bad(id, "`clip` required")) };
+    let to = position_param(e, id, p, "to")?.ok_or_else(|| bad(id, "`to` required"))?;
+    let independent = p.get("independent").and_then(Value::as_bool).unwrap_or(false);
+    let s = e.session_mut();
+    let (track, base) = s.find_clip(clip).map(|(t, c)| (t, c.clone())).ok_or_else(|| bad(id, "no such clip"))?;
+    if base.edit_locked {
+        return Err(bad(id, "the clip is edit locked"));
+    }
+    if independent {
+        return repeat_copies(s, track, base, to);
+    }
+    if to <= base.start {
+        return Err(bad(id, "`to` is before the clip"));
+    }
+    let cycle_end = base.looping.map_or(base.end(), |l| base.start.saturating_add(l.end));
+    let was_looped = base.looping.is_some();
+    if !was_looped && to <= base.end() {
+        return Ok(json!({"looped": false, "length": base.length}));
+    }
+    // Looping the whole clip needs its source to cover it; a clip at its natural length does.
+    if !was_looped && let Some(c) = s.find_clip_mut(clip) {
+        c.looping = Some(ClipLoop { start: 0, end: c.length });
+    }
+    let target = if was_looped && to <= cycle_end { cycle_end } else { to };
+    if was_looped
+        && to <= cycle_end
+        && let Some(c) = s.find_clip_mut(clip)
+    {
+        c.looping = None;
+    }
+    let Some(done) = crate::edit::trim_clip(s, clip, None, Some(target), false) else {
+        return Err(bad(id, "the clip cannot be resized"));
+    };
+    Ok(json!({"looped": done.looping.is_some(), "length": done.length}))
+}
+
+/// Alt on the handle (a Repeat): plain copies of `base` back to back from its end up to `to`, the
+/// last one trimmed there. Nothing is linked; the original is unchanged.
+fn repeat_copies(s: &mut soundcraft_model::Session, track: TrackId, mut base: soundcraft_model::Clip, to: Samples) -> Result<Value> {
+    base.loop_id = None;
+    let len = base.length.max(1);
+    let from = base.end();
+    let span = to.saturating_sub(from).max(0);
+    let reps = (span / len).min(MAX_REPEATS);
+    let tail = if reps < MAX_REPEATS { span - reps * len } else { 0 };
+    let mut made = 0;
+    for k in 0..=reps {
+        let mut nc = base.clone();
+        nc.start = 0;
+        if k == reps {
+            if tail == 0 {
+                break;
+            }
+            nc.trim_end_to(tail);
+        }
+        let _ = crate::edit::paste(s, track, from + len * k, &[nc], len, false);
+        made += 1;
+    }
+    Ok(json!({"repeats": made, "tail": tail}))
+}
+
+/// Most repeats one `clip.loop_to` with `independent` lays down.
+const MAX_REPEATS: i64 = 1000;
+
+fn set_loop(e: &mut Engine, p: &Value) -> Result<Value> {
+    let id = "clip.set_loop";
+    let ids = clip_ids_param(e, p);
+    if ids.is_empty() {
+        return Err(bad(id, "select a clip"));
+    }
+    let s = e.session_mut();
+    let mut done = 0;
+    for cid in ids {
+        let Some((_, c)) = s.find_clip(cid) else { continue };
+        let start = i64_or(p, "start", 0).clamp(-MAX_POSITION, MAX_POSITION);
+        let end = i64_or(p, "end", c.length).clamp(-MAX_POSITION, MAX_POSITION);
+        if start >= end || end <= 0 {
+            return Err(bad(id, "the loop `start` must be before its `end`, inside the clip"));
+        }
+        if c.edit_locked {
+            continue;
+        }
+        match &c.content {
+            ClipContent::Audio { source, offset } => {
+                let frames = s.source(*source).map_or(i64::MAX, |src| i64::try_from(src.frames).unwrap_or(i64::MAX));
+                if start.saturating_add(*offset) < 0 || end.saturating_add(*offset) > frames {
+                    return Err(bad(id, "the loop range reaches outside the audio file"));
+                }
+            }
+            ClipContent::Midi { .. } if start < 0 => return Err(bad(id, "a MIDI loop starts at or after the clip start")),
+            _ => {}
+        }
+        if let Some(c) = s.find_clip_mut(cid) {
+            c.looping = Some(ClipLoop { start, end });
+            done += 1;
+        }
+    }
+    Ok(json!({"clips": done}))
+}
+
+fn clear_loop(e: &mut Engine, p: &Value) -> Result<Value> {
+    let ids = clip_ids_param(e, p);
+    let s = e.session_mut();
+    let mut done = 0;
+    for cid in ids {
+        let Some(c) = s.find_clip_mut(cid) else { continue };
+        let Some(l) = c.looping.take() else { continue };
+        if !c.edit_locked {
+            c.length = c.length.min(l.end.max(1));
+            c.clamp_fades();
+            done += 1;
+        } else {
+            c.looping = Some(l);
+        }
+    }
+    if done == 0 {
+        return Err(bad("clip.clear_loop", "the selection has no loop"));
+    }
+    Ok(json!({"clips": done}))
 }
 
 fn rename(e: &mut Engine, p: &Value) -> Result<Value> {
