@@ -206,12 +206,13 @@ disables saving settings.
 - Approximate record alignment on devices whose clock never validates can differ by up to one input block (K14); Freeze renders a fixed 2 second tail.
 - The Windows release is one download (zip and MSI) with native WASAPI and native ASIO. It is unsigned: SmartScreen shows "More info", then "Run anyway".
 
-## Based on SoundCraft
+## Lineage
 
-transit is based on [SoundCraft](https://github.com/storytold/soundcraft) by storytold, an
-open-source Rust digital audio workstation. The audio engine, plug-in hosts and most crates come
-from it; the transit UI and product work are by @derekmwright. The crates we own are named `transit-*`; crates inherited from SoundCraft keep their
-`soundcraft-*` names until they are renamed. Engine fixes may be offered back upstream.
+transit began in October 2026 as a fork of [SoundCraft](https://github.com/storytold/soundcraft) by
+storytold, an open-source Rust digital audio workstation. transit has its own audio engine (native
+WASAPI and native ASIO backends) and its own product direction; the plug-in hosts and a number of
+crates were inherited and keep their `soundcraft-*` names until they are renamed. Engine fixes that
+apply upstream may be offered back.
 
 ## License
 
