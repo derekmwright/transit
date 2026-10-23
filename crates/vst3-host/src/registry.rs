@@ -424,7 +424,7 @@ fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
     }
 }
 
-/// Builds and leaks the `PluginInfo` for one plugin type. Called at most once per id (cached).
+/// Builds and leaks the `PluginInfo` for one plugin type. Called once per id (cached), outside the registry lock.
 fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
     let params: Vec<ParamInfo> =
         inst.params().iter().filter(|p| p.flags & (PARAM_HIDDEN | PARAM_READ_ONLY | PARAM_BYPASS) == 0).map(|p| param_info(inst, p)).collect();
@@ -455,24 +455,25 @@ fn instantiate_raw(id: &str) -> Result<(Instance, &'static PluginInfo), Vst3Erro
         None => scan().into_iter().find(|d| d.id == id).ok_or_else(|| Vst3Error::NotFound(id.to_string()))?,
     };
     let made = Bundle::load(&desc.path).and_then(|b| b.instantiate(&cid));
-    let mut r = lock();
-    match made {
-        Ok(inst) => {
-            let info = match r.infos.get(id) {
-                Some(i) => *i,
-                None => {
-                    let i = build_info(&desc, &inst);
-                    r.infos.insert(id.to_string(), i);
-                    i
-                }
-            };
-            Ok((inst, info))
-        }
+    let inst = match made {
+        Ok(inst) => inst,
         Err(e) => {
-            r.failed.insert(id.to_string(), e.clone());
-            Err(e)
+            lock().failed.insert(id.to_string(), e.clone());
+            return Err(e);
         }
-    }
+    };
+    // The parameter table is read outside the registry lock (issue #56): a large table, or a
+    // controller that hangs inside it, must not stall `cached_info` on the UI thread. Two first
+    // instances that race both build it; the first insert wins (the other is leaked, once).
+    let cached = lock().infos.get(id).copied();
+    let info = match cached {
+        Some(i) => i,
+        None => {
+            let built = build_info(&desc, &inst);
+            *lock().infos.entry(id.to_string()).or_insert(built)
+        }
+    };
+    Ok((inst, info))
 }
 
 pub fn instantiate(id: &str) -> Result<Box<dyn Plugin>, Vst3Error> {
