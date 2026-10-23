@@ -21,6 +21,7 @@ pub mod backend;
 pub mod device_clock;
 pub mod devices;
 pub mod hardware_probe;
+pub mod loop_probe;
 pub mod midi_capture;
 pub mod plan_bridge;
 pub mod player;

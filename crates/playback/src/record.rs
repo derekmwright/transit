@@ -241,12 +241,14 @@ fn capture_callbacks(
     monitor: &Arc<InputRing>,
     mut clock: crate::device_clock::CallbackClock,
     progress: Option<start::InputProgress>,
+    loop_probe: Option<Arc<crate::loop_probe::LoopProbe>>,
 ) -> (ab::CaptureCallback, ab::ErrorCallback) {
     let (sh, errors) = (Arc::clone(shared), Arc::clone(shared));
     let mon = Arc::clone(monitor);
     let capture = move |block: &mut ab::CaptureBlock<'_>| {
         crate::mark_audio_thread();
         let first_frame = clock.observer.next_frame();
+        let (position, channels) = (block.device_position, usize::from(block.channels));
         clock.observer.record(block.frames, block.stamp);
         if let Some(progress) = &progress {
             progress.publish(clock.observer.next_frame(), block.frames as u64);
@@ -256,6 +258,10 @@ fn capture_callbacks(
             let capture = sh.begin_capture();
             block.chunks(&mut |offset, samples| {
                 mon.push(samples);
+                // The loopback calibration (native ASIO) records the return by sample position.
+                if let Some(probe) = &loop_probe {
+                    probe.record(samples, channels, position.map(|p| p + offset as u64));
+                }
                 if capture.is_some()
                     && let Some(frame) = first_frame.checked_add(offset as u64)
                 {
@@ -301,6 +307,12 @@ impl Recorder {
         Recorder::open_with(&crate::AudioConfig::default())
     }
 
+    /// Hand a new loopback calibration to the running input stream (the app's Measure); false
+    /// where the backend applies it only at the next open.
+    pub(crate) fn set_calibration(&self, calibration: Option<ab::Calibration>) -> bool {
+        self._stream.as_ref().is_some_and(|stream| stream.set_calibration(calibration))
+    }
+
     /// Open the input device `audio` chooses (else the default) at its chosen rate and buffer
     /// size when the device offers them, else at the device's defaults. Integer devices (ASIO
     /// drivers usually are) are converted to f32.
@@ -315,7 +327,7 @@ impl Recorder {
         let mut failure = "no usable input stream".to_string();
         let mut opened = None;
         for (index, request) in plan.attempts.iter().enumerate() {
-            match Recorder::build(&*backend, &plan.endpoint, request, None) {
+            match Recorder::build(&*backend, &plan.endpoint, request, None, None) {
                 Ok(recorder) => {
                     opened = Some(recorder);
                     break;
@@ -338,7 +350,9 @@ impl Recorder {
     /// the driver creates both directions' buffers once, then starts both ([`Recorder::start`]).
     /// `mode` is the output's: both streams open in the same one.
     /// The buffer must be the output's: cpal sizes the input's scratch buffer at build time,
-    /// and the output's build recreates the buffers at its own size.
+    /// and the output's build recreates the buffers at its own size. `loop_probe` is the Player's
+    /// loopback calibration probe, which the capture callback feeds.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_on(
         backend: &dyn ab::Backend,
         endpoint: &ab::Endpoint,
@@ -347,13 +361,14 @@ impl Recorder {
         mode: ab::Mode,
         progress: start::InputProgress,
         calibration: Option<ab::Calibration>,
+        loop_probe: Option<Arc<crate::loop_probe::LoopProbe>>,
     ) -> Result<Recorder, ab::OpenError> {
         let format = backend.capture_format(endpoint, Some(rate)).map_err(ab::OpenError::Other)?;
         if format.rate != rate {
             return Err(ab::OpenError::Other(format!("the input does not run at {rate} Hz")));
         }
         let request = ab::OpenRequest { format, period, mode, origin: ab::HostOrigin::default(), calibration };
-        Recorder::build(backend, endpoint, &request, Some(progress))
+        Recorder::build(backend, endpoint, &request, Some(progress), loop_probe)
     }
 
     /// The recorder around a new, not yet started input stream on `endpoint`.
@@ -362,6 +377,7 @@ impl Recorder {
         endpoint: &ab::Endpoint,
         request: &ab::OpenRequest,
         progress: Option<start::InputProgress>,
+        loop_probe: Option<Arc<crate::loop_probe::LoopProbe>>,
     ) -> Result<Recorder, ab::OpenError> {
         let format = request.format;
         let channels = usize::from(format.channels).max(1);
@@ -370,7 +386,7 @@ impl Recorder {
         let monitor = InputRing::new(usize::from(format.channels), format.rate);
         let (callback_clock, clock) = crate::device_clock::stream_clock(crate::device_clock::Direction::Input, format.rate)
             .map_err(|error| ab::OpenError::Other(error.into()))?;
-        let (capture, on_error) = capture_callbacks(&shared, &monitor, callback_clock, progress);
+        let (capture, on_error) = capture_callbacks(&shared, &monitor, callback_clock, progress, loop_probe);
         let (stream, achieved) = backend.open_capture(endpoint, request, capture, on_error)?;
         let clock = crate::device_clock::MaintainedClock::start(clock)
             .map_err(|error| {

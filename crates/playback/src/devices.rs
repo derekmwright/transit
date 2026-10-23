@@ -120,9 +120,15 @@ pub struct AudioConfig {
     pub sample_rate: Option<u32>,
     /// Device buffer in frames.
     pub buffer_size: Option<u32>,
-    /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`). Only the
-    /// native backends apply one, and only on an exact key match.
+    /// Loopback calibrations of device pairs (`audio-bench --loopback --settings`, and the
+    /// Calibration line's Measure over native ASIO). Only the native backends apply one, and only
+    /// on an exact key match.
     pub calibrations: Vec<LoopbackCalibration>,
+    /// The output path the native ASIO calibration's Measure plays its click on (the user's last
+    /// choice; `None` is the main output's path).
+    pub calibration_send: Option<String>,
+    /// The input path it listens on (`None` is the first input path).
+    pub calibration_return: Option<String>,
     /// The native WASAPI backend opens the device shared (through the Windows mixer), which is its
     /// default; false asks for exclusive mode (ADR 0016, amendment 2 of 2026-10-22). Missing in a
     /// saved config reads as true: shared.
@@ -140,6 +146,8 @@ impl Default for AudioConfig {
             sample_rate: None,
             buffer_size: None,
             calibrations: Vec::new(),
+            calibration_send: None,
+            calibration_return: None,
             share_device: true,
         }
     }
@@ -168,7 +176,10 @@ pub fn calibration_mode(system: &str, mode: transit_audio_backend::Mode) -> Opti
 
 /// One measured loopback of an output/input pair. The key is `(device, input, mode, rate,
 /// period)`; a calibration applies to a stream pair only when every part of the key is equal,
-/// because the round trip changes with any of them.
+/// because the round trip changes with any of them. Under [`MODE_ASIO`] the round trip is the
+/// whole loop in the driver's sample positions (the app's Measure, `audio-bench --backend asio`),
+/// under the WASAPI modes the delay the stamps do not account for (see
+/// [`transit_audio_backend::Calibration`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoopbackCalibration {
     /// The output device name, as the backend lists it.
@@ -182,7 +193,8 @@ pub struct LoopbackCalibration {
     pub rate: u32,
     /// The requested period in frames; 0 is the driver's default.
     pub period: u32,
-    /// The median round trip, in frames at `rate`.
+    /// The median round trip, in frames at `rate` (a loop that comes up in two phases, one
+    /// period apart, keeps the median of the run; the spread shows the other).
     pub round_trip_frames: u32,
     /// The uncertainty of `round_trip_frames`, in frames: the measured spread plus one frame of
     /// position granularity.
@@ -211,6 +223,62 @@ impl LoopbackCalibration {
     }
 }
 
+/// The key a calibration of an open stream pair is looked up and stored under (the parts of
+/// [`LoopbackCalibration`] before its figures): what the Player matched, or would match, at the
+/// open.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CalibrationKey {
+    pub device: String,
+    pub input: Option<String>,
+    pub mode: String,
+    pub rate: u32,
+    /// The requested period in frames; 0 is the driver's default.
+    pub period: u32,
+}
+
+impl CalibrationKey {
+    /// The key of the pair of audio system `system` opened on output `device` with `request`,
+    /// paired with `input` (`None` on ASIO, whose input is the driver's own); `None` for a mode
+    /// no calibration names.
+    pub fn of(system: &str, device: &str, input: Option<&str>, request: &transit_audio_backend::OpenRequest) -> Option<Self> {
+        Some(Self {
+            device: device.to_owned(),
+            input: input.map(str::to_owned),
+            mode: calibration_mode(system, request.mode)?.to_owned(),
+            rate: request.format.rate,
+            period: request.period.frames().unwrap_or(0),
+        })
+    }
+
+    /// The record of a loop measured under this key.
+    pub fn record(&self, round_trip_frames: u32, spread_frames: u32, measured_at: &str) -> LoopbackCalibration {
+        LoopbackCalibration {
+            device: self.device.clone(),
+            input: self.input.clone(),
+            mode: self.mode.clone(),
+            rate: self.rate,
+            period: self.period,
+            round_trip_frames,
+            spread_frames,
+            measured_at: measured_at.to_owned(),
+        }
+    }
+}
+
+/// Today's date in UTC as `YYYY-MM-DD`, for [`LoopbackCalibration::measured_at`].
+pub fn utc_today() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let z = i64::try_from(secs / 86_400).unwrap_or(0) + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Whether a calibration whose run named `recorded` measured the pair a config pairs as `pairing`:
 /// both unnamed, both naming the same endpoint (case-insensitive), or an automatic pairing
 /// (`pairing` is `None`) that resolved to the endpoint `recorded` names (`resolved`).
@@ -224,6 +292,20 @@ pub fn input_matches(recorded: Option<&str>, pairing: Option<&str>, resolved: Op
 }
 
 impl AudioConfig {
+    /// Keep `calibration`, replacing a saved one with the same key.
+    pub fn store_calibration(&mut self, calibration: LoopbackCalibration) {
+        match self.calibrations.iter_mut().find(|c| c.same_key(&calibration)) {
+            Some(saved) => *saved = calibration,
+            None => self.calibrations.push(calibration),
+        }
+    }
+
+    /// The saved calibrations of the native ASIO driver `driver` at any rate or period (for "not
+    /// calibrated at this buffer size").
+    pub fn asio_calibrations<'a>(&'a self, driver: &'a str) -> impl Iterator<Item = &'a LoopbackCalibration> + 'a {
+        self.calibrations.iter().filter(move |c| c.mode == MODE_ASIO && c.device.eq_ignore_ascii_case(driver))
+    }
+
     /// The saved calibration of the pair opened on output `device` in `mode` ([`MODE_SHARED`] or
     /// [`MODE_EXCLUSIVE`]) at `rate` and the requested `period` (0 is the driver's default), under
     /// this config's paired input.
@@ -638,6 +720,8 @@ mod tests {
             buffer_size: Some(256),
             backend: Backend::NativeWasapi,
             calibrations: vec![sample_calibration()],
+            calibration_send: Some("Out 3-4".into()),
+            calibration_return: Some("In 2".into()),
             share_device: true,
         };
         let s = serde_json::to_string(&c).unwrap();
@@ -700,6 +784,28 @@ mod tests {
         let req = request(48_000, Period::Frames(64));
         assert!(cfg.calibration_for("ASIO", "Focusrite USB ASIO", None, &req).is_some(), "the driver name and mode asio");
         assert!(cfg.calibration_for("WASAPI", "Focusrite USB ASIO", None, &req).is_none(), "a WASAPI open never takes it");
+    }
+
+    #[test]
+    fn a_measured_asio_loop_is_stored_under_the_open_key_and_found_only_there() {
+        use transit_audio_backend::{Mode, Period};
+        let driver = "Focusrite USB ASIO";
+        let mut req = request(48_000, Period::Frames(256));
+        req.mode = Mode::Shared;
+        let key = CalibrationKey::of("ASIO", driver, None, &req).expect("ASIO names a mode");
+        assert_eq!((key.mode.as_str(), key.rate, key.period, key.input.as_deref()), (MODE_ASIO, 48_000, 256, None));
+        let mut cfg = AudioConfig::default();
+        cfg.store_calibration(key.record(1_062, 7, "2026-10-23"));
+        cfg.store_calibration(key.record(1_065, 4, "2026-10-24"));
+        assert_eq!(cfg.calibrations.len(), 1, "the same key is replaced");
+        let found = cfg.calibration_for("ASIO", driver, None, &req).expect("the open key");
+        assert_eq!(found.round_trip_ns, 1_065 * 1_000_000_000 / 48_000);
+        assert!(cfg.calibration_for("ASIO", driver, None, &request(48_000, Period::Frames(64))).is_none(), "another buffer size");
+        assert!(cfg.calibration_for("ASIO", driver, None, &request(44_100, Period::Frames(256))).is_none(), "another rate");
+        cfg.store_calibration(CalibrationKey { period: 64, ..key.clone() }.record(297, 7, "2026-10-23"));
+        assert_eq!(cfg.asio_calibrations(driver).count(), 2);
+        assert_eq!(cfg.asio_calibrations("ModelMixer").count(), 0);
+        assert_eq!(utc_today().len(), 10);
     }
 
     #[test]

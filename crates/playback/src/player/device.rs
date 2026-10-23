@@ -120,6 +120,15 @@ pub struct Player {
     io: RefCell<Arc<IoMap>>,
     /// The hardware-insert round-trip probe (ADR 0015 section 5); the audio thread plays and records it.
     probe: Option<Arc<crate::hardware_probe::HwProbe>>,
+    /// The loopback calibration probe (native ASIO, #20): the device callbacks play and record it
+    /// by sample position ([`crate::loop_probe`]).
+    loop_probe: Option<Arc<crate::loop_probe::LoopProbe>>,
+    /// The key a loopback calibration of the open pair is stored under (a duplex open whose mode
+    /// a calibration names); see [`Self::start_loop_calibration`].
+    pub calibration_key: Option<devices::CalibrationKey>,
+    /// The calibration the open streams use: the one saved for the key at the open, or one handed
+    /// to them since ([`Self::apply_calibration`]).
+    pub calibration: Option<ab::Calibration>,
     /// A live input ring feeds the plan (`set_input`): the probe has something to read.
     plan_input: Cell<bool>,
     pub device_buffer: Option<u32>,
@@ -222,6 +231,9 @@ impl Player {
             device_channels: 0,
             io: RefCell::new(Arc::new(IoMap::default())),
             probe: None,
+            loop_probe: None,
+            calibration_key: None,
+            calibration: None,
             plan_input: Cell::new(false),
             device_buffer: None,
             silent: true,
@@ -288,6 +300,7 @@ impl Player {
         let probe = Arc::new(crate::hardware_probe::HwProbe::new(target.sample_rate));
         audio.set_probe(Arc::clone(&probe));
         player.probe = Some(probe);
+        player.loop_probe = Some(Arc::new(crate::loop_probe::LoopProbe::new(device_rate)));
         *player.capture.get_mut() = Some(capture);
         let (anchor, access) = Anchor::new(audio);
         player.state = Some(anchor);
@@ -446,7 +459,16 @@ impl Player {
             *player.input.get_mut() = if duplex {
                 let progress = player.record_start.get_mut().as_ref().map(record::start::Control::input_progress);
                 let built = progress.ok_or_else(|| ab::OpenError::Other("the record start latch is missing".to_owned())).and_then(|progress| {
-                    record::Recorder::build_on(&*backend, endpoint, rate, request.period, request.mode, progress, request.calibration)
+                    record::Recorder::build_on(
+                        &*backend,
+                        endpoint,
+                        rate,
+                        request.period,
+                        request.mode,
+                        progress,
+                        request.calibration,
+                        player.loop_probe.clone(),
+                    )
                 });
                 match built {
                     Ok(recorder) => HeldInput::Held(Some(recorder)),
@@ -500,6 +522,10 @@ impl Player {
             player.output_channel_names = backend.channel_names(endpoint, ab::Direction::Output);
             player.input_channel_names = if duplex { backend.channel_names(endpoint, ab::Direction::Input) } else { Vec::new() };
             player.device_exclusive = request.mode == ab::Mode::Exclusive;
+            // On ASIO the input is the driver's own: its calibration names none.
+            let key_input = if system == devices::ASIO_SYSTEM { None } else { cfg.input_pairing.as_deref().or(paired.as_deref()) };
+            player.calibration_key = if duplex { devices::CalibrationKey::of(&system, &name, key_input, &request) } else { None };
+            player.calibration = request.calibration;
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {
@@ -672,6 +698,9 @@ impl Player {
         }
         if send.iter().any(|c| *c >= self.device_channels) || ret.iter().any(|c| *c >= io.inputs) {
             return Err("a path names a channel the device did not open".into());
+        }
+        if self.loop_calibration_running() {
+            return Err("a measurement is already running".into());
         }
         if !probe.arm(send, ret) {
             return Err("a measurement is already running".into());
@@ -1299,6 +1328,8 @@ struct DeviceOutput {
     timing: telemetry::Accumulator,
     shared: Arc<Shared>,
     fault: Arc<Fault>,
+    /// The loopback calibration probe: its click goes on top of the block, by sample position.
+    loop_probe: Option<Arc<crate::loop_probe::LoopProbe>>,
     /// Typed device buffers in tests convert through the scratch of the adapter; real streams
     /// convert inside their adapter.
     #[cfg(test)]
@@ -1315,6 +1346,7 @@ impl DeviceOutput {
             timing: telemetry::Accumulator::default(),
             shared: Arc::clone(&player.shared),
             fault: Arc::clone(&player.fault),
+            loop_probe: player.loop_probe.clone(),
             #[cfg(test)]
             convert: crate::OutputCallback::new(channels),
         }
@@ -1326,8 +1358,14 @@ impl DeviceOutput {
         let mut plans = plan_bridge::callback_scope();
         let mut actions = action_lane::callback_scope();
         let (access, fault, shared, channels) = (&mut self.access, &*self.fault, &*self.shared, self.channels);
+        let (probe, position) = (self.loop_probe.as_deref(), block.device_position);
+        let mut offset = 0u64;
         block.render(&mut |buffer| {
             render_held(access, fault, shared, buffer, channels, &mut plans, &mut actions);
+            if let Some(probe) = probe {
+                probe.play(buffer, channels, position.map(|p| p + offset));
+            }
+            offset += (buffer.len() / channels) as u64;
         });
     }
 
@@ -1443,5 +1481,6 @@ mod rate_tests {
         );
     }
 }
+mod calibrate;
 #[cfg(test)]
 mod tests;

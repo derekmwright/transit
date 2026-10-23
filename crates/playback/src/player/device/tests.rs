@@ -430,13 +430,13 @@ fn failed_open_retaining_callback_cannot_hold_shutdown_or_plugin_reclamation_hos
         let ((), heap) = measure(|| callback.fill(&mut out));
         assert!(heap.is_zero(), "retained callback must render silence without heap work: {heap:?}");
         assert_eq!(out, [0.0; 128]);
-        let DeviceOutput { access, channels: _, timing, shared, fault, convert } = callback;
+        let DeviceOutput { access, channels: _, timing, shared, fault, loop_probe, convert } = callback;
         // This is backend closure teardown, not timed rendering. The empty
         // allocation is permitted to be freed here; Audio was already reclaimed.
         let ((), heap) = measure(|| drop(access));
         assert_eq!(heap.allocs, 0);
         assert_eq!(heap.frees, 1);
-        drop((timing, shared, fault, convert));
+        drop((timing, shared, fault, loop_probe, convert));
     })
     .join()
     .unwrap();
@@ -1292,4 +1292,100 @@ fn an_input_opened_on_demand_goes_through_the_native_backend_that_serves_the_out
     assert!(native.running(ab::Direction::Input), "started");
     assert!(fallback.opens().is_empty(), "cpal was not asked");
     assert_eq!((recorder.device_name.as_str(), recorder.channels), ("Fake device", 2));
+}
+
+/// #20, K31: the Calibration line's Measure over native ASIO. A click plays on output 2 and comes
+/// back on input 2 a scripted number of device frames later; the probe counts sample positions,
+/// so a backlog in the input ring (capture blocks with no render between them) does not enter
+/// it, and the figure is stored under the open key and handed to both running streams.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_loop_over_native_asio_is_measured_in_sample_positions_and_applied_to_the_running_streams() {
+    use ab::fake::{SliceSink, SliceSource};
+    const BLOCK: usize = 256;
+    const LOOP: usize = 1_065;
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let attempt = ab::OpenRequest {
+        format,
+        period: ab::Period::Frames(BLOCK as u32),
+        mode: ab::Mode::Shared,
+        origin: ab::HostOrigin::default(),
+        calibration: None,
+    };
+    let fake = ab::fake::FakeBackend::new(format).named("ASIO", "Focusrite USB ASIO").with_capture(2, true).with_attempts(vec![attempt]);
+    let mut player = open_asio(&fake, &asio_config());
+    let key = player.calibration_key.clone().expect("a duplex ASIO open has a calibration key");
+    assert_eq!((key.device.as_str(), key.mode.as_str(), key.rate, key.period, key.input), ("Focusrite USB ASIO", "asio", 48_000, 256, None));
+    assert_eq!(player.calibration, None, "nothing saved for this key yet");
+    assert!(player.start_loop_calibration(&[2], &[1]).is_err(), "a channel the device did not open");
+    let (mut output, mut input) = (vec![0.0f32; BLOCK * 2], vec![0.0f32; BLOCK * 2]);
+    let mut position = 9_000u64;
+    // A backlog in the input ring: capture blocks with no render between them.
+    for _ in 0..3 {
+        assert!(fake.pump_capture_at(BLOCK, ab::Stamp::INVALID, Some(position), format, &mut SliceSource { data: &input, channels: 2 }));
+        position += BLOCK as u64;
+    }
+    player.start_loop_calibration(&[1], &[1]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(player.loop_calibration_running());
+    assert!(player.start_hardware_probe(&[1], &[1]).is_err(), "one measurement at a time");
+    // Output channel 1 by sample position, as the cable carries it back.
+    let mut sent: std::collections::BTreeMap<u64, f32> = std::collections::BTreeMap::new();
+    let mut result = None;
+    for _ in 0..1_000 {
+        for f in 0..BLOCK {
+            let at = position + f as u64;
+            input[f * 2] = 0.0;
+            input[f * 2 + 1] = at.checked_sub(LOOP as u64).and_then(|k| sent.get(&k)).copied().unwrap_or(0.0);
+        }
+        assert!(fake.pump_capture_at(BLOCK, ab::Stamp::INVALID, Some(position), format, &mut SliceSource { data: &input, channels: 2 }));
+        assert!(fake.pump_render_at(BLOCK, ab::Stamp::INVALID, Some(position), &mut SliceSink { data: &mut output, channels: 2 }));
+        for (f, frame) in output.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(frame[0], 0.0, "the click plays on the send channel only");
+            sent.insert(position + f as u64, frame[1]);
+        }
+        player.service().unwrap();
+        position += BLOCK as u64;
+        if let Some(done) = player.loop_calibration_result() {
+            result = Some(done);
+            break;
+        }
+    }
+    let measured = result.expect("the measurement finished").expect("every click came back");
+    assert_eq!((measured.round_trip_frames, measured.spread_frames, measured.found), (LOOP as u32, 0, measured.sent));
+    assert!(!player.loop_calibration_running() && !player.loop_calibration_lacks_position());
+    let record = player.calibration_record(&measured).expect("a key");
+    assert_eq!((record.round_trip_frames, record.spread_frames, record.period, record.mode.as_str()), (1_065, 1, 256, "asio"));
+    let calibration = record.to_backend();
+    assert!(player.apply_calibration(calibration), "both running streams take it");
+    let live = fake.live_calibrations();
+    assert_eq!(live, [(ab::Direction::Output, calibration), (ab::Direction::Input, calibration)]);
+    assert_eq!(player.calibration, calibration);
+    // The next open finds it under the same key.
+    let cfg = AudioConfig { calibrations: vec![record], ..asio_config() };
+    drop(player);
+    let reopened = open_asio(&fake, &cfg);
+    assert_eq!(reopened.calibration, calibration);
+}
+
+/// A driver that reports no sample position cannot be measured this way; it is said, not hung.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_loop_measurement_without_sample_positions_says_so_and_is_refused_off_asio() {
+    use ab::fake::{SliceSink, SliceSource};
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let fake = ab::fake::FakeBackend::new(format).named("ASIO", "Focusrite USB ASIO").with_capture(2, true);
+    let player = open_asio(&fake, &asio_config());
+    player.start_loop_calibration(&[1], &[1]).unwrap();
+    let (mut output, input) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+    for _ in 0..4 {
+        fake.pump_capture(256, ab::Stamp::INVALID, format, &mut SliceSource { data: &input, channels: 2 });
+        fake.pump_render(256, ab::Stamp::INVALID, &mut SliceSink { data: &mut output, channels: 2 });
+    }
+    assert!(player.loop_calibration_lacks_position() && player.loop_calibration_result().is_none());
+    player.cancel_loop_calibration();
+    assert!(!player.loop_calibration_running());
+    // Not a native ASIO device: refused.
+    let wasapi = fake_factory(false).with_capture(2, true);
+    let other = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &wasapi, &fake_factory(false)).unwrap();
+    assert!(other.start_loop_calibration(&[1], &[1]).unwrap_err().contains("native ASIO"));
 }

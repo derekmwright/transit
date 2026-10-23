@@ -458,6 +458,8 @@ fn audio_patch_merges_fields_and_rejects_zero_atomically() {
             input_pairing: None,
             backend: Backend::Auto,
             calibrations: Vec::new(),
+            calibration_send: None,
+            calibration_return: None,
             share_device: true,
         }
     );

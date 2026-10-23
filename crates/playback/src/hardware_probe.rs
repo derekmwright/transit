@@ -59,7 +59,7 @@ pub fn click_template(rate: u32) -> Vec<f32> {
     samples
 }
 
-fn frames_of(rate: u32, ms: u64) -> u64 {
+pub(crate) fn frames_of(rate: u32, ms: u64) -> u64 {
     u64::from(rate) * ms / 1000
 }
 
