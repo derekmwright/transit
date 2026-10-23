@@ -122,6 +122,9 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 - Transport load readout (for example "30%  128 @ 48 kHz  ASIO") with an overload warning.
 - Piano roll with a velocity lane, and step entry: play notes on your keyboard to enter them at the cursor. Keys you play live are accented on the piano roll's keyboard. It shares the adaptive grid (Ctrl+1-4), with step-cursor keys and a fixed-velocity setting.
 - Freeze, Unfreeze and Flatten a track (the snowflake on the track header); a frozen track plays its rendered audio, with its key sources running.
+- Group tracks: Track > New Group Track or the "+ Group" quick-add; Ctrl+G folds the selected tracks into a group, Ctrl+Shift+G ungroups, and you can drag track headers into a folder. Edit Group… is the separate edit-group feature.
+- Fade and crossfade handles on audio clips: hover a top corner and drag for length (Shift: no snap), Alt-drag to bend, click for the shape menu, double-click to reset; right-click overlapping clips for Crossfade.
+- Clip-internal loops: drag the loop handle at a clip header's upper right to repeat the clip in cycles (dividers show each cycle; Alt-drag makes independent copies). Edits inside the loop apply to every cycle.
 
 ### Mixer and routing
 
@@ -136,6 +139,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 ### Instruments and effects
 
 - Hosts CLAP and VST3 plug-ins, with their own editor windows, saved state, and reported latency.
+- The plug-in window header has a preset dropdown (Save, Save As…, Load…, previous/next), Bypass and a menu (Reset, Copy/Paste state, Delete, Show in chain). User presets are `.vstpreset` files other hosts can read.
 - The device card shows Loading while a heavy plug-in instantiates.
 - Plug-ins load on a host thread, so a slow or stuck plug-in no longer freezes the UI: its slot reads "Loading…" while it instantiates and "Not responding" if it stops answering.
 - Plug-in browser with a background scan and your own search folders.
@@ -149,6 +153,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 
 - Play hosted instruments live from a USB controller; on Windows it uses the native WinMM driver.
 - Input without usable timestamps is still played, with approximate timing, rather than dropped.
+- External MIDI output per MIDI track: the mixer strip's Out button picks Instrument or a hardware MIDI port, a channel and a millisecond offset. Notes and controllers follow the playback clock (clip loops included), live input echoes while armed or monitoring, and All Notes Off is sent on stop, loop wrap, disarm, unplug and exit.
 - MIDI recording: arm an instrument track and record, with a count-in. Overdub merges into the clip under the pass. With a loop on, each lap is committed as a stacked take and recording continues; stopping mid-lap keeps the partial lap, and the status line reports the take count. Held notes are cut at the loop end and resume at the start of the next lap.
 - A MIDI take journal is written during the pass and kept until an autosave that holds the recording lands; after a crash, the next launch recovers it as a `<Track>_recovered` clip. Record works without a validated device clock: alignment is approximate, a take recorded that way says so, and when recording cannot start you get a plain-English reason.
 - A hosted plug-in that re-sends an unchanged parameter value no longer registers an automation touch; only a real change does.
@@ -162,6 +167,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 - Native WASAPI backend (build with the `native-wasapi` feature; pick it under Audio Devices > Backend), with a cpal fallback. It plays, captures (filling any lost packets with zeros, so a take keeps its length) and runs duplex: an input is paired with its output by device, chosen with the Paired input selector. It opens the device shared by default; a "Take exclusive control of the device" checkbox opens it exclusive instead (other apps are silenced while transit runs), and an exclusive open that fails steps down to shared, with a message, rather than failing silently. `audio-bench --backend wasapi` measures it. Verified on a Scarlett 2i2 in shared and exclusive mode (a Model 12 run is pending). On Windows, native WASAPI gives any interface a dependable, calibrated stereo path with no SDK and no extra driver install. How many channels it sees is decided by the vendor's WDM driver: the TASCAM Model 12 registers one stereo playback and one stereo recording endpoint, so WASAPI shows 2 in and 2 out on it in every mode, and individual channels cannot be recorded over WASAPI. Multichannel and tracking-grade latency on Windows are the ASIO path (a native ASIO backend is in progress).
 - Native ASIO backend (build with the `native-asio` feature; no Steinberg SDK and no LLVM): choose Audio system ASIO, then Backend > Native ASIO. It lists every installed driver and says which failed to load, opens every channel of the interface (all 12 inputs and 10 outputs of the TASCAM Model 12, named as the driver names them), plays, records and runs hardware inserts duplex, shows the buffer, sample format and latency the driver reports, and opens the driver's own settings (Driver settings). About 6 ms round trip on the Scarlett 2i2 at 64 samples.
 - Loopback calibration: `audio-bench --backend wasapi --loopback --settings` measures the interface's round trip and saves it, and the timing label then reads "calibrated". Over native ASIO the Calibration line in Audio Devices has a Measure button: a click through a cable from an output to an input times the loop at the current buffer size and rate, recordings are placed from it, and the driver's own latency figures are shown beside it (until then they are used; on the Scarlett 2i2 at 48 kHz they are within about 5 frames of the measured loop). Shared mode is not a low-latency path (about 248 ms round trip on the Scarlett 2i2); exclusive mode measured about 223 ms there (and about 276 ms, often silent, on a Model 12), and ASIO about 23 ms, so ASIO remains the tracking path on that interface.
+- `audio-bench --midi-roundtrip` measures MIDI-to-audio onset latency; the benchmarks page lists results for several interfaces.
 - Tracks, buses and sends route to any output path, with latency aligned across them.
 - Native ASIO recovers from a driver reset request (the driver changing its buffer size or sample rate) and reopens the device, and its audio thread runs at MMCSS Pro Audio priority.
 - The Calibration Measure button works per driver, sample rate and buffer size, and keeps a result for each combination.
