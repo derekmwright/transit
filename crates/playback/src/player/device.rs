@@ -1102,6 +1102,11 @@ impl Player {
     pub fn take_header_actions(&self) -> Vec<(TrackId, usize, soundcraft_dsp::HeaderAction)> {
         self.owner().map(|mut owner| owner.take_header_actions()).unwrap_or_default()
     }
+    /// The identity of the live instance in this slot (`None`: none). A job started for one
+    /// instance must not land on another that took the slot meanwhile (issue #68).
+    pub fn instance(&self, track: TrackId, slot: usize) -> Option<soundcraft_mix::SlotGen> {
+        self.owner().ok().and_then(|owner| owner.instance(track, slot))
+    }
     /// The live plug-in's own name in this slot (`None`: no live instance).
     pub fn live_name(&self, track: TrackId, slot: usize) -> Option<&'static str> {
         self.owner().ok().and_then(|owner| owner.live_name(track, slot))

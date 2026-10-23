@@ -383,6 +383,9 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn take_header_actions(&mut self) -> Vec<(TrackId, usize, soundcraft_dsp::HeaderAction)> {
         self.handles.take_header_actions()
     }
+    pub fn instance(&self, track: TrackId, slot: usize) -> Option<soundcraft_mix::SlotGen> {
+        self.handles.binding(track, slot).map(|b| b.2)
+    }
     pub fn live_name(&self, track: TrackId, slot: usize) -> Option<&'static str> {
         self.handles.live_name(track, slot)
     }

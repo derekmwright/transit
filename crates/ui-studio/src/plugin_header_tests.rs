@@ -139,11 +139,20 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
     let t = engine.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Stereo, Some("Drums"));
     let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
     // Save As picks a name the way the dialog would: "My Kit" in the folder offered.
+    // What the dialogs answer: Save As's file name, and the confirmations (and what they asked).
+    let name = std::sync::Arc::new(std::sync::Mutex::new("My Kit.vstpreset".to_string()));
+    let yes = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let questions = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (picked, answer, asked) = (std::sync::Arc::clone(&name), std::sync::Arc::clone(&yes), std::sync::Arc::clone(&questions));
     let services = Services {
         config_dir: Some(config.clone()),
-        pick_save: Some(Box::new(|default: &str| {
+        pick_save: Some(Box::new(move |default: &str| {
             let p = Path::new(default);
-            Some(p.with_file_name("My Kit.vstpreset").to_string_lossy().into_owned())
+            Some(p.with_file_name(picked.lock().unwrap().as_str()).to_string_lossy().into_owned())
+        })),
+        confirm: Some(Box::new(move |question: &str| {
+            asked.lock().unwrap().push(question.to_owned());
+            *answer.lock().unwrap()
         })),
         ..Services::default()
     };
@@ -232,10 +241,43 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
     assert_eq!(live(&mut app, &ctx, t, 1), state(0.75), "pasted: {}", app.status);
     assert_eq!(app.engine.session().tracks[0].mixer.inserts[1].as_ref().unwrap().preset, "My Kit");
 
-    // Bypass from the strip; Delete removes the preset file.
+    // A load whose slot is given another instance meanwhile: the result is dropped, not stored on
+    // the new insert (review note 8).
+    set_live(&mut app, &ctx, t, 1, state(0.25));
+    let mine = app.editor_header((t, 1)).unwrap().user.iter().position(|n| n == "My Kit").unwrap();
+    app.header_action(t, 1, HeaderAction::User(mine));
+    app.run("mix.insert_remove", serde_json::json!({"track": t.0, "slot": 1})).unwrap();
+    app.run("mix.insert", serde_json::json!({"track": t.0, "plugin": gain, "slot": 1})).unwrap();
+    let steps = app.engine.undo_history().len();
+    settle(&mut app, &ctx);
+    assert_eq!(app.status, "The plug-in in that slot changed while its preset loaded; nothing was stored");
+    assert_eq!(app.engine.undo_history().len(), steps, "no load step for the new insert");
+    let ins = app.engine.session().tracks[0].mixer.inserts[1].clone().unwrap();
+    assert_ne!(ins.preset, "My Kit", "the new insert was not given the old one's preset");
+    assert!(ins.state_bytes().is_none_or(|s| s != state(0.75)));
+
+    // Save As to a name the dialog showed without the extension: an existing preset under the
+    // extended name is not replaced; the save takes a numbered name (review note 10).
+    *name.lock().unwrap() = "My Kit".into();
+    let kit = std::fs::read(&file).unwrap();
+    app.header_action(t, 0, HeaderAction::SaveAs);
+    settle(&mut app, &ctx);
+    assert_eq!(std::fs::read(&file).unwrap(), kit, "My Kit untouched");
+    let second = soundcraft_engine::presets::path(&config, &gain, "My Kit 2").unwrap();
+    assert!(second.exists(), "saved as My Kit 2: {}", app.status);
+    std::fs::remove_file(&second).unwrap();
+    app.plugin_header = crate::plugin_header::HeaderState::default();
+    app.header_action(t, 0, HeaderAction::User(mine));
+    settle(&mut app, &ctx);
+
+    // Bypass from the strip; Delete asks first, and only a yes removes the preset file.
     app.header_action(t, 0, HeaderAction::Bypass);
     assert!(app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().bypass);
     assert!(app.editor_header((t, 0)).unwrap().bypassed);
+    app.header_action(t, 0, HeaderAction::Delete);
+    assert!(file.exists(), "answered no: kept");
+    assert!(questions.lock().unwrap()[0].contains("My Kit"), "{:?}", questions.lock().unwrap());
+    *yes.lock().unwrap() = true;
     app.header_action(t, 0, HeaderAction::Delete);
     assert!(!file.exists());
     let _ = std::fs::remove_dir_all(&config);

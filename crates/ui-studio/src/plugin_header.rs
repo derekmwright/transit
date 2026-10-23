@@ -19,12 +19,16 @@ use serde_json::{Map, Value, json};
 use soundcraft_dsp::{EditorHeader, HeaderAction, JobPoll, LoadedValues, StateJob};
 use soundcraft_engine::io::presets as files;
 use soundcraft_engine::presets;
+use soundcraft_mix::SlotGen;
 use soundcraft_model::{Insert, TrackId, b64};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// How often the user preset folders are listed again (another host may add presets).
 const LIST_EVERY_S: f64 = 2.0;
+
+/// Said when a job's slot holds another instance by the time it finishes: its result is dropped.
+const SLOT_CHANGED: &str = "The plug-in in that slot changed while its preset loaded; nothing was stored";
 
 /// The preset name a new insert starts with (`Insert::new`): shown as no preset.
 const NO_PRESET: &str = "<factory default>";
@@ -106,7 +110,22 @@ impl Step {
 struct Op {
     key: (TrackId, usize),
     plugin: String,
+    /// The live instance the job was started for: a result is dropped when another instance
+    /// (or another plug-in) has taken the slot since.
+    instance: Option<SlotGen>,
+    /// The insert the job was started for (its uid): a replaced insert drops the result too.
+    uid: u64,
     step: Step,
+}
+
+/// `path`, or when a file is there already, the first free "name 2.ext", "name 3.ext", ….
+fn unused_name(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    (2..10_000).map(|n| path.with_file_name(format!("{stem} {n}.{ext}"))).find(|p| !p.exists()).unwrap_or(path)
 }
 
 fn slot_json(slot: usize) -> Value {
@@ -240,7 +259,10 @@ impl StudioApp {
                     if let Some(ext) = presets::extension(&plugin)
                         && !path.extension().is_some_and(|x| x.eq_ignore_ascii_case(ext))
                     {
+                        // The dialog confirmed the name it showed, not this one: an existing
+                        // preset under it is never replaced unasked; the save takes a numbered name.
                         path.set_extension(ext);
+                        path = unused_name(path);
                     }
                     self.start_read(key, &plugin, Then::Save(path));
                 }
@@ -260,7 +282,10 @@ impl StudioApp {
             HeaderAction::Reset => {
                 let job = self.player.as_ref().map(|p| p.begin_default_state(&plugin, 2));
                 match job {
-                    Some(Ok(job)) => self.plugin_header.ops.push(Op { key, plugin, step: Step::Default { job } }),
+                    Some(Ok(job)) => {
+                        let instance = self.instance_at(key);
+                        self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Default { job } });
+                    }
                     Some(Err(e)) => self.status = format!("Reset: {e}"),
                     None => {}
                 }
@@ -274,6 +299,14 @@ impl StudioApp {
             }
             HeaderAction::Delete => {
                 if let Some(path) = current.and_then(|i| user.get(i)).and_then(|n| user_path(n)) {
+                    let question = format!("Delete the preset \u{201c}{}\u{201d}? This cannot be undone.", ins.preset);
+                    let Some(confirm) = self.services.confirm.as_ref() else {
+                        self.status = "Deleting a preset needs a confirmation dialog".into();
+                        return;
+                    };
+                    if !confirm(&question) {
+                        return;
+                    }
                     match self.engine.execute("plugin.preset_delete", &json!({"path": path.to_string_lossy()})) {
                         Ok(_) => self.status = format!("Deleted the preset \u{201c}{}\u{201d}", ins.preset),
                         Err(e) => self.status = format!("Preset: {e}"),
@@ -288,11 +321,32 @@ impl StudioApp {
         }
     }
 
+    /// The live instance in the slot at `key`.
+    fn instance_at(&self, key: (TrackId, usize)) -> Option<SlotGen> {
+        self.player.as_ref().and_then(|p| p.instance(key.0, key.1))
+    }
+
+    /// The uid of the insert at `key` (0: none).
+    fn uid_at(&self, key: (TrackId, usize)) -> u64 {
+        self.hosted_insert(key).map_or(0, |i| i.uid.get())
+    }
+
+    /// Whether the slot at `key` still holds the insert and the live instance of `plugin` a job
+    /// was started for.
+    fn still_holds(&self, key: (TrackId, usize), op: &Op) -> bool {
+        op.instance.is_some()
+            && self.instance_at(key) == op.instance
+            && self.hosted_insert(key).is_some_and(|i| i.plugin == op.plugin && i.uid.get() == op.uid)
+    }
+
     /// Starts reading the live state at `key`.
     fn start_read(&mut self, key: (TrackId, usize), plugin: &str, then: Then) {
+        let instance = self.instance_at(key);
         let Some(p) = &self.player else { return };
         match p.begin_save_state(key.0, key.1) {
-            Ok(job) => self.plugin_header.ops.push(Op { key, plugin: plugin.to_owned(), step: Step::Read { job, then } }),
+            Ok(job) => {
+                self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin: plugin.to_owned(), instance, step: Step::Read { job, then } })
+            }
             Err(e) => self.status = format!("Preset: {e}"),
         }
     }
@@ -303,16 +357,16 @@ impl StudioApp {
     }
 
     /// Loads `state` into the live instance at `key`.
-    fn start_live_load(&mut self, key: (TrackId, usize), plugin: String, state: Vec<u8>, source: Source) {
+    fn start_live_load(&mut self, key: (TrackId, usize), plugin: String, state: Vec<u8>, source: Source, instance: Option<SlotGen>) {
         let Some(p) = &self.player else { return };
         match p.begin_load_state(key.0, key.1, state) {
-            Ok(job) => self.plugin_header.ops.push(Op { key, plugin, step: Step::Load { job, source } }),
+            Ok(job) => self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Load { job, source } }),
             Err(e) => self.status = format!("Preset: {e}"),
         }
     }
 
     /// A finished live read.
-    fn read_done(&mut self, key: (TrackId, usize), plugin: String, state: Option<Vec<u8>>, then: Then) {
+    fn read_done(&mut self, key: (TrackId, usize), plugin: String, instance: Option<SlotGen>, state: Option<Vec<u8>>, then: Then) {
         let slot = slot_json(key.1);
         match then {
             Then::Save(path) => {
@@ -353,7 +407,7 @@ impl StudioApp {
                     },
                     Source::State { state, .. } => state.clone(),
                 };
-                self.start_live_load(key, plugin, data, source);
+                self.start_live_load(key, plugin, data, source, instance);
             }
         }
     }
@@ -396,10 +450,11 @@ impl StudioApp {
         for key in self.engine.take_state_restores() {
             let Some(state) = self.hosted_insert(key).and_then(|i| i.state_bytes()) else { continue };
             let plugin = self.hosted_insert(key).map(|i| i.plugin).unwrap_or_default();
-            if let Some(p) = &self.player
-                && let Ok(job) = p.begin_load_state(key.0, key.1, state)
-            {
-                self.plugin_header.ops.push(Op { key, plugin, step: Step::Restore { job } });
+            let instance = self.instance_at(key);
+            let Some(p) = &self.player else { continue };
+            match p.begin_load_state(key.0, key.1, state) {
+                Ok(job) => self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Restore { job } }),
+                Err(e) => self.status = format!("Could not give the plug-in its earlier state: {e}"),
             }
         }
         for mut op in std::mem::take(&mut self.plugin_header.ops) {
@@ -408,19 +463,26 @@ impl StudioApp {
                 Step::Read { ref mut job, .. } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
                     JobPoll::Ready(state) => {
+                        let holds = self.still_holds(key, &op);
                         let Step::Read { then, .. } = op.step else { continue };
-                        self.read_done(key, op.plugin, state, then);
+                        if !matches!(then, Then::Copy) && !holds {
+                            self.status = SLOT_CHANGED.into();
+                            continue;
+                        }
+                        self.read_done(key, op.plugin, op.instance, state, then);
                     }
                     JobPoll::Failed(e) => self.status = format!("Preset: {e}"),
                 },
                 Step::Default { ref mut job } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
+                    JobPoll::Ready(Some(_)) if !self.still_holds(key, &op) => self.status = SLOT_CHANGED.into(),
                     JobPoll::Ready(Some(state)) => self.start_load(key, &op.plugin, Source::State { state, name: "Default".into() }),
                     JobPoll::Ready(None) => self.status = "The plug-in has no default state to load".into(),
                     JobPoll::Failed(e) => self.status = format!("Reset: {e}"),
                 },
                 Step::Load { ref mut job, .. } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
+                    JobPoll::Ready(_) if !self.still_holds(key, &op) => self.status = SLOT_CHANGED.into(),
                     JobPoll::Ready(values) => {
                         let Step::Load { source, .. } = op.step else { continue };
                         self.load_done(key, values, source);
@@ -429,6 +491,7 @@ impl StudioApp {
                 },
                 Step::Restore { ref mut job } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
+                    JobPoll::Ready(Some(_)) if !self.still_holds(key, &op) => {}
                     JobPoll::Ready(Some(values)) => {
                         // The undone (or redone) step's parameters may not match the state it
                         // stored; the plug-in's own values after the load are the ones to keep.

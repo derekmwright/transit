@@ -276,6 +276,15 @@ fn services() -> Services {
             };
             d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())
         })),
+        confirm: Some(Box::new(|question: &str| {
+            rfd::MessageDialog::new()
+                .set_title("transit")
+                .set_description(question)
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .set_level(rfd::MessageLevel::Warning)
+                .show()
+                == rfd::MessageDialogResult::Yes
+        })),
         config_dir: config::config_dir(),
         open_audio: None,
         ..Services::default()

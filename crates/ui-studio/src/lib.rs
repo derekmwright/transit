@@ -201,6 +201,9 @@ impl Default for UiState {
 pub struct Services {
     pub pick_open: Option<Box<dyn Fn(&str) -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// Asks a yes/no question (deleting a plug-in preset, issue #68); `None`: such actions are
+    /// refused.
+    pub confirm: Option<Box<dyn Fn(&str) -> bool>>,
     /// The app's settings folder; user presets live under `presets/` in it. `None`: factory presets only.
     pub config_dir: Option<std::path::PathBuf>,
     /// Replaces the deferred launch open of the audio device (tests); `None`: the real open.
