@@ -19,6 +19,8 @@ const LOOP_ZONE_W: f32 = 20.0;
 /// (from under the header strip), in each top corner of the body.
 pub const FADE_ZONE_W: f32 = 18.0;
 pub const FADE_ZONE_H: f32 = 14.0;
+/// Room under the rows for the Add Track buttons: the gap, three rows of buttons, a margin.
+const ADD_STACK_H: f32 = 8.0 + 60.0 + 22.0 + 8.0;
 
 /// Most repeats one loop drag shows or lays down (the engine caps `clip.loop_to` at the same).
 const MAX_LOOP_REPEATS: usize = 1000;
@@ -302,7 +304,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let rows: Vec<&Track> = s.tracks.iter().filter(|t| shown(app, &s, t)).collect();
     app.arrange.order = rows.iter().map(|t| t.id).collect();
     let geo = RowGeo::new(app, &rows, rh);
-    let content_h = geo.total() + 60.0;
+    let content_h = geo.total() + ADD_STACK_H;
     app.finish.layout.takes.clear();
     app.finish.layout.chips.clear();
     app.arrange.vscroll = app.arrange.vscroll.clamp(0.0, (content_h - tl.height()).max(0.0));

@@ -141,6 +141,9 @@ pub enum Plan {
     None,
     /// Set the fades: (clip, side, fade) in order.
     Set(Vec<(ClipId, Side, Fade)>),
+    /// Dragged to nothing: remove this fade (`edit.fades_delete` over the clip), keeping the
+    /// clip's other fade.
+    Remove { clip: ClipId, track: TrackId, keep: Option<(Side, Fade)>, start: Samples, end: Samples },
     /// Dragged outward across the boundary of an abutting neighbor: a crossfade over
     /// `start..end` on `track` (`edit.fades_create`'s range form).
     Cross { track: TrackId, start: Samples, end: Samples },
@@ -185,6 +188,12 @@ pub fn plan(s: &Session, clip: ClipId, side: Side, len: Samples, alt: bool) -> P
         if abuts && is_audio(c) {
             return Plan::Cross { track, start: boundary.saturating_sub(d).max(0), end: boundary.saturating_add(d) };
         }
+    }
+    // To nothing: remove the fade, unless an overlapping neighbor would be trimmed by the delete.
+    if side.of(c).len > 0 && overlap(s, clip).is_none() {
+        let other = side.other();
+        let keep = Some(other).filter(|o| o.of(c).len > 0).map(|o| (o, o.of(c)));
+        return Plan::Remove { clip, track, keep, start: c.start, end: c.end() };
     }
     Plan::None
 }
@@ -244,7 +253,7 @@ pub(crate) fn commit(app: &mut StudioApp, live: &Live) {
             let s = app.engine.session();
             v.iter().any(|(c, side, f)| s.find_clip(*c).is_some_and(|x| side.of(x.1) != *f))
         }
-        Plan::Cross { .. } => true,
+        Plan::Cross { .. } | Plan::Remove { .. } => true,
     };
     if !changes {
         return;
@@ -254,6 +263,12 @@ pub(crate) fn commit(app: &mut StudioApp, live: &Live) {
             Plan::None => {}
             Plan::Set(v) => {
                 for (clip, side, fade) in v {
+                    app.engine.execute_merged("edit.fades_create", &set_params(clip, side, fade), key)?;
+                }
+            }
+            Plan::Remove { clip, track, keep, start, end } => {
+                app.engine.execute_merged("edit.fades_delete", &json!({"tracks": [track.0], "start": start, "end": end}), key)?;
+                if let Some((side, fade)) = keep {
                     app.engine.execute_merged("edit.fades_create", &set_params(clip, side, fade), key)?;
                 }
             }

@@ -3622,3 +3622,39 @@ fn dragging_a_fade_past_the_boundary_into_an_abutting_neighbor_makes_a_crossfade
     assert!(r.clip(b).fade_in.len > 0, "B fades in");
     assert_eq!(undo_len(&mut r.app), before + 1, "one undo step");
 }
+
+#[test]
+fn dragging_a_fade_to_nothing_removes_it_and_keeps_the_other_side() {
+    let mut r = fade_rig();
+    r.app.run("edit.fades_create", json!({"clip": r.clip.0, "side": "in", "length": r.bar})).unwrap();
+    r.app.run("edit.fades_create", json!({"clip": r.clip.0, "side": "out", "length": r.bar})).unwrap();
+    frames(&mut r.app, &r.ctx, 4, &mut r.time);
+    let r0 = r.rect(r.clip);
+    let h = r.handle(r.clip, true);
+    let before = undo_len(&mut r.app);
+    // The handle sits inside the fade: drag it back to the clip start.
+    r.go(h, (r0[0] - 4.0, h.1), json!({}));
+    let c = r.clip(r.clip);
+    assert_eq!(c.fade_in.len, 0, "the fade-in is gone");
+    assert_eq!(c.fade_out.len, r.bar, "the fade-out stays");
+    assert_eq!(undo_len(&mut r.app), before + 1, "one undo step");
+    r.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(r.clip(r.clip).fade_in.len, r.bar);
+}
+
+#[test]
+fn the_last_add_track_row_is_inside_the_scrollable_content_at_the_minimum_header_width() {
+    let mut app = StudioApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+    app.ui.header_width = 160.0;
+    app.ui.show_mixer = false;
+    app.ui.show_devices = false;
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    frames(&mut app, &ctx, 4, &mut time);
+    // Scroll to the bottom; the button rows must then be inside the track list.
+    app.arrange.vscroll = 1.0e6;
+    frames(&mut app, &ctx, 4, &mut time);
+    let l = &app.arrange.layout;
+    assert!(l.add_more[3] <= l.track_list[3], "the \"+ ...\" row {:?} is inside the list {:?}", l.add_more, l.track_list);
+    assert!(l.add_more[2] <= l.track_list[2] && l.add_group[2] <= l.track_list[2], "and inside its width");
+}
