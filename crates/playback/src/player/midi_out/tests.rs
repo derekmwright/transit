@@ -17,7 +17,7 @@ fn port_of(key: &PortKey) -> MidiOutPort {
 }
 
 fn destination(track: u64, key: &PortKey, channel: MidiOutChannel, offset_ms: i64) -> Destination {
-    Destination { track: TrackId(track), port: port_of(key), channel, offset_ns: offset_ms * 1_000_000 }
+    Destination { track: TrackId(track), port: port_of(key), channel, offset_ns: offset_ms * 1_000_000, echo: true }
 }
 
 fn message(track: u64, at_ns: u64, bytes: [u8; 3]) -> OutEvent {
@@ -180,8 +180,8 @@ fn a_port_absent_at_load_is_missing_and_sends_nothing_until_it_appears() {
     let absent = MidiOutPort { backend: "fake".into(), name: "Synth OUT".into(), ordinal: 0, id: "usb-synth".into() };
     let foreign = MidiOutPort { backend: "coremidi".into(), name: "Synth OUT".into(), ordinal: 0, id: String::new() };
     out.configure(vec![
-        Destination { track: TrackId(1), port: absent, channel: MidiOutChannel::AsRecorded, offset_ns: 0 },
-        Destination { track: TrackId(2), port: foreign, channel: MidiOutChannel::AsRecorded, offset_ns: 0 },
+        Destination { track: TrackId(1), port: absent, channel: MidiOutChannel::AsRecorded, offset_ns: 0, echo: true },
+        Destination { track: TrackId(2), port: foreign, channel: MidiOutChannel::AsRecorded, offset_ns: 0, echo: true },
     ]);
     until("both are missing", || {
         let s = out.status();
@@ -244,4 +244,39 @@ fn a_full_ring_keeps_room_for_releases() {
     assert!(playback.push(OutEvent { kind: Kind::Stop, ..OutEvent::default() }));
     assert_eq!(out.status().dropped, 1);
     assert_eq!(out.status().dropped_releases, 0);
+}
+
+#[test]
+fn disarming_ends_what_the_echo_holds_and_a_late_echo_cannot_start_a_note() {
+    // Refutation B1: the key-up and pedal-up of an echo cannot arrive after the route goes.
+    let mut rig = Rig::new(|key| vec![destination(3, key, MidiOutChannel::AsRecorded, 0)]);
+    assert!(rig.echo.push(message(3, 0, [0x90, 60, 100])));
+    assert!(rig.echo.push(message(3, 0, [0xB0, 64, 127])));
+    rig.wait_sent(2);
+    let disarmed = |key: &PortKey| vec![Destination { echo: false, ..destination(3, key, MidiOutChannel::AsRecorded, 0) }];
+    rig.out.configure(disarmed(&rig.key));
+    let sends = rig.wait_sent(4);
+    assert_eq!(sends.iter().skip(2).map(|s| s.message.clone()).collect::<Vec<_>>(), [vec![0x80, 60, 64], vec![0xB0, 64, 0]]);
+    // An echo still in flight from the revoked route may end things but not start them.
+    assert!(rig.echo.push(message(3, 0, [0x90, 62, 100])));
+    assert!(rig.echo.push(message(3, 0, [0x80, 60, 0])));
+    rig.wait_sent(5);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(rig.sent().last(), Some(&vec![0x80, 60, 0]));
+    assert!(!rig.sent().contains(&vec![0x90, 62, 100]));
+}
+
+#[test]
+fn a_revoked_echo_route_releases_its_notes_and_pedal_even_when_the_destination_is_unchanged() {
+    // Input change, channel filter change or the controller unplugged: still armed.
+    let mut rig = Rig::new(|key| vec![destination(4, key, MidiOutChannel::Channel(2), 0)]);
+    assert!(rig.echo.push(message(4, 0, [0x90, 60, 100])));
+    assert!(rig.echo.push(message(4, 0, [0xB0, 64, 127])));
+    rig.out.release_echo(TrackId(4));
+    // The note-on pushed before the release goes out before it, never after.
+    let sends = rig.wait_sent(4);
+    assert_eq!(
+        sends.iter().map(|s| s.message.clone()).collect::<Vec<_>>(),
+        [vec![0x92, 60, 100], vec![0xB2, 64, 127], vec![0x82, 60, 64], vec![0xB2, 64, 0]]
+    );
 }

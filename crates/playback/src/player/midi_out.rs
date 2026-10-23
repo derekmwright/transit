@@ -125,6 +125,9 @@ pub struct Destination {
     pub channel: MidiOutChannel,
     /// Added to every playback event's instant (not to echo).
     pub offset_ns: i64,
+    /// Live input is echoed (the track is armed or monitored). Going false ends what the echo
+    /// holds; while false, echoed note-ons and pedal-downs are not sent.
+    pub echo: bool,
 }
 
 impl Destination {
@@ -136,9 +139,13 @@ impl Destination {
             .iter()
             .filter(|t| t.kind.is_midi() && !t.inactive)
             .filter_map(|t| match &t.midi_output {
-                soundcraft_model::MidiOutput::External { port, channel, .. } => {
-                    Some(Self { track: t.id, port: port.clone(), channel: *channel, offset_ns: (f64::from(t.midi_output.offset_ms()) * 1e6) as i64 })
-                }
+                soundcraft_model::MidiOutput::External { port, channel, .. } => Some(Self {
+                    track: t.id,
+                    port: port.clone(),
+                    channel: *channel,
+                    offset_ns: (f64::from(t.midi_output.offset_ms()) * 1e6) as i64,
+                    echo: t.mixer.record_arm || t.mixer.input_monitor,
+                }),
                 soundcraft_model::MidiOutput::Internal => None,
             })
             .take(MAX_DESTINATIONS)
@@ -197,6 +204,8 @@ enum Control {
     Destinations(Vec<Destination>),
     /// All notes off now on every open destination (Stop and the panic button, from Main).
     Panic,
+    /// An echo route of this track was revoked: end every note and pedal its echo holds.
+    ReleaseEcho(TrackId),
 }
 
 #[derive(Default)]
@@ -287,6 +296,17 @@ impl Out {
             }
             // Full: try again at the next service; the thread drains the queue every millisecond.
             Err(_) => self.error = Some("MIDI output control queue is full".into()),
+        }
+    }
+
+    /// Ends every note and pedal live input holds on `track`'s destination. Main calls it when
+    /// it revokes an echo route, since the key-up can no longer arrive.
+    pub fn release_echo(&self, track: TrackId) {
+        if self.control.try_send(Control::ReleaseEcho(track)).is_ok() {
+            self.wake();
+        } else {
+            // The queue is full of unprocessed updates; Stop or the panic still releases.
+            log::warn!("MIDI output control queue is full; echo release for track {} skipped", track.0);
         }
     }
 
@@ -477,9 +497,15 @@ impl Worker {
 
     fn wait(&self) {
         let Some(next) = self.pending.first().map(|p| p.deadline) else {
-            // `sleep` uses a high-resolution timer on Windows; a park timeout rounds to the
-            // system timer tick, which can be 15.6 ms.
-            std::thread::sleep(Duration::from_millis(1));
+            if self.tracks.is_empty() {
+                // No external destination: nothing on the rings needs sending. Wake for the port
+                // poll (the picker's list), or when Main configures, panics or stops.
+                std::thread::park_timeout(PORT_POLL);
+            } else {
+                // `sleep` uses a high-resolution timer on Windows; a park timeout rounds to the
+                // system timer tick, which can be 15.6 ms.
+                std::thread::sleep(Duration::from_millis(1));
+            }
             return;
         };
         let now = self.now();
@@ -500,6 +526,18 @@ impl Worker {
                     self.pending.retain(|p| p.origin == Origin::Echo);
                     self.release_all(true);
                 }
+                Ok(Control::ReleaseEcho(track)) => {
+                    // Echo the route already pushed goes out first, so its note-on cannot follow
+                    // the release.
+                    self.drain();
+                    self.send_due();
+                    if let Some(i) = self.tracks.iter().position(|t| t.destination.track == track)
+                        && let Some(mut t) = self.take_track(i)
+                    {
+                        self.release_track(&mut t, Some(Origin::Echo), false);
+                        self.put_track(i, t);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.shared.stop.store(true, Ordering::Release);
@@ -517,6 +555,10 @@ impl Worker {
         for mut track in old {
             match destinations.iter().find(|d| d.track == track.destination.track) {
                 Some(d) if d.port == track.destination.port && d.channel == track.destination.channel => {
+                    if track.destination.echo && !d.echo {
+                        // Disarmed or unmonitored: the key-up will not be echoed.
+                        self.release_track(&mut track, Some(Origin::Echo), false);
+                    }
                     track.destination = d.clone();
                     kept.push(track);
                 }
@@ -615,10 +657,15 @@ impl Worker {
                     self.dirty = true;
                 }
                 // Disconnections flagged by this poll are handled by check_lost; a returning
-                // port reopens here. A failed open is retried only when ports change.
+                // port reopens here.
                 self.check_lost();
-                if added || self.ports.iter().any(|p| p.handle.is_none() && p.state == DestinationState::Pending) {
-                    self.open_missing(added);
+                // A used port without a handle is retried on every poll, not only when the port
+                // list changes: an old output thread stuck in a driver at a device reopen may
+                // still hold it, and the open succeeds once that thread lets go.
+                let unopened =
+                    self.ports.iter().enumerate().any(|(i, p)| p.handle.is_none() && !p.foreign && self.tracks.iter().any(|t| t.port == i));
+                if added || unopened {
+                    self.open_missing(true);
                 }
             }
             Err(error) => {
@@ -750,6 +797,10 @@ impl Worker {
             return;
         }
         if origin == Origin::Echo {
+            // A late echo for a track no longer armed or monitored may only end things.
+            if !track.destination.echo && !transit_midi_io::is_release(event.message()) {
+                return;
+            }
             bytes[0] = (status & 0xF0) | track.destination.channel.resolve(status & 0x0F);
         }
         let message = bytes.get(..usize::from(event.len).min(3)).unwrap_or(&[]);

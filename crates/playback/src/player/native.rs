@@ -307,6 +307,7 @@ impl Native {
             if owner.source_status(*request) == Ok(sources::State::Revoked) { owner.release_source(*request).is_err() } else { true }
         });
         self.out.configure(midi_out::Destination::of_session(owner.requested_session()));
+        let mut echo_revoked = Vec::new();
         let routes: Vec<_> = owner
             .requested_session()
             .tracks
@@ -339,6 +340,12 @@ impl Native {
                 if present && !input.failed && !input.lost && binding.port.admitted() && routes.contains(&binding.route) {
                     return true;
                 }
+                // The key-up for a note this route echoed can no longer reach the output thread
+                // (disarm, monitor off, input or filter change, input unplugged): end what the
+                // echo holds, as revoking the source does for an instrument.
+                if binding.route.echo && !echo_revoked.contains(&binding.route.target.0) {
+                    echo_revoked.push(binding.route.target.0);
+                }
                 binding.port.invalidate();
                 if let Ok(request) = owner.revoke_source(binding.port.token()) {
                     self.retired.push(request);
@@ -350,6 +357,9 @@ impl Native {
                 input.closed = true;
                 input.attached = None;
             }
+        }
+        for track in echo_revoked {
+            self.out.release_echo(track);
         }
         // Failed opens remain visible until a reconnect or a port identity change;
         // do not spin native opens at UI repaint frequency.

@@ -129,3 +129,46 @@ fn live_input_on_an_armed_external_track_is_echoed_without_an_instrument() {
     assert!(fake.input_port(&input).unwrap().deliver(1_000, &[0x80, 60, 0]));
     until("the echoed release", || fake.sent(&key).contains(&vec![0x81, 60, 0]));
 }
+
+/// Refutation B1, through the Player: a key and the sustain pedal held through the echo when the
+/// track stops echoing (`disarm`) or its controller is unplugged (`unplug`).
+fn held_echo_is_released(unplug: bool) {
+    let fake = Fake::default();
+    let (mut s, track, key) = session(&fake);
+    let input = fake.add_input("Keys");
+    s.track_mut(track).unwrap().mixer.record_arm = true;
+    let (mut player, access, _clock) = Player::prepare(Arc::new(s.clone()), 48_000, soundcraft_model::IoMap::default()).unwrap();
+    player.midi.get_mut().as_mut().unwrap().enable(fake.io());
+    let mut callback = DeviceOutput::new(access, &player, 2);
+    until("ready", || {
+        player.service().unwrap();
+        callback.fill_f32(&mut [0.0f32; 256]);
+        let status = player.midi_status().unwrap();
+        status.routes == 1 && status.output.track(track) == Some(&crate::player::midi_out::DestinationState::Connected)
+    });
+    assert!(fake.input_port(&input).unwrap().deliver(0, &[0x90, 60, 100, 0xB0, 64, 127]));
+    until("echo", || fake.sent(&key).contains(&vec![0x90, 60, 100]) && fake.sent(&key).contains(&vec![0xB0, 64, 127]));
+    if unplug {
+        fake.remove_input(&input);
+    } else {
+        s.track_mut(track).unwrap().mixer.record_arm = false;
+        player.update_session(Arc::new(s)).unwrap();
+    }
+    until("the held note and pedal end on the port", || {
+        player.service().unwrap();
+        callback.fill_f32(&mut [0.0f32; 256]);
+        let sent = fake.sent(&key);
+        sent.contains(&vec![0x80, 60, 64]) && sent.contains(&vec![0xB0, 64, 0])
+    });
+    assert_eq!(player.midi_status().unwrap().output.audio_thread_sends, 0);
+}
+
+#[test]
+fn disarming_while_a_key_and_the_pedal_are_held_releases_them_on_the_port() {
+    held_echo_is_released(false);
+}
+
+#[test]
+fn unplugging_the_controller_while_a_key_and_the_pedal_are_held_releases_them_on_the_port() {
+    held_echo_is_released(true);
+}
