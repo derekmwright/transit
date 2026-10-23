@@ -1673,6 +1673,13 @@ pub fn mark_audio_thread() {
     AUDIO_THREAD.set(true);
 }
 
+/// Takes the mark of [`mark_audio_thread`] off the calling thread. For a thread that stood in for
+/// the audio callback for a while (device-free test stepping) and then goes back to being an
+/// ordinary thread, whose panics and log records must then be reported normally.
+pub fn unmark_audio_thread() {
+    AUDIO_THREAD.set(false);
+}
+
 /// True on the thread [`mark_audio_thread`] marked, and on a worker while it renders strips for
 /// it. Lock-free and allocation-free.
 pub fn on_audio_thread() -> bool {

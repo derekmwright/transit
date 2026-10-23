@@ -168,11 +168,18 @@ impl Player {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn step_device_free(&self) {
+        // The caller's thread is the audio thread for this block only: left marked, its later
+        // panics would be swallowed by the engine's audio-thread panic hook (no message at all
+        // for a failing test) and its log records deferred.
+        let was = crate::on_audio_thread();
         crate::mark_audio_thread();
         if let Ok(mut output) = self.test_output.try_borrow_mut()
             && let Some(output) = output.as_mut()
         {
             output.fill_f32(&mut [0.0f32; 1024]);
+        }
+        if !was {
+            soundcraft_mix::unmark_audio_thread();
         }
     }
 
