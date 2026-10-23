@@ -18,9 +18,12 @@ fn disabled_by(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// "v0.2.0-alpha.2" or "0.2.0-alpha.2" as a version; `None` for anything else.
+/// "v0.2.0-alpha.2" or "0.2.0-alpha.2" as a version; `None` for anything else. Build metadata
+/// (`+x`) is dropped: it never makes a release newer.
 fn parse_tag(tag: &str) -> Option<Version> {
-    Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
+    let mut v = Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()?;
+    v.build = semver::BuildMetadata::EMPTY;
+    Some(v)
 }
 
 /// The highest release newer than `current` in a releases-list answer. Drafts and malformed tags
@@ -48,8 +51,12 @@ pub fn newest_newer(current: &Version, releases: &serde_json::Value) -> Option<U
 
 /// One request to `url`, judged against `running`.
 pub fn check(url: &str, running: &str) -> UpdateOutcome {
-    let Ok(current) = Version::parse(running) else { return UpdateOutcome::Failed };
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).user_agent(concat!("transit/", env!("CARGO_PKG_VERSION"))).build();
+    let Some(current) = parse_tag(running) else { return UpdateOutcome::Failed };
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("transit/", env!("CARGO_PKG_VERSION")))
+        .build();
     let fetched = agent.get(url).set("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string());
     let body = match fetched.and_then(|r| r.into_string().map_err(|e| e.to_string())) {
         Ok(b) => b,

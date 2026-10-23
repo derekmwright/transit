@@ -7,6 +7,8 @@ use soundcraft_time::{GridValue, NoteValue, TimeFormat};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        // Help > Check for Updates...: the studio app answers it (it owns the network service); listed here for agents.
+        cmd!(view "help.check_updates", "Check for Updates...", [], None, "{}", always, |_, _| Err(bad("help.check_updates", "runs in the transit app only"))),
         cmd!(view "view.zoom_in", "Zoom In", [], Some("Cmd+]"), "{}", always, |e, _| zoom(e, 0.5, None)),
         cmd!(view "view.zoom_out", "Zoom Out", [], Some("Cmd+["), "{}", always, |e, _| zoom(e, 2.0, None)),
         cmd!(view "view.zoom_by", "Zoom By", [], None, "{factor: >1 zooms in, x?: px into the timeline to hold (else the insertion point if on screen)}", always, |e, p| {

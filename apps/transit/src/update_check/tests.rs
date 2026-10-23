@@ -13,13 +13,16 @@ const RUNNING: &str = "0.2.0-alpha.1";
 struct Fake {
     url: String,
     hits: Arc<AtomicUsize>,
+    /// The request heads the server received.
+    heads: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn fake(status: &str, body: &str) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/releases", listener.local_addr().unwrap());
     let hits = Arc::new(AtomicUsize::new(0));
-    let (count, status, body) = (hits.clone(), status.to_string(), body.to_string());
+    let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (count, status, body, log) = (hits.clone(), status.to_string(), body.to_string(), heads.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
@@ -32,12 +35,13 @@ fn fake(status: &str, body: &str) -> Fake {
                     Ok(n) => seen.extend_from_slice(&buf[..n]),
                 }
             }
+            log.lock().unwrap().push(String::from_utf8_lossy(&seen).into_owned());
             let reply =
                 format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(reply.as_bytes());
         }
     });
-    Fake { url, hits }
+    Fake { url, hits, heads }
 }
 
 const NEWER: &str = r#"[
@@ -105,6 +109,39 @@ fn fetch_finds_a_newer_release() {
         other => panic!("{other:?}"),
     }
     assert_eq!(f.hits.load(Ordering::SeqCst), 1);
+    let head = f.heads.lock().unwrap()[0].to_ascii_lowercase();
+    assert!(head.starts_with("get /releases "), "{head}");
+    let want = format!("user-agent: transit/{}", env!("CARGO_PKG_VERSION"));
+    assert!(head.lines().any(|l| l.trim_end() == want), "{head}");
+}
+
+#[test]
+fn ten_is_newer_than_nine_and_build_metadata_is_ignored() {
+    assert_eq!(newest_newer(&v("0.9.9"), &releases(&["v0.10.0"])).unwrap().version, "0.10.0");
+    assert_eq!(newest_newer(&v("0.10.0"), &releases(&["v0.9.9"])), None);
+    assert_eq!(newest_newer(&v("0.2.0"), &releases(&["v0.2.0+x"])), None);
+    assert_eq!(newest_newer(&v("0.2.0"), &releases(&["v0.2.0+x", "v0.2.1+y"])).unwrap().version, "0.2.1");
+}
+
+#[test]
+fn a_launch_check_is_due_when_missing_in_the_future_or_a_day_old() {
+    let day = update::CHECK_INTERVAL_SECS;
+    assert!(update::check_due(0, 1_000_000));
+    assert!(update::check_due(2_000_000, 1_000_000), "a timestamp in the future");
+    assert!(update::check_due(1_000_000 - day, 1_000_000));
+    assert!(!update::check_due(1_000_000 - day + 1, 1_000_000));
+    assert!(!update::check_due(1_000_000, 1_000_000));
+}
+
+#[test]
+fn a_future_timestamp_still_runs_the_launch_check() {
+    let f = fake("200 OK", NEWER);
+    let mut app = studio(&f.url);
+    app.ui.last_update_check = u64::MAX / 2;
+    app.update_tick(&egui::Context::default());
+    settle(&mut app);
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1);
+    assert!(app.ui.last_update_check < u64::MAX / 2);
 }
 
 #[test]

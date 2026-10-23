@@ -64,6 +64,12 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// A launch check is due when none is recorded, the record is in the future (a clock that was set
+/// forward and corrected, or a damaged file), or the last one is a day old.
+pub fn check_due(last: u64, now: u64) -> bool {
+    last == 0 || last > now || now - last >= CHECK_INTERVAL_SECS
+}
+
 impl StudioApp {
     /// Why Help > Check for Updates is unavailable, or `None` when it works.
     pub fn update_check_unavailable(&self) -> Option<&'static str> {
@@ -102,8 +108,7 @@ impl StudioApp {
     pub fn update_tick(&mut self, ctx: &egui::Context) {
         if !self.update.auto_done && !self.splash.visible && self.services.update_check.is_some() {
             self.update.auto_done = true;
-            let due = now().saturating_sub(self.ui.last_update_check) >= CHECK_INTERVAL_SECS;
-            if self.ui.check_for_updates && due {
+            if self.ui.check_for_updates && check_due(self.ui.last_update_check, now()) {
                 self.start_update_check(false);
             }
         }
