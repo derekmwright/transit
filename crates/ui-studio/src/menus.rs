@@ -270,6 +270,19 @@ pub fn menu_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
                         ui.close();
                     }
                     ui.separator();
+                    let why = app.update_check_unavailable();
+                    let b = ui.add_enabled(why.is_none(), egui::Button::new("Check for Updates…")).on_disabled_hover_text(why.unwrap_or_default());
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Check for Updates…".into(), String::new(), b.rect));
+                    if b.clicked() {
+                        let _ = app.run("help.check_updates", json!({}));
+                        ui.close();
+                    }
+                    let b = ui
+                        .add_enabled(why.is_none(), egui::Checkbox::new(&mut app.ui.check_for_updates, "Check for New Versions on Launch"))
+                        .on_hover_text(crate::update::PRIVACY)
+                        .on_disabled_hover_text(why.unwrap_or_default());
+                    app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "Check for New Versions on Launch".into(), String::new(), b.rect));
+                    ui.separator();
                     let b = ui.button("About transit…");
                     app.arrange.bar_menu.push(crate::mixer::MenuItem::at(ui, "About transit…".into(), String::new(), b.rect));
                     if b.clicked() {
@@ -294,6 +307,10 @@ pub fn status_bar(app: &mut StudioApp, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(egui::RichText::new(&app.status).color(TOKENS.text_dim).size(11.5));
+                if let Some(n) = app.update.notice.clone() {
+                    ui.add_space(crate::theme::SPACE);
+                    crate::update::notice_line(ui, &n);
+                }
                 if let Some(w) = app.io_warning() {
                     ui.add_space(crate::theme::SPACE);
                     let (r, _) = ui.allocate_exact_size(egui::vec2(crate::icons::ICON, crate::icons::ICON), egui::Sense::hover());

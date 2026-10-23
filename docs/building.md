@@ -28,6 +28,12 @@ transit keeps `ui.json`, `Autosave/` and `logs/` in its own settings folder:
 Set `TRANSIT_CONFIG_DIR` to use a different folder, for example to keep a test build away from your
 real settings. The plug-in scan cache is shared with the inherited soundcraft apps (`SOUNDCRAFT_CONFIG_DIR` overrides).
 
+## The update check
+
+transit checks once a day, after the splash, whether a newer release exists (Help > Check for Updates… runs it on demand). The check is a single anonymous request to GitHub's public API (`api.github.com/repos/derekmwright/transit/releases`); nothing else is sent, and nothing is downloaded or installed. Turn it off with Help > Check for New Versions on Launch, or set `TRANSIT_NO_UPDATE_CHECK=1` (CI, tests, packagers; this also disables the Help entry).
+
+The code is behind the Cargo feature `update-check` of the `transit` app, on by default (it brings `ureq` on rustls, no OpenSSL). Headless and distro builds can leave it out: `cargo build -p transit --no-default-features --features native-wasapi,native-asio` has no HTTP dependency.
+
 ## Packaging
 
 `packaging/` holds the per-platform scripts, all building `-p transit` and reading the version from

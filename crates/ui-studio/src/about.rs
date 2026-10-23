@@ -83,6 +83,9 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 s.version = version.clone();
                 ui.label(egui::RichText::new(&s.version).strong().size(16.0).color(TOKENS.text));
                 ui.add_space(SPACE / 2.0);
+                if let Some(n) = &app.update.notice {
+                    crate::update::notice_line(ui, n);
+                }
                 s.repo = REPO_URL.to_string();
                 ui.hyperlink_to(REPO_LINK, REPO_URL);
                 s.credit = CREDIT.to_string();
@@ -91,6 +94,7 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 ui.add_space(SPACE / 2.0);
                 s.licenses = LICENSES.to_string();
                 ui.label(egui::RichText::new(format!("Licensed {LICENSES}")).color(TOKENS.text_dim));
+                ui.label(egui::RichText::new(crate::update::PRIVACY).color(TOKENS.text_dim).size(11.0));
                 ui.add_space(SPACE);
                 ui.horizontal(|ui| {
                     let copy = ui.button("Copy version info");

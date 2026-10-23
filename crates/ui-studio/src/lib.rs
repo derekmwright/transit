@@ -45,6 +45,7 @@ pub mod telemetry;
 pub mod tempo_edit;
 pub mod theme;
 pub mod transport;
+pub mod update;
 pub mod waveform;
 pub mod widgets;
 
@@ -132,6 +133,11 @@ pub struct UiState {
     /// Automation > Thin after write (follow-ups): when a write pass ends, `automation.thin`
     /// runs on the tracks it wrote, as part of the pass's undo step. A preference.
     pub thin_after_write: bool,
+    /// Help > Check for New Versions on Launch: at most once a day, one anonymous request to
+    /// GitHub's public API (see [`update`]). A preference.
+    pub check_for_updates: bool,
+    /// When the last update check started (seconds since the Unix epoch; 0: never).
+    pub last_update_check: u64,
     /// Tracks whose take lanes are shown (slice 6). View state of the open session, never in the
     /// document; the lanes it opens are in `ui.inspect`'s slice 6 layout.
     #[serde(skip)]
@@ -177,6 +183,8 @@ impl Default for UiState {
             count_in_bars: 1,
             metronome_db: 0.0,
             thin_after_write: true,
+            check_for_updates: true,
+            last_update_check: 0,
             takes_open: Vec::new(),
             show_history: false,
             auto_shown: Vec::new(),
@@ -194,6 +202,10 @@ pub struct Services {
     pub config_dir: Option<std::path::PathBuf>,
     /// Replaces the deferred launch open of the audio device (tests); `None`: the real open.
     pub open_audio: Option<Box<dyn Fn(std::sync::Arc<soundcraft_model::Session>, &soundcraft_playback::AudioConfig) -> Player>>,
+    /// Starts a new-version check (the app's, behind its `update-check` feature); `None`: no check.
+    pub update_check: Option<update::UpdateCheck>,
+    /// The check is off because `TRANSIT_NO_UPDATE_CHECK` is set (says why in the Help menu).
+    pub update_off_by_env: bool,
 }
 
 /// Ballistic meter display state (copied from `soundcraft-ui-egui`, see [`host::feed_meter`]).
@@ -340,6 +352,8 @@ pub struct StudioApp {
     pub shortcuts_window: menus::ShortcutsLayout,
     /// Help > About transit: open flag and last frame's layout.
     pub about: about::AboutState,
+    /// The new-version notice and the check behind it.
+    pub update: update::UpdateState,
     /// The launch splash (shown while plug-ins scan or the first device opens).
     pub splash: splash::SplashState,
     /// The output-callback telemetry readout and its window (polled a few times a second).
@@ -427,6 +441,7 @@ impl StudioApp {
             imports: import::ImportQueue::default(),
             shortcuts_window: menus::ShortcutsLayout::default(),
             about: about::AboutState::default(),
+            update: update::UpdateState::default(),
             splash: splash::SplashState::default(),
             telemetry: telemetry::TelemetryState::default(),
             finish: finish::FinishState::default(),
@@ -500,6 +515,10 @@ impl StudioApp {
         }
         if id == "ui.set" {
             return self.set_ui(&params);
+        }
+        if id == "help.check_updates" {
+            self.check_for_updates_now()?;
+            return Ok(json!({"checking": true}));
         }
         if id == "io.measure_hardware_latency" {
             return self.measure_hardware_latency(&params);
@@ -891,6 +910,7 @@ impl StudioApp {
         menus::shortcuts(self, &ctx);
         menus::menu_bar(self, ui);
         transport::bar(self, ui);
+        self.update_tick(&ctx);
         menus::status_bar(self, ui);
         browser::panel(self, ui); // slice 4: left of the panes and the arrangement
         // Slice 3: the piano roll replaces the mixer and device chain panes while it is open.
@@ -951,6 +971,8 @@ impl StudioApp {
             "editors_open": open,
             "main_meter": self.main_meter.level,
             "status": self.status,
+            "update_notice": self.update.notice,
+            "update_checking": self.update.checking(),
             "layout": self.arrange.layout,
             "focus_track": self.focus_track(),
             "mixer": self.mixer.layout,

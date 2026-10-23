@@ -17,6 +17,8 @@ mod control_server;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
+#[cfg(all(feature = "update-check", not(target_arch = "wasm32")))]
+mod update_check;
 
 #[cfg(test)]
 mod audio_review_tests;
@@ -262,8 +264,19 @@ fn services() -> Services {
         })),
         config_dir: config::config_dir(),
         open_audio: None,
+        ..Services::default()
     }
 }
+
+/// The new-version check (feature `update-check`); the studio decides when to run it.
+#[cfg(all(feature = "update-check", not(target_arch = "wasm32")))]
+fn install_update_check(services: &mut Services, ctx: &egui::Context) {
+    services.update_check = update_check::for_app(ctx);
+    services.update_off_by_env = update_check::disabled_by_env();
+}
+
+#[cfg(not(all(feature = "update-check", not(target_arch = "wasm32"))))]
+fn install_update_check(_services: &mut Services, _ctx: &egui::Context) {}
 
 /// A saved window size, or the default when the prefs file holds nonsense.
 fn sane_window_size([w, h]: [f32; 2]) -> [f32; 2] {
@@ -392,6 +405,7 @@ fn main() -> eframe::Result {
             let cache = config::soundcraft_dir().filter(|_| prefs_enabled());
             transit_ui_studio::plugin_scan::start(&app.ui.plugin_dirs, cache.as_deref(), std::env::current_exe().ok());
             app.splash.arm();
+            install_update_check(&mut app.services, &cc.egui_ctx);
             app.about.app_version = env!("CARGO_PKG_VERSION").to_string();
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
