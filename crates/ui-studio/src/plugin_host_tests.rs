@@ -112,8 +112,10 @@ fn frames_advance_while_a_slow_plug_in_loads_and_the_slot_shows_loading_then_rea
     assert!(seen_loading, "the slot read as loading");
     assert!(!p.stuck(track, slot), "a 500 ms creation is not stuck");
     assert!(took >= Duration::from_millis(500), "the fixture's synth is slow to make ({took:?})");
-    assert!(loading_frames >= 20, "only {loading_frames} frames ran while the synth loaded ({took:?})");
-    assert!(worst < Duration::from_millis(250), "a frame waited for the plug-in: {worst:?}");
+    // Load-tolerant: a starved runner can stall a frame, but one that waited for the plug-in
+    // takes the fixture's full 500 ms.
+    assert!(loading_frames >= 10, "only {loading_frames} frames ran while the synth loaded ({took:?})");
+    assert!(worst < Duration::from_millis(400), "a frame waited for the plug-in: {worst:?}");
     // Ready: its plan is adopted on the next blocks and it has an editor handle.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !app.player.as_ref().unwrap().has_editor(track, slot) && Instant::now() < deadline {

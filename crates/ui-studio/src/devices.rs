@@ -476,7 +476,7 @@ fn card_body(
     crate::icons::paint(&pc, pos2(x0 + 6.0, eb.center().y), Icon::OpenEditor, 12.0, ink);
     pc.text(pos2(x0 + 16.0, eb.center().y), Align2::LEFT_CENTER, label, font, ink);
     let tip = if stuck && !builtin {
-        "The plug-in did not finish loading within 10 s and was left out; remove it and add it again, or reopen the session, to retry"
+        "The plug-in did not finish loading within 10 s and was left out; remove it and add it again to retry"
     } else if loading && !builtin {
         "The plug-in is still loading; its editor opens when it is ready"
     } else if !enabled {

@@ -335,7 +335,7 @@ pub struct StudioApp {
     /// as a clip click, a lane click or Select All, clears it. View state, not the document.
     pub tracks_selected_by_header: bool,
     editors: Vec<EditorWanted>,
-    /// Plug-in host threads already reported as wedged in the status line (ADR 0018).
+    /// Plug-in host threads not responding, as last reported in the status line (ADR 0018).
     host_wedged_shown: usize,
     /// The arrangement: gesture in progress, scroll, and last frame's layout (for `ui.inspect`).
     pub arrange: arrange::ArrangeState,
@@ -746,14 +746,17 @@ impl StudioApp {
             self.status = format!("Plug-in editor: {e}");
         }
         let wedged = p.plugin_host_wedged();
+        let stuck = p.any_stuck();
         if wedged > self.host_wedged_shown {
-            self.host_wedged_shown = wedged;
-            self.status = if p.any_stuck() {
-                "A plug-in did not finish loading within 10 s and was left out (Not responding); remove it and add it again, or reopen the session, to retry".into()
+            self.status = if stuck {
+                "A plug-in did not finish loading within 10 s and was left out (Not responding); remove it and add it again to retry".into()
             } else {
-                "A plug-in stopped responding; its editor and state can no longer be reached until the session is reopened".into()
+                "A plug-in is not responding; the live state of the plug-ins on its thread is not saved until it responds again".into()
             };
+        } else if wedged == 0 && self.host_wedged_shown > 0 {
+            self.status = "The plug-in that was not responding has returned; its state is saved again".into();
         }
+        self.host_wedged_shown = wedged;
     }
 
     pub fn is_playing(&self) -> bool {
