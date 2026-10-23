@@ -70,6 +70,8 @@ pub struct AudioDevicesLayout {
     pub io: Option<soundcraft_model::IoMap>,
     /// The Calibration line (only under a native backend: under the Paired input for WASAPI).
     pub calibration: Option<String>,
+    /// The native ASIO Calibration line's Measure, as drawn.
+    pub calibration_measure: CalibrationLayout,
     /// The drivers of the chosen system that failed to load, as said under the Output list
     /// (native ASIO's per-driver diagnostics).
     pub diagnostics: Vec<String>,
@@ -78,6 +80,27 @@ pub struct AudioDevicesLayout {
     pub listing: Option<String>,
     /// The Hardware inserts subsection as drawn.
     pub hardware: crate::audio_devices_io::HardwareLayout,
+}
+
+/// The native ASIO Calibration line's Measure as drawn, for `ui.inspect` and tests.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CalibrationLayout {
+    /// Why Measure is off; empty when it can run (or when the line is not drawn).
+    pub blocked: String,
+    /// The output path the click plays on and the input path it is found on.
+    pub send: String,
+    pub ret: String,
+    /// "Measuring… <n>/<total> clicks" while it runs; empty otherwise.
+    pub progress: String,
+    /// What the last measurement said.
+    pub result: String,
+}
+
+/// What the Calibration line's Measure asks for this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CalibrationAction {
+    Measure { send: String, ret: String },
+    Cancel,
 }
 
 /// Devices standing in for the machine's (the control channel's `audio.fake_devices`, tests):
@@ -127,8 +150,15 @@ pub struct AudioDevicesState {
     io_editor: crate::audio_devices_io::IoEditor,
     /// The measurement the Hardware inserts Measure started and has not collected yet.
     pub(crate) measuring: Option<crate::hardware_measure::Pending>,
-    /// What to show as the last measurement's result, set where the editor is not at hand.
-    pub(crate) measure_note: Option<String>,
+    /// What to show as the last measurement's result, set where the editor is not at hand, with
+    /// the kind of measurement it was (a hardware insert's, or the ASIO calibration's).
+    pub(crate) measure_note: Option<(crate::hardware_measure::MeasureKind, String)>,
+    /// The output and input paths picked for the ASIO calibration's Measure (`None`: the
+    /// remembered pair, else the main output and the first input).
+    calibration_send: Option<String>,
+    calibration_return: Option<String>,
+    /// What the last ASIO calibration measurement said.
+    calibration_result: String,
     #[cfg(test)]
     pub(crate) fake_probe: Option<crate::hardware_measure::FakeProbe>,
     /// Scripted device-loop counters (output, input) standing in for the streams, so tests can
@@ -198,6 +228,12 @@ impl AudioDevicesState {
     pub(crate) fn begin_verification(&mut self) {
         self.verification = Some(Verification::default());
     }
+    /// `ui.audio` changed here (a measurement stored a calibration or remembered its paths): the
+    /// draft already has the same change, so it is not reset to `ui.audio` on the next frame.
+    pub(crate) fn adopt_audio(&mut self, audio: &AudioConfig) {
+        self.base = Some(audio.clone());
+    }
+
     /// List the devices again on the next frame the window is drawn (Rescan, a new fake).
     pub fn forget_listing(&mut self) {
         // A listing probes the drivers on the host thread, which the open settings panel holds:
@@ -385,6 +421,46 @@ impl StudioApp {
             self.io_warning_cache = Some((key, text));
         }
         self.io_warning_cache.as_ref().and_then(|(_, t)| t.clone())
+    }
+
+    /// Save `ui.audio` with the preferences now (a calibration was measured): the same file and
+    /// switches as the save after a verified reopen. A failure is said on the status line.
+    pub(crate) fn save_audio_preferences(&mut self) {
+        if std::env::var_os("TRANSIT_NO_PREFS").is_some() || std::env::var_os("SOUNDCRAFT_NO_PREFS").is_some() {
+            return;
+        }
+        let Some(dir) = self.autosave_dir.as_deref().and_then(std::path::Path::parent) else { return };
+        if let Err(e) = persist_audio(&dir.join("ui.json"), &self.ui) {
+            self.status = format!("The calibration is in use, but the settings could not be saved: {e}");
+        }
+    }
+
+    /// Why the native ASIO Calibration line's Measure is off, `None` when it can run: it times
+    /// the driver as it is open, so the window's choices must be the open ones.
+    pub(crate) fn calibration_blocker(&self, draft: &AudioConfig) -> Option<&'static str> {
+        if self.measuring_kind() == Some(crate::hardware_measure::MeasureKind::Insert) {
+            return Some("A hardware insert measurement is running.");
+        }
+        #[cfg(test)]
+        if self.audio_devices.fake_probe.is_some() {
+            return None;
+        }
+        let Some(player) = self.player.as_ref().filter(|p| !p.silent) else { return Some("Measuring needs the open audio device.") };
+        if !(player.native_backend && devices::is_asio_system(Some(&player.device_system))) {
+            return Some("Apply Native ASIO first: Measure times the open driver.");
+        }
+        let Some(key) = player.calibration_key.as_ref() else {
+            return Some("The driver's input is not open with its output: there is no loop to time.");
+        };
+        let other_driver = draft.output.as_deref().is_some_and(|d| !d.eq_ignore_ascii_case(&key.device));
+        let other_rate = draft.sample_rate.is_some_and(|r| r != key.rate);
+        if other_driver || other_rate || draft.buffer_size.unwrap_or(0) != key.period {
+            return Some("Apply the changes first: Measure times the driver as it is open.");
+        }
+        if self.is_playing() {
+            return Some("Stop the transport to measure.");
+        }
+        None
     }
 
     /// Audio › Audio Devices: open the window with the saved choices.
@@ -744,19 +820,121 @@ pub fn calibration_line(cfg: &AudioConfig, device: &str, paired_input: Option<&s
     format!("not calibrated \u{b7} {mode}: run {command} (with this app closed)")
 }
 
-/// The Calibration line under the native ASIO backend: a saved loopback of this driver (its
-/// registry name), rate and buffer under the mode key `asio`, else the driver's own figures. The
-/// bench writes no ASIO calibration yet: the Focusrite driver's `getLatencies` over-reports (known
-/// issue K31), so the stamps carry the driver's figures and a placement can be off by it.
+/// "256 / 48 kHz": the period and rate a calibration was measured at ("driver buffer" for the
+/// driver's default period).
+pub fn period_rate_text(period: u32, rate: u32) -> String {
+    let khz = f64::from(rate) / 1000.0;
+    let khz = if rate.is_multiple_of(1000) { format!("{khz:.0}") } else { format!("{khz:.1}") };
+    let period = if period == 0 { "driver buffer".to_string() } else { period.to_string() };
+    format!("{period} / {khz} kHz")
+}
+
+/// "1062 frames (22.1 ms) \u{b1}7 at 256 / 48 kHz": a measured loop with its spread and conditions.
+pub fn calibrated_text(c: &soundcraft_playback::LoopbackCalibration) -> String {
+    format!("{} \u{b1}{} at {}", crate::hardware_ui::frames_text(c.round_trip_frames, c.rate), c.spread_frames, period_rate_text(c.period, c.rate))
+}
+
+/// The Calibration line under the native ASIO backend (#20, known issue K31): the loop of this
+/// driver (its registry name) measured at this rate and buffer, else the driver's own figures.
+/// The drivers' `getLatencies` figures cannot be corrected by a fixed model, so a measurement
+/// belongs to its buffer size and rate: at another one the line says so and Measure times it again.
 pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, rate: u32) -> String {
     let period = cfg.buffer_size.unwrap_or(0);
-    let mode = devices::MODE_ASIO;
-    if let Some(c) = cfg.find_calibration(driver, mode, rate, period) {
-        return format!("measured {} frames \u{b1}{} ({}) \u{b7} {mode}", c.round_trip_frames, c.spread_frames, c.measured_at);
+    if let Some(c) = cfg.find_calibration(driver, devices::MODE_ASIO, rate, period) {
+        return format!("calibrated: {} ({})", calibrated_text(c), c.measured_at);
     }
-    format!(
-        "not calibrated \u{b7} {mode}: the driver's own latency figures are used (no loopback calibration over native ASIO yet, see known issue K31)"
-    )
+    let elsewhere: Vec<String> = cfg.asio_calibrations(driver).map(|c| period_rate_text(c.period, c.rate)).collect();
+    if elsewhere.is_empty() {
+        "not calibrated: the driver's own latency figures are used; Measure times the loop through a cable from an output to an input".into()
+    } else {
+        format!(
+            "not calibrated at this buffer size and rate (measured at {}): the driver's own latency figures are used; Measure times it again",
+            elsewhere.join(", ")
+        )
+    }
+}
+
+/// The pick of `pick` if it still names one of `names`, else `remembered` if it does, else
+/// `fallback` if it does, else the first name.
+fn pick_path(pick: Option<&str>, remembered: Option<&str>, fallback: Option<&str>, names: &[&str]) -> Option<String> {
+    [pick, remembered, fallback].into_iter().flatten().find(|n| names.contains(n)).or(names.first().copied()).map(str::to_owned)
+}
+
+/// The Measure row under the native ASIO Calibration line: an output path for the click (the
+/// remembered one, else Main's), an input path to find it on (the remembered one, else the first),
+/// Measure, then the progress with Cancel while it runs and what the last run said.
+fn calibration_measure(
+    ui: &mut egui::Ui,
+    io: &soundcraft_model::IoMap,
+    (draft, send, ret): (&AudioConfig, &mut Option<String>, &mut Option<String>),
+    blocked: Option<&str>,
+    progress: Option<(u32, u32)>,
+    result: &str,
+    (controls, items): (&mut Vec<(String, &'static str, egui::Rect)>, &mut Vec<MenuItem>),
+) -> (Option<CalibrationAction>, CalibrationLayout) {
+    use soundcraft_model::IoDirection;
+    let outputs: Vec<&str> = io.paths_of(IoDirection::Output).map(|p| p.name.as_str()).collect();
+    let inputs: Vec<&str> = io.paths_of(IoDirection::Input).map(|p| p.name.as_str()).collect();
+    *send = pick_path(send.as_deref(), draft.calibration_send.as_deref(), Some(io.main.as_str()), &outputs);
+    *ret = pick_path(ret.as_deref(), draft.calibration_return.as_deref(), None, &inputs);
+    let running = progress.is_some();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!running, |ui| {
+            for (label, key, names, pick) in [("Out", "cal_send", &outputs, &mut *send), ("In", "cal_ret", &inputs, &mut *ret)] {
+                ui.label(egui::RichText::new(label).color(TOKENS.text_dim).size(11.5));
+                let combo = egui::ComboBox::from_id_salt(key).selected_text(pick.as_deref().unwrap_or("None")).show_ui(ui, |ui| {
+                    for n in names {
+                        let b = crate::menus::check_button(ui, pick.as_deref() == Some(*n), *n);
+                        items.push(MenuItem::at(ui, (*n).to_string(), format!("{key}_entry"), b.rect));
+                        if b.clicked() {
+                            *pick = Some((*n).to_string());
+                        }
+                    }
+                });
+                controls.push((pick.clone().unwrap_or_default(), key, combo.response.rect));
+            }
+        });
+        let ready = send.is_some() && ret.is_some();
+        let b = ui.add_enabled(ready && blocked.is_none() && !running, egui::Button::new("Measure"));
+        controls.push(("Measure".into(), "cal_measure", b.rect));
+        let tip = blocked.unwrap_or(if running {
+            "A measurement is running."
+        } else {
+            "Play a click on the output and time it back on the input: the loop at this buffer size and rate. Cable the output to the input first."
+        });
+        if b.on_hover_text(tip).on_disabled_hover_text(tip).clicked()
+            && let (Some(send), Some(ret)) = (send.clone(), ret.clone())
+        {
+            action = Some(CalibrationAction::Measure { send, ret });
+        }
+    });
+    let mut layout = CalibrationLayout {
+        blocked: blocked.unwrap_or_default().to_owned(),
+        send: send.clone().unwrap_or_default(),
+        ret: ret.clone().unwrap_or_default(),
+        result: result.to_owned(),
+        ..Default::default()
+    };
+    if let Some((sent, total)) = progress {
+        layout.progress = format!("Measuring\u{2026} {sent}/{total} clicks");
+        ui.horizontal(|ui| {
+            let r = ui.label(egui::RichText::new(&layout.progress).color(TOKENS.text).size(11.5));
+            controls.push((layout.progress.clone(), "cal_progress", r.rect));
+            let b = ui.button("Cancel");
+            controls.push(("Cancel".into(), "cal_cancel", b.rect));
+            if b.on_hover_text("Stop measuring; nothing is stored.").clicked() {
+                action = Some(CalibrationAction::Cancel);
+            }
+        });
+    } else if let Some(why) = blocked {
+        ui.label(egui::RichText::new(why).color(TOKENS.text_dim).size(11.0));
+    }
+    if !result.is_empty() {
+        let r = ui.add(egui::Label::new(egui::RichText::new(result).color(TOKENS.text).size(11.5)).wrap());
+        controls.push((result.to_owned(), "cal_result", r.rect));
+    }
+    (action, layout)
 }
 
 /// The bench command inside a "not calibrated" [`calibration_line`] (`None` for a measured one).
@@ -835,8 +1013,11 @@ fn choose_backend(ui: &mut egui::Ui, enabled: bool, value: &mut Backend, options
 pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     check(app);
     app.audio_devices.layout = AudioDevicesLayout::default();
-    if let Some(note) = app.audio_devices.measure_note.take() {
-        app.audio_devices.io_editor.hw_result = note;
+    if let Some((kind, note)) = app.audio_devices.measure_note.take() {
+        match kind {
+            crate::hardware_measure::MeasureKind::Insert => app.audio_devices.io_editor.hw_result = note,
+            crate::hardware_measure::MeasureKind::Loop => app.audio_devices.calibration_result = note,
+        }
     }
     if !app.audio_devices.open {
         app.cancel_measure("");
@@ -884,8 +1065,14 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
     let mut io_items = Vec::new();
     let mut hw_action = None;
     let mut hw_layout = Default::default();
-    let blocker = app.measure_blocker();
-    let progress = app.measure_progress();
+    // One measurement at a time: the running one's progress shows where it was started.
+    let loop_running = app.measuring_kind() == Some(crate::hardware_measure::MeasureKind::Loop);
+    let (progress, cal_progress) = if loop_running { (None, app.measure_progress()) } else { (app.measure_progress(), None) };
+    let blocker = if loop_running { Some("The calibration measurement is running.") } else { app.measure_blocker() };
+    let cal_blocker = app.calibration_blocker(&draft);
+    let (mut cal_send, mut cal_ret) = (app.audio_devices.calibration_send.clone(), app.audio_devices.calibration_return.clone());
+    let cal_result = app.audio_devices.calibration_result.clone();
+    let mut cal_action = None;
     let rate = app.engine.session().sample_rate.hz();
     let mut open = true;
     let r = egui::Window::new("Audio Devices")
@@ -1017,14 +1204,28 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                     ui.end_row();
                 }
                 // Native ASIO: the input is the driver's own, so there is no pairing; a calibration
-                // is the driver's (mode `asio`).
+                // is the driver's (mode `asio`), measured here through a loop cable.
                 if native_asio {
                     label(ui, "Calibration");
                     let rate = draft.sample_rate.or(app.player.as_ref().map(|p| p.device_rate)).unwrap_or(48_000);
                     let driver = dev.map(|d| d.name.as_str()).or(app.player.as_ref().map(|p| p.device_name.as_str())).unwrap_or_default();
                     let line = asio_calibration_line(&draft, driver, rate);
-                    let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5)).wrap());
-                    controls.push((line.clone(), "calibration_text", shown.rect));
+                    ui.vertical(|ui| {
+                        ui.set_max_width(ui.available_width());
+                        let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5)).wrap());
+                        controls.push((line.clone(), "calibration_text", shown.rect));
+                        let (measure, drawn) = calibration_measure(
+                            ui,
+                            &io,
+                            (&draft, &mut cal_send, &mut cal_ret),
+                            cal_blocker,
+                            cal_progress,
+                            &cal_result,
+                            (&mut controls, &mut lay.items),
+                        );
+                        cal_action = measure;
+                        lay.calibration_measure = drawn;
+                    });
                     lay.calibration = Some(line);
                     ui.end_row();
                 }
@@ -1125,6 +1326,21 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
             Ok(_) => editor.done(&edit),
             Err(error) => app.status = error,
         }
+    }
+    (app.audio_devices.calibration_send, app.audio_devices.calibration_return) = (cal_send, cal_ret);
+    match cal_action {
+        Some(CalibrationAction::Measure { send, ret }) => {
+            app.audio_devices.calibration_result.clear();
+            if let Err(why) = app.start_loop_measure(&send, &ret) {
+                app.status.clone_from(&why);
+                app.audio_devices.calibration_result = why;
+            }
+        }
+        Some(CalibrationAction::Cancel) => {
+            app.audio_devices.calibration_result.clear();
+            app.cancel_measure("Measurement cancelled.");
+        }
+        None => {}
     }
     if let Some(action) = hw_action {
         use crate::audio_devices_io::HardwareAction;

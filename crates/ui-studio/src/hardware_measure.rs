@@ -5,6 +5,11 @@
 //! it is done. The Audio Devices window starts the same measurement without waiting
 //! ([`StudioApp::start_measure`]): it shows the clicks sent so far and a per-frame step collects
 //! the result ([`StudioApp::step_measure`]). Both store the result through one function.
+//!
+//! The Calibration line's Measure over native ASIO (#20, known issue K31) runs through the same
+//! flow ([`MeasureKind::Loop`]): the Player's loop probe times the click by sample position, and
+//! the result is stored as the driver's loopback calibration under the open key and handed to the
+//! running streams, so recordings are placed from it at once.
 
 use crate::StudioApp;
 use serde_json::{Value, json};
@@ -28,6 +33,19 @@ fn message(error: &EngineError) -> String {
     }
 }
 
+/// What a measurement times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeasureKind {
+    /// A hardware insert's pair, in the plan's frames (the delay compensation's view).
+    #[default]
+    Insert,
+    /// The open native ASIO driver's loop, in sample positions: its loopback calibration.
+    Loop,
+}
+
+/// How long a loop measurement waits for a sample position before it says the driver gives none.
+const POSITION_GRACE: Duration = Duration::from_secs(1);
+
 /// A measurement the window started and has not collected yet.
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -35,6 +53,7 @@ pub struct Pending {
     ret: String,
     rate: u32,
     began: Instant,
+    pub(crate) kind: MeasureKind,
 }
 
 /// A stand-in for the Player's probe, driven by tests.
@@ -45,6 +64,8 @@ pub(crate) struct FakeProbe {
     pub result: Option<Result<Measured, ProbeError>>,
     pub started: Vec<(Vec<u16>, Vec<u16>)>,
     pub cancelled: usize,
+    /// The key a loop measurement stores under (the open Player's), `None` for none.
+    pub key: Option<soundcraft_playback::devices::CalibrationKey>,
 }
 
 impl StudioApp {
@@ -61,7 +82,7 @@ impl StudioApp {
     }
 
     fn run_hardware_probe(&mut self, send: &str, ret: &str) -> Result<Value, String> {
-        let pending = self.begin_measure(send, ret)?;
+        let pending = self.begin_measure(send, ret, MeasureKind::Insert)?;
         loop {
             if let Some(done) = self.poll_measure(&pending)? {
                 return self.finish_measure(&pending, done);
@@ -73,9 +94,28 @@ impl StudioApp {
     /// The window's Measure: start the measurement and return at once. Step it with
     /// [`Self::step_measure`] every frame. Errors say why it did not start.
     pub(crate) fn start_measure(&mut self, send: &str, ret: &str) -> Result<(), String> {
-        let pending = self.begin_measure(send, ret)?;
+        let pending = self.begin_measure(send, ret, MeasureKind::Insert)?;
         self.audio_devices.measuring = Some(pending);
         Ok(())
+    }
+
+    /// The Calibration line's Measure over native ASIO: time the driver's loop from output path
+    /// `send` to input path `ret` and return at once (collected like [`Self::start_measure`]).
+    /// The pair is remembered as the next Measure's default.
+    pub(crate) fn start_loop_measure(&mut self, send: &str, ret: &str) -> Result<(), String> {
+        let pending = self.begin_measure(send, ret, MeasureKind::Loop)?;
+        self.audio_devices.measuring = Some(pending);
+        for cfg in [&mut self.ui.audio, &mut self.audio_devices.draft] {
+            cfg.calibration_send = Some(send.to_owned());
+            cfg.calibration_return = Some(ret.to_owned());
+        }
+        self.audio_devices.adopt_audio(&self.ui.audio);
+        Ok(())
+    }
+
+    /// The kind of the measurement running, if one is.
+    pub(crate) fn measuring_kind(&self) -> Option<MeasureKind> {
+        self.audio_devices.measuring.as_ref().map(|p| p.kind)
     }
 
     /// Clicks sent and in all, while the window's measurement runs.
@@ -85,7 +125,8 @@ impl StudioApp {
         if let Some(f) = &self.audio_devices.fake_probe {
             return Some(f.progress);
         }
-        Some(self.player.as_ref().map_or((0, 0), |p| p.hardware_probe_progress()))
+        let loop_kind = self.measuring_kind() == Some(MeasureKind::Loop);
+        Some(self.player.as_ref().map_or((0, 0), |p| if loop_kind { p.loop_calibration_progress() } else { p.hardware_probe_progress() }))
     }
 
     /// Per frame: collect the window's measurement when it is done. Stores the result like the
@@ -96,37 +137,45 @@ impl StudioApp {
             Ok(None) => return,
             Ok(Some(done)) => self.finish_measure(&pending, done).map(|v| {
                 let n = |k: &str| v.get(k).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or(0);
-                crate::audio_devices_io::measured_text(n("round_trip_frames"), n("spread_frames"), pending.rate)
+                match pending.kind {
+                    MeasureKind::Insert => crate::audio_devices_io::measured_text(n("round_trip_frames"), n("spread_frames"), pending.rate),
+                    MeasureKind::Loop => v.get("said").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                }
             }),
             Err(why) => Err(why),
         };
         self.audio_devices.measuring = None;
-        self.audio_devices.measure_note = Some(said.unwrap_or_else(|why| {
-            self.status.clone_from(&why);
-            why
-        }));
+        self.audio_devices.measure_note = Some((
+            pending.kind,
+            said.unwrap_or_else(|why| {
+                self.status.clone_from(&why);
+                why
+            }),
+        ));
     }
 
     /// Stop the window's measurement (Cancel, the window closing) and leave `say` in the window.
     /// Nothing is stored.
     pub(crate) fn cancel_measure(&mut self, say: &str) {
-        if self.audio_devices.measuring.take().is_none() {
-            return;
-        }
+        let Some(pending) = self.audio_devices.measuring.take() else { return };
         self.cancel_probe();
-        self.audio_devices.measure_note = Some(say.into());
+        self.audio_devices.measure_note = Some((pending.kind, say.into()));
     }
 
     /// Check the request, make the plan know the table and start the click train.
-    fn begin_measure(&mut self, send: &str, ret: &str) -> Result<Pending, String> {
+    fn begin_measure(&mut self, send: &str, ret: &str, kind: MeasureKind) -> Result<Pending, String> {
         if self.audio_devices.measuring.is_some() {
             return Err("a measurement is already running".into());
         }
         let (out, back) = self.engine.hardware_measurement(send, ret).map_err(|e| message(&e))?;
         // The plan must know the table (and so the pair's sinks) as it is now.
         self.sync_io();
-        let rate = self.engine.session().sample_rate.hz();
-        let pending = Pending { send: send.into(), ret: ret.into(), rate, began: Instant::now() };
+        // An insert counts the session's frames; a loop the device's.
+        let rate = match kind {
+            MeasureKind::Insert => self.engine.session().sample_rate.hz(),
+            MeasureKind::Loop => self.player.as_ref().map_or(self.engine.session().sample_rate.hz(), |p| p.device_rate),
+        };
+        let pending = Pending { send: send.into(), ret: ret.into(), rate, began: Instant::now(), kind };
         #[cfg(test)]
         if let Some(f) = self.audio_devices.fake_probe.as_mut() {
             f.started.push((out, back));
@@ -136,7 +185,10 @@ impl StudioApp {
         if player.is_playing() {
             return Err("stop the transport before measuring".into());
         }
-        player.start_hardware_probe(&out, &back)?;
+        match kind {
+            MeasureKind::Insert => player.start_hardware_probe(&out, &back)?,
+            MeasureKind::Loop => player.start_loop_calibration(&out, &back)?,
+        }
         Ok(pending)
     }
 
@@ -148,11 +200,20 @@ impl StudioApp {
             return Ok(f.result.take());
         }
         let Some(player) = self.player.as_ref() else { return Err("the audio device went away while measuring".into()) };
-        if let Some(done) = player.hardware_probe_result() {
+        let done = match pending.kind {
+            MeasureKind::Insert => player.hardware_probe_result(),
+            MeasureKind::Loop => player.loop_calibration_result(),
+        };
+        if let Some(done) = done {
             return Ok(Some(done));
+        }
+        if pending.kind == MeasureKind::Loop && player.loop_calibration_lacks_position() && pending.began.elapsed() > POSITION_GRACE {
+            player.cancel_loop_calibration();
+            return Err("the driver reports no sample position, so its loop cannot be measured: the driver's own figures stay in use".into());
         }
         if pending.began.elapsed() > WAIT {
             player.cancel_hardware_probe();
+            player.cancel_loop_calibration();
             return Err("the audio device did not answer: no measurement".into());
         }
         Ok(None)
@@ -166,11 +227,15 @@ impl StudioApp {
         }
         if let Some(player) = &self.player {
             player.cancel_hardware_probe();
+            player.cancel_loop_calibration();
         }
     }
 
     /// Store a finished measurement in the table and say it: the one place both paths end.
     fn finish_measure(&mut self, pending: &Pending, outcome: Result<Measured, ProbeError>) -> Result<Value, String> {
+        if pending.kind == MeasureKind::Loop {
+            return self.finish_loop(pending, outcome);
+        }
         let (send, ret, rate) = (&pending.send, &pending.ret, pending.rate);
         match outcome {
             Ok(m) => {
@@ -182,5 +247,40 @@ impl StudioApp {
             }
             Err(ProbeError::NoSignal { .. }) => Err(format!("no signal returned on {ret}: check the cable and input gain")),
         }
+    }
+
+    /// A finished loop measurement: kept as the driver's calibration under the open key (in
+    /// `ui.audio`, saved with the preferences), handed to the running streams, and said.
+    fn finish_loop(&mut self, pending: &Pending, outcome: Result<Measured, ProbeError>) -> Result<Value, String> {
+        let measured = match outcome {
+            Ok(m) => m,
+            Err(ProbeError::NoSignal { found, sent }) => {
+                return Err(format!(
+                    "the click came back on {found} of {sent} tries: check the cable from {} to {} and the input gain",
+                    pending.send, pending.ret
+                ));
+            }
+        };
+        let key = self.loop_key().ok_or("the audio device changed while measuring: nothing stored")?;
+        let record = key.record(measured.round_trip_frames, measured.spread_frames.saturating_add(1), &soundcraft_playback::devices::utc_today());
+        let said = crate::audio_devices::calibrated_text(&record);
+        let calibration = record.to_backend();
+        for cfg in [&mut self.ui.audio, &mut self.audio_devices.draft] {
+            cfg.store_calibration(record.clone());
+        }
+        self.audio_devices.adopt_audio(&self.ui.audio);
+        let live = self.player.as_mut().is_some_and(|p| p.apply_calibration(calibration));
+        self.status = if live { format!("Calibrated: {said}") } else { format!("Calibrated: {said}; it applies when the device is next opened") };
+        self.save_audio_preferences();
+        Ok(json!({"round_trip_frames": record.round_trip_frames, "spread_frames": record.spread_frames, "said": said, "live": live}))
+    }
+
+    /// The key a loop measurement of the open device stores under.
+    fn loop_key(&self) -> Option<soundcraft_playback::devices::CalibrationKey> {
+        #[cfg(test)]
+        if let Some(f) = &self.audio_devices.fake_probe {
+            return f.key.clone();
+        }
+        self.player.as_ref().filter(|p| !p.silent)?.calibration_key.clone()
     }
 }
