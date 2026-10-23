@@ -449,7 +449,9 @@ impl Host {
             }
             let Ok(worker) = worker_rx.recv() else { return };
             let _ = worker.thread.set(std::thread::current().id());
-            run(&worker, &rx, &queue, &config, weak);
+            run(&worker, rx, &queue, &config, weak);
+            // `queue` (the OLE apartment on Windows) ends here, after `run` dropped the receiver:
+            // no job can reach this thread any more.
         });
         if spawned.is_err() {
             return None;
@@ -623,8 +625,11 @@ impl Host {
     }
 }
 
-/// A host thread's loop: jobs, OS messages, ticks.
-fn run(worker: &Arc<Worker>, rx: &mpsc::Receiver<Arc<JobCell>>, queue: &MessageQueue, config: &Config, host: Weak<Inner>) {
+/// A host thread's loop: jobs, OS messages, ticks. It takes the job receiver by value and drops
+/// it before returning, while the thread's message queue (its COM apartment) still exists: a job
+/// sent after that fails to send and is leaked by its sender, so no plug-in object is destroyed
+/// on this thread after the apartment ends (issue #56).
+fn run(worker: &Arc<Worker>, rx: mpsc::Receiver<Arc<JobCell>>, queue: &MessageQueue, config: &Config, host: Weak<Inner>) {
     if let Some(start) = &config.hooks.start {
         worker.busy(|| catch_unwind(AssertUnwindSafe(|| start())).is_ok());
     }
@@ -663,6 +668,9 @@ fn run(worker: &Arc<Worker>, rx: &mpsc::Receiver<Arc<JobCell>>, queue: &MessageQ
     while let Ok(cell) = rx.try_recv() {
         std::mem::forget(cell.take());
     }
+    // A job sent between the drain and this drop is dropped here, on this thread, with the
+    // apartment still alive; after it every send fails and the sender leaks the job.
+    drop(rx);
     drop(ctx);
 }
 
