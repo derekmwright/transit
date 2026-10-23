@@ -1311,10 +1311,12 @@ impl IPluginFactoryTrait for Factory {
     unsafe fn createInstance(&self, cid: FIDString, iid: FIDString, obj: *mut *mut c_void) -> tresult {
         set_up_late_state();
         let cid = unsafe { *(cid as *const TUID) };
-        // A heavy library: the synth takes half a second to make (the other classes do not).
+        // A heavy library: the synth takes half a second to make (the other classes do not), or
+        // `VST3_FIXTURE_CREATE_MS` milliseconds.
         #[cfg(feature = "slow-create")]
         if cid == SYNTH_CID {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            let ms = std::env::var("VST3_FIXTURE_CREATE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
         }
         let unknown = if cid == GAIN_CID {
             ComWrapper::new(GainProcessor {
