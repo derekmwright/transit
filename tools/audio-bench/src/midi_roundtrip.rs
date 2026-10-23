@@ -44,12 +44,17 @@ const STALL_MS: u64 = 2000;
 pub const DEFAULT_NOTE: u8 = 60;
 pub const DEFAULT_VELOCITY: u8 = 100;
 pub const DEFAULT_TRIALS: u32 = 10;
-pub const DEFAULT_GAP_MS: u32 = 750;
+pub const DEFAULT_GAP_MS: u32 = 1500;
 pub const DEFAULT_MAX_MS: u32 = 1000;
 /// A trial further than this many standard deviations from the mean is listed as an outlier.
 pub const OUTLIER_SIGMAS: f64 = 2.0;
-/// The clock map's fit residual above which a send position is refused, in ns.
-pub const MAX_FIT_RESIDUAL_NS: f64 = 500_000.0;
+/// The default limit of the clock map's fit residual at a send (`--max-fit-residual-ms`), in ns.
+/// A trial above it is skipped. A real driver's position times jitter (the TASCAM Model 12's
+/// fit at about 0.5 ms), so this is a sanity limit, not an accuracy claim: the residual is
+/// reported as the send position's uncertainty.
+pub const DEFAULT_MAX_FIT_RESIDUAL_NS: u64 = 1_000_000;
+/// A pre-send window more than this many times the floor (+6 dB) gets a warning.
+pub const PRE_SEND_WARN_FACTOR: f32 = 2.0;
 /// An onset this far after its threshold crossing gets a slow-attack warning, in ms.
 pub const SLOW_ATTACK_MS: f64 = 1.0;
 
@@ -76,6 +81,8 @@ pub struct Settings {
     pub gap_ms: u32,
     /// The sanity window: an onset must come within this time of the send.
     pub max_ms: u32,
+    /// The clock map's fit residual above which a trial is skipped, in ns.
+    pub max_fit_residual_ns: u64,
     /// 0-based input channels of the return, summed (one for mono, two for a stereo pair).
     pub returns: Vec<u16>,
 }
@@ -90,6 +97,7 @@ impl Settings {
             trials: DEFAULT_TRIALS,
             gap_ms: DEFAULT_GAP_MS,
             max_ms: DEFAULT_MAX_MS,
+            max_fit_residual_ns: DEFAULT_MAX_FIT_RESIDUAL_NS,
             returns,
         }
     }
@@ -403,17 +411,14 @@ impl Clock {
         Ok(())
     }
 
-    /// The sample position at host time `host_ns`, and the map's fit residual in ns. A residual
-    /// above [`MAX_FIT_RESIDUAL_NS`] is refused.
+    /// The clock map's fit residual now, in ns.
+    fn residual(&self) -> Result<f64, String> {
+        Ok(self.fitter.map().ok_or("the clock map is not valid (the position clock did not fit)")?.residual_ns)
+    }
+
+    /// The sample position at host time `host_ns`, and the map's fit residual in ns.
     fn position_at(&self, host_ns: u64) -> Result<(u64, f64), String> {
         let map = self.fitter.map().ok_or("the clock map is not valid (the position clock did not fit)")?;
-        if map.residual_ns > MAX_FIT_RESIDUAL_NS {
-            return Err(format!(
-                "the position clock's fit residual is {:.3} ms, above {:.1} ms: the driver's position times are irregular",
-                map.residual_ns / 1e6,
-                MAX_FIT_RESIDUAL_NS / 1e6
-            ));
-        }
         let position = map.host_to_frame(self.key, host_ns, host_ns).map_err(|e| format!("the send instant is outside the clock map ({e:?})"))?;
         Ok((position, map.residual_ns))
     }
@@ -502,6 +507,8 @@ pub struct Report {
     pub trials: Vec<Trial>,
     /// The detector's envelope window, in samples: the onset lags the attack by up to one less.
     pub envelope_window: usize,
+    /// Trials skipped because the clock fit's residual was above the limit (no note was sent).
+    pub skipped: u32,
     /// Stream error callbacks and capture blocks lost to the clock map during the run.
     pub stream_errors: u64,
     pub lost_blocks: u64,
@@ -520,6 +527,16 @@ impl Report {
     /// The mean minus the driver's reported input latency: an estimate of MIDI delivery plus synth response.
     pub fn delivery_estimate(&self) -> Option<f64> {
         Some(self.summary()?.mean - self.input_latency? as f64)
+    }
+
+    /// The largest clock fit residual at a send, in ns.
+    pub fn fit_residual_max_ns(&self) -> f64 {
+        self.trials.iter().map(|t| t.fit_residual_ns).fold(0.0f64, f64::max)
+    }
+
+    /// [`Report::fit_residual_max_ns`] in samples: the send position's uncertainty.
+    pub fn send_uncertainty_samples(&self) -> f64 {
+        self.fit_residual_max_ns() * f64::from(self.rate) / 1e9
     }
 
     /// The report as printed.
@@ -595,11 +612,31 @@ impl Report {
                     ));
                 }
             }
-            let residual = self.trials.iter().map(|t| t.fit_residual_ns).fold(0.0f64, f64::max);
+            let residual = self.fit_residual_max_ns();
             lines.push(format!(
-                "clock fit residual at the sends: max {:.1} us (refused above {:.0} us)",
+                "send-position uncertainty from the clock fit: +-{:.1} us ({:.1} samples), the largest fit residual at a send (trials above {:.2} ms are skipped)",
                 residual / 1000.0,
-                MAX_FIT_RESIDUAL_NS / 1000.0
+                self.send_uncertainty_samples(),
+                self.settings.max_fit_residual_ns as f64 / 1e6
+            ));
+        }
+        for (k, t) in self.trials.iter().enumerate() {
+            if t.pre_send > self.floor * PRE_SEND_WARN_FACTOR {
+                let above = if self.floor > 0.0 { format!("{:.1} dB above", 20.0 * (t.pre_send / self.floor).log10()) } else { "above".to_string() };
+                lines.push(format!(
+                    "warning: trial {}'s pre-send level {} is {above} the noise floor {}: the previous release may still be sounding; raise --gap-ms",
+                    k + 1,
+                    onset::dbfs(t.pre_send),
+                    onset::dbfs(self.floor)
+                ));
+            }
+        }
+        if self.skipped > 0 {
+            lines.push(format!(
+                "skipped: {} of {} trials (fit residual above {:.2} ms; no note sent)",
+                self.skipped,
+                self.settings.trials,
+                self.settings.max_fit_residual_ns as f64 / 1e6
             ));
         }
         match (self.input_latency, self.delivery_estimate()) {
@@ -654,6 +691,11 @@ impl Report {
             "driver_input_latency_samples": self.input_latency,
             "estimated_delivery_plus_synth_samples": self.delivery_estimate(),
             "trials": trials,
+            "max_fit_residual_ns": self.settings.max_fit_residual_ns,
+            "fit_residual_max_ns": self.fit_residual_max_ns(),
+            "send_position_uncertainty_ns": self.fit_residual_max_ns(),
+            "send_position_uncertainty_samples": self.send_uncertainty_samples(),
+            "skipped_fit_residual": self.skipped,
             "stream_errors": self.stream_errors, "lost_blocks": self.lost_blocks,
         })
     }
@@ -682,7 +724,7 @@ pub fn measure(
         outcome = Some(trials(&streams, settings, &midi_port, &mut *midi, &mut *driver, interrupt)?);
         Ok(())
     })?;
-    let (floor, trials, lost_blocks) = outcome.ok_or("the measurement did not run")?;
+    let (floor, trials, skipped, lost_blocks) = outcome.ok_or("the measurement did not run")?;
     let rate = opened.render_rate;
     let input_latency = opened.capture.and_then(|c| c.latency).map(|d| (d.as_secs_f64() * f64::from(rate)).round() as u64);
     Ok(Report {
@@ -695,6 +737,7 @@ pub fn measure(
         floor,
         trials,
         envelope_window: onset::window(rate),
+        skipped,
         stream_errors: streams.errors.load(Ordering::Relaxed),
         lost_blocks,
     })
@@ -720,7 +763,7 @@ fn trials(
     midi: &mut dyn MidiSink,
     driver: &mut dyn Driver,
     interrupt: &Interrupt,
-) -> Result<(f32, Vec<Trial>, u64), String> {
+) -> Result<(f32, Vec<Trial>, u32, u64), String> {
     // First, so that every exit below releases the note.
     let mut notes = Notes { midi, interrupt, channel: settings.channel, note: settings.note };
     let rate = streams.render.get().map(|a| a.format.rate).ok_or("the output did not open")?;
@@ -758,10 +801,29 @@ fn trials(
     let reference = onset::noise_floor(&streams.read(end - floor_frames, end)?, w);
     let threshold = onset::threshold(reference)?;
     let guard = (reference.peak * onset::QUIET_FACTOR).min(threshold);
-    let mut out = Vec::new();
+    let (mut out, mut skipped) = (Vec::new(), 0u32);
     for k in 1..=settings.trials {
         let fail = |e: String| format!("trial {k}: {e}");
+        if k > 1 {
+            pass(driver, &mut clock, streams, u64::from(settings.gap_ms) * 1_000_000)?;
+        }
         clock.drain(streams)?;
+        // The send position is only as good as the clock fit: above the limit, skip the trial
+        // before any note is sent.
+        let residual = clock.residual().map_err(fail)?;
+        if residual > settings.max_fit_residual_ns as f64 {
+            skipped += 1;
+            eprintln!("trial {k}: skipped, the clock fit's residual is {:.3} ms", residual / 1e6);
+            if u64::from(skipped) * 2 > u64::from(settings.trials) {
+                return Err(format!(
+                    "{skipped} of {} trials skipped: the position clock's fit residual ({:.3} ms) is above --max-fit-residual-ms {:.2}; the driver's position times are irregular",
+                    settings.trials,
+                    residual / 1e6,
+                    settings.max_fit_residual_ns as f64 / 1e6
+                ));
+            }
+            continue;
+        }
         let end = streams.captured_end.load(Ordering::Acquire);
         let pre = onset::noise_floor(&streams.read(end - floor_frames, end).map_err(fail)?, w);
         onset::at_floor(reference, pre).map_err(fail)?;
@@ -820,15 +882,12 @@ fn trials(
             send_call_ns,
             fit_residual_ns,
         });
-        if k < settings.trials {
-            pass(driver, &mut clock, streams, u64::from(settings.gap_ms) * 1_000_000)?;
-        }
     }
     drop(notes);
     if interrupt.release_failed.load(Ordering::SeqCst) {
         return Err("releasing the note failed: check that the synth is silent".into());
     }
-    Ok((reference.peak, out, clock.lost))
+    Ok((reference.peak, out, skipped, clock.lost))
 }
 
 #[cfg(test)]
@@ -876,6 +935,43 @@ mod tests {
         assert_eq!(log.0, vec![vec![0x82, 60, 0], vec![0xB2, 123, 0]], "no note-on, then the release");
         assert!(!interrupt.note_outstanding());
         assert!(interrupt.ctrl_c());
+    }
+
+    #[test]
+    fn a_pre_send_level_above_the_floor_and_the_fit_residual_are_reported() {
+        let trial = |pre_send: f32, fit_residual_ns: f64| Trial {
+            send: 1000,
+            onset: 2000,
+            crossing: 1999,
+            pre_send,
+            threshold: 0.001,
+            peak: 0.1,
+            send_call_ns: 0,
+            fit_residual_ns,
+        };
+        let report = Report {
+            device: "d".into(),
+            midi_port: "m".into(),
+            settings: Settings::new(0, vec![0]),
+            rate: 44_100,
+            buffer: Some(256),
+            input_latency: Some(300),
+            floor: 0.00005,
+            trials: vec![trial(0.00005, 467_700.0), trial(0.00043, 496_700.0)],
+            envelope_window: 11,
+            skipped: 1,
+            lost_blocks: 0,
+            stream_errors: 0,
+        };
+        let text = report.lines().join("\n");
+        assert!(text.contains("warning: trial 2's pre-send level -67.3 dBFS is 18.7 dB above the noise floor -86.0 dBFS"), "{text}");
+        assert!(!text.contains("warning: trial 1"), "{text}");
+        assert!(text.contains("send-position uncertainty from the clock fit: +-496.7 us (21.9 samples)"), "{text}");
+        assert!(text.contains("skipped: 1 of 10 trials"), "{text}");
+        let json = report.json("c", "d", &crate::report::Machine { cpu: "c".into(), os: "o".into() });
+        assert_eq!(json["fit_residual_max_ns"], 496_700.0);
+        assert_eq!(json["skipped_fit_residual"], 1);
+        assert_eq!(json["max_fit_residual_ns"], 1_000_000);
     }
 
     #[test]

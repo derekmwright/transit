@@ -179,11 +179,13 @@ with its **fastest attack and shortest release**, no delay or reverb, no arpeggi
 repository root:
 
 ```
-cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --midi-out "<port name or part>" --midi-channel 1 --in 1 --backend asio --device "<ASIO driver>" --rate 44100 --buffer 256 --trials 10 --gap-ms 750 --json docs/benchmarks/<date>-<machine>-<synth>.json
+cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --midi-out "<port name or part>" --midi-channel 1 --in 1 --backend asio --device "<ASIO driver>" --rate 44100 --buffer 256 --trials 10 --gap-ms 1500 --json docs/benchmarks/<date>-<machine>-<synth>.json
 ```
 
 Native ASIO only: both ends are counted in the driver's sample positions. Defaults: note 60,
-velocity 100, 10 trials, 750 ms gap, 1000 ms window (`--max-ms`).
+velocity 100, 10 trials, 1500 ms gap, 1000 ms window (`--max-ms`), 1.0 ms fit residual limit
+(`--max-fit-residual-ms`). The gap must outlast the synth's release. On a Moog Model D a 750 ms gap
+left the pre-send window at about -67 dBFS against a -86 dBFS floor.
 
 Method:
 
@@ -191,8 +193,12 @@ Method:
   send call. A `ClockFitter` (the clock map the app's MIDI output thread uses, ADR 0017) is fitted to
   the capture blocks' sample position, position time and arrival. That map turns the send instant
   into the device's sample position: the position clock, not the presentation clock. The fit's
-  residual at each send is printed and written to the JSON. A send is refused when it is above
-  0.5 ms. The send call's own time is inside L, because the instant is read before the call.
+  residual at each send is written to the JSON. Its maximum is printed as the send position's
+  uncertainty ("send-position uncertainty from the clock fit: +-us (samples)"). A real driver's
+  position times jitter: the TASCAM Model 12 fits at about 0.5 ms. While the residual is above
+  `--max-fit-residual-ms`, the trial is skipped before any note is sent. If more than half the
+  trials are skipped, the run is refused. The send call's own time is inside L, because the
+  instant is read before the call.
 - **Onset.** The input is recorded by sample position. The detector takes a 0.25 ms causal envelope
   (the mean absolute value). Its threshold is the envelope peak of 100 ms of noise floor measured
   before the first note, plus 12 dB (never below -60 dBFS). The detector finds the first crossing,
@@ -205,8 +211,10 @@ Method:
   envelope window less one sample (11 samples at 48 kHz) of envelope lag. The run prints this bias
   on its own line. It is part of L, and nothing is subtracted for it. A fast attack keeps it to a
   sample or two.
-- **Per trial.** The 100 ms before each send must be at the noise floor (within 6 dB). If not, the
-  run is refused: the previous release is still sounding, so raise `--gap-ms` or shorten the release.
+- **Per trial.** The 100 ms before each send must be at the noise floor: within 6 dB of it, or
+  under -66 dBFS when the floor is lower than that. If not, the run is refused: the previous release
+  is still sounding, so raise `--gap-ms` or shorten the release. A pre-send level more than 6 dB above
+  the floor gets a warning even when it is under that limit.
   A trial with no onset within `--max-ms` is also refused, with the level heard. That points to the
   channel, the port, the input or the level.
 - **Safety.** Every exit path sends the note-off and All Notes Off (CC 123) on the channel: errors, a

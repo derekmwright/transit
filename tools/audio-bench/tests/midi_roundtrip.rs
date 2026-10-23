@@ -39,6 +39,9 @@ struct Rig {
     interrupt_on_note: bool,
     interrupted: bool,
     noise: u32,
+    /// Arrival jitter of the blocks in `from..to` (positions), alternating `+ns` and `-ns`: a
+    /// driver whose position clock fits with a residual of about `ns`.
+    jitter: Option<(u64, u64, u64)>,
 }
 
 fn t(position: u64) -> u64 {
@@ -78,6 +81,7 @@ impl Rig {
             interrupt_on_note: false,
             interrupted: false,
             noise: 0x1234_5678,
+            jitter: None,
         };
         (rig, audio)
     }
@@ -123,7 +127,16 @@ impl Rig {
 
     fn pump(&mut self) {
         let p = self.position;
-        let host = t(p);
+        let host = match self.jitter {
+            Some((from, to, ns)) if (from..to).contains(&p) => {
+                if (p / u64::from(PERIOD)).is_multiple_of(2) {
+                    t(p) + ns
+                } else {
+                    t(p) - ns
+                }
+            }
+            _ => t(p),
+        };
         let stamp = |frame: i64| ab::Stamp {
             host_callback_ns: host,
             backend_callback_ns: host as i64,
@@ -287,6 +300,43 @@ fn a_ctrl_c_during_the_device_open_sends_no_note_and_releases() {
     assert_released(&rig, 0);
     assert!(!interrupt.note_outstanding());
     assert!(interrupt.ctrl_c(), "with nothing outstanding a second press may exit");
+}
+
+#[test]
+fn a_trial_with_a_jittery_clock_fit_is_skipped_and_the_run_goes_on() {
+    // Warm-up starts at position 4800; the first trial comes about 100 ms later. The blocks of its
+    // fit window jitter by 300 us; the window has moved past them by the second trial.
+    let (mut rig, audio) = Rig::new(&[600, 600]);
+    rig.jitter = Some((0, 4800 + 7200, 300_000));
+    let io = rig.midi.io();
+    let mut port = open_output(&io, "Synth").unwrap();
+    let mut s = settings(3);
+    (s.gap_ms, s.max_fit_residual_ns) = (400, 200_000);
+    let report = measure(&audio, &request(), &s, &mut port, &mut rig, &Interrupt::default()).unwrap();
+    assert_eq!((report.skipped, report.trials.len()), (1, 2));
+    assert_eq!(rig.midi.sent(&rig.port).iter().filter(|m| m[0] == 0x90).count(), 2, "no note for the skipped trial");
+    assert!(report.trials.iter().all(|t| t.fit_residual_ns <= 200_000.0));
+    let text = report.lines().join(
+        "
+",
+    );
+    assert!(text.contains("skipped: 1 of 3 trials"), "{text}");
+    assert!(text.contains("send-position uncertainty from the clock fit"), "{text}");
+    assert_released(&rig, 0);
+}
+
+#[test]
+fn more_than_half_the_trials_skipped_refuses_the_run() {
+    let (mut rig, audio) = Rig::new(&[600, 600, 600, 600]);
+    rig.jitter = Some((0, u64::MAX, 300_000));
+    let io = rig.midi.io();
+    let mut port = open_output(&io, "Synth").unwrap();
+    let mut s = settings(4);
+    s.max_fit_residual_ns = 200_000;
+    let refused = measure(&audio, &request(), &s, &mut port, &mut rig, &Interrupt::default()).unwrap_err();
+    assert!(refused.contains("3 of 4 trials skipped") && refused.contains("--max-fit-residual-ms 0.20"), "{refused}");
+    assert_eq!(rig.midi.sent(&rig.port).iter().filter(|m| m[0] == 0x90).count(), 0);
+    assert_released(&rig, 0);
 }
 
 #[test]

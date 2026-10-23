@@ -36,8 +36,10 @@ usage: audio-bench [options]
   --in <ch>[,<ch>]       1-based input channel(s) of the synth's audio, summed (`1`, or `1,2` for a stereo pair)
   --note <0-127>         note to play (default 60); --velocity <1-127> (default 100)
   --trials <n>           notes to time (default 10)
-  --gap-ms <ms>          silence after each note-off (default 750; longer than the synth's release)
+  --gap-ms <ms>          silence after each note-off (default 1500; longer than the synth's release)
   --max-ms <ms>          an onset must come within this of the send (default 1000)
+  --max-fit-residual-ms <ms>  skip a trial while the position clock's fit residual is above this (default 1.0);
+                         more than half skipped refuses the run
   --json <path>          also write the result, every trial and the command line, as JSON
   fake mode only:
   --fake-delay <frames>  software loopback delay (default 144)
@@ -92,6 +94,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     let (mut delay, mut jitter, mut gap, mut burst) = (None, None, None::<Option<f64>>, false);
     let mut list = false;
     let mut midi = false;
+    let mut max_residual = None::<f64>;
     let (mut port, mut channel, mut inputs, mut json) = (None::<String>, None::<u8>, None::<Vec<u16>>, None);
     let (mut note, mut velocity, mut trials, mut gap_ms, mut max) = (None::<u8>, None::<u8>, None::<u32>, None::<u32>, None::<u32>);
     while let Some(flag) = args.next() {
@@ -133,6 +136,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             "--trials" => trials = Some(number(&flag, value())?),
             "--gap-ms" => gap_ms = Some(number(&flag, value())?),
             "--max-ms" => max = Some(number(&flag, value())?),
+            "--max-fit-residual-ms" => max_residual = Some(number(&flag, value())?),
             "--json" => json = Some(PathBuf::from(value().ok_or("--json needs a path")?)),
             "--rate" => request.rate = number(&flag, value())?,
             "--seconds" => seconds = number(&flag, value())?,
@@ -158,7 +162,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     if list {
         return Ok(Command::List(system));
     }
-    let midi_given = port.is_some() || channel.is_some() || inputs.is_some() || json.is_some();
+    let midi_given = port.is_some() || channel.is_some() || inputs.is_some() || json.is_some() || max_residual.is_some();
     if !midi && (midi_given || note.is_some() || velocity.is_some() || trials.is_some() || gap_ms.is_some() || max.is_some()) {
         return Err("--midi-out, --midi-channel, --in, --note, --velocity, --trials, --gap-ms, --max-ms and --json need --midi-roundtrip".into());
     }
@@ -211,6 +215,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
         settings.trials = trials.unwrap_or(settings.trials);
         settings.gap_ms = gap_ms.unwrap_or(settings.gap_ms);
         settings.max_ms = max.unwrap_or(settings.max_ms);
+        if let Some(ms) = max_residual {
+            if !(ms.is_finite() && ms > 0.0 && ms <= 100.0) {
+                return Err("--max-fit-residual-ms must be above 0 and at most 100".into());
+            }
+            settings.max_fit_residual_ns = (ms * 1e6).round() as u64;
+        }
         if settings.note > 127 || !(1..=127).contains(&settings.velocity) {
             return Err("--note counts 0 to 127 and --velocity 1 to 127".into());
         }
@@ -307,7 +317,15 @@ mod tests {
         let Ok(Command::MidiRoundTrip { midi, .. }) = parse_str("--midi-roundtrip --midi-out x --midi-channel 16 --in 3 --backend asio") else {
             panic!("did not parse")
         };
-        assert_eq!((midi.settings.channel, midi.settings.returns.as_slice(), midi.settings.gap_ms), (15, &[2u16][..], 750));
+        assert_eq!((midi.settings.channel, midi.settings.returns.as_slice(), midi.settings.gap_ms), (15, &[2u16][..], 1500));
+        assert_eq!(midi.settings.max_fit_residual_ns, 1_000_000);
+        let Ok(Command::MidiRoundTrip { midi, .. }) =
+            parse_str("--midi-roundtrip --midi-out x --midi-channel 1 --in 1 --backend asio --max-fit-residual-ms 0.75")
+        else {
+            panic!("did not parse")
+        };
+        assert_eq!(midi.settings.max_fit_residual_ns, 750_000);
+        assert!(parse_str("--midi-roundtrip --midi-out x --midi-channel 1 --in 1 --backend asio --max-fit-residual-ms 0").is_err());
         let base = "--midi-roundtrip --backend asio --midi-out x";
         assert!(parse_str(&format!("{base} --in 1")).unwrap_err().contains("--midi-channel"));
         assert!(parse_str(&format!("{base} --midi-channel 1")).unwrap_err().contains("--in"));
