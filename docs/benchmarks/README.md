@@ -183,25 +183,39 @@ cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --
 ```
 
 Native ASIO only: both ends are counted in the driver's sample positions. Defaults: note 60,
-velocity 100, 10 trials, 1500 ms gap, 1000 ms window (`--max-ms`), 1.0 ms fit residual limit
-(`--max-fit-residual-ms`). The gap must outlast the synth's release. On a Behringer Model D a 750 ms gap
-left the pre-send window at about -67 dBFS against a -86 dBFS floor.
+velocity 100, 10 trials, 1500 ms gap, 1000 ms window (`--max-ms`), 0.5 ms limit on the clock fit's
+standard error at a send (`--max-fit-error-ms`; it replaced `--max-fit-residual-ms`, which the
+Model D runs used), one unmeasured warm-up note (`--no-warmup` skips it). The gap must outlast the
+synth's release. On a Behringer Model D a 750 ms gap left the pre-send window at about -67 dBFS
+against a -86 dBFS floor.
 
 Method:
 
 - **Send instant.** The control thread reads the host clock (`HostOrigin`, QPC) right before the
-  send call. A `ClockFitter` (the clock map the app's MIDI output thread uses, ADR 0017) is fitted to
-  the capture blocks' sample position, position time and arrival. That map turns the send instant
-  into the device's sample position: the position clock, not the presentation clock. The fit's
-  residual at each send is written to the JSON. Its maximum is printed as the send position's
-  uncertainty ("send-position uncertainty from the clock fit: +-us (samples)"). A real driver's
-  position times jitter: the TASCAM Model 12 fits at about 0.5 ms. While the residual is above
-  `--max-fit-residual-ms`, the trial is skipped before any note is sent. If more than half the
-  trials are skipped, the run is refused. The send call's own time is inside L, because the
-  instant is read before the call.
+  send call. The bench's position clock turns it into the device's sample position: a least-squares
+  line of the capture blocks' arrival time against their first sample position, over the last 2 s of
+  blocks (never fewer than 32), with points far outside the spread dropped once. It is the same kind
+  of map the app's MIDI output thread uses (ADR 0017), over a longer window, so it converges where
+  the app's fitter (about 64 points, 2 ms residual limit) does not: the Scarlett 2i2 at buffer 256,
+  whose buffers arrive with about one block of scatter. The app's fitter is fed the same blocks and
+  printed beside it ("the app's clock map ... valid at k of n sends"). The warm-up waits for 1 s of
+  fit. If no fit comes within 3 s, the error gives the block count, the arrival spacing against the
+  block length, the fit scatter and the fitted rate.
+- **Fit figures.** Three are printed. The *clock-fit scatter* is the largest distance of a block from
+  the line: how irregular the arrivals are, and **not a bound on the send offset** (the line averages
+  over hundreds of blocks). The *standard error at the send* is the line's own uncertainty at the
+  send position, the send-position uncertainty. The *leave-last-out prediction error* is the newest
+  block against the line fitted without it. A trial whose standard error is above
+  `--max-fit-error-ms` is skipped before any note is sent; more than half skipped refuses the run. A
+  constant offset of the arrivals (the driver's dispatch delay) is in the line and in every L alike;
+  no fit sees it. The send call's own time is inside L, because the instant is read before the call.
+- **Warm-up note.** One note is played and released before trial 1 and not measured, so a
+  first-note effect of the port or the synth stays out of the trials.
 - **Onset.** The input is recorded by sample position. The detector takes a 0.25 ms causal envelope
-  (the mean absolute value). Its threshold is the envelope peak of 100 ms of noise floor measured
-  before the first note, plus 12 dB (never below -60 dBFS). The detector finds the first crossing,
+  (the mean absolute value). Its threshold is the noise floor plus 12 dB (never below -60 dBFS). The
+  floor is the lowest envelope peak of the 100 ms reference window before the first note and of
+  every trial's 100 ms pre-send window, so a tail in one window (a previous run's note) does not set
+  it; at the end every onset is found again against that floor. The detector finds the first crossing,
   then refines it to the first sample where the envelope exceeds 10 percent of the attack's peak
   within the next 20 ms. That refined sample is the onset. The distance between the two crossings is
   printed as the detector's uncertainty. It bounds the late side only: the true start, before the
@@ -211,12 +225,12 @@ Method:
   envelope window less one sample (11 samples at 48 kHz) of envelope lag. The run prints this bias
   on its own line. It is part of L, and nothing is subtracted for it. A fast attack keeps it to a
   sample or two.
-- **Per trial.** The 100 ms before each send must be at the noise floor: within 6 dB of it, or
-  under -66 dBFS when the floor is lower than that. If not, the run is refused: the previous release
-  is still sounding, so raise `--gap-ms` or shorten the release. A pre-send level more than 6 dB above
-  the floor gets a warning even when it is under that limit.
-  A trial with no onset within `--max-ms` is also refused, with the level heard. That points to the
-  channel, the port, the input or the level.
+- **Per trial.** A pre-send window more than 6 dB above the floor gets a warning, and the trial
+  waits another gap and reads it again once. If it is still above, the trial runs with its threshold
+  raised to 12 dB over that window (a release still sounding must not count as the onset). A pre-send
+  window above -20 dBFS is refused: raise `--gap-ms` or shorten the release. A trial with no onset
+  within `--max-ms` is also refused, with the level heard. That points to the channel, the port, the
+  input or the level.
 - **Safety.** Every exit path sends the note-off and All Notes Off (CC 123) on the channel: errors, a
   refusal and Ctrl+C included. The Ctrl+C handler only sets flags. The first press stops the run,
   which releases the note and exits with status 130. A stop seen before a note-on means that note is
@@ -242,6 +256,56 @@ Results entry (one per synth and chain; keep the JSON next to this README):
 - Driver input latency <n> samples; estimated delivery + synth response <x> ms (estimate)
 - Command: `<as printed>`; JSON: [<file>](<file>)
 ```
+
+## Placement against the grid
+
+`--placement` (issue #71) checks a compensation instead of measuring one: does sending each note
+early by the measured offset put the synth's onsets on the grid? It schedules a pattern of note-ons
+at intended device sample positions P (default 8 notes, 500 ms apart, the first 250 ms after
+scheduling), sends each at P minus the compensation, finds each onset O as the round trip does, and
+reports the placement error per note:
+
+    E = O - P   (samples and ms)
+
+With `--compensation` it plays the pattern twice and prints the two runs side by side:
+**uncompensated** (sent at P; E is the round trip L of each note) and **compensated** (sent the
+compensation early; E is what is left). Then the mean, median, standard deviation, min and max of
+each run, and one reading line, "compensated placement within +-X ms" (the largest |E| of the
+compensated run). Without `--compensation` it plays once and suggests the mean as the compensation.
+
+```
+cargo run -p audio-bench --features native-asio --release -- --placement --compensation <samples, or <ms>ms> --midi-out "<port name or part>" --midi-channel 1 --in 1 --backend asio --device "<ASIO driver>" --rate 44100 --buffer 256 --json docs/benchmarks/<date>-<machine>-<synth>-placement.json
+```
+
+Options beside the round trip's (all but `--trials`): `--compensation 1070` (samples) or
+`--compensation 24.3ms`; `--pattern-ms 0,500,1250,...` (onsets from the pattern's start, increasing,
+at least 50 ms apart) or `--pattern-count <n> --pattern-spacing-ms <ms>`; `--lead-ms` (default 250).
+The compensation must stay within the lead either way, or the run is refused before anything opens:
+a positive one at or above the lead would be due before it was scheduled, a negative one beyond it
+would send every note more than the lead after its position. `--gap-ms` is the wait after
+the warm-up note and between the two runs. Each note is held 100 ms (at most half the smallest
+spacing).
+
+How the sends are timed: each deadline is the host time of P minus the compensation by the
+bench's position clock, recomputed from the freshest fit while waiting, and the wait is the MIDI
+output thread's: sleep until 300 us before the deadline, then yield until it has come. How late
+each send landed against its deadline is printed ("sends against their deadlines"); it is inside E.
+
+How to read it:
+
+- **Uncompensated E** is the round trip of each note: it should agree with `--midi-roundtrip`'s L on
+  the same chain within the run-to-run spread.
+- **Compensated E** should sit near 0, within the synth's attack variation and the clock's noise
+  (the detector's late bias of a sample or two remains, as in L). A mean clearly away from 0 means
+  the offset is wrong for this chain, rate or buffer; the mean of the uncompensated run is the better
+  figure.
+- **The spread** of the compensated run is the synth plus the clock; it is what no stored offset can
+  remove. The detector, fit and warning lines are the round trip's.
+- A note whose pre-send window (the 100 ms before it, or a quarter of the spacing) is more than 6 dB
+  above the floor gets a warning: the previous note's release was still sounding. Its threshold is
+  raised over it; for a long release, raise `--pattern-spacing-ms`.
+
+Safety is the round trip's: one guard releases the note on every path, and the same Ctrl+C rules.
 
 ## Call for testers
 

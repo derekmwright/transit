@@ -165,3 +165,34 @@ A stored External Instrument offset near 1070 samples places this synth within a
 the grid (the 1 ms is the order of the position-clock residual, and the run medians span about 1.7 ms).
 The synth's own attack variation is the limit, not the offset. The offset is specific to this chain,
 sample rate and buffer: change any of them and it should be measured again.
+
+## Next: placement with the measured offsets
+
+The bench limitations above are fixed in the next bench slice (issue #71): a warm-up note before
+trial 1, the floor taken as the lowest window of the run, and a clock fit over 2 s of blocks that
+converges with the Scarlett's buffer-256 arrivals. `--placement` then checks the offsets measured
+here: each note of a pattern is sent the compensation early, and its onset's error against its
+intended position is reported, uncompensated and compensated side by side (see the README, "Placement
+against the grid"). The pattern spacing matches the round trip's 1500 ms gap, which the Model D's
+release needs.
+
+TASCAM Model 12, input 3, 44.1 kHz, buffer 256, compensation 1070 samples:
+
+```
+cargo run -p audio-bench --features native-asio --release -- --placement --compensation 1070 --pattern-spacing-ms 1500 --midi-out "MODEL D" --midi-channel 1 --in 3 --backend asio --device "Model Mixer ASIO Driver" --rate 44100 --buffer 256 --json model-d-model12-placement.json
+```
+
+Scarlett 2i2, input 1, 48 kHz, buffer 64, compensation 955 samples:
+
+```
+cargo run -p audio-bench --features native-asio --release -- --placement --compensation 955 --pattern-spacing-ms 1500 --midi-out "MODEL D" --midi-channel 1 --in 1 --backend asio --device "Focusrite USB ASIO" --rate 48000 --buffer 64 --json model-d-scarlett-placement.json
+```
+
+The Scarlett run that was refused at buffer 256 (S3), to check the clock fit fix:
+
+```
+cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --midi-out "MODEL D" --midi-channel 1 --in 1 --backend asio --device "Focusrite USB ASIO" --rate 48000 --buffer 256 --note 60 --trials 12 --gap-ms 1500 --json scarlett-s3b.json
+```
+
+A compensated run within about 1 ms of zero confirms the offset for that chain; the uncompensated
+run should repeat the round trip's median within its spread.
