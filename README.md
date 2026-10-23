@@ -92,6 +92,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 - Try the latest release and report what breaks, with the steps to make it happen.
 - Read the [known issues](docs/known-issues/README.md) and pick one.
 - Review an [ADR](docs/adr) draft when one is posted.
+- Working with AI coding agents? Read [Working on transit with AI coding agents](docs/contributing/agents.md).
 
 ## Features
 

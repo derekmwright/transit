@@ -15,7 +15,7 @@ row, never a longer file.
 
 ## Read first (agents and people)
 
-1. `AGENTS.md` at the repository root: the rules.
+1. `AGENTS.md` at the repository root, and [`agents.md`](agents.md): the rules and the agent workflow.
 2. [`knowledge/README.md`](knowledge/README.md): always read `layering.md` and `audio-thread.md`;
    then the topic files for the crates you touch.
 3. [`evidence/README.md`](evidence/README.md): read `gates.md` and `refutation-review.md` before
