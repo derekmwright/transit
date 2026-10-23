@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use audio_bench::midi_roundtrip::{Driver, Settings, measure, open_output};
+use audio_bench::midi_roundtrip::{Driver, Interrupt, Settings, measure, open_output};
 use audio_bench::session::Request;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -204,14 +204,20 @@ fn the_latency_follows_the_synths_delay_in_sample_positions() {
     let (mut rig, audio) = Rig::new(&delays);
     let io = rig.midi.io();
     let mut port = open_output(&io, "fake synth").unwrap();
-    let report = measure(&audio, &request(), &settings(10), &mut port, &mut rig).unwrap();
+    let report = measure(&audio, &request(), &settings(10), &mut port, &mut rig, &Interrupt::default()).unwrap();
     let latencies: Vec<u64> = report.trials.iter().map(|t| t.latency()).collect();
-    // The onset is the 10 percent crossing of a causal envelope: the same small lag every trial.
-    let lag = latencies[0] - delays[0];
-    assert!(lag < audio_bench::onset::window(RATE) as u64, "lag {lag}");
+    // The threshold crossing is the synth's first sample exactly: the send position has no offset.
+    for (trial, delay) in report.trials.iter().zip(delays) {
+        assert_eq!(trial.crossing - trial.send, delay, "{trial:?}");
+    }
+    // The onset is the 10 percent crossing of the 12-sample causal envelope: the scripted attack
+    // (0.5 at once, alternating) reaches 0.5 x 2 / 12 = 0.083 > 10 percent of its ~0.49 peak on
+    // its second sample, so the detector's bias is exactly 1 sample, every trial.
+    let lag = 1;
     for (latency, delay) in latencies.iter().zip(delays) {
         assert_eq!(*latency, delay + lag, "{latencies:?}");
     }
+    assert!(report.trials.iter().all(|t| t.fit_residual_ns < 1000.0), "the virtual clock fits exactly");
     for trial in &report.trials {
         assert!(trial.uncertainty() <= audio_bench::onset::window(RATE) as u64, "{trial:?}");
         assert!(trial.onset >= trial.send);
@@ -229,6 +235,8 @@ fn the_latency_follows_the_synths_delay_in_sample_positions() {
     assert!(text.contains("effective compensation offset for this chain"), "{text}");
     assert!(text.contains("outliers (beyond 2 std dev): trial 9"), "{text}");
     assert!(text.contains("estimated MIDI delivery + synth response"), "{text}");
+    assert!(text.contains("detector onset bias: late") && text.contains("up to 11 samples"), "{text}");
+    assert!(!text.contains("warning:"), "a fast attack gets no slow-attack warning: {text}");
     let json = report.json("audio-bench --midi-roundtrip", "2026-10-23", &audio_bench::report::Machine { cpu: "c".into(), os: "o".into() });
     assert_eq!(json["trials"].as_array().unwrap().len(), 10);
     assert_eq!(json["trials"][8]["latency_samples"], 900 + lag);
@@ -245,7 +253,7 @@ fn a_silent_synth_is_refused_and_the_note_released() {
     rig.synth_channel = 1; // listens on channel 2; the measurement plays on channel 1
     let io = rig.midi.io();
     let mut port = open_output(&io, "Fake Synth").unwrap();
-    let refused = measure(&audio, &request(), &settings(3), &mut port, &mut rig).unwrap_err();
+    let refused = measure(&audio, &request(), &settings(3), &mut port, &mut rig, &Interrupt::default()).unwrap_err();
     assert!(refused.contains("trial 1: no onset within 200 ms"), "{refused}");
     assert!(refused.contains("MIDI channel 1") && refused.contains("input 1"), "{refused}");
     assert_eq!(rig.midi.sent(&rig.port).iter().filter(|m| m[0] == 0x90).count(), 1, "it stops at the first silent trial");
@@ -260,10 +268,25 @@ fn an_interrupt_mid_trial_releases_the_note() {
     let mut port = open_output(&io, "Synth").unwrap();
     let mut s = settings(2);
     s.channel = 4;
-    let refused = measure(&audio, &request(), &s, &mut port, &mut rig).unwrap_err();
+    let refused = measure(&audio, &request(), &s, &mut port, &mut rig, &Interrupt::default()).unwrap_err();
     assert!(refused.contains("interrupted"), "{refused}");
     assert_released(&rig, 4);
     assert!(!audio.running(ab::Direction::Output), "the streams stopped");
+}
+
+#[test]
+fn a_ctrl_c_during_the_device_open_sends_no_note_and_releases() {
+    let (mut rig, audio) = Rig::new(&[600]);
+    let io = rig.midi.io();
+    let mut port = open_output(&io, "Synth").unwrap();
+    let interrupt = Interrupt::default();
+    assert!(!interrupt.ctrl_c(), "the first press only stops");
+    let refused = measure(&audio, &request(), &settings(2), &mut port, &mut rig, &interrupt).unwrap_err();
+    assert!(refused.contains("interrupted"), "{refused}");
+    assert_eq!(rig.midi.sent(&rig.port).iter().filter(|m| m[0] == 0x90).count(), 0, "no note-on after the stop");
+    assert_released(&rig, 0);
+    assert!(!interrupt.note_outstanding());
+    assert!(interrupt.ctrl_c(), "with nothing outstanding a second press may exit");
 }
 
 #[test]
@@ -275,7 +298,7 @@ fn a_ringing_return_before_the_send_is_refused() {
     let mut port = open_output(&io, "Synth").unwrap();
     let mut s = settings(2);
     s.gap_ms = 1;
-    let refused = measure(&audio, &request(), &s, &mut port, &mut rig).unwrap_err();
+    let refused = measure(&audio, &request(), &s, &mut port, &mut rig, &Interrupt::default()).unwrap_err();
     assert!(refused.contains("trial 2") && refused.contains("above the noise floor"), "{refused}");
     assert_released(&rig, 0);
 }

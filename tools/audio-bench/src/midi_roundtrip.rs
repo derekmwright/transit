@@ -48,6 +48,10 @@ pub const DEFAULT_GAP_MS: u32 = 750;
 pub const DEFAULT_MAX_MS: u32 = 1000;
 /// A trial further than this many standard deviations from the mean is listed as an outlier.
 pub const OUTLIER_SIGMAS: f64 = 2.0;
+/// The clock map's fit residual above which a send position is refused, in ns.
+pub const MAX_FIT_RESIDUAL_NS: f64 = 500_000.0;
+/// An onset this far after its threshold crossing gets a slow-attack warning, in ms.
+pub const SLOW_ATTACK_MS: f64 = 1.0;
 
 const NONE: u64 = u64::MAX;
 
@@ -126,10 +130,55 @@ pub trait Driver {
     fn wait(&mut self, ns: u64) -> Result<(), String>;
 }
 
-/// Real time: [`ab::HostOrigin`] (the origin the backends stamp in) and sleeps, ended by `interrupted`.
+/// What Ctrl+C and the control thread share: the stop request, and whether a note-on may be
+/// outstanding. The Ctrl+C handler only sets flags; it may end the process at once only while no
+/// note can be sounding ([`Interrupt::ctrl_c`]). The note's guard sets `note_on` before it sends a
+/// note-on and clears it once the note-off and All Notes Off went out.
+#[derive(Debug, Default)]
+pub struct Interrupt {
+    stop: AtomicBool,
+    note_on: AtomicBool,
+    release_failed: AtomicBool,
+}
+
+impl Interrupt {
+    /// Ctrl+C was pressed: request the stop. True when the process may exit right now: on a second
+    /// press, and only while no note-on is outstanding. Otherwise the control thread sees the stop
+    /// at its next poll, releases the note and ends the run. Sequentially consistent with
+    /// [`Interrupt::arm_note`]: either the handler sees the note outstanding, or the control
+    /// thread sees the stop and does not send.
+    pub fn ctrl_c(&self) -> bool {
+        let again = self.stop.swap(true, Ordering::SeqCst);
+        again && !self.note_on.load(Ordering::SeqCst)
+    }
+
+    /// Whether a stop was requested.
+    pub fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Whether a note-on may be outstanding.
+    pub fn note_outstanding(&self) -> bool {
+        self.note_on.load(Ordering::SeqCst)
+    }
+
+    /// Before a note-on: mark it outstanding, then refuse when a stop was requested (Ctrl+C during
+    /// the device open or the warm-up included).
+    fn arm_note(&self) -> Result<(), String> {
+        self.note_on.store(true, Ordering::SeqCst);
+        if self.stopped() { Err("interrupted".into()) } else { Ok(()) }
+    }
+
+    fn note_released(&self) {
+        self.note_on.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Real time: [`ab::HostOrigin`] (the origin the backends stamp in) and sleeps, ended by a stop
+/// request of `interrupt`.
 pub struct RealTime<'a> {
     pub origin: ab::HostOrigin,
-    pub interrupted: &'a AtomicBool,
+    pub interrupt: &'a Interrupt,
 }
 
 impl Driver for RealTime<'_> {
@@ -137,11 +186,11 @@ impl Driver for RealTime<'_> {
         self.origin.now_ns().unwrap_or(0)
     }
     fn wait(&mut self, ns: u64) -> Result<(), String> {
-        if self.interrupted.load(Ordering::Relaxed) {
+        if self.interrupt.stopped() {
             return Err("interrupted".into());
         }
         std::thread::sleep(std::time::Duration::from_nanos(ns.min(10_000_000)));
-        if self.interrupted.load(Ordering::Relaxed) { Err("interrupted".into()) } else { Ok(()) }
+        if self.interrupt.stopped() { Err("interrupted".into()) } else { Ok(()) }
     }
 }
 
@@ -164,26 +213,33 @@ pub fn open_output(io: &transit_midi_io::MidiIo, wanted: &str) -> Result<transit
 /// included) the note-off and All Notes Off on the channel, so no note is left sounding.
 struct Notes<'a> {
     midi: &'a mut dyn MidiSink,
+    interrupt: &'a Interrupt,
     channel: u8,
     note: u8,
 }
 
 impl Notes<'_> {
     fn on(&mut self, velocity: u8) -> Result<(), String> {
+        self.interrupt.arm_note()?;
         self.midi.send(&[0x90 | self.channel, self.note, velocity])
     }
     fn off(&mut self) -> Result<(), String> {
-        self.midi.send(&[0x80 | self.channel, self.note, 0])
+        self.midi.send(&[0x80 | self.channel, self.note, 0])?;
+        self.interrupt.note_released();
+        Ok(())
     }
 }
 
 impl Drop for Notes<'_> {
     fn drop(&mut self) {
-        let off = self.off();
+        let off = self.midi.send(&[0x80 | self.channel, self.note, 0]);
         let all = self.midi.send(&[0xB0 | self.channel, 123, 0]);
         if let Err(e) = off.and(all) {
+            self.interrupt.release_failed.store(true, Ordering::SeqCst);
             eprintln!("audio-bench: releasing the note failed ({e}); check that the synth is silent");
         }
+        // Both messages were tried: a further Ctrl+C may end the process now.
+        self.interrupt.note_released();
     }
 }
 
@@ -347,10 +403,19 @@ impl Clock {
         Ok(())
     }
 
-    /// The sample position at host time `host_ns`.
-    fn position_at(&self, host_ns: u64) -> Result<u64, String> {
+    /// The sample position at host time `host_ns`, and the map's fit residual in ns. A residual
+    /// above [`MAX_FIT_RESIDUAL_NS`] is refused.
+    fn position_at(&self, host_ns: u64) -> Result<(u64, f64), String> {
         let map = self.fitter.map().ok_or("the clock map is not valid (the position clock did not fit)")?;
-        map.host_to_frame(self.key, host_ns, host_ns).map_err(|e| format!("the send instant is outside the clock map ({e:?})"))
+        if map.residual_ns > MAX_FIT_RESIDUAL_NS {
+            return Err(format!(
+                "the position clock's fit residual is {:.3} ms, above {:.1} ms: the driver's position times are irregular",
+                map.residual_ns / 1e6,
+                MAX_FIT_RESIDUAL_NS / 1e6
+            ));
+        }
+        let position = map.host_to_frame(self.key, host_ns, host_ns).map_err(|e| format!("the send instant is outside the clock map ({e:?})"))?;
+        Ok((position, map.residual_ns))
     }
 }
 
@@ -371,8 +436,10 @@ pub struct Trial {
     pub pre_send: f32,
     pub threshold: f32,
     pub peak: f32,
-    /// Time the send call took, in ns (not part of the latency; for the record).
+    /// Time the send call took, in ns (inside L, since the instant is read before the call).
     pub send_call_ns: u64,
+    /// The clock map's fit residual at the send, in ns.
+    pub fit_residual_ns: f64,
 }
 
 impl Trial {
@@ -380,7 +447,8 @@ impl Trial {
     pub fn latency(&self) -> u64 {
         self.onset - self.send
     }
-    /// The detector's uncertainty: the distance between the two crossings, in samples.
+    /// The detector's uncertainty: how far the onset lies after the threshold crossing, in samples.
+    /// Late side only: the true start, before the crossing, is not bounded.
     pub fn uncertainty(&self) -> u64 {
         self.onset.abs_diff(self.crossing)
     }
@@ -432,6 +500,8 @@ pub struct Report {
     /// The reference noise floor (envelope peak), taken before the first note.
     pub floor: f32,
     pub trials: Vec<Trial>,
+    /// The detector's envelope window, in samples: the onset lags the attack by up to one less.
+    pub envelope_window: usize,
     /// Stream error callbacks and capture blocks lost to the clock map during the run.
     pub stream_errors: u64,
     pub lost_blocks: u64,
@@ -472,11 +542,12 @@ impl Report {
         ];
         for (k, t) in self.trials.iter().enumerate() {
             lines.push(format!(
-                "trial {:>2}: {} samples ({:.2} ms), detector +-{} samples, pre-send {}, threshold {}, attack peak {}",
+                "trial {:>2}: {} samples ({:.2} ms), onset {} samples after the threshold crossing, fit residual {:.1} us, pre-send {}, threshold {}, attack peak {}",
                 k + 1,
                 t.latency(),
                 self.ms(t.latency() as f64),
                 t.uncertainty(),
+                t.fit_residual_ns / 1000.0,
                 onset::dbfs(t.pre_send),
                 onset::dbfs(t.threshold),
                 onset::dbfs(t.peak)
@@ -507,8 +578,28 @@ impl Report {
             let worst = widths.iter().copied().max().unwrap_or(0);
             let mean = widths.iter().sum::<u64>() as f64 / widths.len().max(1) as f64;
             lines.push(format!(
-                "detector uncertainty (floor-threshold crossing to 10%-of-peak crossing): mean {mean:.1} samples, max {worst} samples ({:.2} ms)",
+                "detector uncertainty (late side only: onset after the floor-threshold crossing; the true start before the crossing is not bounded): mean {mean:.1} samples, max {worst} samples ({:.2} ms)",
                 self.ms(worst as f64)
+            ));
+            let lag = self.envelope_window.saturating_sub(1);
+            lines.push(format!(
+                "detector onset bias: late, by the attack's rise to 10% of its peak plus up to {lag} samples ({:.2} ms) of envelope lag; included in L, nothing subtracted",
+                self.ms(lag as f64)
+            ));
+            for (k, t) in self.trials.iter().enumerate() {
+                if self.ms(t.uncertainty() as f64) > SLOW_ATTACK_MS {
+                    lines.push(format!(
+                        "warning: trial {}'s onset is {:.2} ms after its threshold crossing: a slow attack; use the synth's fastest attack",
+                        k + 1,
+                        self.ms(t.uncertainty() as f64)
+                    ));
+                }
+            }
+            let residual = self.trials.iter().map(|t| t.fit_residual_ns).fold(0.0f64, f64::max);
+            lines.push(format!(
+                "clock fit residual at the sends: max {:.1} us (refused above {:.0} us)",
+                residual / 1000.0,
+                MAX_FIT_RESIDUAL_NS / 1000.0
             ));
         }
         match (self.input_latency, self.delivery_estimate()) {
@@ -544,6 +635,7 @@ impl Report {
                     "trial": k + 1, "send_position": t.send, "onset_position": t.onset, "threshold_crossing_position": t.crossing,
                     "latency_samples": t.latency(), "latency_ms": self.ms(t.latency() as f64), "detector_uncertainty_samples": t.uncertainty(),
                     "pre_send_envelope_peak": t.pre_send, "threshold": t.threshold, "attack_peak": t.peak, "send_call_ns": t.send_call_ns,
+                    "fit_residual_ns": t.fit_residual_ns,
                 })
             })
             .collect();
@@ -556,6 +648,8 @@ impl Report {
             "inputs": self.settings.returns.iter().map(|c| c + 1).collect::<Vec<_>>(),
             "gap_ms": self.settings.gap_ms, "max_ms": self.settings.max_ms,
             "rate": self.rate, "buffer": self.buffer, "noise_floor_envelope_peak": self.floor,
+            "envelope_window_samples": self.envelope_window,
+            "detector": "onset late by the attack's rise to 10% of its peak plus up to envelope_window_samples - 1; included in the latency, nothing subtracted",
             "effective_compensation_offset": summary,
             "driver_input_latency_samples": self.input_latency,
             "estimated_delivery_plus_synth_samples": self.delivery_estimate(),
@@ -568,13 +662,15 @@ impl Report {
 /// Open `request`'s device duplex through `backend`, then play `settings.trials` notes into
 /// `midi` and time each one's onset on the return. Any trial without an onset, a return not at its
 /// noise floor before a send, a stalled input or an error from `driver` ends the run with an
-/// error; the note is released on every path.
+/// error; the note is released on every path. A stop requested through `interrupt` before a
+/// note-on refuses that note.
 pub fn measure(
     backend: &dyn ab::Backend,
     request: &Request,
     settings: &Settings,
     midi: &mut dyn MidiSink,
     driver: &mut dyn Driver,
+    interrupt: &Interrupt,
 ) -> Result<Report, String> {
     settings.check()?;
     let streams = Arc::new(Streams::new(request.rate, settings));
@@ -583,7 +679,7 @@ pub fn measure(
     let midi_port = midi.name();
     let mut outcome = None;
     let opened = session::run_with(backend, &request, &streams, &mut || {
-        outcome = Some(trials(&streams, settings, &midi_port, &mut *midi, &mut *driver)?);
+        outcome = Some(trials(&streams, settings, &midi_port, &mut *midi, &mut *driver, interrupt)?);
         Ok(())
     })?;
     let (floor, trials, lost_blocks) = outcome.ok_or("the measurement did not run")?;
@@ -598,6 +694,7 @@ pub fn measure(
         input_latency,
         floor,
         trials,
+        envelope_window: onset::window(rate),
         stream_errors: streams.errors.load(Ordering::Relaxed),
         lost_blocks,
     })
@@ -622,9 +719,10 @@ fn trials(
     port: &str,
     midi: &mut dyn MidiSink,
     driver: &mut dyn Driver,
+    interrupt: &Interrupt,
 ) -> Result<(f32, Vec<Trial>, u64), String> {
     // First, so that every exit below releases the note.
-    let mut notes = Notes { midi, channel: settings.channel, note: settings.note };
+    let mut notes = Notes { midi, interrupt, channel: settings.channel, note: settings.note };
     let rate = streams.render.get().map(|a| a.format.rate).ok_or("the output did not open")?;
     if streams.capture.get().map(|a| a.format.rate) != Some(rate) {
         return Err("the input did not open at the output's rate".into());
@@ -670,7 +768,7 @@ fn trials(
         let sent = driver.now_ns();
         notes.on(settings.velocity).map_err(fail)?;
         let send_call_ns = driver.now_ns().saturating_sub(sent);
-        let send = clock.position_at(sent).map_err(fail)?;
+        let (send, fit_residual_ns) = clock.position_at(sent).map_err(fail)?;
         // The scan keeps one envelope window of samples before the send.
         let base = send.saturating_sub(w as u64);
         let stop = send + frames_of(rate, u64::from(settings.max_ms));
@@ -720,12 +818,16 @@ fn trials(
             threshold,
             peak: found.peak,
             send_call_ns,
+            fit_residual_ns,
         });
         if k < settings.trials {
             pass(driver, &mut clock, streams, u64::from(settings.gap_ms) * 1_000_000)?;
         }
     }
     drop(notes);
+    if interrupt.release_failed.load(Ordering::SeqCst) {
+        return Err("releasing the note failed: check that the synth is silent".into());
+    }
     Ok((reference.peak, out, clock.lost))
 }
 
@@ -733,6 +835,48 @@ fn trials(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_c_exits_at_once_only_on_a_second_press_with_no_note_outstanding() {
+        let interrupt = Interrupt::default();
+        assert!(!interrupt.ctrl_c(), "a first press only requests the stop");
+        assert!(interrupt.stopped());
+        assert!(interrupt.ctrl_c(), "a second press with no note outstanding exits");
+
+        let interrupt = Interrupt::default();
+        interrupt.note_on.store(true, Ordering::SeqCst);
+        assert!(!interrupt.ctrl_c());
+        assert!(!interrupt.ctrl_c(), "a second press while a note may sound waits for the release");
+        assert!(!interrupt.ctrl_c());
+        assert!(interrupt.stopped(), "the stop stays requested");
+        interrupt.note_released();
+        assert!(interrupt.ctrl_c(), "once released, the next press exits");
+    }
+
+    #[test]
+    fn a_stop_requested_before_a_note_on_refuses_it_and_the_guard_still_releases() {
+        struct Log(Vec<Vec<u8>>);
+        impl MidiSink for Log {
+            fn send(&mut self, message: &[u8]) -> Result<(), String> {
+                self.0.push(message.to_vec());
+                Ok(())
+            }
+            fn name(&self) -> String {
+                "log".into()
+            }
+        }
+        let (interrupt, mut log) = (Interrupt::default(), Log(Vec::new()));
+        assert!(!interrupt.ctrl_c(), "Ctrl+C during the device open");
+        {
+            let mut notes = Notes { midi: &mut log, interrupt: &interrupt, channel: 2, note: 60 };
+            assert_eq!(notes.on(100).unwrap_err(), "interrupted");
+            assert!(interrupt.note_outstanding(), "no exit until the guard has released");
+            assert!(!interrupt.ctrl_c());
+        }
+        assert_eq!(log.0, vec![vec![0x82, 60, 0], vec![0xB2, 123, 0]], "no note-on, then the release");
+        assert!(!interrupt.note_outstanding());
+        assert!(interrupt.ctrl_c());
+    }
 
     #[test]
     fn the_summary_lists_mean_median_spread_and_outliers() {

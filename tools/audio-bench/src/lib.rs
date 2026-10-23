@@ -155,12 +155,12 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
 }
 
 /// `--midi-roundtrip`: open the MIDI output and the native ASIO device and measure the
-/// MIDI-to-audio onset latency ([`midi_roundtrip`]). `interrupted` (set by Ctrl+C) ends it early,
-/// releasing the note.
+/// MIDI-to-audio onset latency ([`midi_roundtrip`]). A stop requested through `interrupt`
+/// (Ctrl+C) ends it early, releasing the note.
 pub fn run_midi_roundtrip(
     config: &Config,
     options: &midi_roundtrip::Options,
-    interrupted: &std::sync::atomic::AtomicBool,
+    interrupt: &midi_roundtrip::Interrupt,
 ) -> Result<midi_roundtrip::Report, String> {
     if config.kind != Kind::Asio {
         return Err("--midi-roundtrip needs --backend asio: it places the note and the onset by the driver's sample positions".into());
@@ -169,8 +169,8 @@ pub fn run_midi_roundtrip(
     let request = resolve_asio_device(&config.request)?;
     let io = transit_midi_io::MidiIo::new("audio-bench");
     let mut port = midi_roundtrip::open_output(&io, &options.port)?;
-    let mut driver = midi_roundtrip::RealTime { origin: ab::HostOrigin::default(), interrupted };
-    midi_roundtrip::measure(backend.as_ref(), &request, &options.settings, &mut port, &mut driver)
+    let mut driver = midi_roundtrip::RealTime { origin: ab::HostOrigin::default(), interrupt };
+    midi_roundtrip::measure(backend.as_ref(), &request, &options.settings, &mut port, &mut driver, interrupt)
 }
 
 /// `args` as one shell line (an argument with a space, a quote or nothing in it quoted).

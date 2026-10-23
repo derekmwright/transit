@@ -26,7 +26,7 @@ soundcraft-playback.workspace = true
 # `--midi-roundtrip`: the MIDI output port the note goes to.
 transit-midi-io.workspace = true
 # `--midi-roundtrip` releases its note on Ctrl+C (a console's default handler ends the process without unwinding).
-ctrlc = "=3.4.7"
+ctrlc = "=3.5.2"
 
 [target.'cfg(windows)'.dependencies]
 # The same asio-sys cpal uses; `--list-devices` asks it why a registered driver is not listed.
