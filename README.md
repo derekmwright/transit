@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/transit-audio/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/transit-audio/transit/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://discord.gg/7PPUBZqA66"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
 </p>
 
 A desktop DAW in pure Rust with Ableton/Logic-style ergonomics and its own audio engine, device
@@ -40,6 +41,8 @@ The builds are unsigned. On Windows, SmartScreen shows "More info", then "Run an
 ![Piano roll](docs/images/transit-pianoroll.png)
 
 ## How to help
+
+Join the Discord for announcements, testing reports and questions: [Discord invite](https://discord.gg/7PPUBZqA66)
 
 transit is measured on real hardware, and the bench has only two Windows interfaces on it. Loopback
 measurements from other machines are the most useful contribution right now.
