@@ -1094,6 +1094,20 @@ fn open_asio(fake: &ab::fake::FakeBackend, cfg: &AudioConfig) -> Player {
 }
 
 #[test]
+fn a_saved_asio_driver_that_is_not_installed_opens_nothing_else_and_says_so() {
+    let fake = model12().strict_names();
+    let fallback = fake_factory(false);
+    let cfg = AudioConfig { output: Some("TASCAM Model 12 ASIO".into()), ..asio_config() };
+    let refused = Player::open_native(Arc::new(Session::default()), &cfg, Box::new(fake.clone()), &fallback, NativeKind::Asio).err();
+    let why = refused.expect("no other driver and no cpal fallback");
+    assert!(why.contains("\"TASCAM Model 12 ASIO\"") && why.contains("\"Model Mixer ASIO Driver\""), "{why}");
+    assert!(fake.opens().is_empty() && fallback.opens().is_empty(), "nothing opened");
+    // The installed driver still opens by its name.
+    let named = AudioConfig { output: Some("Model Mixer ASIO Driver".into()), ..asio_config() };
+    assert!(!open_asio(&fake, &named).silent);
+}
+
+#[test]
 fn a_native_asio_driver_opens_every_channel_capture_first_in_its_one_mode() {
     let fake = model12();
     let calibration = crate::LoopbackCalibration {

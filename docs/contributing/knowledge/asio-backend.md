@@ -223,6 +223,12 @@ asked of `createBuffers` and the usual `--loopback --out-ch --in-ch`. The cpal p
 --system ASIO`, `--features asio`) stays for comparison. The backend lines of an ASIO run always end
 with `overloads, busy skips, position jumps, resets`.
 
+`--device` names a driver by its registry name (the Model 12's is "Model Mixer ASIO Driver", not
+"TASCAM Model 12 ASIO"); a name that matches one driver ignoring case, or is part of only one
+driver's name ("model mixer"), resolves to it and the bench says which on stderr. An unknown or
+ambiguous name is an error listing the installed drivers (`resolve_driver_name`): before slice d2 the
+backend silently opened the first driver instead, which the hardware run of 2026-10-22 hit.
+
 Hardware (2026-10-22, `hardware_scarlett_duplex_streams_two_seconds` and
 `hardware_model12_duplex_streams_two_seconds`, capture then render, every channel, two seconds of
 silence): the Scarlett at 48 kHz and 64 frames granted 64, reported latencies 188 in / 140 out frames
@@ -257,6 +263,13 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   counts; drivers that failed to load are listed under the Output list as "Not loaded: <driver>:
   <problem>" (`AsioBackend::diagnostics`, minus the `blocked` ones). While cpal's ASIO host holds a
   driver nothing is probed (the registry names only), so two drivers are never loaded at once.
+- **A driver that is gone.** A named driver is opened by its registry name only, never replaced:
+  `plan_render`/`plan_capture` of a name that is not installed fail with the list of installed
+  drivers, one that failed to load fails with its problem. The Player asks
+  `Backend::missing_device` first and, for a saved driver that is no longer installed, opens
+  nothing (no other driver, no cpal fallback); the status line and the window's notes say "The
+  audio device did not open: no ASIO driver named ... is installed; the installed ASIO drivers
+  are: ...". (Slice d2.)
 - **Open order in the Player.** `Player::open_native` runs the same `open_stepped` ladder as native
   WASAPI, with no mode step (ASIO has one mode; `share_device` does not apply). Because
   `capture_with_render` is true, `open_stepped` builds the input first (`Recorder::build_on`, an

@@ -1341,6 +1341,24 @@ fn a_device_that_does_not_reopen_is_tried_three_times_then_left_to_reconnect() {
     assert!(t.app.reopen.status(false).unwrap().ends_with("use Reconnect (resets 1, stalls 0, reopened 0)"));
 }
 
+/// A saved ASIO driver that is no longer installed opens nothing else: the status says so and
+/// lists the installed drivers.
+#[test]
+fn a_saved_asio_driver_that_is_no_longer_installed_is_said_not_replaced() {
+    let driver = scarlett_driver().strict_names();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::with_fake_native_asio(session, cfg, &again));
+    run(&mut t, &driver, 10);
+    let opens = driver.opens().len();
+    let gone = AudioConfig { output: Some("TASCAM Model 12 ASIO".into()), ..t.app.ui.audio.clone() };
+    t.app.apply_audio(gone).expect("applied");
+    assert_eq!(driver.opens().len(), opens, "the installed driver was not opened in its place");
+    assert!(t.app.player.as_ref().is_some_and(|p| p.silent));
+    assert!(t.app.status.contains("The audio device did not open: no ASIO device named \"TASCAM Model 12 ASIO\""), "{}", t.app.status);
+    assert!(t.app.status.contains("\"Focusrite USB ASIO\""), "the installed drivers are named: {}", t.app.status);
+    assert!(t.app.audio_devices.notes.iter().any(|n| n.starts_with("The audio device did not open")), "{:?}", t.app.audio_devices.notes);
+}
+
 /// N10: a session change that needs the device reopened (another sample rate) replaces the Player;
 /// when the new one runs, a reopen that had given up is cleared there too.
 #[test]

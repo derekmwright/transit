@@ -546,6 +546,12 @@ pub trait Backend {
     fn host_blocked(&self) -> bool {
         false
     }
+    /// Why `name` is not a device of this system at all (an ASIO driver that is not installed),
+    /// where the system can tell; `None` otherwise. A caller then says so instead of opening
+    /// another device or falling back to another backend.
+    fn missing_device(&self, _name: &str) -> Option<String> {
+        None
+    }
     /// The names of `endpoint`'s channels in `direction`, in device channel order, where the
     /// system reports them (ASIO: `getChannelInfo`); empty when it does not. For a duplex endpoint
     /// the input names are the capture side's.

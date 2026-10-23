@@ -71,8 +71,9 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         }
         Kind::Asio => {
             let backend = asio_backend()?;
+            let request = resolve_asio_device(&config.request)?;
             let seconds = config.seconds;
-            let opened = session::run(backend.as_ref(), &config.request, &shared, &mut || {
+            let opened = session::run(backend.as_ref(), &request, &shared, &mut || {
                 std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
                 Ok(())
             })?;
@@ -165,6 +166,27 @@ pub fn wasapi_backend() -> Result<Box<dyn ab::Backend>, String> {
 pub fn asio_backend() -> Result<Box<dyn ab::Backend>, String> {
     use ab::BackendFactory;
     transit_audio_asio::AsioFactory.backend(None).ok_or_else(|| "the native ASIO backend is not available".to_string())
+}
+
+/// `--device` of `--backend asio` as an installed driver's registry name: the exact name, else the
+/// one that matches ignoring case or contains it ("model mixer"), said on stderr. An unknown or
+/// ambiguous name is an error listing the installed drivers; the default driver never stands in.
+#[cfg(all(windows, target_pointer_width = "64", feature = "native-asio"))]
+pub fn resolve_asio_device(request: &session::Request) -> Result<session::Request, String> {
+    let Some(wanted) = request.device.as_deref() else { return Ok(request.clone()) };
+    let backend = transit_audio_asio::AsioBackend::shared().map_err(|e| format!("the native ASIO backend did not start: {e}"))?;
+    let installed = backend.driver_names().map_err(|e| format!("the ASIO drivers could not be listed: {e}"))?;
+    let resolved = transit_audio_asio::resolve_driver_name(&installed, wanted).map_err(|e| format!("--device: {e}"))?;
+    if !resolved.exact {
+        eprintln!("--device \"{wanted}\" is the ASIO driver \"{}\"", resolved.name);
+    }
+    Ok(session::Request { device: Some(resolved.name), ..request.clone() })
+}
+
+/// Without the native ASIO backend there is no driver to resolve (`asio_backend` says why).
+#[cfg(not(all(windows, target_pointer_width = "64", feature = "native-asio")))]
+pub fn resolve_asio_device(request: &session::Request) -> Result<session::Request, String> {
+    Ok(request.clone())
 }
 
 /// Without the feature (or off 64-bit Windows) there is no native ASIO backend to measure.

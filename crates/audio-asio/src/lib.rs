@@ -44,7 +44,9 @@ mod stats;
 mod stream_tests;
 mod watchdog;
 
-pub use driver::{BufferSize, DirectionType, DriverDiagnostic, DriverEntry, DriverInfo, PROBE_RATES, SampleType};
+pub use driver::{
+    BufferSize, DirectionType, DriverDiagnostic, DriverEntry, DriverInfo, PROBE_RATES, ResolvedDriver, SampleType, resolve_driver_name,
+};
 
 use host::{Host, Loader, Slot};
 use session::{Callback, SideOwner};
@@ -248,10 +250,36 @@ impl AsioBackend {
         )
     }
 
+    /// The registry names of the installed drivers.
+    pub fn driver_names(&self) -> Result<Vec<String>, ab::OpenError> {
+        Ok(self.drivers()?.into_iter().map(|d| d.name).collect())
+    }
+
+    /// Why `name` cannot be an ASIO driver of this machine (it is not installed), listing the
+    /// installed ones; `None` when it is installed or the registry could not be read.
+    pub fn missing_driver(&self, name: &str) -> Option<String> {
+        let installed = self.driver_names().ok()?;
+        (!installed.iter().any(|n| n == name)).then(|| driver::not_installed(name, &installed))
+    }
+
+    /// The endpoint of the driver named `device` (its registry name, exactly), else the first
+    /// driver with `direction` channels. A named driver that is not installed, failed to load or
+    /// has no `direction` channels is an error saying so: never another driver.
     fn find(&self, direction: ab::Direction, device: Option<&str>) -> Result<ab::Endpoint, String> {
         let endpoints = ab::Backend::endpoints(self, direction).map_err(|e| e.to_string())?;
-        let chosen = device.and_then(|d| endpoints.iter().find(|e| e.name == d || e.id == d)).or_else(|| endpoints.first());
-        chosen.cloned().ok_or_else(|| format!("no ASIO driver offers {direction:?} channels"))
+        let Some(wanted) = device else {
+            return endpoints.first().cloned().ok_or_else(|| format!("no ASIO driver offers {direction:?} channels"));
+        };
+        if let Some(found) = endpoints.iter().find(|e| e.name == wanted || e.id == wanted) {
+            return Ok(found.clone());
+        }
+        if let Some(missing) = self.missing_driver(wanted) {
+            return Err(missing);
+        }
+        match self.diagnostics().into_iter().find(|d| d.driver == wanted) {
+            Some(problem) => Err(format!("ASIO driver \"{wanted}\" could not be opened: {}", problem.problem)),
+            None => Err(format!("ASIO driver \"{wanted}\" has no {direction:?} channels")),
+        }
     }
 
     /// Opens one direction of the endpoint's driver (see [`session`] for the open-order rule).
@@ -491,6 +519,11 @@ impl ab::Backend for AsioBackend {
         self.host.is_stuck()
     }
 
+    /// A driver name that is not in the registry: the app says so instead of opening another.
+    fn missing_device(&self, name: &str) -> Option<String> {
+        self.missing_driver(name)
+    }
+
     fn plan_render(&self, wish: &ab::OutputWish) -> Result<ab::Plan, String> {
         let endpoint = self.find(ab::Direction::Output, wish.device.as_deref())?;
         let attempts = attempts(&endpoint, ab::Direction::Output, &wish.rates, wish.period)?;
@@ -721,6 +754,29 @@ mod tests {
         let capture = backend.plan_capture(&ab::InputWish::default()).expect("capture plan");
         assert_eq!(capture.endpoint.name, "Model Mixer ASIO Driver");
         assert_eq!(capture.attempts[0].format.channels, 12);
+    }
+
+    #[test]
+    fn a_named_driver_that_is_not_installed_or_failed_is_an_error_never_another_driver() {
+        let mut drivers = two_interfaces();
+        let mut absent = FakeSpec::new("Absent", 2, 2, abi::ASIOST_INT32_LSB);
+        absent.init_ok = false;
+        absent.init_message = "hardware not found".into();
+        drivers.push((entry("Absent", 12), absent));
+        let (loader, _) = FakeLoader::new(drivers);
+        let backend = backend(loader);
+        let wish = |device: &str| ab::OutputWish { device: Some(device.into()), rates: vec![48_000], channels: 2, period: None };
+        let missing = backend.plan_render(&wish("TASCAM Model 12 ASIO")).err().expect("not installed");
+        assert_eq!(
+            missing,
+            "no ASIO driver named \"TASCAM Model 12 ASIO\" is installed; the installed ASIO drivers are: \"Model Mixer ASIO Driver\", \"Focusrite USB ASIO\", \"Absent\""
+        );
+        assert_eq!(backend.missing_driver("TASCAM Model 12 ASIO"), Some(missing));
+        assert_eq!(ab::Backend::missing_device(&backend, "Focusrite USB ASIO"), None);
+        let failed = backend.plan_capture(&ab::InputWish { device: Some("Absent".into()), rate: None, period: None }).err().expect("failed");
+        assert!(failed.starts_with("ASIO driver \"Absent\" could not be opened: ") && failed.contains("hardware not found"), "{failed}");
+        assert_eq!(backend.plan_render(&wish("Focusrite USB ASIO")).expect("installed").endpoint.name, "Focusrite USB ASIO");
+        assert_eq!(backend.driver_names().unwrap(), ["Model Mixer ASIO Driver", "Focusrite USB ASIO", "Absent"]);
     }
 }
 

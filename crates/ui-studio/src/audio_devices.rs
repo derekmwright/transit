@@ -387,7 +387,7 @@ impl StudioApp {
         let cfg = self.ui.audio.clone();
         self.audio_devices.input_reported = None;
         let (opened, captured) = if self.player.is_some() || self.audio_devices.fake.is_some() {
-            let captured = match self.reconnect_audio_using(true, soundcraft_playback::Player::with_config) {
+            let captured = match self.reconnect_with_player(true) {
                 Ok(captured) => {
                     self.reopen.reconnected();
                     captured
@@ -405,6 +405,7 @@ impl StudioApp {
         };
         let mut notes = fallback_notes(&cfg, self.audio_devices.systems.as_deref(), &opened);
         notes.extend(self.player.as_ref().and_then(|p| p.backend_note.clone()));
+        notes.extend(self.not_opened_note());
         let stopped = if was_playing { "Playback stopped to change devices. " } else { "" };
         self.status = if notes.is_empty() {
             let name = opened.output.unwrap_or_else(|| "no audio device".into());
@@ -430,6 +431,13 @@ impl StudioApp {
             return;
         }
         let _ = self.reopen_audio();
+    }
+
+    /// Why the device did not open, when the Player runs silent with an error (a saved ASIO
+    /// driver that is no longer installed, say): said, never covered by another device.
+    fn not_opened_note(&self) -> Option<String> {
+        let why = self.player.as_ref().filter(|p| p.silent).and_then(soundcraft_playback::Player::initial_error)?;
+        Some(format!("The audio device did not open: {why}."))
     }
 
     fn opened(&self) -> Opened {
@@ -523,6 +531,7 @@ fn check(app: &mut StudioApp) {
         app.audio_devices.startup_checked = true;
         let mut notes = fallback_notes(&app.ui.audio, None, &app.opened());
         notes.extend(app.player.as_ref().and_then(|p| p.backend_note.clone()));
+        notes.extend(app.not_opened_note());
         if !notes.is_empty() {
             app.status = format!("{} {CHOOSE_ANOTHER}", notes.join(" "));
             app.audio_devices.notes = notes;

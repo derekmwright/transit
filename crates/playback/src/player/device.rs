@@ -313,6 +313,17 @@ impl Player {
         Self::open_native(session, cfg, Box::new(driver.clone()), &fallback, NativeKind::Asio)
     }
 
+    /// [`Self::open_fake_native_asio`], or the silent runtime with its error when it does not open
+    /// (as [`Self::with_config`] does), for the caller's device-free tests.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn with_fake_native_asio(session: Arc<Session>, cfg: &AudioConfig, driver: &ab::fake::FakeBackend) -> Self {
+        match Self::open_fake_native_asio(Arc::clone(&session), cfg, driver) {
+            Ok(player) => player,
+            Err(error) => Self::silent_runtime(session, error),
+        }
+    }
+
     /// [`Self::open_native`] for native WASAPI with a scripted backend (tests).
     #[cfg(test)]
     fn open_native_or_cpal(
@@ -347,6 +358,12 @@ impl Player {
             }
             NativeKind::Asio => OpenStep::PLANNED,
         };
+        // A device the native backend knows is not installed (an ASIO driver removed since it was
+        // saved) is said as such: neither another device nor the cpal backend opens instead.
+        if let Some(why) = cfg.output.as_deref().and_then(|name| native.backend(cfg.system.as_deref())?.missing_device(name)) {
+            log::warn!("{} did not open: {why}", kind.label());
+            return Err(why);
+        }
         let mut notes: Vec<String> = Vec::new();
         loop {
             match Self::open_stepped(Arc::clone(&session), cfg, &*native, step) {

@@ -40,6 +40,8 @@ pub struct FakeBackend {
     names: (Vec<String>, Vec<String>),
     /// The latency each opened stream reports.
     latency: Option<Duration>,
+    /// Every device name but this device's is not installed ([`Backend::missing_device`]).
+    strict: bool,
 }
 
 impl FakeBackend {
@@ -55,11 +57,18 @@ impl FakeBackend {
             duplex: false,
             names: (Vec::new(), Vec::new()),
             latency: None,
+            strict: false,
         }
     }
     /// The system and device names (for example "ASIO" and a driver's registry name).
     pub fn named(mut self, system: &str, device: &str) -> Self {
         (self.system, self.name) = (system.into(), device.into());
+        self
+    }
+    /// Names other than this device's are not installed: [`Backend::missing_device`] says so, as
+    /// the native ASIO backend does for a driver that is not in the registry.
+    pub fn strict_names(mut self) -> Self {
+        self.strict = true;
         self
     }
     /// The channel names the device reports (inputs, outputs), as `getChannelInfo` would.
@@ -166,6 +175,9 @@ impl Backend for FakeBackend {
     }
     fn host_blocked(&self) -> bool {
         self.lock().host_blocked
+    }
+    fn missing_device(&self, name: &str) -> Option<String> {
+        (self.strict && name != self.name).then(|| format!("no {} device named \"{name}\" is installed; the installed ones are: \"{}\"", self.system, self.name))
     }
     fn plan_render(&self, _wish: &OutputWish) -> Result<Plan, String> {
         Ok(Plan { endpoint: self.endpoint(Direction::Output), attempts: self.attempts.clone() })

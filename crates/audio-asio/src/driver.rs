@@ -231,6 +231,58 @@ impl std::fmt::Display for DriverDiagnostic {
     }
 }
 
+/// How a wanted driver name matched an installed one ([`resolve_driver_name`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDriver {
+    /// The registry name of the driver.
+    pub name: String,
+    /// The wanted name was the registry name itself; otherwise it matched by case or as a part.
+    pub exact: bool,
+}
+
+/// The installed driver names, quoted and comma-separated, for messages.
+pub fn driver_list(installed: &[String]) -> String {
+    if installed.is_empty() {
+        return "none".into();
+    }
+    installed.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+}
+
+/// The message for a wanted driver name that is not installed.
+pub fn not_installed(wanted: &str, installed: &[String]) -> String {
+    format!("no ASIO driver named \"{wanted}\" is installed; the installed ASIO drivers are: {}", driver_list(installed))
+}
+
+/// Finds `wanted` among the `installed` registry names: the exact name, else the one name equal
+/// to it ignoring case, else the one name that contains it ignoring case ("model mixer" finds
+/// "Model Mixer ASIO Driver"). No match, or several, is an error that lists the candidates; it
+/// never falls back to another driver.
+pub fn resolve_driver_name(installed: &[String], wanted: &str) -> Result<ResolvedDriver, String> {
+    if installed.iter().any(|n| n == wanted) {
+        return Ok(ResolvedDriver { name: wanted.to_owned(), exact: true });
+    }
+    let lower = wanted.to_lowercase();
+    let unique = |matches: Vec<&String>| -> Result<Option<ResolvedDriver>, String> {
+        match matches.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(ResolvedDriver { name: (*one).clone(), exact: false })),
+            many => Err(format!(
+                "\"{wanted}\" matches several ASIO drivers ({}); name one of them",
+                driver_list(&many.iter().map(|n| (*n).clone()).collect::<Vec<_>>())
+            )),
+        }
+    };
+    if let Some(found) = unique(installed.iter().filter(|n| n.to_lowercase() == lower).collect())? {
+        return Ok(found);
+    }
+    if !lower.is_empty()
+        && let Some(found) = unique(installed.iter().filter(|n| n.to_lowercase().contains(&lower)).collect())?
+    {
+        return Ok(found);
+    }
+    Err(not_installed(wanted, installed))
+}
+
 /// Maps an `ASIOError` returned by `what` on `driver` to the trait's error.
 pub fn asio_error(driver: &str, what: &str, code: i32) -> ab::OpenError {
     let text = format!("ASIO driver \"{driver}\": {what} failed: {} ({code})", abi::error_text(code));
@@ -401,5 +453,24 @@ mod tests {
         assert!(none.format_ranges(ab::Direction::Output).is_empty());
         let mixed = DirectionType::Mixed(vec![SampleType::Int24Lsb, SampleType::Int32Lsb]);
         assert!(mixed.format().is_none() && mixed.describe().contains("unsupported"));
+    }
+
+    #[test]
+    fn a_driver_name_resolves_exactly_then_by_case_then_as_a_unique_part_and_never_to_another() {
+        let installed: Vec<String> =
+            ["Focusrite USB ASIO", "Model Mixer ASIO Driver", "Focusrite Thunderbolt ASIO"].iter().map(|s| (*s).to_string()).collect();
+        let exact = resolve_driver_name(&installed, "Model Mixer ASIO Driver").unwrap();
+        assert_eq!(exact, ResolvedDriver { name: "Model Mixer ASIO Driver".into(), exact: true });
+        assert_eq!(resolve_driver_name(&installed, "focusrite usb asio").unwrap(), ResolvedDriver { name: "Focusrite USB ASIO".into(), exact: false });
+        assert_eq!(resolve_driver_name(&installed, "model mixer").unwrap().name, "Model Mixer ASIO Driver");
+        let several = resolve_driver_name(&installed, "focusrite").unwrap_err();
+        assert!(several.contains("several") && several.contains("\"Focusrite USB ASIO\"") && several.contains("Thunderbolt"), "{several}");
+        let missing = resolve_driver_name(&installed, "TASCAM Model 12 ASIO").unwrap_err();
+        assert_eq!(
+            missing,
+            "no ASIO driver named \"TASCAM Model 12 ASIO\" is installed; the installed ASIO drivers are: \"Focusrite USB ASIO\", \"Model Mixer ASIO Driver\", \"Focusrite Thunderbolt ASIO\""
+        );
+        assert!(resolve_driver_name(&installed, "").is_err(), "an empty name matches nothing");
+        assert!(resolve_driver_name(&[], "Any").unwrap_err().ends_with("are: none"));
     }
 }

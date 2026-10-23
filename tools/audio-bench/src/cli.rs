@@ -10,7 +10,8 @@ usage: audio-bench [options]
                          --features native-wasapi or native-asio)
   --system ASIO|WASAPI   audio system of the cpal backend (default: the platform default)
   --device <name>        output device (and input, with --loopback); default device when absent (alias --out-device);
-                         with --backend asio the ASIO driver's registry name (Focusrite USB ASIO)
+                         with --backend asio the ASIO driver's registry name (Focusrite USB ASIO; a unique part,
+                         any case, also does: model mixer; an unknown name lists the installed drivers)
   --in-device <name>     input device when it differs from --device (not with --backend asio: capture is the driver's own)
   --mode shared|exclusive  device sharing of --backend wasapi (default shared); exclusive holds the device and silences other apps
   --in-mode shared|exclusive  mode of the capture stream when it differs from --mode (the calibration stays keyed on --mode)

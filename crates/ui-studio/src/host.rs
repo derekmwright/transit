@@ -929,7 +929,7 @@ impl StudioApp {
 
     /// [`Self::reconnect_audio_using`] with the Player the app opens (in tests, the scripted one
     /// `reopen_with` holds, when set).
-    fn reconnect_with_player(&mut self, preserve: bool) -> Result<bool, String> {
+    pub(crate) fn reconnect_with_player(&mut self, preserve: bool) -> Result<bool, String> {
         #[cfg(test)]
         if let Some(open) = self.reopen_with.take() {
             let result = self.reconnect_audio_using(preserve, |session, cfg| open(session, cfg));
