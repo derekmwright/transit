@@ -1,10 +1,11 @@
-# 2026-10-24, Ryzen 9 5900X, Behringer Model D over the TASCAM Model 12 (ASIO): MIDI-to-audio onset latency
+# 2026-10-24, Ryzen 9 5900X, Behringer Model D over the TASCAM Model 12 and the Focusrite Scarlett 2i2 (ASIO): MIDI-to-audio onset latency
 
 The first measurement of MIDI-to-audio onset latency with `--midi-roundtrip` (issue #71): a note goes out
 over USB MIDI, a hardware synth plays it, and the bench times when the audio arrives at an ASIO input.
-Four runs, 43 trials in all. The method is in the README under "MIDI-to-audio onset latency".
+Four runs over the TASCAM Model 12 (43 trials), then three kept runs and one discarded run over the
+Focusrite Scarlett 2i2. The method is in the README under "MIDI-to-audio onset latency".
 
-## Setup
+## Setup (TASCAM Model 12)
 
 - **Machine.** Windows 11, AMD Ryzen 9 5900X.
 - **Chain.** The bench sends MIDI out over the Model D's own USB MIDI port ("MODEL D"), channel 1, to the
@@ -53,7 +54,7 @@ Subtracting it from L leaves an estimate of MIDI delivery plus synth response:
 
 That is about 17 ms for MIDI delivery plus the Model D's response.
 
-## Reading
+## Reading (Model 12 runs)
 
 - **What the number is.** L is the end-to-end onset latency: from the instant transit schedules the MIDI
   send to the onset of the synth's audio at the interface input, counted in the driver's sample positions.
@@ -81,7 +82,80 @@ That is about 17 ms for MIDI delivery plus the Model D's response.
 - **Note 48 (run 4).** The median is 1045 samples, 22 below run 2. With 10 trials and a 20-sample
   spread this is not a clear difference between notes.
 
-## Implication for #71
+## Scarlett 2i2
+
+Same bench commit (`bdc7e05`) and the same Model D USB MIDI port ("MODEL D"), channel 1. The Model D's audio
+goes into Focusrite Scarlett 2i2 input 1 (Air off, gain lowered after the first, clipped run) over the
+"Focusrite USB ASIO" driver at 48 kHz. All runs: `--max-fit-residual-ms 2` (except the discarded run, which
+used the 1.0 ms default), `--gap-ms 1500`, note 60.
+
+```
+cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --midi-out "MODEL D" --midi-channel 1 --in 1 --backend asio --device "Focusrite USB ASIO" --rate 48000 --buffer 64 --note 60 --trials 12 --gap-ms 1500 --max-fit-residual-ms 2 --json scarlett-s1b.json
+```
+
+| Run | Differs from the command above |
+|---|---|
+| S1 (discarded) | `--trials 10`, default fit residual limit (1.0 ms) |
+| S1b | none |
+| S2 | `--buffer 128` |
+| S3 | `--buffer 256`: refused, see "Bench limitations found" |
+
+### Results
+
+Onset latency L per trial. Driver input latency is the driver's reported figure.
+
+| Run | Buffer | Trials | Mean (samples / ms) | Median (samples / ms) | Min (samples / ms) | Max (samples / ms) | Std dev (samples / ms) | Outliers (beyond 2 std dev) | Max detector uncertainty | Send-position uncertainty | Warnings |
+|---|---:|---:|---|---|---|---|---|---|---|---|---|
+| S1b | 64 | 12 | 949.8 / 19.79 | 955.0 / 19.90 | 924 / 19.25 | 981 / 20.44 | 20.0 / 0.42 | none | 65 samples (1.35 ms) | 973.0 us (46.7 samples) | slow attack: trial 5 (1.35 ms) |
+| S2 | 128 | 12 | 1072.1 / 22.34 | 1068.5 / 22.26 | 1041 / 21.69 | 1121 / 23.35 | 24.3 / 0.51 | trial 10 | 67 samples (1.40 ms) | 1703.2 us (81.8 samples) | slow attack: trial 8 (1.40 ms) |
+| S1 (discarded) | 64 | 10 | 1231.1 / 25.65 | 990.5 / 20.64 | 955 / 19.90 | 3458 / 72.04 | 782.7 / 16.31 | trial 1 | 30 samples (0.62 ms) | 979.6 us (47.0 samples) | none |
+
+Peaks of the kept runs were -13.5 to -14.1 dBFS (S1b) and -13.5 to -13.9 dBFS (S2), with pre-send windows
+near -87 dBFS. S1b and S2 are the numbers to use. The planned note-48 run (S4) had no result when this page
+was written.
+
+**Discarded run (S1).** The input was clipped: every attack peaked at -0.0 dBFS, and the pre-send window sat
+near -70 dBFS. Trial 1 came out at 3458 samples (72.04 ms), a first-trial outlier, which pulls the mean to
+1231 samples. The other nine trials span 955 to 1007 samples (mean 983.7), a few samples above the unclipped
+S1b. The run is kept here only as a record. The gain was lowered and the run repeated as S1b.
+
+### Derived
+
+| Run | Driver input latency (samples / ms) | Mean L minus driver (samples) | ms |
+|---|---|---:|---:|
+| S1b (64) | 188 / 3.92 | 761.8 | 15.87 |
+| S2 (128) | 300 / 6.25 | 772.1 | 16.09 |
+
+### Cross-check against the Model 12
+
+MIDI delivery plus Model D response comes out at about 15.9 ms (buffer 64) and 16.1 ms (buffer 128) on the
+Scarlett, against about 17 ms on the Model 12, from the same synth, port and notes. The two chains agree
+within about 1 ms, which is the size of the scatter in a single run. Between the two Scarlett buffers the
+mean L moves by 122 samples, and the driver's reported input latency steps by 112 samples (188 to 300). The
+remainder, 10 samples (0.2 ms), is inside the run-to-run noise. So the part of L that depends on the audio
+side moves with the driver's figure, and the remaining part (MIDI plus synth) stays put.
+
+## Bench limitations found
+
+These came out of the Scarlett runs. They are for the next bench slice.
+
+- **The floor is taken from a tail.** The detector's noise floor is read from the pre-send window of the
+  first trial. In S2, trial 1's window still held the tail of the previous note, so the run's floor became
+  -56.3 dBFS and the threshold -44.2 dBFS instead of about -87 and -60 dBFS. It did not change the onsets
+  materially: attacks rise quickly to about -14 dBFS, and trial 1 detected its onset 4 samples after the
+  crossing. It does make the later threshold figure wrong for that run, and a quieter or slower attack could
+  be shifted by it.
+- **The clock fit did not converge at 256.** With buffer 256 on the Scarlett (S3), the bench gave up: "no clock
+  map and input after 3000 ms", with 541 rejected fits. No note was sent. The Model 12 ran at 256 without
+  trouble. This is a bench defect, not a driver verdict.
+- **The fit residual is large on this driver.** The Scarlett's residual at a send reached 0.98 ms (S1b) and
+  1.70 ms (S2), well above the Model 12's 0.5 to 0.93 ms, which is why the runs needed the 2 ms limit.
+  The send-position uncertainty in the table is that residual.
+- **First-note effect on one run.** The one 72 ms trial of S1 was trial 1. It was the only discarded-run
+  trial that far out, and it may be a start-of-run effect rather than clipping. It is not yet separated from
+  the clipping, so a warm-up trial may be needed.
+
+## Implication for #71 (Model 12)
 
 A stored External Instrument offset near 1070 samples places this synth within about a millisecond of
 the grid (the 1 ms is the order of the position-clock residual, and the run medians span about 1.7 ms).
