@@ -34,7 +34,12 @@ pub use soundcraft_model as model;
 /// Shuts the third-party plugin hosts down, running the module exit of every plugin binary they
 /// loaded. Call it at the end of `main`, once every plugin instance (mixer, player) is gone: a
 /// plugin that has been used can crash when its module exit only runs from an exit handler.
+/// The plug-in host thread (ADR 0018) shuts down first, running its own module exits there; it
+/// is waited for at most 5 s, so a plug-in stuck in a call does not hold the exit.
 pub fn shutdown_plugin_hosts() {
+    if !transit_plugin_host::shutdown_shared(std::time::Duration::from_secs(5)) {
+        log::warn!("plug-in host: a host thread did not shut down in time; its plug-ins are left as they are");
+    }
     soundcraft_vst3_host::shutdown();
 }
 

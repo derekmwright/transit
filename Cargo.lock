@@ -3924,6 +3924,7 @@ dependencies = [
  "soundcraft-video",
  "soundcraft-vst3-host",
  "thiserror 2.0.21",
+ "transit-plugin-host",
  "transit-rt",
  "zip",
 ]
