@@ -1,4 +1,4 @@
-//! `cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|ico>` — repository gates.
+//! `cargo xtask <ci|layers|assets|wasm|rt-targets|audio-bench|ico>` — repository gates.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -201,10 +201,6 @@ fn assets() -> Result<(), String> {
     }
 }
 
-fn parity() -> Result<(), String> {
-    cargo(&["run", "-q", "-p", "soundcraft-cli", "--", "parity", "--write", "docs/parity-checklist.md"])
-}
-
 /// Crates that must compile for the web.
 const WASM: &[&str] = &[
     "soundcraft-time",
@@ -295,12 +291,11 @@ fn main() -> ExitCode {
         Some("ci") => ci(),
         Some("layers") => layers(),
         Some("assets") => assets(),
-        Some("parity") => parity(),
         Some("wasm") => wasm(),
         Some("rt-targets") => rt_targets(),
         Some("audio-bench") => audio_bench(args.get(1..).unwrap_or(&[])),
         Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|layers|assets|parity|wasm|rt-targets|audio-bench|ico>".into()),
+        _ => Err("usage: cargo xtask <ci|layers|assets|wasm|rt-targets|audio-bench|ico>".into()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
