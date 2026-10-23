@@ -22,7 +22,37 @@ not permission.
 - **Actions** (transport, MIDI, record start) go through the action lane
   (`crates/playback/src/action_lane.rs`), a bounded preallocated queue.
 - **Plug-ins** are created, scanned and destroyed off the audio thread; only `process` runs on it.
+  Hosted ones are created and destroyed on the plug-in host thread (see below).
 - Logging from the audio thread uses `on_audio_thread()` and defers the write to the UI thread.
+
+## Plug-in host thread
+
+Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../adr/0018-plugin-host-thread.md),
+`crates/plugin-host`), not on the UI thread:
+
+- **Creation:** `playback/src/player/handles.rs` announces an instance for a frame ("Loading…"),
+  submits a job that runs `soundcraft_mix::create_instance` (load, `initialize`, state restore,
+  `prepare`) on the host thread, and polls the result once per frame. The compile takes the
+  finished `NewInstance`; the plan is published and adopted exactly as before. Nothing on the
+  audio side changes: no new lock, no allocation, no wait.
+- **The forwarder:** the host thread wraps each instance (`Ctx::adopt`) in a `Hosted` forwarder.
+  The audio thread calls `process` and the rest through it (one extra virtual call, no
+  allocation: `crates/plugin-host/tests/audio_alloc.rs`).
+- **Destruction:** dropping the forwarder (on the control thread, when a plan retires it) sends
+  the instance to its host thread, which destroys it there; if that thread is gone it is leaked.
+- **Editors and states:** the editor and state reader stay on the host thread. The UI holds
+  proxies: open, close and parameter echoes are sent without waiting; edits and the window state
+  come back through shared state the host thread's 15 ms tick fills. A state read (Save,
+  autosave, device reopen) waits on the host thread, at most the 10 s timeout.
+- **Stuck plug-ins:** a job, tick or window message that runs past 10 s wedges its thread; a fresh
+  thread takes new jobs, the slot reads "Not responding" and compiles empty.
+- **Main-thread rules:** the host thread is the instances' main thread (VST3 controller and
+  views, CLAP `[main-thread]` calls, `request_callback`, `restartComponent` servicing) and pumps
+  window messages (`transit_rt::gui_thread`); VST3 modules are entered and exited on it.
+- **macOS** runs these jobs inline on the UI thread (AppKit), as before ADR 0018.
+
+Code that makes instances itself (offline bounce, freeze, stems, tests) is not routed through
+the host thread.
 
 ## First use allocates on macOS
 
