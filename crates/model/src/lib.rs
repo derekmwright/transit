@@ -20,7 +20,7 @@ mod source;
 mod track;
 
 pub use automation::{AutoParam, AutomationLane, AutomationMode, AutomationPoint};
-pub use clip::{Clip, ClipContent, ClipLoop, Fade, FadeShape};
+pub use clip::{Clip, ClipContent, ClipLoop, Fade, FadeShape, MIN_CYCLE};
 pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use io_map::{HardwareLatency, IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH, input_channel};
 pub use markers::{Group, MarkerKind, MemoryLocation};

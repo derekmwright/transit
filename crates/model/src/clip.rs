@@ -101,6 +101,10 @@ pub struct ClipLoop {
     pub end: Samples,
 }
 
+/// The shortest loop cycle (samples): about 1.3 ms at 48 kHz. A shorter one would spin thousands
+/// of cycles per audio block for no musical purpose.
+pub const MIN_CYCLE: Samples = 64;
+
 impl ClipLoop {
     /// One cycle's length (samples); a valid loop has `start < end`.
     pub fn cycle(self) -> Samples {
@@ -108,7 +112,7 @@ impl ClipLoop {
     }
 
     pub fn is_valid(self) -> bool {
-        self.start < self.end && self.end > 0
+        self.end > 0 && self.cycle() >= MIN_CYCLE
     }
 }
 

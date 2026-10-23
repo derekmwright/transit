@@ -78,9 +78,9 @@ fn collect(s: &Session, t: TrackId, total: Samples, block: usize) -> Vec<(Sample
         let n = block.min((total - pos) as usize);
         visit_clip_events(s, s.track(t).unwrap(), pos, n, |at, e| {
             let what = match e {
-                ClipEvent::On(k, _) => format!("on {k}"),
-                ClipEvent::Off(k) => format!("off {k}"),
-                ClipEvent::Control(m) => format!("cc {} {}", m[1], m[2]),
+                ClipEvent::On(k, _, _) => format!("on {k}"),
+                ClipEvent::Off(k, _) => format!("off {k}"),
+                ClipEvent::Control(m, _) => format!("cc {} {}", m[1], m[2]),
             };
             out.push((pos + at as Samples, what));
         });

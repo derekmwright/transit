@@ -2290,13 +2290,17 @@ impl Rtp {
 
 /// A clip note as it plays: real-time properties applied, its on and off in session samples (the
 /// off clamped to the clip end). `None` when it starts at or after the clip end.
-fn played_note(s: &Session, clip: &Clip, base: i64, rtp: Rtp, n0: &soundcraft_midi::Note) -> Option<(soundcraft_midi::Note, Samples, Samples)> {
+fn played_note(s: &Session, clip: &Clip, base: i64, rtp: Rtp, n0: &soundcraft_midi::Note, keep_negative: bool) -> Option<(soundcraft_midi::Note, Samples, Samples)> {
     let sr = s.sample_rate;
     let mut n = *n0;
     n.velocity = (i64::from(n.velocity) + rtp.velocity).clamp(1, 127) as u8;
     n.pitch = (i64::from(n.pitch) + rtp.transpose).clamp(0, 127) as u8;
     n.length = ((n.length as f64 * rtp.duration) as i64).max(1);
-    n.start = n.start.saturating_add(rtp.delay).max(0);
+    // A looped clip keeps notes a start trim moved before its start (negative ticks).
+    n.start = n.start.saturating_add(rtp.delay);
+    if !keep_negative {
+        n.start = n.start.max(0);
+    }
     let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
     let off = s.tempo.tick_to_samples(base.saturating_add(n.start).saturating_add(n.length), sr).min(clip.end());
     (on < clip.end()).then_some((n, on, off))
@@ -2331,7 +2335,7 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             let (dp, delay) = (rtp.transpose, rtp.delay);
             let looping = clip.looping.filter(|l| l.is_valid());
             for n0 in &sequence.notes {
-                let Some((n, on, off)) = played_note(s, clip, base, rtp, n0) else { continue };
+                let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, looping.is_some()) else { continue };
                 let mut emit = |on: Samples, off: Samples| {
                     let off = off.min(clip.end());
                     if on >= clip.end() {
@@ -2374,9 +2378,11 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             }
             let near = s.tempo.samples_to_ticks(pos, sr).saturating_sub(base).saturating_sub(1)
                 ..=s.tempo.samples_to_ticks(end, sr).saturating_sub(base).saturating_add(1);
-            // Events before tick 0 are what a start trim hid: they don't play.
-            for c in sequence.ctrls.iter().filter(|c| c.tick >= 0) {
-                let tick = c.tick.saturating_add(delay).max(0);
+            // Events before tick 0 are what a start trim hid: they don't play, except in a looped
+            // clip, where later cycles do.
+            for c in sequence.ctrls.iter().filter(|c| c.tick >= 0 || looping.is_some()) {
+                let tick = c.tick.saturating_add(delay);
+                let tick = if looping.is_some() { tick } else { tick.max(0) };
                 if let Some(l) = looping {
                     let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
                     let rel = at.saturating_sub(clip.start);
@@ -2384,7 +2390,7 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
                         continue;
                     }
                     let msg = ctrl_message(c.kind, c.value, dp);
-                    if at >= pos && at < end && at < clip.end() {
+                    if rel >= 0 && at >= pos && at < end && at < clip.end() {
                         visit(usize::try_from(at - pos).unwrap_or(0), ClipEvent::Control(msg, c.channel));
                     }
                     if rel >= l.start {
@@ -2407,6 +2413,67 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             }
         }
     }
+}
+
+/// The note-ons a track's clips play in `pos..pos + frames`, as (absolute sample, key): what the
+/// audio thread would send. Support for tests of edits that must not change how a clip sounds.
+pub fn clip_note_ons(s: &Session, track: TrackId, pos: Samples, frames: usize) -> Vec<(Samples, u8)> {
+    let mut out = Vec::new();
+    if let Some(t) = s.track(track) {
+        visit_clip_events(s, t, pos, frames, |at, e| {
+            if let ClipEvent::On(key, _, _) = e {
+                out.push((pos + at as Samples, key));
+            }
+        });
+    }
+    out.sort();
+    out
+}
+
+/// A looped MIDI clip written out as it sounds: every cycle's notes and controllers as plain
+/// events, ticks from the clip start, cut at the clip end (ADR 0019). `None` for an unlooped or
+/// non-MIDI clip, or when the result would be unreasonably large.
+pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Sequence> {
+    let l = clip.looping.filter(|l| l.is_valid())?;
+    let ClipContent::Midi { sequence } = &clip.content else { return None };
+    let sr = s.sample_rate;
+    let base = s.tempo.samples_to_ticks(clip.start, sr);
+    let end = clip.end();
+    let cycles = clip.length / l.cycle().max(1) + 2;
+    if cycles.saturating_mul((sequence.notes.len() + sequence.ctrls.len()) as i64) > 2_000_000 {
+        return None;
+    }
+    let tick = |at: Samples| s.tempo.samples_to_ticks(at, sr) - base;
+    let mut out = soundcraft_midi::Sequence::default();
+    // Every sounding position of a content point `rel` samples in: the first pass, then each cycle.
+    let places = |rel: Samples| {
+        let first = (0..l.end).contains(&rel).then_some(clip.start + rel);
+        let later = (rel >= l.start && rel < l.end).then(|| (1..).map(move |k| cycle_at(clip.start, l, rel, k)).take_while(|at| *at < end));
+        first.into_iter().chain(later.into_iter().flatten()).filter(|at| *at >= clip.start).collect::<Vec<_>>()
+    };
+    for n in &sequence.notes {
+        let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
+        let off = s.tempo.tick_to_samples(base.saturating_add(n.start).saturating_add(n.length), sr);
+        let rel = on - clip.start;
+        let span = off.min(clip.start + l.end) - on;
+        for at in places(rel) {
+            let to = at.saturating_add(span.max(0)).min(end);
+            let mut m = *n;
+            m.start = tick(at);
+            m.length = (tick(to) - m.start).max(1);
+            out.notes.push(m);
+        }
+    }
+    for c in &sequence.ctrls {
+        let at = s.tempo.tick_to_samples(base.saturating_add(c.tick), sr);
+        for at in places(at - clip.start) {
+            let mut m = *c;
+            m.tick = tick(at);
+            out.ctrls.push(m);
+        }
+    }
+    out.sort();
+    Some(out)
 }
 
 /// Where cycle `k` (1 is the first repeat) of a content point `rel` samples into a looped clip
@@ -2461,7 +2528,7 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
         let base = s.tempo.samples_to_ticks(clip.start, sr);
         let until = pos.min(clip.end());
         let looping = clip.looping.filter(|l| l.is_valid());
-        for c in sequence.ctrls.iter().filter(|c| c.tick >= 0) {
+        for c in sequence.ctrls.iter().filter(|c| c.tick >= 0 || looping.is_some()) {
             let slot = match c.kind {
                 CtrlKind::Cc(n) => usize::from(n & 0x7F),
                 CtrlKind::PitchBend => BEND,
@@ -2469,21 +2536,26 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
                 CtrlKind::Program => PROGRAM,
                 CtrlKind::PolyPressure(_) => continue,
             };
-            let mut at = s.tempo.tick_to_samples(base.saturating_add(c.tick), sr);
-            if let Some(l) = looping {
-                // The latest cycle that sounds before `until` (ADR 0019).
-                let rel = at.saturating_sub(clip.start);
+            let mut at = Some(s.tempo.tick_to_samples(base.saturating_add(c.tick), sr));
+            if let (Some(l), Some(first_pass)) = (looping, at) {
+                // The latest cycle that sounds before `until` (ADR 0019); a controller a start trim
+                // moved before the clip start only sounds in the cycles.
+                let rel = first_pass.saturating_sub(clip.start);
                 if rel >= l.end {
                     continue;
+                }
+                if rel < 0 {
+                    at = None;
                 }
                 if rel >= l.start {
                     let first = cycle_at(clip.start, l, rel, 1);
                     if until > first {
-                        at = cycle_at(clip.start, l, rel, (until - 1 - first).div_euclid(l.cycle().max(1)) + 1);
+                        at = Some(cycle_at(clip.start, l, rel, (until - 1 - first).div_euclid(l.cycle().max(1)) + 1));
                     }
                 }
             }
-            if at < until
+            if let Some(at) = at
+                && at < until
                 && let Some(l) = last.get_mut(slot)
                 && at >= l.0
             {

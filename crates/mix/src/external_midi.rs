@@ -74,7 +74,7 @@ fn sounding_notes(s: &Session, t: &Track, pos: Samples, mut visit: impl FnMut(u8
         let ClipContent::Midi { sequence } = &clip.content else { continue };
         let base = s.tempo.samples_to_ticks(clip.start, s.sample_rate);
         for n0 in &sequence.notes {
-            if let Some((n, on, off)) = played_note(s, clip, base, rtp, n0)
+            if let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, false)
                 && on < pos
                 && off > pos
             {
