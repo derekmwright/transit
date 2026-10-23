@@ -44,8 +44,12 @@ Hosted plug-ins (CLAP, VST3) live on the plug-in host thread ([ADR 0018](../../a
   proxies: open, close and parameter echoes are sent without waiting; edits and the window state
   come back through shared state the host thread's 15 ms tick fills. A state read (Save,
   autosave, device reopen) waits on the host thread, at most the 10 s timeout.
-- **Stuck plug-ins:** a job, tick or window message that runs past 10 s wedges its thread; a fresh
-  thread takes new jobs, the slot reads "Not responding" and compiles empty.
+- **Stuck plug-ins:** a job or tick that runs past 10 s, or a window message (a modal dialog) past
+  120 s, wedges its thread and a fresh thread takes new creations. Only a creation that was stuck
+  marks its slot "Not responding" (and compiles it empty). Instances that already lived on the
+  wedged thread keep playing and their slots look normal; their editors and state reads answer
+  "not responding" until the thread returns, and then work again. The status line says when a
+  plug-in is not responding and when it has returned.
 - **Main-thread rules:** the host thread is the instances' main thread (VST3 controller and
   views, CLAP `[main-thread]` calls, `request_callback`, `restartComponent` servicing) and pumps
   window messages (`transit_rt::gui_thread`); VST3 modules are entered and exited on it.
