@@ -748,6 +748,8 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
 }
 
 #[cfg(test)]
+mod loop_edit_tests;
+#[cfg(test)]
 mod merge_tests {
     use super::*;
 

@@ -37,18 +37,21 @@ pub fn split_clip(clip: &Clip, at: Samples, new_id: ClipId, t: TimeCtx<'_>) -> O
     if at <= clip.start || at >= clip.end() {
         return None;
     }
-    // A looped MIDI clip cannot be cut yet: the halves would lose the loop's notes (ADR 0019).
-    if clip.looping.is_some() && matches!(clip.content, ClipContent::Midi { .. }) {
-        return None;
-    }
     let mut left = clip.clone();
     let mut right = clip.clone();
     right.id = new_id;
     left.trim_end_to(at);
-    right.trim_start_to(at);
+    // A looped MIDI clip keeps every note on both halves and cuts at the cycle phase (ADR 0019).
+    if clip.looping.is_some() {
+        trim_start(&mut right, at, t);
+    } else {
+        right.trim_start_to(at);
+    }
     left.fade_out = Fade::default();
     right.fade_in = Fade::default();
-    if let (ClipContent::Midi { sequence: ls }, ClipContent::Midi { sequence: rs }) = (&mut left.content, &mut right.content) {
+    if clip.looping.is_none()
+        && let (ClipContent::Midi { sequence: ls }, ClipContent::Midi { sequence: rs }) = (&mut left.content, &mut right.content)
+    {
         let boundary = t.ticks(at) - t.ticks(clip.start);
         ls.notes.retain(|n| n.start < boundary);
         ls.ctrls.retain(|c| c.tick < boundary);
@@ -64,24 +67,29 @@ pub fn split_clip(clip: &Clip, at: Samples, new_id: ClipId, t: TimeCtx<'_>) -> O
     Some((left, right))
 }
 
-/// Trim a MIDI clip's start: drop notes before the new start and re-anchor the rest.
-pub(crate) fn rebase_midi_start(clip: &mut Clip, old_start: Samples, t: TimeCtx<'_>) {
-    let delta = t.ticks(clip.start) - t.ticks(old_start);
+/// Move a clip's start edge to `to`: the ONE start-trim for every path (trim drag, Trim to
+/// Selection, Trim Start to Insertion, copy of a time range, retime, split). Audio and video
+/// advance into the file at the cycle phase (the model does that). A MIDI clip re-anchors its
+/// notes and controllers by the phase's ticks and moves its loop with them; an unlooped clip drops
+/// what the trim cut off, a looped one keeps it at negative ticks because later cycles play it
+/// (ADR 0019).
+pub(crate) fn trim_start(clip: &mut Clip, to: Samples, t: TimeCtx<'_>) {
+    let old = clip.start;
+    let delta = to.min(clip.end() - 1) - old;
+    let phase = if delta > 0 { clip.content_pos(delta) } else { delta };
+    clip.trim_start_to(to);
+    let looped = clip.looping.is_some();
     if let ClipContent::Midi { sequence } = &mut clip.content {
-        if delta == 0 {
-            return;
+        let shift = t.ticks(old.saturating_add(phase)) - t.ticks(old);
+        if shift != 0 {
+            if !looped {
+                sequence.notes.retain(|n| n.start >= shift);
+                sequence.ctrls.retain(|c| c.tick >= shift);
+            }
+            sequence.notes.iter_mut().for_each(|n| n.start -= shift);
+            sequence.ctrls.iter_mut().for_each(|c| c.tick -= shift);
         }
-        // A looped clip keeps the notes it cut off the front: later cycles still play them.
-        if clip.looping.is_none() {
-            sequence.notes.retain(|n| n.start >= delta);
-        }
-        sequence.ctrls.retain(|c| c.tick >= delta);
-        for n in &mut sequence.notes {
-            n.start -= delta;
-        }
-        for c in &mut sequence.ctrls {
-            c.tick -= delta;
-        }
+        clip.shift_loop(phase);
     }
 }
 
@@ -153,9 +161,7 @@ pub fn copy_range(s: &Session, track: TrackId, range: Range) -> Vec<Clip> {
         let Some(isect) = c.range().intersect(&range) else { continue };
         let mut part = c.clone();
         if isect.start > part.start {
-            let old = part.start;
-            part.trim_start_to(isect.start);
-            rebase_midi_start(&mut part, old, t);
+            trim_start(&mut part, isect.start, t);
         }
         if isect.end < part.end() {
             part.trim_end_to(isect.end);
@@ -174,7 +180,15 @@ pub fn consolidate_midi(s: &mut Session, track: TrackId, range: Range) -> bool {
     {
         let t = TimeCtx::of(s);
         let base = t.ticks(range.start);
-        for part in copy_range(s, track, range).into_iter().filter(|c| !c.muted) {
+        for mut part in copy_range(s, track, range).into_iter().filter(|c| !c.muted) {
+            // A looped clip is written out cycle by cycle, as it sounds (ADR 0019).
+            if part.looping.is_some() {
+                let mut abs = part.clone();
+                abs.start = range.start.saturating_add(part.start);
+                let Some(seq) = soundcraft_mix::unroll_midi_loop(s, &abs) else { return false };
+                part.content = ClipContent::Midi { sequence: seq };
+                part.looping = None;
+            }
             let at = t.ticks(range.start.saturating_add(part.start)).saturating_sub(base);
             let len = t.ticks(range.start.saturating_add(part.end())).saturating_sub(base).saturating_sub(at);
             let ClipContent::Midi { sequence } = part.content else { continue };
@@ -372,9 +386,7 @@ pub fn trim_to(s: &mut Session, track: TrackId, range: Range) -> usize {
         if let Some(i) = c.range().intersect(&range)
             && i != c.range()
         {
-            let old = c.start;
-            c.trim_start_to(i.start);
-            rebase_midi_start(c, old, tc);
+            trim_start(c, i.start, tc);
             c.trim_end_to(i.end);
             n += 1;
         }
@@ -391,9 +403,7 @@ pub fn trim_start_to(s: &mut Session, track: TrackId, at: Samples) -> usize {
     let mut n = 0;
     for c in &mut pl.clips {
         if c.range().contains(at) && at > c.start {
-            let old = c.start;
-            c.trim_start_to(at);
-            rebase_midi_start(c, old, tc);
+            trim_start(c, at, tc);
             n += 1;
         }
     }
@@ -734,16 +744,8 @@ pub fn trim_clip(s: &mut Session, id: ClipId, start: Option<Samples>, end: Optio
     let t = TimeCtx::of(s);
     let mut c = old.clone();
     if let Some(at) = start {
-        let mut to = at.max(file(&c).map_or(lo, |(f, _)| lo.max(f)));
-        // A looped MIDI clip is cut only within its first pass (its notes shift with the loop).
-        if let (Some(l), ClipContent::Midi { .. }) = (c.looping, &c.content) {
-            to = to.min(old.start.saturating_add(l.end.max(1) - 1));
-        }
-        c.trim_start_to(to);
-        if matches!(c.content, ClipContent::Midi { .. }) {
-            c.shift_loop(c.start - old.start);
-        }
-        rebase_midi_start(&mut c, old.start, t);
+        let to = at.max(file(&c).map_or(lo, |(f, _)| lo.max(f)));
+        trim_start(&mut c, to, t);
         if shuffle {
             c.start = old.start;
         }

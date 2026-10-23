@@ -235,6 +235,8 @@ fn elastic(e: &mut Engine, p: &Value) -> Result<Value> {
         s.edit.values.insert(key("ratio"), ratio);
         let mut nc = base;
         nc.content = soundcraft_model::ClipContent::Audio { source: src, offset: 0 };
+        // The new file holds every cycle already (ADR 0019).
+        nc.looping = None;
         nc.length = out_len;
         nc.stretch = 1.0;
         super::more_util::replace_clip(s, t, *id, nc);
@@ -359,6 +361,9 @@ fn loop_to(e: &mut Engine, p: &Value) -> Result<Value> {
     if !was_looped && to <= base.end() {
         return Ok(json!({"looped": false, "length": base.length}));
     }
+    if !was_looped && base.length < soundcraft_model::MIN_CYCLE {
+        return Err(bad(id, "the clip is too short to loop"));
+    }
     // Looping the whole clip needs its source to cover it; a clip at its natural length does.
     if !was_looped && let Some(c) = s.find_clip_mut(clip) {
         c.looping = Some(ClipLoop { start: 0, end: c.length });
@@ -416,8 +421,8 @@ fn set_loop(e: &mut Engine, p: &Value) -> Result<Value> {
         let Some((_, c)) = s.find_clip(cid) else { continue };
         let start = i64_or(p, "start", 0).clamp(-MAX_POSITION, MAX_POSITION);
         let end = i64_or(p, "end", c.length).clamp(-MAX_POSITION, MAX_POSITION);
-        if start >= end || end <= 0 {
-            return Err(bad(id, "the loop `start` must be before its `end`, inside the clip"));
+        if end <= 0 || end - start < soundcraft_model::MIN_CYCLE {
+            return Err(bad(id, format!("a loop must be at least {} samples long and end inside the clip", soundcraft_model::MIN_CYCLE)));
         }
         if c.edit_locked {
             continue;
@@ -425,7 +430,10 @@ fn set_loop(e: &mut Engine, p: &Value) -> Result<Value> {
         match &c.content {
             ClipContent::Audio { source, offset } => {
                 let frames = s.source(*source).map_or(i64::MAX, |src| i64::try_from(src.frames).unwrap_or(i64::MAX));
-                if start.saturating_add(*offset) < 0 || end.saturating_add(*offset) > frames {
+                // The range is clip time; a stretched clip reads the file at 1 / stretch.
+                let stretch = if c.stretch.is_finite() && c.stretch > 0.0 { c.stretch } else { 1.0 };
+                let file = |x: Samples| offset.saturating_add((x as f64 / stretch).round() as Samples);
+                if file(start) < 0 || file(end) > frames {
                     return Err(bad(id, "the loop range reaches outside the audio file"));
                 }
             }

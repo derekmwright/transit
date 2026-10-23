@@ -161,6 +161,15 @@ pub fn render_stretched(s: &mut Session, cmd: &str, c: &Clip, out_len: Samples) 
         .channels
         .iter()
         .map(|x| {
+            if c.looping.is_some() {
+                // A looped clip plays its cycles: read the file the way playback does (ADR 0019).
+                return (0..n)
+                    .map(|i| {
+                        let rel = c.content_pos((i as f64 * stretch).round() as Samples);
+                        usize::try_from(offset.saturating_add(rel)).ok().and_then(|at| x.get(at)).copied().unwrap_or(0.0)
+                    })
+                    .collect();
+            }
             let mut v: Vec<f32> = x.iter().skip(a).take(n).copied().collect();
             v.resize(n, 0.0);
             v

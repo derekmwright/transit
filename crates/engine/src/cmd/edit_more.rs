@@ -767,6 +767,7 @@ fn tce(e: &mut Engine, p: &Value) -> Result<Value> {
     let scale = |x: Samples| soundcraft_time::to_samples(x as f64 * ratio);
     let mut nc = c.clone();
     nc.content = ClipContent::Audio { source: src, offset: 0 };
+    nc.looping = None;
     nc.start = target.start;
     nc.length = target.len();
     nc.stretch = 1.0;

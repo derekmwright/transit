@@ -117,6 +117,8 @@ fn process(e: &mut Engine, p: &Value) -> Result<Value> {
         let mut nc: Clip = clip.clone();
         nc.name = new_name;
         nc.content = ClipContent::Audio { source: src, offset: 0 };
+        // The rendered file already holds every cycle (ADR 0019).
+        nc.looping = None;
         nc.length = i64::try_from(frames).unwrap_or(nc.length);
         // Invert and Duplicate are phase/copy operations. The clip's gain stays a clip gain,
         // the same way its fades stay editable. Other processes bake a new file at unity gain.

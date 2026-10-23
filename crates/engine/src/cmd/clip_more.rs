@@ -272,6 +272,7 @@ fn remove_pitch_shift(e: &mut Engine, p: &Value) -> Result<Value> {
         let Some(src) = render_stretched(s, id, &c, c.length)? else { continue };
         let mut nc = c.clone();
         nc.content = ClipContent::Audio { source: src, offset: 0 };
+        nc.looping = None;
         nc.stretch = 1.0;
         replace_clip(s, t, cid, nc);
         n += 1;

@@ -646,6 +646,8 @@ pub fn render_clip_gain(e: &mut Engine, cmd: &str, id: soundcraft_model::ClipId)
     let src = add_source(s, &format!("{}_gain", c.name), buf, None, FileFormat::Wav);
     if let Some(cl) = s.find_clip_mut(id) {
         cl.content = ClipContent::Audio { source: src, offset: 0 };
+        // The rendered file holds every cycle (ADR 0019).
+        cl.looping = None;
         cl.gain_db = 0.0;
         cl.gain_env.clear();
         // The new source is the clip as it already sounds, stretch included.

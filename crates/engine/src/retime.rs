@@ -17,7 +17,7 @@
 //! time-locked one now covers loses the covered head. A change that would squeeze a clip to
 //! nothing is refused, so no material is lost silently.
 
-use crate::edit::{TimeCtx, rebase_midi_start};
+use crate::edit::{TimeCtx, trim_start};
 use soundcraft_model::{Clip, ClipContent, Session, TrackId};
 use soundcraft_time::{Range, SampleRate, Samples, TICKS_PER_QUARTER, TempoMap, to_samples};
 use std::collections::HashSet;
@@ -166,9 +166,7 @@ fn move_clips(clips: &mut [Clip], at: &dyn Fn(Samples) -> Samples, ctx: TimeCtx<
             if start >= b.end() {
                 return Err(b.name.clone());
             }
-            let old = b.start;
-            b.trim_start_to(start);
-            rebase_midi_start(b, old, ctx);
+            trim_start(b, start, ctx);
         }
         // Two time-locked clips kept their places, so they still fit as they did.
     }
