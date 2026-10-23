@@ -184,6 +184,11 @@ struct Fx {
     gui_created: bool,
     gui_visible: bool,
     gui_edit_pending: bool,
+    /// Issue #68: 0 floating only (the default), 1 embedded too, 2 embedded reported but its
+    /// `create` fails. Set by the gain's `CMD:gui-embedded` and `CMD:gui-embedded-fails`.
+    gui_embed: u8,
+    /// The last GUI made was floating (asked by `CMD:gui-was-floating`).
+    gui_floating: bool,
 }
 
 unsafe fn fx<'a>(p: *const clap_plugin) -> &'a mut Fx {
@@ -772,6 +777,19 @@ unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istre
     {
         return requests_command(f, &cmd.to_string());
     }
+    // And its GUI modes (issue #68): embedded too, embedded that fails, and a query.
+    match std::str::from_utf8(&bytes[..got]).ok() {
+        Some("CMD:gui-embedded") => {
+            f.gui_embed = 1;
+            return true;
+        }
+        Some("CMD:gui-embedded-fails") => {
+            f.gui_embed = 2;
+            return true;
+        }
+        Some("CMD:gui-was-floating") => return f.gui_floating,
+        _ => {}
+    }
     if got != 16 {
         return false;
     }
@@ -787,15 +805,27 @@ unsafe extern "C" fn state_load(p: *const clap_plugin, stream: *const clap_istre
 
 static STATE: clap_plugin_state = clap_plugin_state { save: Some(state_save), load: Some(state_load) };
 
-unsafe extern "C" fn gui_is_api_supported(_p: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
+unsafe extern "C" fn gui_is_api_supported(p: *const clap_plugin, api: *const c_char, floating: bool) -> bool {
     assert!(!api.is_null());
-    floating
+    floating || unsafe { fx(p) }.gui_embed > 0
 }
 
 unsafe extern "C" fn gui_create(p: *const clap_plugin, _api: *const c_char, floating: bool) -> bool {
     let f = unsafe { fx(p) };
-    assert!(floating && !f.gui_created, "create");
+    assert!(!f.gui_created, "create");
+    assert!(floating || f.gui_embed > 0, "embedded create without embedded support");
+    if !floating && f.gui_embed == 2 {
+        return false;
+    }
     f.gui_created = true;
+    f.gui_floating = floating;
+    true
+}
+
+/// Embedded GUIs (issue #68 modes): any parent is taken; the "GUI" has no real window.
+unsafe extern "C" fn gui_set_parent(p: *const clap_plugin, window: *const clap_window) -> bool {
+    let f = unsafe { fx(p) };
+    assert!(f.gui_created && !f.gui_floating && !window.is_null(), "set_parent");
     true
 }
 
@@ -844,7 +874,7 @@ static GUI: clap_plugin_gui = clap_plugin_gui {
     get_resize_hints: None,
     adjust_size: None,
     set_size: None,
-    set_parent: None,
+    set_parent: Some(gui_set_parent),
     set_transient: None,
     suggest_title: Some(gui_suggest_title),
     show: Some(gui_show),
@@ -963,6 +993,8 @@ unsafe extern "C" fn factory_create(_f: *const clap_plugin_factory, host: *const
         gui_created: false,
         gui_visible: false,
         gui_edit_pending: false,
+        gui_embed: 0,
+        gui_floating: false,
     });
     let raw = Box::into_raw(b);
     unsafe {

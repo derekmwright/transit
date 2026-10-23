@@ -186,7 +186,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 
 ## Status
 
-Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). The Windows release is one download (zip and MSI) with native WASAPI and native ASIO; the cpal ASIO host is build-only (`--features asio`, needs the Steinberg SDK and LLVM) and you can build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
+Pre-alpha. The product is now called transit, and its settings folder moved from `transitDAW` to `transit` (your settings are moved once on first launch). Windows is tested daily and needs Windows 10 version 1607 or later; macOS and Linux build but are untested (their packaging ids are `dev.derekmwright.transit`). The packaging scripts under `packaging/` build the transit app on every platform ([docs/building.md](docs/building.md#packaging)). The Windows release is one download (zip and MSI) with native WASAPI and native ASIO; the cpal ASIO host is build-only (`--features asio`, needs the Steinberg SDK and LLVM) and you can build it yourself ([docs/building.md](docs/building.md#building-with-asio-windows)).
 Expect rough edges and breaking changes to the session format. Back up anything you care about.
 
 ## Build

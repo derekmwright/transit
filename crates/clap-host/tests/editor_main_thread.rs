@@ -44,5 +44,29 @@ fn main() {
     assert!(ed.open().is_err());
     assert!(ed.idle().is_empty());
     ed.close();
+
+    // Issue #68: embedded first where this host has its own window (with the header strip);
+    // a plug-in whose embedded editor fails still gets its floating one.
+    let mut p = soundcraft_clap_host::create(GAIN).expect("fixture");
+    p.prepare(48_000.0, 64, 2);
+    assert!(p.load_state(b"CMD:gui-embedded-fails"));
+    let mut ed = p.editor().expect("editor handle");
+    ed.open().expect("the embedded editor fails: the floating one opens");
+    assert!(ed.is_open());
+    assert!(p.load_state(b"CMD:gui-was-floating"), "the fallback is the floating editor");
+    ed.close();
+    drop((ed, p));
+    let mut p = soundcraft_clap_host::create(GAIN).expect("fixture");
+    p.prepare(48_000.0, 64, 2);
+    assert!(p.load_state(b"CMD:gui-embedded"));
+    let mut ed = p.editor().expect("editor handle");
+    ed.open().expect("the embedded editor opens");
+    assert!(ed.is_open());
+    let _ = ed.idle(); // the fixture's resize request reaches the window
+    assert!(ed.is_open());
+    assert_eq!(p.load_state(b"CMD:gui-was-floating"), !cfg!(windows), "embedded on Windows, floating elsewhere");
+    ed.close();
+    assert!(!ed.is_open());
+    drop((ed, p));
     println!("editor_main_thread: ok");
 }

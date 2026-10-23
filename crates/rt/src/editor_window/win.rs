@@ -26,9 +26,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetFocus, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GCW_ATOM,
     GW_CHILD, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClassLongPtrW, GetClientRect, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
@@ -83,6 +81,9 @@ struct Data {
     tracking: Cell<bool>,
     /// The plug-in window that had focus when the frame was deactivated.
     focus: Cell<HWND>,
+    /// A focus redirection is under way: a plug-in that answers its `WM_SETFOCUS` by focusing the
+    /// frame again is not redirected again (no recursion).
+    focusing: Cell<bool>,
 }
 
 impl Data {
@@ -201,8 +202,8 @@ fn lay_out(hwnd: HWND, d: &Data) {
     unsafe { GetClientRect(hwnd, &raw mut r) };
     let hh = d.header_h();
     let (w, h) = content_size(r.right - r.left, r.bottom - r.top, hh);
-    // SAFETY: the children are null (skipped by MoveWindow's failure) or live children of this
-    // frame, on this thread.
+    // SAFETY: each child is moved only when it is not null (checked below), and then it is a live
+    // child of this frame, on this thread.
     unsafe {
         if !d.header.get().is_null() {
             MoveWindow(d.header.get(), 0, 0, w, hh, 1);
@@ -226,6 +227,9 @@ fn plugin_child(d: &Data) -> HWND {
 /// Gives keyboard focus back to the plug-in: the window it had, or its top child. False when the
 /// plug-in has no window to take it.
 fn focus_plugin(d: &Data) -> bool {
+    if d.focusing.get() {
+        return false;
+    }
     let content = d.content.get();
     let last = d.focus.get();
     // SAFETY: `IsWindow`/`IsChild` accept any handles; `SetFocus` only gets a live descendant of
@@ -235,7 +239,9 @@ fn focus_plugin(d: &Data) -> bool {
         if target.is_null() {
             return false;
         }
+        d.focusing.set(true);
         SetFocus(target);
+        d.focusing.set(false);
         true
     }
 }
@@ -469,8 +475,9 @@ unsafe extern "system" fn header_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 /// One rounded control: fill, border and centered (or left-aligned) text.
 fn draw_control(dc: HDC, r: super::Rect, fill: COLORREF, text: &str, color: COLORREF, left: bool, radius: i32) {
-    // SAFETY: `dc` is the memory DC of the current WM_PAINT; every object created here is selected
-    // out and deleted before returning.
+    // SAFETY: `dc` is a DC of the current WM_PAINT (the memory DC, or the paint DC itself when no
+    // memory DC could be made); every object created here is selected out and deleted before
+    // returning, and a null brush or pen only makes those calls fail.
     unsafe {
         let brush = CreateSolidBrush(fill);
         let pen = CreatePen(PS_SOLID, 1, BORDER);
@@ -588,10 +595,10 @@ impl EditorWindow {
         let title = wide(title);
         // SAFETY: null asks for this process's module handle.
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-        // SAFETY: the active window (or null) of this thread's queue.
-        let owner = unsafe { GetActiveWindow() };
-        // SAFETY: a registered class and NUL-terminated strings that outlive the call; the owner
-        // is null or a window of this thread. Created hidden at a placeholder size.
+        // No owner window (ADR 0018 section 7): an owner would be another editor or a plug-in's own
+        // window, and destroying it would destroy this frame behind its plug-in's back.
+        // SAFETY: a registered class and NUL-terminated strings that outlive the call; no owner
+        // and no parent (a top-level window). Created hidden at a placeholder size.
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
@@ -602,7 +609,7 @@ impl EditorWindow {
                 CW_USEDEFAULT,
                 100,
                 100,
-                owner,
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
                 std::ptr::null(),
@@ -626,6 +633,7 @@ impl EditorWindow {
             pressed: Cell::new(None),
             tracking: Cell::new(false),
             focus: Cell::new(std::ptr::null_mut()),
+            focusing: Cell::new(false),
         });
         let has_header = d.cell.is_some();
         // SAFETY: our frame, on this thread; the box is freed by its WM_NCDESTROY (module docs).
@@ -821,6 +829,67 @@ mod tests {
         assert_eq!(client(win.parent()), (700, 480), "the content area follows the child");
         let hh = super::super::header_height(dpi_of(win.raw()));
         assert_eq!(client(win.raw()), (700, 480 + hh));
+        win.close();
+    }
+
+    /// ADR 0018 section 7: an editor window has no owner, so closing one editor (or a plug-in's
+    /// own window) never destroys another editor's frame, even when that one was active.
+    #[test]
+    fn editor_windows_have_no_owner_and_outlive_each_other() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER;
+        let a = EditorWindow::new("A", 200.0, 100.0, Some(HeaderCell::new())).unwrap();
+        a.raise(); // the active window of this thread, if the system lets it be
+        let b = EditorWindow::new("B", 200.0, 100.0, Some(HeaderCell::new())).unwrap();
+        for w in [&a, &b] {
+            // SAFETY: a live window of this thread; a query.
+            assert!(unsafe { GetWindow(w.raw(), GW_OWNER) }.is_null(), "no owner");
+        }
+        let b_raw = b.raw();
+        a.close();
+        // SAFETY: `IsWindow` accepts any value.
+        assert_ne!(unsafe { IsWindow(b_raw) }, 0, "closing A left B alone");
+        assert!(data(b_raw).is_some());
+        b.close();
+    }
+
+    /// The focus redirection does not recurse: a "plug-in" child that hands focus back to the
+    /// frame on WM_SETFOCUS ends after one redirection.
+    #[test]
+    fn a_plugin_that_bounces_focus_back_does_not_recurse() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFOCUS as SETFOCUS;
+        unsafe extern "system" fn bouncer(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if msg == SETFOCUS {
+                // SAFETY: the frame is this window's grandparent, a live window of this thread.
+                unsafe { SetFocus(GetParent(GetParent(hwnd))) };
+                return 0;
+            }
+            // SAFETY: default handling of a message for the window it was sent to.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        let win = EditorWindow::new("bounce", 200.0, 100.0, None).unwrap();
+        let class = register("TransitEditorBounceTest", bouncer).unwrap();
+        // SAFETY: a registered class; the parent is our live content container on this thread.
+        let child = unsafe {
+            CreateWindowExW(
+                0,
+                usize::from(class) as *const u16,
+                std::ptr::null(),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                200,
+                100,
+                win.parent(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            )
+        };
+        assert!(!child.is_null());
+        // SAFETY: a live window of this thread. Without the guard this would overflow the stack.
+        unsafe { SetFocus(win.raw()) };
+        let d = data(win.raw()).unwrap();
+        assert!(!d.focusing.get(), "the guard is released");
         win.close();
     }
 

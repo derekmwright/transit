@@ -899,13 +899,19 @@ impl GuiLink {
         let api = window_api().ok_or_else(|| "plugin editors are not supported on this platform".to_string())?;
         let (Some(supported), Some(create)) = (vt.is_api_supported, vt.create) else { return Err("incomplete clap.gui extension".into()) };
         // Embedded where this host has its own window (Windows): the window carries the header
-        // strip (issue #68). Floating otherwise, or when the plug-in offers nothing else.
+        // strip (issue #68). Floating otherwise, when the plug-in offers nothing else, or when
+        // embedding fails and the plug-in also offers a floating editor (as before #68).
         // SAFETY: live plugin; `api` is a static NUL-terminated string; main thread.
-        if hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
-            return self.open_embedded(&mut g, vt, api, title);
-        }
+        let floating = unsafe { supported(g.plugin, api.as_ptr(), true) };
         // SAFETY: as above.
-        if !unsafe { supported(g.plugin, api.as_ptr(), true) } {
+        if hostwin::SUPPORTED && unsafe { supported(g.plugin, api.as_ptr(), false) } {
+            match self.open_embedded(&mut g, vt, api, title) {
+                Ok(()) => return Ok(()),
+                Err(e) if floating => log::warn!("clap: the embedded editor failed ({e}); opening the floating one"),
+                Err(e) => return Err(e),
+            }
+        }
+        if !floating {
             return Err("this plugin offers only an embedded editor, which SoundCraft hosts on Windows only".into());
         }
         self.host.gui_closed.store(false, Ordering::Relaxed);
