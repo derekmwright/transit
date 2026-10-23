@@ -853,7 +853,7 @@ mod tests {
     }
 
     /// The focus redirection does not recurse: a "plug-in" child that hands focus back to the
-    /// frame on WM_SETFOCUS ends after one redirection.
+    /// frame on `WM_SETFOCUS` ends after one redirection.
     #[test]
     fn a_plugin_that_bounces_focus_back_does_not_recurse() {
         use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFOCUS as SETFOCUS;
