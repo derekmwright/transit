@@ -249,6 +249,8 @@ fn services() -> Services {
             }
             let d = match purpose {
                 "session.open" => d.add_filter("Session", &["transit"]),
+                // A hosted plug-in's header strip: Load… (issue #68).
+                "plugin.preset" => d.add_filter("Plug-in preset", &["vstpreset", "clappreset"]),
                 _ => d.add_filter("Audio", &["wav", "wave", "aif", "aiff", "flac", "mp3", "ogg"]),
             };
             d.pick_file().map(|p| p.to_string_lossy().into_owned())
@@ -258,6 +260,18 @@ fn services() -> Services {
             let ext = std::path::Path::new(default).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
             let d = match ext.as_str() {
                 "wav" | "aif" | "aiff" | "flac" => rfd::FileDialog::new().add_filter("Audio", &[ext.as_str()]),
+                // A hosted plug-in's Save As… (issue #68): the default is a full path in the
+                // plug-in's user preset folder.
+                "vstpreset" | "clappreset" => {
+                    let path = std::path::Path::new(default);
+                    let d = rfd::FileDialog::new().add_filter("Plug-in preset", &[ext.as_str()]);
+                    let d = match path.parent().filter(|p| p.is_dir()) {
+                        Some(dir) => d.set_directory(dir),
+                        None => d,
+                    };
+                    let name = path.file_name().map_or_else(|| default.to_owned(), |n| n.to_string_lossy().into_owned());
+                    return d.set_file_name(name).save_file().map(|p| p.to_string_lossy().into_owned());
+                }
                 _ => rfd::FileDialog::new().add_filter("Session", &["transit"]),
             };
             d.set_file_name(default).save_file().map(|p| p.to_string_lossy().into_owned())

@@ -37,6 +37,7 @@ mod midi_input;
 mod midi_output;
 pub mod mixer;
 pub mod panel;
+pub mod plugin_header;
 pub mod plugin_scan;
 pub mod presets;
 pub mod recent;
@@ -342,6 +343,8 @@ pub struct StudioApp {
     editors: Vec<EditorWanted>,
     /// Plug-in host threads not responding, as last reported in the status line (ADR 0018).
     host_wedged_shown: usize,
+    /// The hosted editor windows' header strips: preset operations under way (issue #68).
+    pub plugin_header: plugin_header::HeaderState,
     /// The arrangement: gesture in progress, scroll, and last frame's layout (for `ui.inspect`).
     pub arrange: arrange::ArrangeState,
     /// What the last Copy took, so a Paste onto the original is refused (UX gap, plan 06).
@@ -441,6 +444,7 @@ impl StudioApp {
             tracks_selected_by_header: false,
             editors: Vec::new(),
             host_wedged_shown: 0,
+            plugin_header: plugin_header::HeaderState::default(),
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
             mixer: mixer::MixerState::default(),
@@ -821,6 +825,7 @@ impl StudioApp {
         self.update_midi_live();
         self.step_poll();
         self.drive_editors();
+        self.drive_plugin_headers();
         theme::probe_fonts(ctx);
         let wheeling = self.drive_wheel(ctx, now) | self.drive_tempo_wheel(ctx, now);
         // A write pass (slice 7) holds its merge until Stop.
@@ -850,7 +855,10 @@ impl StudioApp {
         }
         // Autosave only runs on frames, and plugin editors are native windows egui never hears from.
         // egui takes its predicted frame time off every delay, so add it back.
-        let editors = self.player.as_ref().is_some_and(Player::any_editor_open) || !self.editors.is_empty() || self.scope_open();
+        let editors = self.player.as_ref().is_some_and(Player::any_editor_open)
+            || !self.editors.is_empty()
+            || self.scope_open()
+            || self.plugin_header.any_busy();
         // A plug-in being made is created one frame after it is announced; come back for it.
         let loading = self.player.as_ref().is_some_and(Player::any_loading);
         ctx.request_repaint_after_secs(
@@ -1070,6 +1078,8 @@ fn service_plugin_requests() -> bool {
     clap.pending + vst3.pending > 0
 }
 
+#[cfg(test)]
+mod plugin_header_tests;
 #[cfg(test)]
 mod plugin_host_tests;
 #[cfg(test)]

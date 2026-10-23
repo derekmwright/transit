@@ -377,6 +377,32 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn any_editor_open(&self) -> bool {
         self.handles.any_editor_open()
     }
+    pub fn set_editor_header(&mut self, track: TrackId, slot: usize, header: &soundcraft_dsp::EditorHeader) {
+        self.handles.set_header(track, slot, header);
+    }
+    pub fn take_header_actions(&mut self) -> Vec<(TrackId, usize, soundcraft_dsp::HeaderAction)> {
+        self.handles.take_header_actions()
+    }
+    pub fn live_name(&self, track: TrackId, slot: usize) -> Option<&'static str> {
+        self.handles.live_name(track, slot)
+    }
+    pub fn editor_available(&self, track: TrackId, slot: usize) -> Result<(), String> {
+        self.handles.editor_available(track, slot)
+    }
+    pub fn begin_save_state(&mut self, track: TrackId, slot: usize) -> Result<soundcraft_dsp::StateJob<Option<Vec<u8>>>, String> {
+        self.handles.begin_save_state(track, slot)
+    }
+    pub fn begin_load_state(
+        &mut self,
+        track: TrackId,
+        slot: usize,
+        data: Vec<u8>,
+    ) -> Result<soundcraft_dsp::StateJob<Option<soundcraft_dsp::LoadedValues>>, String> {
+        self.handles.begin_load_state(track, slot, data)
+    }
+    pub fn begin_default_state(&self, id: &str, ch: usize) -> soundcraft_dsp::StateJob<Option<Vec<u8>>> {
+        self.handles.begin_default_state(id, ch)
+    }
     pub fn editor_set_param(&mut self, track: TrackId, slot: usize, id: &str, value: f32) {
         self.handles.set_param(track, slot, id, value);
     }

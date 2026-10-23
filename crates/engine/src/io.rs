@@ -409,6 +409,9 @@ pub use paths::{PathBounce, PathBounced, PathNormalize, PathStem, bounce_paths, 
 
 mod bounce;
 pub use bounce::{Bounce, BounceOptions, Bounced, bounce_stems, bounce_stems_with};
+
+/// Hosted plug-ins' user preset files (issue #68), through the checked file access.
+pub mod presets;
 use bounce::{bounce_layout, check_bounce_range};
 
 /// Where a bounce is written: its part file, or memory in the browser, which has no file system.

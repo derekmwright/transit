@@ -25,17 +25,22 @@ const CMD: &str = "mix.insert_state";
 
 /// `None` = the instrument slot.
 fn slot_param(p: &Value) -> Result<Option<usize>> {
-    let v = p.get("slot").ok_or_else(|| bad(CMD, "`slot` required"))?;
+    slot_param_for(CMD, p)
+}
+
+/// [`slot_param`] for command `cmd`.
+pub(super) fn slot_param_for(cmd: &str, p: &Value) -> Result<Option<usize>> {
+    let v = p.get("slot").ok_or_else(|| bad(cmd, "`slot` required"))?;
     if let Some(n) = v.as_u64() {
-        return usize::try_from(n).ok().filter(|&n| n < INSERT_SLOTS).map(Some).ok_or_else(|| bad(CMD, "slot out of range"));
+        return usize::try_from(n).ok().filter(|&n| n < INSERT_SLOTS).map(Some).ok_or_else(|| bad(cmd, "slot out of range"));
     }
-    let s = v.as_str().map(|s| s.trim().to_ascii_lowercase()).ok_or_else(|| bad(CMD, "`slot` must be a number or a letter"))?;
+    let s = v.as_str().map(|s| s.trim().to_ascii_lowercase()).ok_or_else(|| bad(cmd, "`slot` must be a number or a letter"))?;
     if s == "instrument" {
         return Ok(None);
     }
     match s.as_bytes() {
         [c @ b'a'..=b'z'] if usize::from(c - b'a') < INSERT_SLOTS => Ok(Some(usize::from(c - b'a'))),
-        _ => s.parse::<usize>().ok().filter(|&n| n < INSERT_SLOTS).map(Some).ok_or_else(|| bad(CMD, "slot out of range")),
+        _ => s.parse::<usize>().ok().filter(|&n| n < INSERT_SLOTS).map(Some).ok_or_else(|| bad(cmd, "slot out of range")),
     }
 }
 

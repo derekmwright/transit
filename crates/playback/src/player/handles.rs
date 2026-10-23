@@ -7,7 +7,7 @@
 //! state go to the host thread too, and a retired instance is destroyed there.
 use super::*;
 use crate::{EditorEdit, PluginStates};
-use soundcraft_dsp::{PluginEditor, PluginStateReader, StateBusy};
+use soundcraft_dsp::{EditorHeader, HeaderAction, JobPoll, LoadedValues, PluginEditor, PluginStateReader, StateBusy, StateJob};
 use soundcraft_mix::InstanceSpec;
 use soundcraft_model::TrackId;
 use std::collections::BTreeMap;
@@ -500,6 +500,73 @@ impl Handles {
     pub fn set_save_deadline(&mut self, deadline: Duration) {
         self.save_deadline = deadline;
     }
+    /// What the header strip of this slot's editor window shows (issue #68); sent on to the
+    /// editor's host thread when it changed.
+    pub fn set_header(&mut self, track: TrackId, slot: usize, header: &EditorHeader) {
+        if let Some(entry) = self.entry_mut(track, slot)
+            && let Some(editor) = &mut entry.editor
+        {
+            editor.set_header(header);
+        }
+    }
+
+    /// What the user did in the editor windows' header strips: (track, slot, action), in order.
+    pub fn take_header_actions(&mut self) -> Vec<(TrackId, usize, HeaderAction)> {
+        let mut out = Vec::new();
+        for (&(track, slot), &generation) in &self.active {
+            if let Some(entry) = self.entries.get_mut(&(track, generation))
+                && let Some(editor) = &mut entry.editor
+            {
+                out.extend(editor.take_header_actions().into_iter().map(|a| (track, slot, a)));
+            }
+        }
+        out
+    }
+
+    /// The live plug-in's own name in this slot (`None`: no live instance).
+    pub fn live_name(&self, track: TrackId, slot: usize) -> Option<&'static str> {
+        self.entry(track, slot).map(|entry| entry.name)
+    }
+
+    /// `Err(reason)` while this slot's editor cannot be driven (its plug-in host thread is not
+    /// responding, or there is no live instance with an editor).
+    pub fn editor_available(&self, track: TrackId, slot: usize) -> Result<(), String> {
+        let entry = self.entry(track, slot).ok_or_else(|| "this plugin instance is not active".to_owned())?;
+        entry.editor.as_ref().ok_or_else(|| "this plugin has no editor".to_owned())?.available()
+    }
+
+    /// Starts reading this slot's live state for a preset save or a copy (issue #68): on the
+    /// plug-in host thread, polled once per frame.
+    pub fn begin_save_state(&mut self, track: TrackId, slot: usize) -> Result<StateJob<Option<Vec<u8>>>, String> {
+        let entry = self.entry_mut(track, slot).ok_or_else(|| "this plugin instance is not active".to_owned())?;
+        Ok(entry.state.as_mut().ok_or_else(|| "this plugin has no state of its own".to_owned())?.begin_save())
+    }
+
+    /// Starts loading a state into this slot's live instance (a preset, issue #68): on the plug-in
+    /// host thread, polled once per frame. The job's values are the plug-in's after the load.
+    pub fn begin_load_state(&mut self, track: TrackId, slot: usize, data: Vec<u8>) -> Result<StateJob<Option<LoadedValues>>, String> {
+        let entry = self.entry_mut(track, slot).ok_or_else(|| "this plugin instance is not active".to_owned())?;
+        let job = entry.state.as_mut().ok_or_else(|| "this plugin has no state of its own".to_owned())?.begin_load(data);
+        // A state the instance takes now is one it holds: a capture reads it again.
+        entry.refused = false;
+        Ok(job)
+    }
+
+    /// The default state of plug-in `id` (Reset to Default, issue #68): a fresh instance made on
+    /// the plug-in host thread, its state read and the instance destroyed there.
+    pub fn begin_default_state(&self, id: &str, ch: usize) -> StateJob<Option<Vec<u8>>> {
+        let id = id.to_owned();
+        let pending = self
+            .host
+            .submit(move |_ctx| soundcraft_mix::create_instance(&id, None, 48_000.0, 512, ch.max(1)).and_then(|mut made| made.plugin.save_state()));
+        StateJob::remote(move || match pending.poll() {
+            Status::Ready(v) => JobPoll::Ready(v),
+            Status::Waiting { .. } => JobPoll::Waiting,
+            Status::Stuck => JobPoll::Failed("the plug-in did not load in time".into()),
+            Status::Failed => JobPoll::Failed("the plug-in host could not make the plug-in".into()),
+        })
+    }
+
     pub fn idle(&mut self) -> Vec<EditorEdit> {
         let mut out = Vec::new();
         for (&(track, slot), &generation) in &self.active {

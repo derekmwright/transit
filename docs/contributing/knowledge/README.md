@@ -19,6 +19,7 @@ the ADRs. A new topic gets a new file and a row here.
 | [`session-format.md`](session-format.md) | Anything saved in a `.transit` file. |
 | [`commands.md`](commands.md) | User actions, undo, the control channel. |
 | [`ui.md`](ui.md) | `crates/ui-studio`: shortcuts, icons, theme, tests. |
+| [`plugin-presets.md`](plugin-presets.md) | Hosted plug-in editor windows, their header strip, user presets. |
 | [`unsafe.md`](unsafe.md) | Any `unsafe`, FFI or OS call. |
 
 Decisions live in [`../../adr/README.md`](../../adr/README.md); the overview is

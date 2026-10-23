@@ -38,6 +38,8 @@ const KNOWN_UNREACHED: &[&str] = &[
     "mix.send_surround_pan",
     "mix.solo_safe",
     "options.post_roll",
+    "plugin.preset_delete", // studio UI only (#68: the hosted plug-in window's header strip); the old UI has no hosted-editor header
+    "plugin.preset_load",   // same
     "options.pre_roll",
     "setup.hardware",        // menu opens the Playback Engine window, which doesn't run it
     "setup.io_map",          // studio UI only (Audio Devices I/O path table); the old UI has no named I/O paths

@@ -1093,6 +1093,40 @@ impl Player {
     pub fn any_editor_open(&self) -> bool {
         self.shared.editors_open.load(Ordering::Relaxed)
     }
+    /// What the header strip of this slot's editor window shows (issue #68).
+    pub fn set_editor_header(&self, track: TrackId, slot: usize, header: &soundcraft_dsp::EditorHeader) -> Result<(), PlayerError> {
+        self.owner()?.set_editor_header(track, slot, header);
+        Ok(())
+    }
+    /// What the user did in the editor windows' header strips: (track, slot, action).
+    pub fn take_header_actions(&self) -> Vec<(TrackId, usize, soundcraft_dsp::HeaderAction)> {
+        self.owner().map(|mut owner| owner.take_header_actions()).unwrap_or_default()
+    }
+    /// The live plug-in's own name in this slot (`None`: no live instance).
+    pub fn live_name(&self, track: TrackId, slot: usize) -> Option<&'static str> {
+        self.owner().ok().and_then(|owner| owner.live_name(track, slot))
+    }
+    /// `Err(reason)` while this slot's editor cannot be driven (its plug-in is not responding).
+    pub fn editor_available(&self, track: TrackId, slot: usize) -> Result<(), String> {
+        self.owner().map_err(|e| e.to_string())?.editor_available(track, slot)
+    }
+    /// Starts reading this slot's live state (a preset save, a copy); poll it once per frame.
+    pub fn begin_save_state(&self, track: TrackId, slot: usize) -> Result<soundcraft_dsp::StateJob<Option<Vec<u8>>>, String> {
+        self.owner().map_err(|e| e.to_string())?.begin_save_state(track, slot)
+    }
+    /// Starts loading a state into this slot's live instance (a preset); poll it once per frame.
+    pub fn begin_load_state(
+        &self,
+        track: TrackId,
+        slot: usize,
+        data: Vec<u8>,
+    ) -> Result<soundcraft_dsp::StateJob<Option<soundcraft_dsp::LoadedValues>>, String> {
+        self.owner().map_err(|e| e.to_string())?.begin_load_state(track, slot, data)
+    }
+    /// Starts reading plug-in `id`'s default state (a fresh instance on the plug-in host thread).
+    pub fn begin_default_state(&self, id: &str, ch: usize) -> Result<soundcraft_dsp::StateJob<Option<Vec<u8>>>, String> {
+        Ok(self.owner().map_err(|e| e.to_string())?.begin_default_state(id, ch))
+    }
     pub fn editor_set_param(&self, track: TrackId, slot: usize, id: &str, value: f32) -> Result<(), PlayerError> {
         self.owner()?.editor_set_param(track, slot, id, value);
         Ok(())

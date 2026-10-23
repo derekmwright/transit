@@ -18,6 +18,7 @@ pub mod inspect;
 pub mod io;
 pub mod midi_journal;
 pub mod midi_take;
+pub mod presets;
 pub mod retime;
 pub mod score;
 
@@ -125,6 +126,9 @@ struct TempoGesture {
 struct HistoryEntry {
     label: String,
     doc: Arc<Session>,
+    /// Hosted plug-in slots whose stored state this step loaded (issue #68): undoing or redoing
+    /// it asks the UI to load the stored state into the live instance.
+    states: Vec<(TrackId, usize)>,
 }
 
 /// Engine state: the document, history, clipboard and transport plumbing.
@@ -173,6 +177,12 @@ pub struct Engine {
     command_targets: cmd::CommandTargets,
     transient_cache: cmd::TransientCache,
     plugin_discovery: cmd::PluginDiscovery,
+    /// Hosted plug-in slots whose stored state an undo or redo changed (issue #68: a preset load
+    /// undone), for the UI to load into the live instances ([`Engine::take_state_restores`]).
+    state_restores: Vec<(TrackId, usize)>,
+    /// Slots the command running now loaded a state into ([`Engine::mark_state_load`]); its undo
+    /// step takes them.
+    state_marks: Vec<(TrackId, usize)>,
 }
 
 /// Logs the routing loops a document holds as it is opened (an older file: the mix renders it
@@ -223,6 +233,8 @@ impl Engine {
             command_targets: cmd::CommandTargets::default(),
             transient_cache: cmd::TransientCache::default(),
             plugin_discovery: cmd::PluginDiscovery::default(),
+            state_restores: Vec::new(),
+            state_marks: Vec::new(),
         }
     }
 
@@ -325,6 +337,7 @@ impl Engine {
         self.saved = Arc::clone(&self.doc);
         self.undo.clear();
         self.redo.clear();
+        self.state_restores.clear();
         self.last_selection = None;
         self.imports.clear();
         self.revision = self.revision.wrapping_add(1);
@@ -375,7 +388,8 @@ impl Engine {
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
         self.keep_runtime_state(&cur);
-        self.redo.push(HistoryEntry { label: h.label, doc: cur });
+        self.note_state_restores(&h.states);
+        self.redo.push(HistoryEntry { label: h.label, doc: cur, states: h.states });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
         true
@@ -386,7 +400,8 @@ impl Engine {
         let cur = std::mem::replace(&mut self.doc, h.doc);
         self.keep_edit_mode(&cur);
         self.keep_runtime_state(&cur);
-        self.undo.push(HistoryEntry { label: h.label, doc: cur });
+        self.note_state_restores(&h.states);
+        self.undo.push(HistoryEntry { label: h.label, doc: cur, states: h.states });
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
         true
@@ -422,12 +437,41 @@ impl Engine {
         }
     }
 
+    /// After an undo or redo of a step that loaded states: the slots whose live instances must
+    /// take the stored state again (issue #68), where the slot still holds a stored state.
+    fn note_state_restores(&mut self, slots: &[(TrackId, usize)]) {
+        for &(t, slot) in slots {
+            let stored = self
+                .doc
+                .track(t)
+                .and_then(|tr| if slot == soundcraft_mix::INSTRUMENT_SLOT { tr.instrument.as_ref() } else { tr.mixer.inserts.get(slot)?.as_ref() });
+            if stored.is_some_and(|i| i.state.is_some()) && !self.state_restores.contains(&(t, slot)) {
+                self.state_restores.push((t, slot));
+            }
+        }
+    }
+
+    /// Called by a command that loads a state into a hosted plug-in slot (a preset): undoing or
+    /// redoing its step asks for the stored state to be loaded live ([`Self::take_state_restores`]).
+    pub(crate) fn mark_state_load(&mut self, track: TrackId, slot: usize) {
+        if !self.state_marks.contains(&(track, slot)) {
+            self.state_marks.push((track, slot));
+        }
+    }
+
+    /// The hosted plug-in slots whose stored state an undo or redo changed since the last call:
+    /// the UI loads each one's stored state into its live instance.
+    pub fn take_state_restores(&mut self) -> Vec<(TrackId, usize)> {
+        std::mem::take(&mut self.state_restores)
+    }
+
     /// Record an undo point manually (for interactive gestures committed by the UI).
     pub fn push_undo(&mut self, label: &str, before: Arc<Session>) {
         if Arc::ptr_eq(&before, &self.doc) {
             return;
         }
-        self.undo.push(HistoryEntry { label: label.to_string(), doc: before });
+        let states = std::mem::take(&mut self.state_marks);
+        self.undo.push(HistoryEntry { label: label.to_string(), doc: before, states });
         self.undo_pushes += 1;
         self.redo.clear();
         if self.undo.len() > self.history_limit {
@@ -448,7 +492,12 @@ impl Engine {
             return Err(bad(format!("n is {n} but the history holds {} step(s)", self.undo.len())));
         }
         let keep = self.undo.len() - n;
-        self.undo.truncate(keep + 1);
+        let states: Vec<(TrackId, usize)> = self.undo.drain(keep + 1..).flat_map(|h| h.states).collect();
+        for s in states {
+            if !self.undo[keep].states.contains(&s) {
+                self.undo[keep].states.push(s);
+            }
+        }
         self.undo[keep].label = label.to_string();
         self.redo.clear();
         self.merge_key = None;
@@ -484,6 +533,7 @@ impl Engine {
         let saved = Arc::clone(&self.saved);
         let rev = self.revision;
         let dirty = self.dirty;
+        self.state_marks.clear();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let scoped = mode.filter(|m| *m != before.edit.edit_mode).map(|m| {
                 Arc::make_mut(&mut self.doc).edit.edit_mode = m;
@@ -528,6 +578,7 @@ impl Engine {
                 if spec.undoable && !Arc::ptr_eq(&before, &self.doc) {
                     self.push_undo(spec.label, before);
                 }
+                self.state_marks.clear();
                 if spec.journal {
                     self.journal.push((id.to_string(), params.clone()));
                 }
