@@ -403,6 +403,22 @@ fn a_shuffle_document_keeps_its_mode_and_stays_clean() {
 }
 
 #[test]
+fn a_slip_gesture_undoes_without_touching_the_mode() {
+    let mut app = app();
+    let (t, clip, bar) = track_with_clip(&mut app);
+    app.run("edit.mode", json!({"mode": "shuffle"})).unwrap();
+    let before = clips_on(&app, t);
+    app.move_clips(&[clip], bar, None).unwrap();
+    assert_ne!(clips_on(&app, t), before);
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+    assert!(app.engine.undo());
+    assert_eq!(clips_on(&app, t), before);
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+    assert!(app.engine.redo());
+    assert_eq!(app.engine.session().edit.edit_mode, soundcraft_model::EditMode::Shuffle);
+}
+
+#[test]
 fn alt_drag_onto_its_own_range_is_refused() {
     let mut app = app();
     let (t, clip, _bar) = track_with_clip(&mut app);

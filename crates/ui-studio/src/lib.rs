@@ -467,17 +467,12 @@ impl StudioApp {
 
     /// Plan 06, L7: this UI offers neither Shuffle nor Spot, so edit commands run as Slip while the
     /// document keeps the mode it was saved with. Only the commands see the override.
-    fn slip_override(&mut self, id: &str) -> bool {
+    fn slip_override(&self, id: &str) -> bool {
         use soundcraft_model::EditMode;
         let edits = id.starts_with("edit.") || id.starts_with("clip.") || id.starts_with("midi.");
-        if !edits || matches!(id, "edit.mode" | "edit.undo" | "edit.redo") {
-            return false;
-        }
-        if matches!(self.engine.session().edit.edit_mode, EditMode::Shuffle | EditMode::Spot) {
-            self.engine.session_mut().edit.edit_mode = EditMode::Slip;
-            return true;
-        }
-        false
+        edits
+            && !matches!(id, "edit.mode" | "edit.undo" | "edit.redo")
+            && matches!(self.engine.session().edit.edit_mode, EditMode::Shuffle | EditMode::Spot)
     }
 
     /// Run a command; errors go to the status line. Plug-in state is captured before saves.
@@ -533,14 +528,13 @@ impl StudioApp {
             self.stop_play();
             self.close_autosave();
         }
-        let (restore, mode) = {
-            let m = self.engine.session().edit.edit_mode;
-            (self.slip_override(id), m)
+        let result = if id == "track.change_width" {
+            self.change_track_width(&params)
+        } else if self.slip_override(id) {
+            self.engine.execute_with_mode(id, &params, soundcraft_model::EditMode::Slip)
+        } else {
+            self.engine.execute(id, &params)
         };
-        let result = if id == "track.change_width" { self.change_track_width(&params) } else { self.engine.execute(id, &params) };
-        if restore && self.engine.session().edit.edit_mode == soundcraft_model::EditMode::Slip {
-            self.engine.session_mut().edit.edit_mode = mode;
-        }
         match result {
             Ok(v) => {
                 if replacing {

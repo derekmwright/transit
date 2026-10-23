@@ -459,6 +459,17 @@ impl Engine {
     /// Run a command by id. Never panics: escaped panics become `EngineError::Internal` and the
     /// document is restored.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        self.execute_scoped(id, params, None)
+    }
+
+    /// Run a command as [`Engine::execute`] does, but with the Edit mode `mode` for this command
+    /// alone. The undo snapshot and any rollback keep the document's own mode, and the result
+    /// carries it too, unless the command itself changed the mode.
+    pub fn execute_with_mode(&mut self, id: &str, params: &Value, mode: soundcraft_model::EditMode) -> Result<Value> {
+        self.execute_scoped(id, params, Some(mode))
+    }
+
+    fn execute_scoped(&mut self, id: &str, params: &Value, mode: Option<soundcraft_model::EditMode>) -> Result<Value> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         self.check_enabled(spec, params)?;
         if spec.view {
@@ -468,7 +479,23 @@ impl Engine {
         let saved = Arc::clone(&self.saved);
         let rev = self.revision;
         let dirty = self.dirty;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, params)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let scoped = mode.filter(|m| *m != before.edit.edit_mode).map(|m| {
+                Arc::make_mut(&mut self.doc).edit.edit_mode = m;
+                (m, Arc::clone(&self.doc))
+            });
+            let result = (spec.run)(self, params);
+            if let Some((m, set)) = scoped {
+                if Arc::ptr_eq(&set, &self.doc) {
+                    // Nothing else changed: the document is the original again, pointer and all.
+                    drop(set);
+                    self.doc = Arc::clone(&before);
+                } else if self.doc.edit.edit_mode == m {
+                    Arc::make_mut(&mut self.doc).edit.edit_mode = before.edit.edit_mode;
+                }
+            }
+            result
+        }));
         let result = result.map(|result| {
             result.and_then(|value| {
                 self.validate_edit(id, &before, &saved)?;

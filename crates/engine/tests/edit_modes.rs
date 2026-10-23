@@ -413,3 +413,40 @@ fn shuffle_lock_and_snap_rules_hold_when_a_call_names_tracks() {
     run(&mut e, "edit.mode", json!({"mode": "grid"}));
     assert!(e.execute("edit.snap_to_grid", &json!({"tracks": [t.0]})).is_err());
 }
+
+fn snap(e: &Engine) -> Value {
+    serde_json::to_value(e.session()).unwrap()
+}
+
+fn starts(e: &Engine, t: TrackId) -> Vec<i64> {
+    e.session().track(t).and_then(|t| t.playlist()).unwrap().clips.iter().map(|c| c.start).collect()
+}
+
+#[test]
+fn a_scoped_mode_leaves_the_history_and_the_session_mode_alone() {
+    let (mut e, t, [a, _b]) = engine("shuffle");
+    let before = starts(&e, t);
+    let doc = snap(&e);
+    e.execute_with_mode("edit.move_clips", &json!({"clips": [a.0], "by": 500}), EditMode::Slip).unwrap();
+    assert_ne!(starts(&e, t), before, "the move ran");
+    assert_eq!(e.session().edit.edit_mode, EditMode::Shuffle);
+    assert!(e.undo());
+    assert_eq!(starts(&e, t), before);
+    assert_eq!(e.session().edit.edit_mode, EditMode::Shuffle);
+    assert_eq!(snap(&e), doc, "undo restores the pre-command document exactly");
+    // The history entry itself holds the original mode: redo and undo again stay in Shuffle.
+    assert!(e.redo());
+    assert_eq!(e.session().edit.edit_mode, EditMode::Shuffle);
+}
+
+#[test]
+fn a_refused_scoped_command_rolls_back_with_the_original_mode() {
+    let (mut e, t, [a, _b]) = engine("shuffle");
+    let aux = e.execute("track.new", &json!({"kind": "aux"})).unwrap()["tracks"][0].clone();
+    let doc = snap(&e);
+    let before = starts(&e, t);
+    assert!(e.execute_with_mode("edit.move_clips", &json!({"clips": [a.0], "by": 0, "track": aux}), EditMode::Slip).is_err());
+    assert_eq!(starts(&e, t), before);
+    assert_eq!(e.session().edit.edit_mode, EditMode::Shuffle);
+    assert_eq!(snap(&e), doc);
+}
