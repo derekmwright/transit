@@ -3,8 +3,9 @@
 //! plays. The plug-in is the VST3 test fixture's synth built with `slow-create` (500 ms in
 //! `createInstance`), loaded through the real Player and plug-in host.
 //!
-//! macOS keeps creation on the UI thread (ADR 0018 section 7), so the test is not run there.
-#![cfg(not(target_os = "macos"))]
+//! Where the default host runs inline (macOS, ADR 0018 section 7) creation stays on the UI
+//! thread, so the test returns at once there (`transit_plugin_host::INLINE_BY_DEFAULT`, the
+//! runtime's own predicate).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::{Services, StudioApp};
@@ -54,6 +55,9 @@ fn frame(app: &mut StudioApp, ctx: &egui::Context) {
 
 #[test]
 fn frames_advance_while_a_slow_plug_in_loads_and_the_slot_shows_loading_then_ready() {
+    if transit_plugin_host::INLINE_BY_DEFAULT {
+        return;
+    }
     // The host registry is process-global: run in a child so no other test sees the fixture.
     if std::env::var_os("TRANSIT_PLUGIN_HOST_FIXTURE_CHILD").is_none() {
         let name = "plugin_host_tests::frames_advance_while_a_slow_plug_in_loads_and_the_slot_shows_loading_then_ready";

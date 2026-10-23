@@ -76,6 +76,11 @@ impl Hooks {
     }
 }
 
+/// Whether hosts run inline unless told otherwise ([`Config::inline`]): on macOS (AppKit wants
+/// editors on the process main thread) and `wasm32`. Tests of host-thread behavior through the
+/// default host ([`shared`]) branch on this, so they follow the runtime's own choice.
+pub const INLINE_BY_DEFAULT: bool = cfg!(any(target_os = "macos", target_arch = "wasm32"));
+
 /// How a [`Host`] runs.
 #[derive(Clone)]
 pub struct Config {
@@ -99,7 +104,7 @@ impl Default for Config {
             dispatch_timeout: DEFAULT_DISPATCH_TIMEOUT,
             tick: DEFAULT_TICK,
             hooks: Hooks::default(),
-            inline: cfg!(any(target_os = "macos", target_arch = "wasm32")),
+            inline: INLINE_BY_DEFAULT,
         }
     }
 }

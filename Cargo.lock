@@ -4657,6 +4657,7 @@ dependencies = [
  "soundcraft-time",
  "soundcraft-vst3-host",
  "transit-audio-backend",
+ "transit-plugin-host",
 ]
 
 [[package]]

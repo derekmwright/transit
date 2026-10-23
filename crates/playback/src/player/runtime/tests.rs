@@ -750,12 +750,19 @@ fn a_slow_instance_is_made_on_the_host_thread_while_frames_advance_and_the_plan_
     assert_eq!(play(&mut ports.plans, track), 0.0);
     assert_eq!(ports.plans.engine().active().generation, first);
 
-    // Later frames submit it to the host thread and poll: none of them waits for the 500 ms.
     let (frames, worst) = frames_until_loaded(&mut runtime, &third_party, &factory);
     assert!(started.elapsed() >= std::time::Duration::from_millis(500));
-    assert!(frames >= 10, "only {frames} frames ran during a 500 ms creation");
-    assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
-    assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()), "made on the plug-in host thread");
+    if transit_plugin_host::INLINE_BY_DEFAULT {
+        // macOS (ADR 0018 section 7): the default host runs inline, so the frame that submits
+        // the instance makes it on this thread and has it at once.
+        assert_eq!(frames, 1, "made in the submitting frame");
+        assert_eq!(*thread.lock().unwrap(), Some(std::thread::current().id()), "made on the calling thread");
+    } else {
+        // Later frames submit it to the host thread and poll: none of them waits for the 500 ms.
+        assert!(frames >= 10, "only {frames} frames ran during a 500 ms creation");
+        assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
+        assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()), "made on the plug-in host thread");
+    }
     assert_eq!(made.load(Ordering::SeqCst), 1);
     assert!(!runtime.loading(track, slot) && !runtime.any_loading() && !runtime.stuck(track, slot));
     assert!(runtime.control.sessions.published.is_some(), "the plan took the instance and was published");
