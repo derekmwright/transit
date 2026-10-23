@@ -3,6 +3,9 @@
 transit speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so
 Claude and other agents can make music with it.
 
+For token locations, desktop client configuration, musical addressing, and a complete
+four-bar MIDI progression, see [Assistant access](assistant-access.md).
+
 ```sh
 soundcraft-cli mcp                    # headless engine (no window, no audio device)
 soundcraft-cli mcp --demo             # headless, starting from the demo session
@@ -107,6 +110,7 @@ Resources: `soundcraft://session` (full session JSON), `soundcraft://commands`.
 
 - Programmatic calls never open dialogs; empty params act on the current selection.
 - Positions: samples, `{"seconds": x}`, or `"bars_beats:5|1|000"`-style strings.
+- MIDI musical aliases use `bar|beat[|tick]` with 1-based bars and beats. Lengths are offsets: `1|2` is one beat, `2|1` one bar. Note aliases must be strings; numeric ticks use `start_ticks`/`length_ticks`. Colon position strings keep their clock-time meaning (for example `0:12` is 12 seconds). See [Assistant access](assistant-access.md#musical-addressing) for origins and the complete contract.
 - Tracks by name or id; clips by id.
 - Every command is undoable through `edit.undo` unless it is a query or a view setting.
 

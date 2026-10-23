@@ -11,7 +11,9 @@ const INSTRUCTIONS: &str = "transit is a digital audio workstation. Everything a
 command: call `list_commands` to discover ids and their params, then `execute` (or `batch`). Positions are samples \
 (integers), `{\"seconds\": x}`, or time strings like \"bars_beats:5|1|000\" / \"0:12.500\". Tracks are referenced by id \
 or name. Verify your work with `inspect_session` (tracks, clips, mixer, automation, markers, selection). Programmatic \
-calls never open dialogs. Tools marked APP_ONLY need the desktop app (`transit --control 0` + `soundcraft-cli mcp --connect PORT`).";
+calls never open dialogs. MIDI note start/length accept 1-based bar|beat[|tick] strings: start 1|1 is the clip beginning, length 1|2 is one beat, length 2|1 is one bar. Note aliases must be strings; numeric ticks use start_ticks/length_ticks. Clip and retrospective start positions retain colon clock strings. \
+MIDI clip start/end use session bars; note times are relative to the clip. Use midi.chord_add for chords (root name or MIDI number, quality or intervals, inversion). \
+inspect_session includes tempo/meter maps, key changes and ticks_per_quarter. Tools marked APP_ONLY need the desktop app (`transit --control 0` + `soundcraft-cli mcp --connect PORT`).";
 
 pub struct Server<B: Backend> {
     pub backend: B,
@@ -31,7 +33,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "execute",
-            "Run one command by id with JSON params. Returns the command's result.",
+            "Run one command by id with JSON params. Discover params via list_commands. MIDI note commands accept start/length as bar|beat[|tick] strings (1-based, length 1|2 = one beat, 2|1 = one bar; numeric ticks use start_ticks/length_ticks); midi.chord_add adds a chord in one undo step. Returns the command's result.",
             json!({"command": {"type": "string"}, "params": {"type": "object"}}),
             &["command"],
         ),
@@ -43,7 +45,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "inspect_session",
-            "The whole session as JSON: tracks (clips, inserts, sends, automation), busses, markers, groups, selection, transport.",
+            "The session as JSON: tempo (BPM events at ticks), meter (numerator/denominator events at ticks), ticks_per_quarter, key (at session start or null), key_signatures (at sample positions), tracks (clips, inserts, sends, automation), busses, markers, groups, selection, transport. Musical context is included in summary and full detail.",
             json!({"detail": {"type": "string", "enum": ["summary", "full"]}}),
             &[],
         ),
