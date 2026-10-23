@@ -432,6 +432,13 @@ impl ab::Stream for AsioStream {
     fn stats(&self) -> Option<ab::StreamStats> {
         Some(self.owner.0.stats.snapshot())
     }
+
+    /// Takes effect at the next buffer switch (an atomic hand-off; never blocks or calls the host
+    /// thread). The next stamp of this direction is invalid.
+    fn set_calibration(&self, calibration: Option<ab::Calibration>) -> bool {
+        self.owner.0.set_calibration(calibration);
+        true
+    }
 }
 
 impl Drop for AsioStream {

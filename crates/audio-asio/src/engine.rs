@@ -17,8 +17,13 @@
 //!
 //! Frame times: a render block's first frame is presented `getLatencies` output frames after the
 //! buffer switch, a capture block's first frame was captured `getLatencies` input frames before it
-//! (the SDK's latencies count from the buffer switch and include the buffer). The calibration moves
-//! the capture frame time earlier by its round trip, as on WASAPI.
+//! (the SDK's latencies count from the buffer switch and include the buffer). A calibration is the
+//! whole loop, measured by a click in sample positions (the output frame at position `p` comes
+//! back at input position `p + round trip`; known issue K31: the drivers' figures cannot be
+//! corrected by a fixed model). Under one, the capture frame time is the callback plus the output
+//! figure minus the round trip, so an output frame and the input frame it comes back as carry the
+//! same time and the input figure is not used. A calibration can be replaced while the stream
+//! runs ([`SideShared::set_calibration`]); the next stamp of that direction is then invalid.
 #![deny(clippy::disallowed_macros, clippy::disallowed_methods)]
 
 use crate::convert::{InputPlanes, OutputPlanes, PlanarSink, PlanarSource, Wire, silence};
@@ -51,8 +56,17 @@ pub(crate) struct SideShared {
     /// `state` becomes [`STARTED`] (release) and read after it is seen (acquire).
     origin_qpc: AtomicU64,
     origin_ns: AtomicI64,
+    /// A calibration the control side set while the stream runs ([`SideShared::set_calibration`]):
+    /// the round trip and its bound in ns ([`NO_CALIBRATION`] for none), taken by the next buffer
+    /// switch when `calibration_changed` is set.
+    calibration_ns: AtomicU64,
+    calibration_bound_ns: AtomicU64,
+    calibration_changed: AtomicBool,
     pub(crate) stats: LoopStats,
 }
+
+/// `SideShared::calibration_ns` of no calibration.
+const NO_CALIBRATION: u64 = u64::MAX;
 
 impl SideShared {
     pub(crate) fn new(events: Arc<DriverEvents>) -> Self {
@@ -62,6 +76,9 @@ impl SideShared {
             stop_requested: AtomicBool::new(false),
             origin_qpc: AtomicU64::new(0),
             origin_ns: AtomicI64::new(0),
+            calibration_ns: AtomicU64::new(NO_CALIBRATION),
+            calibration_bound_ns: AtomicU64::new(0),
+            calibration_changed: AtomicBool::new(false),
             stats: LoopStats::new(events),
         }
     }
@@ -124,6 +141,25 @@ impl SideShared {
 
     fn origin(&self) -> (u64, i64) {
         (self.origin_qpc.load(Ordering::Relaxed), self.origin_ns.load(Ordering::Relaxed))
+    }
+
+    /// Control side: the stamps of this direction use `calibration` from the next buffer switch
+    /// on (the app measured the loop while the stream runs). Never blocks.
+    pub(crate) fn set_calibration(&self, calibration: Option<Calibration>) {
+        let (round_trip, bound) = calibration.map_or((NO_CALIBRATION, 0), |c| (c.round_trip_ns.min(NO_CALIBRATION - 1), c.uncertainty_ns));
+        self.calibration_ns.store(round_trip, Ordering::Relaxed);
+        self.calibration_bound_ns.store(bound, Ordering::Relaxed);
+        self.calibration_changed.store(true, Ordering::Release);
+    }
+
+    /// Callback side: the calibration set since the last call, if one was.
+    fn take_calibration(&self) -> Option<Option<Calibration>> {
+        if !self.calibration_changed.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        let round_trip_ns = self.calibration_ns.load(Ordering::Relaxed);
+        let uncertainty_ns = self.calibration_bound_ns.load(Ordering::Relaxed);
+        Some((round_trip_ns != NO_CALIBRATION).then_some(Calibration { round_trip_ns, uncertainty_ns }))
     }
 }
 
@@ -244,6 +280,17 @@ impl<C> Side<C> {
     /// [`SideShared::enter`] for a side whose callback has not panicked.
     fn enter(&self) -> bool {
         self.shared.enter() && !self.faulted
+    }
+
+    /// Takes a calibration the control side replaced while the stream runs: the next stamp is
+    /// invalid, so the clock fit does not bridge the step the new figure makes, and the held
+    /// times start over (the step may go back).
+    fn refresh_calibration(&mut self) {
+        if let Some(calibration) = self.shared.take_calibration() {
+            self.calibration = calibration;
+            self.invalidate = true;
+            self.held.reset();
+        }
     }
 
     /// Marks `stamp` invalid when a discontinuity asked for it (once).
@@ -417,10 +464,15 @@ impl Engine {
             if let Some(late) = late {
                 side.shared.stats.wake_late(late);
             }
-            let round_trip = side.calibration.map_or(0, |c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
-            let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, true, |callback| {
-                callback.saturating_sub(latency_in).saturating_sub(round_trip)
-            });
+            side.refresh_calibration();
+            // Uncalibrated: the driver's input figure. Calibrated: the output figure minus the
+            // measured loop, so the input frame of a click carries the time its output frame had.
+            let round_trip = side.calibration.map(|c| i64::try_from(c.round_trip_ns).unwrap_or(i64::MAX));
+            let mut stamp =
+                stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, true, |callback| match round_trip {
+                    Some(round_trip) => callback.saturating_add(latency_out).saturating_sub(round_trip),
+                    None => callback.saturating_sub(latency_in),
+                });
             side.invalidated(&mut stamp);
             let mut source = PlanarSource { scratch: &mut side.scratch, planes: inputs, frames, wire: side.wire };
             let mut block = CaptureBlock::new(frames, stamp, side.format, &mut source);
@@ -438,6 +490,7 @@ impl Engine {
                 if let Some(late) = late {
                     side.shared.stats.wake_late(late);
                 }
+                side.refresh_calibration();
                 let mut stamp = stamp(&mut side.held, arrival_100ns, origin_qpc, origin_ns, backend, side.calibration, false, |callback| {
                     callback.saturating_add(latency_out)
                 });

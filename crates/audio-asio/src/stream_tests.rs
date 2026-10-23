@@ -306,7 +306,7 @@ fn a_calibration_makes_both_streams_measured_and_moves_the_capture_frame() {
     let _guard = lock();
     let rig = rig(scarlett());
     let seen = seen();
-    let calibration = ab::Calibration { round_trip_ns: 1_000_000, uncertainty_ns: 20_000 };
+    let calibration = ab::Calibration { round_trip_ns: 10_000_000, uncertainty_ns: 20_000 };
     let mut req_in = request(&rig, ab::Direction::Input, 48_000, Some(64));
     let mut req_out = request(&rig, ab::Direction::Output, 48_000, Some(64));
     req_in.calibration = Some(calibration);
@@ -321,7 +321,66 @@ fn a_calibration_makes_both_streams_measured_and_moves_the_capture_frame() {
     assert_eq!((r.quality, r.offset_uncertainty_ns), (ab::Quality::Measured, Some(20_000)));
     assert_eq!((c.quality, c.offset_uncertainty_ns), (ab::Quality::Measured, Some(20_000)));
     assert_eq!(r.backend_frame_ns - r.backend_callback_ns, 150 * 1_000_000_000 / 48_000, "the output keeps its presentation time");
-    assert_eq!(c.backend_callback_ns - c.backend_frame_ns, 100 * 1_000_000_000 / 48_000 + 1_000_000, "the input carries the round trip");
+    assert_eq!(
+        c.backend_frame_ns - c.backend_callback_ns,
+        150 * 1_000_000_000 / 48_000 - 10_000_000,
+        "the input is placed from the measured loop: the output figure minus the round trip, the input figure unused"
+    );
+    drop((capture, render));
+}
+
+/// K31: a calibration over native ASIO is the whole loop in sample positions. An output frame at
+/// position `p` and the input frame at `p + round trip` (where a cable brings it back) carry the
+/// same frame time, whatever the driver's `getLatencies` figures say (here 100 in, 150 out: a
+/// 250-frame sum against a 300-frame loop, and then a 200-frame loop).
+#[test]
+fn a_calibrated_input_frame_carries_the_time_of_the_output_frame_it_came_back_as() {
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let ns = |frames: u64| frames * 1_000_000_000 / 48_000;
+    let calibration = |frames: u64| ab::Calibration { round_trip_ns: ns(frames), uncertainty_ns: ns(2) };
+    let mut req_in = request(&rig, ab::Direction::Input, 48_000, Some(64));
+    let mut req_out = request(&rig, ab::Direction::Output, 48_000, Some(64));
+    req_in.calibration = Some(calibration(300));
+    req_out.calibration = Some(calibration(300));
+    let (capture, _) = rig.backend.open_capture(&rig.endpoint, &req_in, capture_cb(&seen), error_cb(&seen, ab::Direction::Input)).expect("in");
+    let (render, _) =
+        rig.backend.open_render(&rig.endpoint, &req_out, render_cb(&seen, vec![0.0; 2]), error_cb(&seen, ab::Direction::Output)).expect("out");
+    capture.start().expect("start");
+    render.start().expect("start");
+    drive(&rig, 64, 0, 12, &[]);
+    // The frame time of device frame `at` on a stream, from the block that holds it.
+    let time_of = |blocks: &[(ab::Stamp, Option<u64>)], at: u64| {
+        blocks.iter().find(|(_, p)| p.is_some_and(|p| (p..p + 64).contains(&at))).map(|(s, p)| s.backend_frame_ns + ns(at - p.unwrap()) as i64)
+    };
+    let check = |loop_frames: u64, from: usize| {
+        let renders: Vec<_> = seen.render.lock().unwrap()[from..].iter().map(|(s, p, _)| (*s, *p)).collect();
+        let captures: Vec<_> = seen.capture.lock().unwrap()[from..].iter().map(|(s, p, _)| (*s, *p)).collect();
+        assert!(renders.iter().chain(&captures).all(|(s, _)| s.quality == ab::Quality::Measured));
+        let first = renders[0].1.unwrap();
+        for out in [first, first + 7, first + 64] {
+            let sent = time_of(&renders, out).expect("an output frame");
+            let back = time_of(&captures, out + loop_frames).expect("its input frame");
+            // Within a frame: each stream maps the shared anchor through its own start's pair.
+            assert!(near(sent, back, ns(1) as i64), "loop {loop_frames}: output frame {out} at {sent}, its return at {back}");
+        }
+    };
+    check(300, 0);
+    // A Measure while the streams run replaces the figure: the next stamp of each direction is
+    // invalid, then the new loop holds.
+    assert!(capture.set_calibration(Some(calibration(200))) && render.set_calibration(Some(calibration(200))));
+    let before = seen.render.lock().unwrap().len();
+    drive(&rig, 64, 12 * 64, 12, &[]);
+    assert_eq!(seen.render.lock().unwrap()[before].0.quality, ab::Quality::Invalid, "the step is not bridged");
+    assert_eq!(seen.capture.lock().unwrap()[before].0.quality, ab::Quality::Invalid);
+    check(200, before + 1);
+    // Clearing it returns to the driver's figures.
+    assert!(capture.set_calibration(None));
+    let before = seen.capture.lock().unwrap().len();
+    drive(&rig, 64, 24 * 64, 3, &[]);
+    let c = seen.capture.lock().unwrap()[before + 1].0;
+    assert_eq!((c.quality, c.backend_callback_ns - c.backend_frame_ns), (ab::Quality::BackendEstimate, ns(100) as i64));
     drop((capture, render));
 }
 

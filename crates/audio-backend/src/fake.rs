@@ -4,9 +4,9 @@
 //! the real conversion of an adapter or plain `f32` slices ([`SliceSink`], [`SliceSource`]).
 
 use crate::{
-    Achieved, Backend, BackendFactory, CaptureBlock, CaptureCallback, CaptureSource, Direction, Endpoint, ErrorCallback, Format, InputWish, Mode,
-    OpenError, OpenRequest, OutputWish, Period, Plan, RenderBlock, RenderCallback, RenderSink, SCRATCH_FRAMES, SampleFormat, Stamp, Stream,
-    StreamError, StreamStats, WorkerPriority,
+    Achieved, Backend, BackendFactory, Calibration, CaptureBlock, CaptureCallback, CaptureSource, Direction, Endpoint, ErrorCallback, Format,
+    InputWish, Mode, OpenError, OpenRequest, OutputWish, Period, Plan, RenderBlock, RenderCallback, RenderSink, SCRATCH_FRAMES, SampleFormat, Stamp,
+    Stream, StreamError, StreamStats, WorkerPriority,
 };
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -25,6 +25,8 @@ struct State {
     /// The snapshot each direction's stream reports (output, input): a pump counts a wake; a test
     /// can script the rest.
     stats: [StreamStats; 2],
+    /// Every [`Stream::set_calibration`] so far, in order, with the direction of its stream.
+    calibrations: Vec<(Direction, Option<Calibration>)>,
 }
 
 /// The scripted backend. Clones share one script and one set of streams.
@@ -115,21 +117,38 @@ impl FakeBackend {
     }
     /// Run one render callback. False when no started render stream exists.
     pub fn pump_render(&self, frames: usize, stamp: Stamp, sink: &mut dyn RenderSink) -> bool {
+        self.pump_render_at(frames, stamp, None, sink)
+    }
+    /// [`Self::pump_render`] of a block at the device frame `position` (the driver's sample
+    /// position, as the native ASIO backend reports it).
+    pub fn pump_render_at(&self, frames: usize, stamp: Stamp, position: Option<u64>, sink: &mut dyn RenderSink) -> bool {
         let mut state = self.lock();
         let (started, format) = (state.started[slot(Direction::Output)], self.attempts.first().map(|a| a.format));
         let (Some(render), Some(format), true) = (state.render.as_mut(), format, started) else { return false };
-        render(&mut RenderBlock::new(frames, stamp, format, sink));
+        let mut block = RenderBlock::new(frames, stamp, format, sink);
+        block.device_position = position;
+        render(&mut block);
         state.stats[slot(Direction::Output)].wakes += 1;
         true
     }
     /// Run one capture callback. False when no started capture stream exists.
     pub fn pump_capture(&self, frames: usize, stamp: Stamp, format: Format, source: &mut dyn CaptureSource) -> bool {
+        self.pump_capture_at(frames, stamp, None, format, source)
+    }
+    /// [`Self::pump_capture`] of a block at the device frame `position`.
+    pub fn pump_capture_at(&self, frames: usize, stamp: Stamp, position: Option<u64>, format: Format, source: &mut dyn CaptureSource) -> bool {
         let mut state = self.lock();
         let started = state.started[slot(Direction::Input)];
         let (Some(capture), true) = (state.capture.as_mut(), started) else { return false };
-        capture(&mut CaptureBlock::new(frames, stamp, format, source));
+        let mut block = CaptureBlock::new(frames, stamp, format, source);
+        block.device_position = position;
+        capture(&mut block);
         state.stats[slot(Direction::Input)].wakes += 1;
         true
+    }
+    /// Every calibration a stream of this backend was handed while open, in order.
+    pub fn live_calibrations(&self) -> Vec<(Direction, Option<Calibration>)> {
+        self.lock().calibrations.clone()
     }
     /// Script the snapshot the stream of `direction` reports from [`Stream::stats`].
     pub fn set_stream_stats(&self, direction: Direction, stats: StreamStats) {
@@ -269,6 +288,10 @@ impl Stream for FakeStream {
     }
     fn stats(&self) -> Option<StreamStats> {
         Some(self.lock().stats[slot(self.direction)])
+    }
+    fn set_calibration(&self, calibration: Option<Calibration>) -> bool {
+        self.lock().calibrations.push((self.direction, calibration));
+        true
     }
 }
 

@@ -456,6 +456,14 @@ pub trait Stream {
     fn stats(&self) -> Option<StreamStats> {
         None
     }
+    /// Replace the loopback calibration of an open stream (the app's Measure), so its stamps use
+    /// it from the next callback on; that next stamp is [`Quality::Invalid`], so a clock fit
+    /// restarts there instead of bridging the step. False where the backend cannot (the default):
+    /// the calibration then applies at the next open.
+    fn set_calibration(&self, calibration: Option<Calibration>) -> bool {
+        let _ = calibration;
+        false
+    }
 }
 
 /// Where the samples of a render block go: the adapter lends scratch, converts to the device
