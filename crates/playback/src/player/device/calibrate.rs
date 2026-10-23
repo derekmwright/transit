@@ -74,6 +74,14 @@ impl Player {
         Some(key.record(measured.round_trip_frames, measured.spread_frames.saturating_add(1), &devices::utc_today()))
     }
 
+    /// The loop the driver's own figures give (`getLatencies` output plus input, in frames at the
+    /// device rate), for comparing with a measured one; `None` where the backend reports none.
+    pub fn driver_loop_frames(&self) -> Option<u32> {
+        let input = self.with_held_input(|recorder| recorder.latency).flatten()?;
+        let total = self.output_latency? + input;
+        u32::try_from((total.as_secs_f64() * f64::from(self.device_rate)).round() as u64).ok()
+    }
+
     /// Hand `calibration` to the open output stream and the held input, so the stamps (and the
     /// placement of recordings) use it from the next callback on. False when a stream could not
     /// take it while running: it then applies at the next open.

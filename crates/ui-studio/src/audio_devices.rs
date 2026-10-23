@@ -449,18 +449,27 @@ impl StudioApp {
         if !(player.native_backend && devices::is_asio_system(Some(&player.device_system))) {
             return Some("Apply Native ASIO first: Measure times the open driver.");
         }
-        let Some(key) = player.calibration_key.as_ref() else {
+        if player.calibration_key.is_none() {
             return Some("The driver's input is not open with its output: there is no loop to time.");
-        };
-        let other_driver = draft.output.as_deref().is_some_and(|d| !d.eq_ignore_ascii_case(&key.device));
-        let other_rate = draft.sample_rate.is_some_and(|r| r != key.rate);
-        if other_driver || other_rate || draft.buffer_size.unwrap_or(0) != key.period {
+        }
+        if !self.draft_is_open(draft) {
             return Some("Apply the changes first: Measure times the driver as it is open.");
         }
         if self.is_playing() {
             return Some("Stop the transport to measure.");
         }
         None
+    }
+
+    /// Whether the window's choices are the ones the device was opened with (the open driver's
+    /// buffer is then the one a calibration of it is keyed on).
+    pub(crate) fn draft_is_open(&self, draft: &AudioConfig) -> bool {
+        let applied = &self.ui.audio;
+        draft.system == applied.system
+            && draft.backend == applied.backend
+            && draft.output == applied.output
+            && draft.sample_rate == applied.sample_rate
+            && draft.buffer_size == applied.buffer_size
     }
 
     /// Audio › Audio Devices: open the window with the saved choices.
@@ -829,26 +838,32 @@ pub fn period_rate_text(period: u32, rate: u32) -> String {
     format!("{period} / {khz} kHz")
 }
 
-/// "1062 frames (22.1 ms) \u{b1}7 at 256 / 48 kHz": a measured loop with its spread and conditions.
+/// "1196 frames (24.9 ms) \u{b1}7 at 256 / 48 kHz": a measured loop with its spread and conditions.
 pub fn calibrated_text(c: &soundcraft_playback::LoopbackCalibration) -> String {
     format!("{} \u{b1}{} at {}", crate::hardware_ui::frames_text(c.round_trip_frames, c.rate), c.spread_frames, period_rate_text(c.period, c.rate))
 }
 
 /// The Calibration line under the native ASIO backend (#20, known issue K31): the loop of this
-/// driver (its registry name) measured at this rate and buffer, else the driver's own figures.
-/// The drivers' `getLatencies` figures cannot be corrected by a fixed model, so a measurement
-/// belongs to its buffer size and rate: at another one the line says so and Measure times it again.
-pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, rate: u32) -> String {
-    let period = cfg.buffer_size.unwrap_or(0);
-    if let Some(c) = cfg.find_calibration(driver, devices::MODE_ASIO, rate, period) {
-        return format!("calibrated: {} ({})", calibrated_text(c), c.measured_at);
-    }
+/// driver (its registry name) measured at the buffer it runs (`running`: the open driver's buffer
+/// and rate, `None` when the window's choices are not open yet), else the driver's own figures.
+/// The driver's figures are close by sample position on the drivers measured, but unverified per
+/// driver and phase; a measured loop replaces them. It belongs to the buffer the driver actually
+/// runs, which it may choose itself (its panel's size, a fixed-size driver), so the line keys on
+/// that, not on the size asked for.
+pub fn asio_calibration_line(cfg: &AudioConfig, driver: &str, running: Option<(u32, u32)>) -> String {
     let elsewhere: Vec<String> = cfg.asio_calibrations(driver).map(|c| period_rate_text(c.period, c.rate)).collect();
+    if let Some((period, rate)) = running {
+        if let Some(c) = cfg.find_calibration(driver, devices::MODE_ASIO, rate, period) {
+            return format!("calibrated: {} ({})", calibrated_text(c), c.measured_at);
+        }
+    } else if !elsewhere.is_empty() {
+        return format!("measured at {}: whether it applies is known once the driver runs these choices (Apply)", elsewhere.join(", "));
+    }
     if elsewhere.is_empty() {
-        "not calibrated: the driver's own latency figures are used; Measure times the loop through a cable from an output to an input".into()
+        "not calibrated: the driver's own latency figures are used; Measure checks the loop through a cable from an output to an input".into()
     } else {
         format!(
-            "not calibrated at this buffer size and rate (measured at {}): the driver's own latency figures are used; Measure times it again",
+            "not calibrated at the buffer size and rate the driver runs (measured at {}): the driver's own latency figures are used; Measure checks it again",
             elsewhere.join(", ")
         )
     }
@@ -1207,9 +1222,15 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 // is the driver's (mode `asio`), measured here through a loop cable.
                 if native_asio {
                     label(ui, "Calibration");
-                    let rate = draft.sample_rate.or(app.player.as_ref().map(|p| p.device_rate)).unwrap_or(48_000);
                     let driver = dev.map(|d| d.name.as_str()).or(app.player.as_ref().map(|p| p.device_name.as_str())).unwrap_or_default();
-                    let line = asio_calibration_line(&draft, driver, rate);
+                    // The buffer and rate the open driver runs, when the window's choices are the open ones.
+                    let running = app
+                        .player
+                        .as_ref()
+                        .filter(|p| !p.silent && p.device_name.eq_ignore_ascii_case(driver) && app.draft_is_open(&draft))
+                        .and_then(|p| p.calibration_key.as_ref())
+                        .map(|k| (k.period, k.rate));
+                    let line = asio_calibration_line(&draft, driver, running);
                     ui.vertical(|ui| {
                         ui.set_max_width(ui.available_width());
                         let shown = ui.add(egui::Label::new(egui::RichText::new(&line).color(TOKENS.text_dim).size(11.5)).wrap());

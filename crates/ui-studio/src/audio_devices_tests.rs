@@ -297,7 +297,7 @@ fn native_asio_is_chosen_on_the_asio_system_with_its_calibration_line_and_driver
     assert_eq!(t.app.audio_devices.draft.backend, Backend::NativeAsio);
     assert!(!has_control(&t, "paired_input") && !has_control(&t, "share_device"), "no pairing and no sharing choice on ASIO");
     let line = t.layout()["calibration"].as_str().unwrap().to_string();
-    assert!(line.starts_with("not calibrated: the driver's own latency figures are used; Measure times the loop"), "{line}");
+    assert!(line.starts_with("not calibrated: the driver's own latency figures are used; Measure checks the loop"), "{line}");
     assert_eq!(t.layout()["calibration_measure"]["blocked"], "Measuring needs the open audio device.", "nothing is open to time");
     assert!(!has_control(&t, "panel"), "nothing runs on ASIO yet");
     t.pick("output", &format!("{MODEL12} · 10 ch"));
@@ -1638,13 +1638,18 @@ fn the_asio_calibration_line_names_the_buffer_size_and_rate_it_was_measured_at()
         spread_frames: 7,
         measured_at: "2026-10-23".into(),
     };
-    let cfg = AudioConfig { buffer_size: Some(256), calibrations: vec![at(256, 48_000, 1_062), at(64, 48_000, 297)], ..Default::default() };
-    assert_eq!(asio_calibration_line(&cfg, driver, 48_000), "calibrated: 1062 frames (22.1 ms) \u{b1}7 at 256 / 48 kHz (2026-10-23)");
+    // The requested buffer does not matter: the line keys on the buffer the open driver runs.
+    let cfg = AudioConfig { buffer_size: Some(128), calibrations: vec![at(256, 48_000, 1_196), at(64, 48_000, 333)], ..Default::default() };
+    assert_eq!(asio_calibration_line(&cfg, driver, Some((256, 48_000))), "calibrated: 1196 frames (24.9 ms) \u{b1}7 at 256 / 48 kHz (2026-10-23)");
     assert_eq!(
-        asio_calibration_line(&cfg, driver, 44_100),
-        "not calibrated at this buffer size and rate (measured at 256 / 48 kHz, 64 / 48 kHz): the driver's own latency figures are used; Measure times it again"
+        asio_calibration_line(&cfg, driver, Some((512, 48_000))),
+        "not calibrated at the buffer size and rate the driver runs (measured at 256 / 48 kHz, 64 / 48 kHz): the driver's own latency figures are used; Measure checks it again"
     );
-    assert!(asio_calibration_line(&cfg, "ModelMixer", 48_000).starts_with("not calibrated: the driver's own latency figures are used"));
+    assert_eq!(
+        asio_calibration_line(&cfg, driver, None),
+        "measured at 256 / 48 kHz, 64 / 48 kHz: whether it applies is known once the driver runs these choices (Apply)"
+    );
+    assert!(asio_calibration_line(&cfg, "ModelMixer", None).starts_with("not calibrated: the driver's own latency figures are used"));
     assert_eq!((period_rate_text(128, 44_100), period_rate_text(0, 96_000)), ("128 / 44.1 kHz".to_string(), "driver buffer / 96 kHz".to_string()));
 }
 
@@ -1668,7 +1673,13 @@ fn measure_on_the_asio_calibration_line_times_the_loop_and_stores_it_for_this_bu
         origin: ab::HostOrigin::default(),
         calibration: None,
     };
-    let driver = ab::fake::FakeBackend::new(format).named("ASIO", "Focusrite USB ASIO").with_capture(2, true).with_attempts(vec![attempt]);
+    // The driver reports 5 ms each way (480 frames in all), far from the 1065-frame loop: the
+    // result is stored and says so with a warning.
+    let driver = ab::fake::FakeBackend::new(format)
+        .named("ASIO", "Focusrite USB ASIO")
+        .with_capture(2, true)
+        .with_attempts(vec![attempt])
+        .with_latency(std::time::Duration::from_millis(5));
     let cfg = AudioConfig {
         backend: Backend::NativeAsio,
         system: Some("ASIO".into()),
@@ -1733,8 +1744,11 @@ fn measure_on_the_asio_calibration_line_times_the_loop_and_stores_it_for_this_bu
     );
     let said = "1065 frames (22.2 ms) \u{b1}1 at 256 / 48 kHz";
     assert_eq!(t.layout()["calibration"], json!(format!("calibrated: {said} ({})", c.measured_at)));
-    assert_eq!(t.layout()["calibration_measure"]["result"], said);
-    assert_eq!(t.app.status, format!("Calibrated: {said}"));
+    let warned = format!(
+        "{said}; driver figures 480 frames (+585). Warning: the measured loop is 585 frames from the driver's figures, more than a buffer: check the cable and the paths, and Measure again"
+    );
+    assert_eq!(t.layout()["calibration_measure"]["result"], json!(warned));
+    assert!(t.app.status.starts_with(&format!("Calibrated: {said}; driver figures 480 frames (+585). Warning: ")), "{}", t.app.status);
     let live = driver.live_calibrations();
     assert_eq!(live.len(), 2, "both running streams took it: {live:?}");
     assert!(live.iter().all(|(_, cal)| *cal == c.to_backend()));
@@ -1743,7 +1757,7 @@ fn measure_on_the_asio_calibration_line_times_the_loop_and_stores_it_for_this_bu
     // Another buffer size is another key: not calibrated there, and Measure waits for Apply.
     t.pick("buffer", "64 samples");
     let line = t.layout()["calibration"].as_str().unwrap().to_string();
-    assert!(line.starts_with("not calibrated at this buffer size and rate (measured at 256 / 48 kHz)"), "{line}");
+    assert_eq!(line, "measured at 256 / 48 kHz: whether it applies is known once the driver runs these choices (Apply)");
     assert_eq!(t.layout()["calibration_measure"]["blocked"], "Apply the changes first: Measure times the driver as it is open.");
 }
 

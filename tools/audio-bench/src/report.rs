@@ -78,7 +78,9 @@ impl Row {
         let ms = |n: u64| n as f64 * 1000.0 / f64::from(rate.max(1));
         let mut lines = Vec::new();
         let (out, inp) = (self.render_achieved.and_then(|a| a.latency).map(frames), self.capture_achieved.and_then(|a| a.latency).map(frames));
-        let period = self.requested.map_or_else(|| "driver buffer".to_string(), |p| p.to_string());
+        // The buffer the driver ran (the key of the app's calibration), else the one asked for.
+        let period =
+            self.render_achieved.and_then(|a| a.period.frames()).or(self.requested).map_or_else(|| "driver buffer".to_string(), |p| p.to_string());
         let at = format!("{period} / {rate} Hz");
         match (out, inp) {
             (Some(out), Some(inp)) => lines.push(format!(
@@ -372,22 +374,23 @@ mod tests {
         let mut r = row(true);
         assert!(r.asio_calibration_lines().is_empty(), "only native ASIO runs");
         r.backend = "asio".into();
-        r.requested = Some(256);
+        r.requested = Some(128);
         let opened = |latency_us: u64| {
             let mut a = ab::Achieved::requested(ab::Format::new(48_000, 2, ab::SampleFormat::I32), ab::Period::Frames(256));
             a.latency = Some(std::time::Duration::from_micros(latency_us));
             a
         };
-        // The Scarlett at 256 frames: 12.9 + 11.9 ms reported, 1062 frames measured.
+        // The Scarlett at 256 frames (asked 128, the driver ran 256): 12.9 + 11.9 ms reported, 1196
+        // frames by sample position.
         (r.render_achieved, r.capture_achieved) = (Some(opened(12_896)), Some(opened(11_896)));
-        r.calibration = Some(Ok(crate::calibration::Figures { rate: 48_000, round_trip_frames: 1_062, spread_frames: 7, paired: 16, clicks: 16 }));
+        r.calibration = Some(Ok(crate::calibration::Figures { rate: 48_000, round_trip_frames: 1_196, spread_frames: 7, paired: 16, clicks: 16 }));
         r.stored_calibration = Some(None);
         assert_eq!(
             r.asio_calibration_lines(),
             [
                 "driver-reported latency: out 619 fr (12.90 ms) + in 571 fr (11.90 ms) = 1190 fr (24.79 ms)",
-                "app calibration (the click loop by sample position at 256 / 48000 Hz): 1062 fr (22.12 ms) +-7 fr, 16 of 16 clicks",
-                "measured minus driver-reported: -128 fr",
+                "app calibration (the click loop by sample position at 256 / 48000 Hz): 1196 fr (24.92 ms) +-7 fr, 16 of 16 clicks",
+                "measured minus driver-reported: +6 fr",
                 "stored before this run: none for this key",
             ]
         );

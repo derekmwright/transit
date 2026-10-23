@@ -127,7 +127,10 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
         // On ASIO the input is the driver's own: the app's key names none.
         let input = if config.kind == Kind::Asio { None } else { config.request.in_device.as_deref() };
         let mode = calibration::mode_key(config.kind, config.request.mode);
-        let record = calibration::record(&figures, &opened.device, input, mode, config.request.period.unwrap_or(0), &date);
+        // On ASIO the loop belongs to the buffer the driver runs (its panel's size, a fixed-size
+        // driver's one size), which the app keys on too; elsewhere to the requested period.
+        let period = if config.kind == Kind::Asio { opened.render.period.frames().or(config.request.period) } else { config.request.period };
+        let record = calibration::record(&figures, &opened.device, input, mode, period.unwrap_or(0), &date);
         stored_calibration = Some(calibration::stored(path, &record));
         calibration::merge_settings(path, &record)?;
     }

@@ -452,7 +452,11 @@ impl Player {
             if step.default_period {
                 request.period = ab::Period::Default;
             }
-            request.calibration = if duplex { cfg.calibration_for(&system, &name, paired.as_deref(), &request) } else { None };
+            // On ASIO the loop depends on the buffer the driver runs, which it may choose itself (its
+            // panel's size for "driver buffer", a fixed-size driver's one size): the calibration is
+            // looked up by the achieved buffer after the open and handed to both streams then.
+            let asio = system == devices::ASIO_SYSTEM;
+            request.calibration = if duplex && !asio { cfg.calibration_for(&system, &name, paired.as_deref(), &request) } else { None };
             let (rate, channels) = (request.format.rate, request.format.channels);
             let io = IoMap::for_device(&system, &name, inputs, channels);
             let (mut player, access, clock) = Self::prepare(Arc::clone(&session), rate, io)?;
@@ -496,6 +500,26 @@ impl Player {
                 }
             };
             player.stream = Some(stream);
+            // The key of a calibration of this pair: on ASIO the buffer the driver runs.
+            let mut keyed = request;
+            if asio && let Some(frames) = achieved.period.frames() {
+                keyed.period = ab::Period::Frames(frames);
+            }
+            let calibration = match (duplex, asio) {
+                (true, true) => cfg.calibration_for(&system, &name, None, &keyed),
+                (true, false) => request.calibration,
+                (false, _) => None,
+            };
+            if asio && calibration.is_some() {
+                let output = player.stream.as_ref().is_some_and(|stream| stream.set_calibration(calibration));
+                let input = match player.input.get_mut() {
+                    HeldInput::Held(Some(recorder)) => recorder.set_calibration(calibration),
+                    _ => false,
+                };
+                if !(output && input) {
+                    log::warn!("the ASIO calibration of {name} could not be handed to both streams; the driver's figures are used");
+                }
+            }
             if let HeldInput::Held(Some(recorder)) = player.input.get_mut()
                 && let Err(failure) = recorder.start()
             {
@@ -524,8 +548,8 @@ impl Player {
             player.device_exclusive = request.mode == ab::Mode::Exclusive;
             // On ASIO the input is the driver's own: its calibration names none.
             let key_input = if system == devices::ASIO_SYSTEM { None } else { cfg.input_pairing.as_deref().or(paired.as_deref()) };
-            player.calibration_key = if duplex { devices::CalibrationKey::of(&system, &name, key_input, &request) } else { None };
-            player.calibration = request.calibration;
+            player.calibration_key = if duplex { devices::CalibrationKey::of(&system, &name, key_input, &keyed) } else { None };
+            player.calibration = calibration;
             player.silent = false;
             #[cfg(not(target_arch = "wasm32"))]
             if let Some(midi) = player.midi.get_mut() {

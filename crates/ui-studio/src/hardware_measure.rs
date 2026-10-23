@@ -66,6 +66,8 @@ pub(crate) struct FakeProbe {
     pub cancelled: usize,
     /// The key a loop measurement stores under (the open Player's), `None` for none.
     pub key: Option<soundcraft_playback::devices::CalibrationKey>,
+    /// The loop the driver's figures give, `None` for none.
+    pub driver_loop: Option<u32>,
 }
 
 impl StudioApp {
@@ -263,7 +265,21 @@ impl StudioApp {
         };
         let key = self.loop_key().ok_or("the audio device changed while measuring: nothing stored")?;
         let record = key.record(measured.round_trip_frames, measured.spread_frames.saturating_add(1), &soundcraft_playback::devices::utc_today());
-        let said = crate::audio_devices::calibrated_text(&record);
+        let mut said = crate::audio_devices::calibrated_text(&record);
+        // The driver's own figures beside it: a loop more than a buffer away from them is more
+        // likely a wrong cable or path, or a loop that came up in another phase, than the driver.
+        let driver = self.driver_loop_frames();
+        let mut warning = None;
+        if let Some(driver) = driver {
+            let difference = i64::from(record.round_trip_frames) - i64::from(driver);
+            said.push_str(&format!("; driver figures {driver} frames ({difference:+})"));
+            if difference.unsigned_abs() > u64::from(key.period.max(1)) {
+                warning = Some(format!(
+                    "the measured loop is {} frames from the driver's figures, more than a buffer: check the cable and the paths, and Measure again",
+                    difference.unsigned_abs()
+                ));
+            }
+        }
         let calibration = record.to_backend();
         for cfg in [&mut self.ui.audio, &mut self.audio_devices.draft] {
             cfg.store_calibration(record.clone());
@@ -271,8 +287,21 @@ impl StudioApp {
         self.audio_devices.adopt_audio(&self.ui.audio);
         let live = self.player.as_mut().is_some_and(|p| p.apply_calibration(calibration));
         self.status = if live { format!("Calibrated: {said}") } else { format!("Calibrated: {said}; it applies when the device is next opened") };
+        if let Some(warning) = &warning {
+            said = format!("{said}. Warning: {warning}");
+            self.status = format!("{}. Warning: {warning}", self.status);
+        }
         self.save_audio_preferences();
         Ok(json!({"round_trip_frames": record.round_trip_frames, "spread_frames": record.spread_frames, "said": said, "live": live}))
+    }
+
+    /// The loop the open driver's own figures give, in frames (`None` without them).
+    fn driver_loop_frames(&self) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(f) = &self.audio_devices.fake_probe {
+            return f.driver_loop;
+        }
+        self.player.as_ref().filter(|p| !p.silent)?.driver_loop_frames()
     }
 
     /// The key a loop measurement of the open device stores under.

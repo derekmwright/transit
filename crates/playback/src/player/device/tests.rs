@@ -1128,7 +1128,12 @@ fn a_native_asio_driver_opens_every_channel_capture_first_in_its_one_mode() {
         [(ab::Direction::Input, ab::Mode::Shared, ab::Period::Default), (ab::Direction::Output, ab::Mode::Shared, ab::Period::Default)],
         "both directions open before either starts, capture first, as planned (no exclusive step)"
     );
-    assert!(fake.opens().iter().all(|(_, request)| request.calibration.is_some()), "a calibration keyed `asio` reaches both streams");
+    assert!(fake.opens().iter().all(|(_, request)| request.calibration.is_none()), "on ASIO it is not looked up by the request");
+    let live = fake.live_calibrations();
+    assert!(
+        live.len() == 2 && live.iter().all(|(_, c)| c.is_some()),
+        "a calibration keyed `asio` reaches both streams once the buffer is known: {live:?}"
+    );
     assert!(fake.running(ab::Direction::Input) && fake.running(ab::Direction::Output));
     assert_eq!((player.device_system.as_str(), player.device_name.as_str(), player.device_channels), ("ASIO", "Model Mixer ASIO Driver", 10));
     assert!(!player.device_exclusive, "ASIO is never reported as WASAPI exclusive");
@@ -1388,4 +1393,37 @@ fn a_loop_measurement_without_sample_positions_says_so_and_is_refused_off_asio()
     let wasapi = fake_factory(false).with_capture(2, true);
     let other = Player::open_native_or_cpal(Arc::new(Session::default()), &AudioConfig::default(), &wasapi, &fake_factory(false)).unwrap();
     assert!(other.start_loop_calibration(&[1], &[1]).unwrap_err().contains("native ASIO"));
+}
+
+/// #20 review B1: on ASIO a calibration belongs to the buffer the driver runs, not to the one asked
+/// for. A fixed-size driver (or "driver buffer" with the panel's size) runs 256 frames whatever is
+/// requested: the measurement is keyed 256, and after the panel moves to 512 the next open, which
+/// asks exactly the same, does not apply it.
+#[test]
+fn an_asio_calibration_is_keyed_and_applied_by_the_buffer_the_driver_runs() {
+    let format = ab::Format::new(48_000, 2, ab::SampleFormat::F32);
+    let asked =
+        ab::OpenRequest { format, period: ab::Period::Frames(128), mode: ab::Mode::Shared, origin: ab::HostOrigin::default(), calibration: None };
+    let fake = ab::fake::FakeBackend::new(format)
+        .named("ASIO", "Focusrite USB ASIO")
+        .with_capture(2, true)
+        .with_attempts(vec![asked])
+        .with_fixed_buffer(256);
+    let player = open_asio(&fake, &asio_config());
+    let key = player.calibration_key.clone().expect("a key");
+    assert_eq!((key.period, player.device_buffer), (256, Some(256)), "the run's buffer, not the request's 128");
+    let measured = crate::hardware_probe::Measured { round_trip_frames: 1_196, spread_frames: 3, found: 8, sent: 8 };
+    let record = player.calibration_record(&measured).unwrap();
+    assert_eq!(record.period, 256);
+    let cfg = AudioConfig { calibrations: vec![record.clone()], ..asio_config() };
+    drop(player);
+    let again = open_asio(&fake, &cfg);
+    assert_eq!(again.calibration, record.to_backend(), "the same buffer: applied");
+    drop(again);
+    fake.set_fixed_buffer(512);
+    let before = fake.live_calibrations().len();
+    let moved = open_asio(&fake, &cfg);
+    assert_eq!((moved.device_buffer, moved.calibration), (Some(512), None), "the panel moved: not calibrated at 512");
+    assert_eq!(fake.live_calibrations().len(), before, "nothing handed to the streams");
+    assert_eq!(moved.calibration_key.as_ref().map(|k| k.period), Some(512));
 }

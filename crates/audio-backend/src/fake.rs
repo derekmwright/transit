@@ -44,6 +44,9 @@ pub struct FakeBackend {
     latency: Option<Duration>,
     /// Every device name but this device's is not installed ([`Backend::missing_device`]).
     strict: bool,
+    /// The buffer every stream opens with whatever was asked, as a fixed-size ASIO driver (or its
+    /// panel's size for the default period); `None` grants the request.
+    fixed_buffer: Option<Arc<Mutex<u32>>>,
 }
 
 impl FakeBackend {
@@ -60,6 +63,19 @@ impl FakeBackend {
             names: (Vec::new(), Vec::new()),
             latency: None,
             strict: false,
+            fixed_buffer: None,
+        }
+    }
+    /// Every stream opens with a buffer of `frames` whatever it asked for, until
+    /// [`Self::set_fixed_buffer`] changes it (a driver whose panel sets the size).
+    pub fn with_fixed_buffer(mut self, frames: u32) -> Self {
+        self.fixed_buffer = Some(Arc::new(Mutex::new(frames)));
+        self
+    }
+    /// The size a driver of [`Self::with_fixed_buffer`] runs from its next open on.
+    pub fn set_fixed_buffer(&self, frames: u32) {
+        if let Some(size) = &self.fixed_buffer {
+            *size.lock().unwrap_or_else(PoisonError::into_inner) = frames;
         }
     }
     /// The system and device names (for example "ASIO" and a driver's registry name).
@@ -174,9 +190,13 @@ impl FakeBackend {
         if let Some(error) = state.fail_open.take() {
             return Err(error);
         }
+        let period = match &self.fixed_buffer {
+            Some(size) => Period::Frames(*size.lock().unwrap_or_else(PoisonError::into_inner)),
+            None => request.period,
+        };
         Ok((
             Box::new(FakeStream { state: Arc::clone(&self.state), direction, latency: self.latency }),
-            Achieved { buffer_frames: request.period.frames(), latency: self.latency, ..Achieved::requested(request.format, request.period) },
+            Achieved { buffer_frames: period.frames(), latency: self.latency, ..Achieved::requested(request.format, period) },
         ))
     }
 }

@@ -795,14 +795,14 @@ mod tests {
         let key = CalibrationKey::of("ASIO", driver, None, &req).expect("ASIO names a mode");
         assert_eq!((key.mode.as_str(), key.rate, key.period, key.input.as_deref()), (MODE_ASIO, 48_000, 256, None));
         let mut cfg = AudioConfig::default();
-        cfg.store_calibration(key.record(1_062, 7, "2026-10-23"));
-        cfg.store_calibration(key.record(1_065, 4, "2026-10-24"));
+        cfg.store_calibration(key.record(1_192, 7, "2026-10-23"));
+        cfg.store_calibration(key.record(1_196, 4, "2026-10-24"));
         assert_eq!(cfg.calibrations.len(), 1, "the same key is replaced");
         let found = cfg.calibration_for("ASIO", driver, None, &req).expect("the open key");
-        assert_eq!(found.round_trip_ns, 1_065 * 1_000_000_000 / 48_000);
+        assert_eq!(found.round_trip_ns, 1_196 * 1_000_000_000 / 48_000);
         assert!(cfg.calibration_for("ASIO", driver, None, &request(48_000, Period::Frames(64))).is_none(), "another buffer size");
         assert!(cfg.calibration_for("ASIO", driver, None, &request(44_100, Period::Frames(256))).is_none(), "another rate");
-        cfg.store_calibration(CalibrationKey { period: 64, ..key.clone() }.record(297, 7, "2026-10-23"));
+        cfg.store_calibration(CalibrationKey { period: 64, ..key.clone() }.record(333, 7, "2026-10-23"));
         assert_eq!(cfg.asio_calibrations(driver).count(), 2);
         assert_eq!(cfg.asio_calibrations("ModelMixer").count(), 0);
         assert_eq!(utc_today().len(), 10);
