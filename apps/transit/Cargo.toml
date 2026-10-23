@@ -10,6 +10,9 @@ publish = false
 workspace = true
 
 [features]
+# A once-a-day check for a newer release (one anonymous request to the GitHub API). Headless and distro builds can leave it out.
+default = ["update-check"]
+update-check = ["dep:ureq", "dep:semver"]
 # ASIO audio devices on Windows (see soundcraft-playback's `asio` feature).
 asio = ["soundcraft-playback/asio"]
 # The native WASAPI backend (ADR 0016): the "Native WASAPI (experimental)" choice in Audio Devices.
@@ -31,6 +34,8 @@ soundcraft-automation.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rfd.workspace = true
+ureq = { workspace = true, optional = true }
+semver = { workspace = true, optional = true }
 
 [build-dependencies]
 # Icon + VERSIONINFO for transit.exe; build.rs only uses it when the target is Windows.

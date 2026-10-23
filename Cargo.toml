@@ -72,6 +72,9 @@ egui_kittest = "0.36"
 egui_extras = { version = "0.36", default-features = false, features = ["svg"] }
 resvg = { version = "0.45.1", default-features = false }
 rfd = "0.17"
+# The new-version check (apps/transit, feature update-check): a blocking HTTPS client on rustls, no OpenSSL.
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
+semver = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [workspace.lints.rust]
