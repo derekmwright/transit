@@ -461,7 +461,10 @@ mod tests {
             ["Focusrite USB ASIO", "Model Mixer ASIO Driver", "Focusrite Thunderbolt ASIO"].iter().map(|s| (*s).to_string()).collect();
         let exact = resolve_driver_name(&installed, "Model Mixer ASIO Driver").unwrap();
         assert_eq!(exact, ResolvedDriver { name: "Model Mixer ASIO Driver".into(), exact: true });
-        assert_eq!(resolve_driver_name(&installed, "focusrite usb asio").unwrap(), ResolvedDriver { name: "Focusrite USB ASIO".into(), exact: false });
+        assert_eq!(
+            resolve_driver_name(&installed, "focusrite usb asio").unwrap(),
+            ResolvedDriver { name: "Focusrite USB ASIO".into(), exact: false }
+        );
         assert_eq!(resolve_driver_name(&installed, "model mixer").unwrap().name, "Model Mixer ASIO Driver");
         let several = resolve_driver_name(&installed, "focusrite").unwrap_err();
         assert!(several.contains("several") && several.contains("\"Focusrite USB ASIO\"") && several.contains("Thunderbolt"), "{several}");

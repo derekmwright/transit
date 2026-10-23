@@ -177,7 +177,8 @@ impl Backend for FakeBackend {
         self.lock().host_blocked
     }
     fn missing_device(&self, name: &str) -> Option<String> {
-        (self.strict && name != self.name).then(|| format!("no {} device named \"{name}\" is installed; the installed ones are: \"{}\"", self.system, self.name))
+        (self.strict && name != self.name)
+            .then(|| format!("no {} device named \"{name}\" is installed; the installed ones are: \"{}\"", self.system, self.name))
     }
     fn plan_render(&self, _wish: &OutputWish) -> Result<Plan, String> {
         Ok(Plan { endpoint: self.endpoint(Direction::Output), attempts: self.attempts.clone() })

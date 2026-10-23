@@ -162,7 +162,8 @@ impl AsioBackend {
             let names: Vec<String> = installed.into_iter().map(|e| e.name).collect();
             return Err(ab::OpenError::DeviceNotAvailable(driver::not_installed(name, &names)));
         };
-        self.probe_entry(&entry).map_err(|d| if d.blocked { ab::OpenError::InUse(d.problem) } else { ab::OpenError::DeviceNotAvailable(d.to_string()) })
+        self.probe_entry(&entry)
+            .map_err(|d| if d.blocked { ab::OpenError::InUse(d.problem) } else { ab::OpenError::DeviceNotAvailable(d.to_string()) })
     }
 
     /// What the last probe of `name` found, if it was probed: its report, or why it failed.
@@ -832,14 +833,14 @@ mod tests {
         let (loader, _) = FakeLoader::new(drivers);
         let backend = backend(loader);
         let wish = |device: &str| ab::OutputWish { device: Some(device.into()), rates: vec![48_000], channels: 2, period: None };
-        let missing = backend.plan_render(&wish("TASCAM Model 12 ASIO")).err().expect("not installed");
+        let Err(missing) = backend.plan_render(&wish("TASCAM Model 12 ASIO")) else { panic!("not installed") };
         assert_eq!(
             missing,
             "no ASIO driver named \"TASCAM Model 12 ASIO\" is installed; the installed ASIO drivers are: \"Model Mixer ASIO Driver\", \"Focusrite USB ASIO\", \"Absent\""
         );
         assert_eq!(backend.missing_driver("TASCAM Model 12 ASIO"), Some(missing));
         assert_eq!(ab::Backend::missing_device(&backend, "Focusrite USB ASIO"), None);
-        let failed = backend.plan_capture(&ab::InputWish { device: Some("Absent".into()), rate: None, period: None }).err().expect("failed");
+        let Err(failed) = backend.plan_capture(&ab::InputWish { device: Some("Absent".into()), rate: None, period: None }) else { panic!("failed") };
         assert!(failed.starts_with("ASIO driver \"Absent\" could not be opened: ") && failed.contains("hardware not found"), "{failed}");
         assert_eq!(backend.plan_render(&wish("Focusrite USB ASIO")).expect("installed").endpoint.name, "Focusrite USB ASIO");
         assert_eq!(backend.driver_names().unwrap(), ["Model Mixer ASIO Driver", "Focusrite USB ASIO", "Absent"]);

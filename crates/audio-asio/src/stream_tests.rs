@@ -811,11 +811,21 @@ fn a_stop_from_inside_the_callback_returns_at_once_and_the_host_stops_the_driver
     };
     let (c, _) = rig
         .backend
-        .open_stream(&rig.endpoint, &request(&rig, ab::Direction::Input, 48_000, Some(64)), Callback::Capture(capture), error_cb(&seen, ab::Direction::Input))
+        .open_stream(
+            &rig.endpoint,
+            &request(&rig, ab::Direction::Input, 48_000, Some(64)),
+            Callback::Capture(capture),
+            error_cb(&seen, ab::Direction::Input),
+        )
         .expect("open capture");
     let (r, _) = rig
         .backend
-        .open_stream(&rig.endpoint, &request(&rig, ab::Direction::Output, 48_000, Some(64)), Callback::Render(render), error_cb(&seen, ab::Direction::Output))
+        .open_stream(
+            &rig.endpoint,
+            &request(&rig, ab::Direction::Output, 48_000, Some(64)),
+            Callback::Render(render),
+            error_cb(&seen, ab::Direction::Output),
+        )
         .expect("open render");
     *capture_slot.lock().unwrap() = Some(c);
     *render_slot.lock().unwrap() = Some(r);

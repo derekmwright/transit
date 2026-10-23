@@ -521,8 +521,8 @@ impl StudioApp {
         if let Some((systems, lister)) = &self.audio_devices.machine {
             return (systems.clone(), Some(std::sync::Arc::clone(lister)));
         }
-        let lister: Option<AsioLister> =
-            devices::NATIVE_ASIO_COMPILED.then(|| std::sync::Arc::new(|selected: Option<String>| devices::native_asio_system(selected.as_deref())) as AsioLister);
+        let lister: Option<AsioLister> = devices::NATIVE_ASIO_COMPILED
+            .then(|| std::sync::Arc::new(|selected: Option<String>| devices::native_asio_system(selected.as_deref())) as AsioLister);
         (devices::cpal_audio_systems(), lister)
     }
 
@@ -854,11 +854,8 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         app.relist_asio();
     }
     app.poll_asio_listing();
-    let asio_listing = if app.audio_devices.asio_listing.is_some() {
-        Some(ASIO_LISTING.to_owned())
-    } else {
-        app.audio_devices.asio_listing_note.clone()
-    };
+    let asio_listing =
+        if app.audio_devices.asio_listing.is_some() { Some(ASIO_LISTING.to_owned()) } else { app.audio_devices.asio_listing_note.clone() };
     let systems = app.audio_devices.systems.clone().unwrap_or_default();
     let mut draft = app.audio_devices.draft.clone();
     let mut lay = AudioDevicesLayout { open: true, systems: systems.iter().map(|s| s.name.clone()).collect(), ..Default::default() };
