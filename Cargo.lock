@@ -3988,6 +3988,7 @@ dependencies = [
  "transit-audio-backend",
  "transit-audio-wasapi",
  "transit-midi-io",
+ "transit-plugin-host",
  "transit-rt",
  "triple_buffer",
 ]

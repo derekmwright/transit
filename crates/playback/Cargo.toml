@@ -15,6 +15,7 @@ soundcraft-model.workspace = true
 soundcraft-mix.workspace = true
 soundcraft-dsp.workspace = true
 transit-rt.workspace = true
+transit-plugin-host.workspace = true
 soundcraft-clap-host.workspace = true
 soundcraft-vst3-host.workspace = true
 soundcraft-asio-panel.workspace = true

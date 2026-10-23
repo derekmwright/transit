@@ -318,6 +318,18 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
     pub fn any_loading(&self) -> bool {
         self.handles.any_loading()
     }
+    pub fn stuck(&self, track: TrackId, slot: usize) -> bool {
+        self.handles.stuck(track, slot)
+    }
+    pub fn any_stuck(&self) -> bool {
+        self.handles.any_stuck()
+    }
+    pub fn plugin_host_wedged(&self) -> usize {
+        self.handles.host_wedged()
+    }
+    pub fn take_editor_errors(&mut self) -> Vec<(TrackId, usize, String)> {
+        self.handles.take_editor_errors()
+    }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.handles.has_editor(track, slot)
     }

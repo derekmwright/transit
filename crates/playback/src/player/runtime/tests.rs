@@ -651,13 +651,15 @@ fn a_path_table_edit_is_a_plan_on_the_same_engine_and_the_callback_allocates_not
 }
 
 /// A factory standing in for a heavy third-party plug-in: it counts its calls and takes `delay`.
-fn slow_factory(delay: std::time::Duration, made: &Arc<AtomicUsize>) -> impl FnMut(&soundcraft_mix::InstanceSpec) -> Option<NewInstance> {
+/// A factory that sleeps `delay` (a heavy plug-in's creation) and counts its calls and the thread
+/// it ran on.
+fn slow_factory(delay: std::time::Duration, made: &Arc<AtomicUsize>) -> super::handles::Factory {
     let made = Arc::clone(made);
-    move |spec| {
+    Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
         made.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(delay);
         soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)
-    }
+    })
 }
 
 fn synth_session(with_instrument: bool) -> (Arc<Session>, soundcraft_model::TrackId) {
@@ -684,30 +686,61 @@ fn play(plans: &mut plan_bridge::Audio, track: soundcraft_model::TrackId) -> f32
     total
 }
 
-#[test]
-fn a_slow_instance_is_announced_a_frame_before_it_is_made_and_the_plan_waits_for_it() {
+/// A frame may take this long at most while a plug-in loads (generous for loaded CI runners; the
+/// fixture sleeps 500 ms).
+const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs 5 ms "frames" of `service_with` until nothing is loading; returns the frames and the
+/// longest one.
+fn frames_until_loaded(
+    runtime: &mut RuntimeControl<u8, u8>,
+    third_party: &dyn Fn(&str) -> bool,
+    factory: &super::handles::Factory,
+) -> (u32, std::time::Duration) {
+    let (start, mut n, mut worst) = (std::time::Instant::now(), 0u32, std::time::Duration::ZERO);
+    while runtime.any_loading() && start.elapsed() < std::time::Duration::from_secs(20) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let t = std::time::Instant::now();
+        runtime.handles.service_with(&mut runtime.control, third_party, factory);
+        worst = worst.max(t.elapsed());
+        n += 1;
+    }
+    (n, worst)
+}
+
+/// A session whose second request adds the instrument; returns the runtime after the first plan.
+fn with_instrument_requested() -> (RuntimeControl<u8, u8>, AudioPorts<u8, u8>, soundcraft_model::TrackId, PlanGeneration) {
     let (before, track) = synth_session(false);
     let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(before, None, target(), PlanLimits::default()).unwrap();
     runtime.service();
     adopt(&mut ports.plans);
     runtime.service();
     let first = ports.plans.engine().active().generation;
-
     // Same track id: the second session adds only the instrument.
     let mut edited = (**runtime.requested_session()).clone();
     edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
-    let edited = Arc::new(edited);
-    runtime.update_session(Arc::clone(&edited)).unwrap();
+    runtime.update_session(Arc::new(edited)).unwrap();
+    (runtime, ports, track, first)
+}
 
+#[test]
+fn a_slow_instance_is_made_on_the_host_thread_while_frames_advance_and_the_plan_waits_for_it() {
+    let (mut runtime, mut ports, track, first) = with_instrument_requested();
     let made = Arc::new(AtomicUsize::new(0));
-    let mut create = slow_factory(std::time::Duration::from_millis(500), &made);
+    let thread = Arc::new(std::sync::Mutex::new(None));
+    let slow = slow_factory(std::time::Duration::from_millis(500), &made);
+    let seen = Arc::clone(&thread);
+    let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
+        *seen.lock().unwrap() = Some(std::thread::current().id());
+        slow(spec)
+    });
     let slot = soundcraft_mix::INSTRUMENT_SLOT;
     let third_party = |id: &str| id == "subtractive_synth";
 
     // Frame 1: announced, nothing made, nothing compiled, and the slot reads as loading.
     let started = std::time::Instant::now();
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
-    assert!(started.elapsed() < std::time::Duration::from_millis(100), "the announcing frame does not wait for the plug-in");
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+    assert!(started.elapsed() < FRAME_BUDGET, "the announcing frame does not wait for the plug-in");
     assert_eq!(made.load(Ordering::SeqCst), 0);
     assert!(runtime.loading(track, slot) && runtime.any_loading());
     assert!(runtime.control.sessions.published.is_none(), "the request waits uncompiled");
@@ -717,11 +750,14 @@ fn a_slow_instance_is_announced_a_frame_before_it_is_made_and_the_plan_waits_for
     assert_eq!(play(&mut ports.plans, track), 0.0);
     assert_eq!(ports.plans.engine().active().generation, first);
 
-    // Frame 2: made (once), compiled in the same call.
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    // Later frames submit it to the host thread and poll: none of them waits for the 500 ms.
+    let (frames, worst) = frames_until_loaded(&mut runtime, &third_party, &factory);
     assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+    assert!(frames >= 20, "only {frames} frames ran during a 500 ms creation");
+    assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
+    assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()), "made on the plug-in host thread");
     assert_eq!(made.load(Ordering::SeqCst), 1);
-    assert!(!runtime.loading(track, slot) && !runtime.any_loading());
+    assert!(!runtime.loading(track, slot) && !runtime.any_loading() && !runtime.stuck(track, slot));
     assert!(runtime.control.sessions.published.is_some(), "the plan took the instance and was published");
 
     // Bound: it sounds. Making it again for the compile would be a second call.
@@ -731,36 +767,29 @@ fn a_slow_instance_is_announced_a_frame_before_it_is_made_and_the_plan_waits_for
     runtime.retire(ports);
 }
 
-/// Renders 512-frame blocks on a thread standing in for the audio callback while the control
-/// thread sits in a 500 ms plug-in factory. Returns the blocks that began and ended inside the
-/// creation (`soundcraft_mix::creating_instance`) and the worst block time.
+/// Renders 512-frame blocks on a thread standing in for the audio callback while the plug-in host
+/// thread sits in a 500 ms plug-in factory and the control thread polls. Returns the blocks that
+/// began and ended inside the creation and the worst block time.
 fn render_while_an_instance_is_made() -> (u32, std::time::Duration) {
-    let (before, track) = synth_session(false);
-    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(before, None, target(), PlanLimits::default()).unwrap();
-    runtime.service();
-    adopt(&mut ports.plans);
-    runtime.service();
-    let mut edited = (**runtime.requested_session()).clone();
-    edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
-    runtime.update_session(Arc::new(edited)).unwrap();
-
+    let (mut runtime, ports, _, _) = with_instrument_requested();
     let made = Arc::new(AtomicUsize::new(0));
-    let mut slow = slow_factory(std::time::Duration::from_millis(500), &made);
+    let slow = slow_factory(std::time::Duration::from_millis(500), &made);
     // True for the whole factory call, so blocks are counted across the sleep as well as the load.
     let in_factory = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = Arc::clone(&in_factory);
-    let mut create = move |spec: &soundcraft_mix::InstanceSpec| {
+    let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
         flag.store(true, Ordering::Release);
         let made = slow(spec);
         flag.store(false, Ordering::Release);
         made
-    };
+    });
     let third_party = |id: &str| id == "subtractive_synth";
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
 
-    // 512 frames at 48 kHz is a 10.7 ms budget. The audio thread renders while the control
-    // thread sits in the 500 ms factory; no lock is shared between them.
+    // 512 frames at 48 kHz is a 10.7 ms budget. The audio thread renders while the host thread
+    // sits in the 500 ms factory; no lock is shared between them.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut ports = ports;
     let audio = {
         let stop = Arc::clone(&stop);
         let in_factory = Arc::clone(&in_factory);
@@ -779,7 +808,7 @@ fn render_while_an_instance_is_made() -> (u32, std::time::Duration) {
             (during, worst, plans)
         })
     };
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    frames_until_loaded(&mut runtime, &third_party, &factory);
     std::thread::sleep(std::time::Duration::from_millis(50));
     stop.store(true, Ordering::Release);
     let (during, worst, plans) = audio.join().unwrap();
@@ -821,14 +850,52 @@ fn a_request_that_no_longer_wants_a_staged_instance_drops_it() {
     edited.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
     runtime.update_session(Arc::new(edited)).unwrap();
     let made = Arc::new(AtomicUsize::new(0));
-    let mut create = slow_factory(std::time::Duration::ZERO, &made);
+    let factory = slow_factory(std::time::Duration::ZERO, &made);
     let third_party = |id: &str| id == "subtractive_synth";
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
     assert!(runtime.loading(track, soundcraft_mix::INSTRUMENT_SLOT));
     // Undo before it is made: nothing is created and nothing is left loading.
     runtime.update_session(base).unwrap();
-    runtime.handles.service_with(&mut runtime.control, &third_party, &mut create);
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
     assert!(!runtime.any_loading());
     assert_eq!(made.load(Ordering::SeqCst), 0);
+    runtime.retire(ports);
+}
+
+/// ADR 0018 section 5: a plug-in that never returns from its creation costs its slot, not the
+/// UI: no frame waits for it, the slot reads stuck after the host's timeout, and the session is
+/// compiled without it. Releasing the plug-in later destroys the late instance on its thread.
+#[test]
+fn a_creation_that_never_returns_is_stuck_after_the_timeout_and_the_session_compiles_without_it() {
+    let (mut runtime, mut ports, track, _) = with_instrument_requested();
+    runtime.handles = Handles::with_host(transit_plugin_host::Host::new(transit_plugin_host::Config {
+        timeout: std::time::Duration::from_millis(300),
+        inline: false,
+        ..transit_plugin_host::Config::default()
+    }));
+    let (release, hang) = std::sync::mpsc::channel::<()>();
+    let hang = std::sync::Mutex::new(hang);
+    let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
+        let _ = hang.lock().unwrap().recv(); // until the test lets go
+        soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)
+    });
+    let slot = soundcraft_mix::INSTRUMENT_SLOT;
+    let third_party = |id: &str| id == "subtractive_synth";
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+    assert!(runtime.loading(track, slot));
+    let (frames, worst) = frames_until_loaded(&mut runtime, &third_party, &factory);
+    assert!(frames >= 20, "frames ran meanwhile ({frames})");
+    assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
+    assert!(runtime.stuck(track, slot) && runtime.any_stuck(), "the slot reads as not responding");
+    assert!(!runtime.loading(track, slot));
+    assert_eq!(runtime.handles.host_wedged(), 1);
+    assert!(runtime.control.sessions.published.is_some(), "the session compiled without the stuck instance");
+    adopt(&mut ports.plans);
+    assert_eq!(play(&mut ports.plans, track), 0.0, "the stuck slot is silent");
+    // Another edit of the same document keeps the mark and does not try again.
+    runtime.update_session(Arc::clone(runtime.requested_session())).unwrap();
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+    assert!(runtime.stuck(track, slot) && !runtime.any_loading());
+    drop(release);
     runtime.retire(ports);
 }

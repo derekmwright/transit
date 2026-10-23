@@ -1,10 +1,41 @@
 //! Editor/state-reader ownership follows confirmed SlotBinding, never a slot name.
+//!
+//! Hosted (third-party) instances are made on the plug-in host thread (ADR 0018,
+//! `transit-plugin-host`): a request is announced for a frame ("Loading…"), submitted, and polled
+//! once per service call; the compile takes the instance when it is ready. The editor and state
+//! handles captured here are the host's proxies, so opening an editor, idling it and reading a
+//! state go to the host thread too, and a retired instance is destroyed there.
 use super::*;
 use crate::{EditorEdit, PluginStates};
 use soundcraft_dsp::{PluginEditor, PluginStateReader};
 use soundcraft_mix::InstanceSpec;
 use soundcraft_model::TrackId;
 use std::collections::BTreeMap;
+use transit_plugin_host::{Ctx, Host, Pending, Status};
+
+/// Makes one instance for a spec, on whichever thread runs it (the plug-in host thread for hosted
+/// plug-ins).
+pub(crate) type Factory = Arc<dyn Fn(&InstanceSpec) -> Option<NewInstance> + Send + Sync>;
+
+/// What a creation job on the host thread returns: `Err` when the factory unwound.
+type Made = Result<Option<NewInstance>, ()>;
+
+/// The job that makes `spec` on the host thread and adopts the instance there.
+fn creation(spec: InstanceSpec, factory: Factory) -> impl FnOnce(&mut Ctx) -> Made + Send + 'static {
+    move |ctx| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory(&spec).map(|mut made| {
+                made.plugin = ctx.adopt(made.plugin);
+                made
+            })
+        }))
+        .map_err(|payload| {
+            if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+                std::mem::forget(secondary);
+            }
+        })
+    }
+}
 
 struct Entry {
     editor: Option<Box<dyn PluginEditor>>,
@@ -18,9 +49,11 @@ struct Entry {
 enum Stage {
     /// Seen in the latest request; not yet announced to the UI.
     Queued,
-    /// Announced for a frame (the UI shows it as loading); made on the next service.
+    /// Announced for a frame (the UI shows it as loading); submitted on the next service.
     Announced,
-    /// Made (or refused: `None`), waiting for the compile to take it.
+    /// Being made on the plug-in host thread.
+    Requested(Pending<Made>),
+    /// Made (or refused, failed or stuck: `None`), waiting for the compile to take it.
     Ready(Option<NewInstance>),
 }
 
@@ -29,10 +62,15 @@ struct Staged {
     stage: Stage,
 }
 
-#[derive(Default)]
 pub struct Handles {
-    /// Third-party instances made ahead of the compile, one per service call (see [`Handles::stage`]).
+    /// Third-party instances made ahead of the compile on the host thread (see [`Handles::stage`]).
     staged: Vec<Staged>,
+    /// Specs whose creation did not return within the host's timeout: the slot is empty and the
+    /// UI says "Not responding" until the request no longer has it.
+    stuck: Vec<InstanceSpec>,
+    /// Why editors that accepted an open request then failed, for the status line.
+    editor_errors: Vec<(TrackId, usize, String)>,
+    host: Host,
     /// Keyed by (track, generation): the generation is the instance's identity and survives a
     /// reorder, while the slot it sits at does not.
     entries: BTreeMap<(TrackId, SlotGen), Entry>,
@@ -41,67 +79,103 @@ pub struct Handles {
     main_thread: PhantomData<Rc<()>>,
 }
 
+impl Default for Handles {
+    fn default() -> Self {
+        Handles::with_host(transit_plugin_host::shared().clone())
+    }
+}
+
 impl Handles {
-    /// Normal Player preparation: all factory/handle calls run on the owner thread.
-    pub fn service<T: Copy, R: Copy>(&mut self, control: &mut Control<T, R>) {
-        let target = control.sessions.target;
-        self.service_with(control, &soundcraft_mix::is_third_party, &mut |spec| {
-            soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), target.sample_rate as f32, target.max_block as usize, spec.ch)
-        });
+    /// Handles whose hosted instances are made on `host` (tests use their own).
+    pub(crate) fn with_host(host: Host) -> Self {
+        Handles {
+            staged: Vec::new(),
+            stuck: Vec::new(),
+            editor_errors: Vec::new(),
+            host,
+            entries: BTreeMap::new(),
+            active: BTreeMap::new(),
+            generation: PlanGeneration::default(),
+            main_thread: PhantomData,
+        }
     }
 
-    /// [`Self::service`] with the factory and the choice of what is made a frame ahead supplied
-    /// (the tests have no plug-in hosts to load).
-    pub(super) fn service_with<T: Copy, R: Copy>(
-        &mut self,
-        control: &mut Control<T, R>,
-        deferred: &dyn Fn(&str) -> bool,
-        create: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
-    ) {
+    /// Normal Player preparation: hosted instances are made on the plug-in host thread,
+    /// built-ins (cheap) on this, the owner thread, during the compile.
+    pub fn service<T: Copy, R: Copy>(&mut self, control: &mut Control<T, R>) {
+        let target = control.sessions.target;
+        let factory: Factory = Arc::new(move |spec: &InstanceSpec| {
+            soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), target.sample_rate as f32, target.max_block as usize, spec.ch)
+        });
+        self.service_with(control, &soundcraft_mix::is_third_party, &factory);
+    }
+
+    /// [`Self::service`] with the factory and the choice of what goes to the host thread
+    /// supplied (the tests have no plug-in hosts to load).
+    pub(super) fn service_with<T: Copy, R: Copy>(&mut self, control: &mut Control<T, R>, deferred: &dyn Fn(&str) -> bool, factory: &Factory) {
+        self.host.check();
         control.sessions.reclaim(false);
-        control.sessions.hold = self.stage(&mut control.sessions, deferred, create);
+        control.sessions.hold = self.stage(&mut control.sessions, deferred, factory);
         control.service(&mut |spec, generation| {
             let ready = self.staged.iter().position(|st| st.spec == *spec && matches!(st.stage, Stage::Ready(_)));
             let made = match ready.map(|i| self.staged.swap_remove(i).stage) {
                 Some(Stage::Ready(made)) => made,
-                _ => create(spec),
+                _ if self.stuck.contains(spec) => None,
+                // Not predicted by `stage` (a slot that moved for layout reasons): made now on
+                // the host thread, waited for up to its timeout.
+                _ if deferred(&spec.id) => self.make_now(spec, factory),
+                _ => factory(spec),
             }?;
             self.capture((spec.track, spec.slot, generation), made)
         });
         self.refresh(&mut control.sessions);
     }
 
+    /// Makes a hosted instance the compile asks for that `stage` did not predict: on the host
+    /// thread, waiting at most the host's timeout. A factory unwind unwinds the compile (a
+    /// session fault, as before); a stuck creation leaves the slot empty and marked.
+    fn make_now(&mut self, spec: &InstanceSpec, factory: &Factory) -> Option<NewInstance> {
+        let pending = self.host.submit(creation(spec.clone(), Arc::clone(factory)));
+        let timeout = self.host.timeout();
+        match pending.wait(timeout) {
+            Some(Ok(made)) => made,
+            Some(Err(())) => std::panic::resume_unwind(Box::new("a plug-in factory panicked on the host thread")),
+            None => {
+                log::error!("{}: not made within {timeout:?}; the slot stays empty", spec.id);
+                self.stuck.push(spec.clone());
+                None
+            }
+        }
+    }
+
     /// Makes the third-party instances the latest request needs before it is compiled, so the
-    /// compile finds them and the control thread never sits in a factory with the UI unpainted:
-    /// the first call only announces them ([`Self::loading`] turns true and the frame is
-    /// painted), each later call makes one, and the request compiles in the call that made the
-    /// last. The active plan keeps playing meanwhile and has no strip or slot for the new
-    /// instance, which is silence. True while the request has to wait.
+    /// compile finds them and the control thread never sits in a factory: the first call only
+    /// announces them ([`Self::loading`] turns true and the frame is painted), the next submits
+    /// them to the plug-in host thread, and each later call polls them; the request compiles in
+    /// the call that finds the last one ready. The active plan keeps playing meanwhile and has no
+    /// strip or slot for the new instance, which is silence. True while the request has to wait.
     ///
-    /// Creation is one SDK call on the main thread (VST3 `createInstance` and `initialize`), so a
-    /// single instance still blocks this thread for as long as the plug-in takes; what changes is
-    /// that nothing else is queued behind it in the same frame and the UI has said why.
-    fn stage(
-        &mut self,
-        sessions: &mut SessionControl,
-        deferred: &dyn Fn(&str) -> bool,
-        create: &mut dyn FnMut(&InstanceSpec) -> Option<NewInstance>,
-    ) -> bool {
+    /// A creation that runs past the host's timeout is stuck (ADR 0018 section 5): its slot is
+    /// compiled empty and reads "Not responding" ([`Self::stuck`]) while the request keeps it.
+    fn stage(&mut self, sessions: &mut SessionControl, deferred: &dyn Fn(&str) -> bool, factory: &Factory) -> bool {
         // With a plan in flight the compiler's view is not current; wait for its return.
         let wanted: Vec<InstanceSpec> = match &sessions.latest {
             Some(request) if !sessions.faulted() && sessions.bridge.can_prepare() => {
                 let all = sessions.restore.is_some();
-                soundcraft_mix::realtime_instance_specs(&request.session)
-                    .into_iter()
-                    .filter(|spec| deferred(&spec.id) && (all || !sessions.bridge.reuses(spec)))
-                    .collect()
+                let specs = soundcraft_mix::realtime_instance_specs(&request.session);
+                // A stuck mark lasts while the request still has that instance.
+                self.stuck.retain(|spec| specs.contains(spec));
+                specs.into_iter().filter(|spec| deferred(&spec.id) && (all || !sessions.bridge.reuses(spec))).collect()
             }
             _ => Vec::new(),
         };
-        // What no request asks for any more dies here, on main.
+        // What no request asks for any more dies here: a request not yet started is cancelled,
+        // a running one finishes on the host thread and its instance is destroyed there.
         self.staged.retain(|st| wanted.contains(&st.spec));
         for spec in wanted {
             if !self.staged.iter().any(|st| st.spec == spec) {
+                // Asked for afresh (a reopen): it gets another try.
+                self.stuck.retain(|s| *s != spec);
                 self.staged.push(Staged { spec, stage: Stage::Queued });
             }
         }
@@ -113,16 +187,32 @@ impl Handles {
             }
             return true;
         }
-        if let Some(st) = self.staged.iter_mut().find(|st| matches!(st.stage, Stage::Announced)) {
-            // A factory unwind is a session fault, as when the compile makes the instance.
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create(&st.spec))) {
-                Ok(made) => st.stage = Stage::Ready(made),
-                Err(payload) => {
+        // Inline (macOS) runs each job where it is submitted: one per call, as before.
+        let inline = self.host.is_inline();
+        for st in self.staged.iter_mut().filter(|st| matches!(st.stage, Stage::Announced)) {
+            st.stage = Stage::Requested(self.host.submit(creation(st.spec.clone(), Arc::clone(factory))));
+            if inline {
+                break;
+            }
+        }
+        for st in &mut self.staged {
+            let Stage::Requested(pending) = &st.stage else { continue };
+            match pending.poll() {
+                Status::Waiting { .. } => {}
+                Status::Ready(Ok(made)) => st.stage = Stage::Ready(made),
+                Status::Ready(Err(())) => {
+                    // A factory unwind is a session fault, as when the compile makes the instance.
                     st.stage = Stage::Ready(None);
                     sessions.fault();
-                    if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
-                        std::mem::forget(secondary);
-                    }
+                }
+                Status::Failed => {
+                    log::error!("{}: the plug-in host could not make it", st.spec.id);
+                    st.stage = Stage::Ready(None);
+                }
+                Status::Stuck => {
+                    log::error!("{}: not made within {:?}; the slot stays empty", st.spec.id, self.host.timeout());
+                    self.stuck.push(st.spec.clone());
+                    st.stage = Stage::Ready(None);
                 }
             }
         }
@@ -137,6 +227,27 @@ impl Handles {
     /// Whether any instance is waiting to be made.
     pub fn any_loading(&self) -> bool {
         self.staged.iter().any(|st| !matches!(st.stage, Stage::Ready(_)))
+    }
+
+    /// Whether this slot's plug-in did not finish loading within the host's timeout: the slot is
+    /// empty and the UI says it is not responding.
+    pub fn stuck(&self, track: TrackId, slot: usize) -> bool {
+        self.stuck.iter().any(|spec| spec.track == track && spec.slot == slot)
+    }
+
+    /// Whether any slot is stuck.
+    pub fn any_stuck(&self) -> bool {
+        !self.stuck.is_empty()
+    }
+
+    /// How many plug-in host threads have wedged in this process (the status line says so).
+    pub fn host_wedged(&self) -> usize {
+        self.host.wedged()
+    }
+
+    /// Editor opens that failed after they were accepted: (track, slot, why), each once.
+    pub fn take_editor_errors(&mut self) -> Vec<(TrackId, usize, String)> {
+        std::mem::take(&mut self.editor_errors)
     }
 
     /// Take every possibly-panicking handle before committing the entry. On a factory
@@ -247,6 +358,9 @@ impl Handles {
                 && let Some(editor) = &mut entry.editor
             {
                 out.extend(editor.idle().into_iter().map(|(id, value)| (track, slot, id, value)));
+                if let Some(e) = editor.take_error() {
+                    self.editor_errors.push((track, slot, e));
+                }
             }
         }
         out

@@ -1022,6 +1022,24 @@ impl Player {
     pub fn any_loading(&self) -> bool {
         self.owner().is_ok_and(|owner| owner.any_loading())
     }
+    /// Whether this slot's plug-in did not load within the plug-in host's timeout (ADR 0018): the
+    /// slot is empty and the UI says the plug-in is not responding.
+    pub fn stuck(&self, track: TrackId, slot: usize) -> bool {
+        self.owner().is_ok_and(|owner| owner.stuck(track, slot))
+    }
+    /// Whether any slot is stuck (see [`Player::stuck`]).
+    pub fn any_stuck(&self) -> bool {
+        self.owner().is_ok_and(|owner| owner.any_stuck())
+    }
+    /// How many plug-in host threads have wedged in this process (a plug-in call that never
+    /// returned); 0 normally.
+    pub fn plugin_host_wedged(&self) -> usize {
+        self.owner().map_or(0, |owner| owner.plugin_host_wedged())
+    }
+    /// Editor windows that were accepted for opening and then failed: (track, slot, why), once.
+    pub fn take_editor_errors(&self) -> Vec<(TrackId, usize, String)> {
+        self.owner().map(|mut owner| owner.take_editor_errors()).unwrap_or_default()
+    }
     pub fn has_editor(&self, track: TrackId, slot: usize) -> bool {
         self.owner().is_ok_and(|owner| owner.has_editor(track, slot))
     }
