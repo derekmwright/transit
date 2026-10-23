@@ -43,7 +43,7 @@ fn set_instrument(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.instrument", "`plugin` required"))?;
     let (plugin_id, is_instrument, info) =
-        super::clap::plugin_head(plugin, p.get("params").is_some()).ok_or_else(|| bad("mix.instrument", format!("unknown plugin `{plugin}`")))?;
+        super::clap::plugin_head(plugin, p.get("params").is_some()).ok_or_else(|| super::clap::unknown("mix.instrument", plugin))?;
     if !is_instrument {
         return Err(bad("mix.instrument", format!("`{plugin}` is not an instrument")));
     }

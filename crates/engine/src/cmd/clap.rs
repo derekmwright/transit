@@ -64,19 +64,30 @@ fn hosted_info(id: &str, wait: std::time::Duration) -> std::result::Result<Optio
         let mut reads = info_reads();
         reads.iter().position(|(read, _)| read == id).map(|i| reads.swap_remove(i).1)
     };
-    let read = running.unwrap_or_else(|| {
+    let submit = || {
         let id = id.to_owned();
         transit_plugin_host::shared().submit(move |_| {
             soundcraft_clap_host::plugin_info(&id).or_else(|| soundcraft_vst3_host::plugin_info(&id)).or_else(|| soundcraft_au_host::plugin_info(&id))
         })
-    });
+    };
+    let mut fresh = running.is_none();
+    let mut read = running.unwrap_or_else(submit);
     let deadline = std::time::Instant::now() + wait;
     loop {
         match read.poll() {
             transit_plugin_host::Status::Ready(info) => return Ok(info),
             transit_plugin_host::Status::Failed => return Ok(None),
-            // Its thread is not responding: the next call asks the thread that took over.
-            transit_plugin_host::Status::Stuck => return Err(Loading),
+            // An earlier read whose thread stopped responding: ask the thread that took over.
+            transit_plugin_host::Status::Stuck if !fresh => {
+                read = submit();
+                fresh = true;
+            }
+            // Its thread is not responding, or is busy (another plug-in's dialog): say so; the
+            // next call asks again.
+            transit_plugin_host::Status::Stuck => {
+                info_reads().push((id.to_owned(), read));
+                return Err(Loading);
+            }
             transit_plugin_host::Status::Waiting { .. } if std::time::Instant::now() >= deadline => {
                 info_reads().push((id.to_owned(), read));
                 return Err(Loading);
@@ -88,9 +99,17 @@ fn hosted_info(id: &str, wait: std::time::Duration) -> std::result::Result<Optio
 
 /// [`plugin_info`] for a command: "unknown plugin", or that its description is still loading.
 pub fn require_info(cmd: &str, id: &str) -> Result<&'static PluginInfo> {
-    plugin_info(id).ok_or_else(|| {
-        if loading(id) { bad(cmd, format!("`{id}` is still loading its parameter table; try again in a moment")) } else { bad(cmd, "unknown plugin") }
-    })
+    plugin_info(id).ok_or_else(|| unknown(cmd, id))
+}
+
+/// The error for a plug-in whose description a command could not get: unknown, or not read yet
+/// because the plug-in host is busy (a slow load, another plug-in's dialog) or not responding.
+pub fn unknown(cmd: &str, id: &str) -> EngineError {
+    if loading(id) {
+        bad(cmd, format!("`{id}` has not finished loading its parameter table (the plug-in host is busy or not responding); try again in a moment"))
+    } else {
+        bad(cmd, format!("unknown plugin `{id}`"))
+    }
 }
 
 /// What adding a plug-in needs to know of it: its id and whether it is an instrument, and its full

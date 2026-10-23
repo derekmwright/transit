@@ -383,8 +383,7 @@ fn insert(e: &mut Engine, p: &Value) -> Result<Value> {
     }
     let plugin = str_param(p, "plugin").ok_or_else(|| bad("mix.insert", "`plugin` required"))?.to_string();
     let named = p.get("params").and_then(Value::as_object);
-    let (plugin_id, _, info) =
-        super::clap::plugin_head(&plugin, named.is_some()).ok_or_else(|| bad("mix.insert", format!("unknown plugin `{plugin}`")))?;
+    let (plugin_id, _, info) = super::clap::plugin_head(&plugin, named.is_some()).ok_or_else(|| super::clap::unknown("mix.insert", &plugin))?;
     let t = tracks_required(e, "mix.insert", p)?.first().copied().ok_or_else(|| bad("mix.insert", "no track"))?;
     let explicit = slot_of(p, "slot", INSERT_SLOTS);
     let s = e.session_mut();
