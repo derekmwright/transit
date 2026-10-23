@@ -1,14 +1,19 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/transit-wordmark-white-2172.png">
-    <source media="(prefers-color-scheme: light)" srcset="assets/brand/transit-wordmark-graphite-2172.png">
-    <img alt="transit" src="assets/brand/transit-wordmark-graphite-2172.png" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/transit-wordmark-white.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/transit-wordmark-graphite.svg">
+    <img alt="transit" src="assets/brand/transit-wordmark-graphite.svg" width="360">
   </picture>
 </p>
+
+<p align="center"><strong>An open-source DAW in Rust with native ASIO, measured latency, and plug-ins that cannot freeze the window.</strong></p>
 
 <p align="center">
   <a href="https://github.com/transit-audio/transit/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/transit-audio/transit/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://discord.gg/7PPUBZqA66"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
+  <a href="https://github.com/transit-audio/transit/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/transit-audio/transit"></a>
+  <a href="#license"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/github/license/transit-audio/transit"></a>
+  <a href="https://github.com/transit-audio/transit/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/transit-audio/transit/total"></a>
 </p>
 
 A desktop DAW in pure Rust with Ableton/Logic-style ergonomics and its own audio engine, device
@@ -24,6 +29,13 @@ credited in About and in NOTICE.
 > Releases are frequent, and each lists its
 > [known issues](docs/known-issues/README.md). Measurements and bug reports are the most valuable
 > help right now: see [How to help](#how-to-help).
+
+## Why transit
+
+- A native ASIO backend written from the protocol up, without the Steinberg SDK.
+- Latency you can measure in the app, not just read off a box.
+- Plug-in loading that cannot freeze the window.
+- Ableton and Logic ergonomics on a measured engine.
 
 ## Downloads
 

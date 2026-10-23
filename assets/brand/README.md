@@ -22,3 +22,9 @@ This is the wordmark only; the app icon is separate (`assets/app-icon/`).
 
 The wordmark is part of the project under the repository's MIT OR Apache-2.0 dual license.
 The artwork is by its owner, @derekmwright.
+
+## Social preview
+
+`social-preview-1280x640.png` is the 1280 x 640 GitHub social preview card (white wordmark and the
+tagline "An open-source DAW in Rust" on `#101214`). It is uploaded by hand under repository
+Settings > Social preview; GitHub has no API for it.
