@@ -89,7 +89,15 @@ pub fn specs() -> Vec<CommandSpec> {
             e.transport_requests.push(crate::TransportRequest::AllNotesOff);
             Ok(json!({}))
         }),
-        cmd!("event.midi_note", "Add MIDI Note", [], None, "{clip, pitch, start_ticks, length_ticks, velocity?: 100}", has_selection, add_note),
+        cmd!(
+            "event.midi_note",
+            "Add MIDI Note",
+            [],
+            None,
+            "{clip, pitch, start_ticks?|start?, length_ticks?|length?, velocity?: 100}; start/length: bar|beat[|tick] strings only, 1-based, start relative to clip, length 1|2 = 1 beat and 2|1 = 1 bar at note start; numeric values require start_ticks/length_ticks; aliases exclusive",
+            has_selection,
+            add_note
+        ),
         cmd!(
             "markers.add",
             "New Memory Location",
@@ -278,13 +286,14 @@ fn duration(e: &mut Engine, p: &Value) -> Result<Value> {
 fn add_note(e: &mut Engine, p: &Value) -> Result<Value> {
     let ids = clip_ids_param(e, p);
     let id = *ids.first().ok_or_else(|| bad("event.midi_note", "`clip` required"))?;
+    let (start, length) = midi_time::timing(e, p, id, TICKS_PER_QUARTER, "event.midi_note")?;
     let note = soundcraft_midi::Note {
         pitch: i64_or(p, "pitch", 60).clamp(0, 127) as u8,
         velocity: i64_or(p, "velocity", 100).clamp(1, 127) as u8,
         release_velocity: 64,
         channel: i64_or(p, "channel", 0).clamp(0, 15) as u8,
-        start: i64_or(p, "start_ticks", 0).max(0),
-        length: i64_or(p, "length_ticks", TICKS_PER_QUARTER).max(1),
+        start,
+        length,
     };
     let s = e.session_mut();
     match s.find_clip_mut(id).map(|c| &mut c.content) {

@@ -75,6 +75,9 @@ pub fn session(e: &Engine, full: bool) -> Value {
     json!({
         "name": s.name, "path": e.path, "dirty": e.is_dirty(), "sample_rate": s.sample_rate.hz(), "bit_depth": s.bit_depth,
         "frame_rate": s.frame_rate.label(), "tempo": s.tempo.tempos(), "meter": s.tempo.meters(), "main_format": s.main_format().label(),
+        "ticks_per_quarter": soundcraft_time::TICKS_PER_QUARTER,
+        "key": s.key_signatures.iter().filter(|(at, _)| *at <= 0).max_by_key(|(at, _)| *at).map(|(_, key)| key),
+        "key_signatures": s.key_signatures.iter().map(|(at, key)| json!({"at": at, "key": key})).collect::<Vec<_>>(),
         "length_samples": s.content_end(),
         "tracks": s.tracks.iter().map(|t| track_json(e, t, full)).collect::<Vec<_>>(),
         "busses": s.busses.iter().map(|b| {

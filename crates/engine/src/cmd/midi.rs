@@ -15,13 +15,38 @@ pub fn specs() -> Vec<CommandSpec> {
             "New MIDI Clip",
             ["Clip"],
             None,
-            "{track, start?, end?|length?} (default: the edit selection, or 1 bar)",
+            "{track, start?, end?|length?}; bar|beat[|tick] strings (1-based session positions; length 1|2 = 1 beat and 2|1 = 1 bar at start), or sample/time values; default: selection or 1 bar",
             has_tracks,
             new_clip
         ),
-        cmd!("midi.note_add", "Add Note", [], None, "{clip, pitch, start_ticks, length_ticks?: 480, velocity?: 100, channel?: 0}", always, note_add),
-        cmd!("midi.note_edit", "Edit Note", [], None, "{clip, index, pitch?, start_ticks?, length_ticks?, velocity?}", always, note_edit),
+        cmd!(
+            "midi.note_add",
+            "Add Note",
+            [],
+            None,
+            "{clip, pitch, start_ticks?|start?, length_ticks?: 480|length?, velocity?: 100, channel?: 0}; start/length: bar|beat[|tick] strings only, 1-based, start relative to clip, length 1|2 = 1 beat and 2|1 = 1 bar at note start; numeric values require start_ticks/length_ticks; aliases exclusive",
+            always,
+            note_add
+        ),
+        cmd!(
+            "midi.note_edit",
+            "Edit Note",
+            [],
+            None,
+            "{clip, index, pitch?, start_ticks?|start?, length_ticks?|length?, velocity?}; start/length: bar|beat[|tick] strings only, 1-based, start relative to clip, length 1|2 = 1 beat and 2|1 = 1 bar at note start; numeric values require start_ticks/length_ticks; aliases exclusive",
+            always,
+            note_edit
+        ),
         cmd!("midi.note_delete", "Delete Notes", [], None, "{clip, indices: [n]}", always, note_delete),
+        cmd!(
+            "midi.chord_add",
+            "Add Chord",
+            [],
+            None,
+            "{clip, root: MIDI number or note name (C3=60, bare G=G3), quality: maj|min|dim|aug|maj7|min7|dom7|sus2|sus4 OR notes: [1..32 semitone intervals], inversion?: 0, start?|start_ticks?, length?|length_ticks?: 480, velocity?: 100}; start/length: bar|beat[|tick] strings only, 1-based, start relative to clip, length 1|2 = 1 beat and 2|1 = 1 bar at note start; numeric values require start_ticks/length_ticks; aliases exclusive; inversion raises lowest N tones one octave",
+            always,
+            chord_add
+        ),
         cmd!("midi.notes_move", "Move Notes", [], None, "{clip, indices: [n], ticks?: 0, semitones?: 0}", always, notes_move),
     ]
 }
@@ -47,7 +72,7 @@ fn new_clip(e: &mut Engine, p: &Value) -> Result<Value> {
     if !e.session().track(t).is_some_and(|x| x.kind.is_midi()) {
         return Err(bad("midi.new_clip", "not a MIDI or instrument track"));
     }
-    let mut r = range_param(e, "midi.new_clip", p)?;
+    let mut r = midi_time::clip_range(e, p, "midi.new_clip")?;
     if r.is_empty() {
         let s = e.session();
         let bar = soundcraft_time::GridValue::Note { value: soundcraft_time::NoteValue::Bar, dotted: false, triplet: false };
@@ -63,13 +88,14 @@ fn new_clip(e: &mut Engine, p: &Value) -> Result<Value> {
 
 fn note_add(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = clip_id(p, "midi.note_add")?;
+    let (start, length) = midi_time::timing(e, p, id, TICKS_PER_QUARTER / 2, "midi.note_add")?;
     let n = Note {
         pitch: i64_or(p, "pitch", 60).clamp(0, 127) as u8,
         velocity: i64_or(p, "velocity", 100).clamp(1, 127) as u8,
         release_velocity: 64,
         channel: i64_or(p, "channel", 0).clamp(0, 15) as u8,
-        start: i64_or(p, "start_ticks", 0).max(0),
-        length: i64_or(p, "length_ticks", TICKS_PER_QUARTER / 2).max(1),
+        start,
+        length,
     };
     let seq = seq_mut(e, id, "midi.note_add")?;
     seq.notes.push(n);
@@ -81,23 +107,41 @@ fn note_add(e: &mut Engine, p: &Value) -> Result<Value> {
 fn note_edit(e: &mut Engine, p: &Value) -> Result<Value> {
     let id = clip_id(p, "midi.note_edit")?;
     let idx = p.get("index").and_then(Value::as_u64).ok_or_else(|| bad("midi.note_edit", "`index` required"))? as usize;
+    let original = *seq_mut(e, id, "midi.note_edit")?.notes.get(idx).ok_or_else(|| bad("midi.note_edit", "index out of range"))?;
+    let origin = midi_time::origin(e, id, "midi.note_edit")?;
+    let start = midi_time::param(e, p, "start", origin, "midi.note_edit")?.unwrap_or(original.start).max(0);
+    let at = origin.checked_add(start).ok_or_else(|| bad("midi.note_edit", "note start is out of range"))?;
+    let length = midi_time::param(e, p, "length", at, "midi.note_edit")?.unwrap_or(original.length).max(1);
+    start.checked_add(length).ok_or_else(|| bad("midi.note_edit", "note end is out of range"))?;
     let seq = seq_mut(e, id, "midi.note_edit")?;
     let n = seq.notes.get_mut(idx).ok_or_else(|| bad("midi.note_edit", "index out of range"))?;
     if let Some(v) = p.get("pitch").and_then(Value::as_i64) {
         n.pitch = v.clamp(0, 127) as u8;
     }
-    if let Some(v) = p.get("start_ticks").and_then(Value::as_i64) {
-        n.start = v.max(0);
-    }
-    if let Some(v) = p.get("length_ticks").and_then(Value::as_i64) {
-        n.length = v.max(1);
-    }
+    n.start = start;
+    n.length = length;
     if let Some(v) = p.get("velocity").and_then(Value::as_i64) {
         n.velocity = v.clamp(1, 127) as u8;
     }
     let edited = *n;
     seq.sort();
     Ok(json!({"note": edited, "index": seq.notes.iter().position(|x| *x == edited)}))
+}
+
+fn chord_add(e: &mut Engine, p: &Value) -> Result<Value> {
+    let cmd = "midi.chord_add";
+    let id = clip_id(p, cmd)?;
+    let pitches = midi_chord::pitches(p)?;
+    let (start, length) = midi_time::timing(e, p, id, TICKS_PER_QUARTER / 2, cmd)?;
+    let velocity = match p.get("velocity") {
+        None => 100,
+        Some(v) => v.as_u64().filter(|v| (1..=127).contains(v)).ok_or_else(|| bad(cmd, "velocity must be 1..127"))? as u8,
+    };
+    let notes: Vec<_> = pitches.into_iter().map(|pitch| Note { pitch, velocity, release_velocity: 64, channel: 0, start, length }).collect();
+    let seq = seq_mut(e, id, cmd)?;
+    seq.notes.extend_from_slice(&notes);
+    seq.sort();
+    Ok(json!({"added": notes.len(), "notes": notes}))
 }
 
 fn indices(p: &Value) -> Vec<usize> {

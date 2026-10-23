@@ -146,7 +146,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Retrospective Record",
             ["Event"],
             None,
-            "{track?, notes?: [{pitch, start?: position | start_ticks?, length_ticks?: 240, velocity?: 100}]} — turns captured MIDI into a clip (input quantize applies)",
+            "{track?, notes?: [{pitch, start?: position | start_ticks?, length_ticks?: 240|length?, velocity?: 100}]}; start/length also accept bar|beat[|tick], 1-based session positions, length 1|2 = 1 beat and 2|1 = 1 bar at note start; length must be a string, numeric ticks use length_ticks; aliases exclusive; input quantize applies",
             always,
             retro_record
         ),
@@ -750,7 +750,11 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
     let sr = s.sample_rate;
     let mut raw: Vec<(i64, Note)> = Vec::new();
     for v in list.iter().take(100_000) {
+        if v.get("start_ticks").is_some() && v.get("start").is_some() {
+            return Err(bad(id, "use either start or start_ticks, not both"));
+        }
         let tick = match (v.get("start_ticks").and_then(Value::as_i64), v.get("start")) {
+            (None, Some(value)) if midi_time::is_musical(value) => midi_time::param(e, v, "start", 0, id)?.unwrap_or(0),
             (Some(tk), _) => tk.max(0),
             (None, Some(_)) => s.tempo.samples_to_ticks(position_param(e, id, v, "start")?.unwrap_or(0).max(0), sr),
             _ => return Err(bad(id, "each note needs `start` or `start_ticks`")),
@@ -761,14 +765,18 @@ fn retro_record(e: &mut Engine, p: &Value) -> Result<Value> {
             release_velocity: 64,
             channel: i64_or(v, "channel", 0).clamp(0, 15) as u8,
             start: 0,
-            length: i64_or(v, "length_ticks", TICKS_PER_QUARTER / 4).clamp(1, TICKS_PER_QUARTER * 1024),
+            length: midi_time::param(e, v, "length", tick, id)?.unwrap_or(TICKS_PER_QUARTER / 4).clamp(1, TICKS_PER_QUARTER * 1024),
         };
+        let end = tick.checked_add(note.length).ok_or_else(|| bad(id, "note end is out of range"))?;
+        if s.tempo.tick_to_samples(end, sr) > MAX_POSITION {
+            return Err(bad(id, "note end exceeds the session position limit"));
+        }
         raw.push((tick, note));
     }
     let first = raw.iter().map(|x| x.0).min().unwrap_or(0);
     // Start the clip on the bar line so the quantize grid lines up with the music.
     let clip_tick = s.tempo.bar_start_tick(s.tempo.bar_beat_at_tick(first).bar).min(first).max(0);
-    let end_tick = raw.iter().map(|(tk, n)| tk.saturating_add(n.length)).max().unwrap_or(first + 1);
+    let end_tick = raw.iter().map(|(tk, n)| tk.saturating_add(n.length)).max().unwrap_or_else(|| first.saturating_add(1));
     let mut seq = soundcraft_midi::Sequence::default();
     for (tk, mut n) in raw {
         n.start = tk - clip_tick;
