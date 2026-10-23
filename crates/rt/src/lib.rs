@@ -30,6 +30,10 @@
 
 pub mod handoff;
 
+/// The OS message queue of a window-hosting thread that is not the UI thread (the plug-in host
+/// thread, ADR 0018): attach, wait, dispatch, and a cross-thread waker.
+pub mod gui_thread;
+
 mod shell;
 pub use shell::set_app_user_model_id;
 
