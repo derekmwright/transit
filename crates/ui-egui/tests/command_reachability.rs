@@ -23,6 +23,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "io.measure_hardware_latency", // same
     "markers.next",
     "markers.previous",
+    "midi.chord_add", // assistant/control-first (#45): the chord track is written through the control channel and MCP; no chord editor in the UI yet
     "mix.clear_mutes",
     "mix.clear_solos",
     "mix.insert_copy", // studio UI only (Alt-drag in the device chain); the old UI has no device reorder
