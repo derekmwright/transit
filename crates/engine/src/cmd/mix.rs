@@ -441,7 +441,7 @@ fn insert_param(e: &mut Engine, p: &Value) -> Result<Value> {
     let s = e.session_mut();
     let ins =
         s.track_mut(t).and_then(|tr| tr.mixer.inserts.get_mut(slot)).and_then(Option::as_mut).ok_or_else(|| bad("mix.insert_param", "empty slot"))?;
-    let info = super::clap::plugin_info(&ins.plugin).ok_or_else(|| bad("mix.insert_param", "unknown plugin"))?;
+    let info = super::clap::require_info("mix.insert_param", &ins.plugin)?;
     let pi =
         info.params.iter().find(|x| x.id == param).ok_or_else(|| bad("mix.insert_param", format!("`{}` has no parameter `{param}`", info.id)))?;
     let v = value.clamp(pi.min, pi.max);
@@ -461,7 +461,7 @@ fn insert_params(e: &mut Engine, p: &Value) -> Result<Value> {
         .and_then(|tr| tr.mixer.inserts.get_mut(slot))
         .and_then(Option::as_mut)
         .ok_or_else(|| bad("mix.insert_params", "empty slot"))?;
-    let info = super::clap::plugin_info(&ins.plugin).ok_or_else(|| bad("mix.insert_params", "unknown plugin"))?;
+    let info = super::clap::require_info("mix.insert_params", &ins.plugin)?;
     let mut unknown: Vec<&str> = Vec::new();
     let mut non_numeric: Vec<&str> = Vec::new();
     for (k, v) in &obj {
