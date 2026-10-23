@@ -1,3 +1,4 @@
+use crate::mixer::RoutingChoice;
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
 use soundcraft_model::{ClipId, TrackId};
@@ -881,7 +882,14 @@ fn routing_menus_never_offer_a_loop() {
     app.set_output(fx2, "FX 3").unwrap();
     let s = app.engine.session_arc();
     let io = app.engine.io_map().clone();
-    let labels = |v: Vec<(String, String)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+    let labels = |v: Vec<RoutingChoice>| {
+        v.into_iter()
+            .map(|choice| match choice {
+                RoutingChoice::Separator => String::new(),
+                RoutingChoice::Entry { label, .. } => label,
+            })
+            .collect::<Vec<_>>()
+    };
     let out3 = labels(output_choices(&s, s.track(fx3).unwrap(), &io));
     assert!(!out3.iter().any(|l| l == "FX 1" || l == "FX 2" || l == "FX 3"), "three hops back: {out3:?}");
     let out2 = labels(output_choices(&s, s.track(fx2).unwrap(), &io));
@@ -1827,7 +1835,11 @@ fn orphan_buses_leave_the_routing_menus_and_one_entry_removes_them() {
     assert_eq!(labels.last().map(String::as_str), Some("Remove unused buses (2)"));
     let s = app.engine.session_arc();
     assert!(crate::mixer::send_targets(&s, s.track(fx).unwrap(), None, &Default::default()).is_empty());
-    assert!(!crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default()).iter().any(|(l, _)| l.contains("Lost")));
+    assert!(
+        !crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default())
+            .iter()
+            .any(|choice| matches!(choice, RoutingChoice::Entry { label, .. } if label.contains("Lost")))
+    );
     let before = undo_len(&mut app);
     let item = app.mixer.layout.menu.last().cloned().unwrap();
     click(&mut app, mid(item.rect));
@@ -2151,7 +2163,13 @@ fn a_mono_track_can_take_input_two() {
     let r = app.add_audio_track("mono");
     let t = new_audio(&mut app, r);
     let s = app.engine.session_arc();
-    let labels: Vec<String> = crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default()).into_iter().map(|c| c.0).collect();
+    let labels: Vec<String> = crate::mixer::input_choices(&s, s.track(t).unwrap(), 2, &Default::default())
+        .into_iter()
+        .map(|choice| match choice {
+            RoutingChoice::Entry { label, .. } => label,
+            RoutingChoice::Separator => String::new(),
+        })
+        .collect();
     assert_eq!(labels, ["In 1", "In 2"]);
     app.set_input(t, "In 2").unwrap();
     assert_eq!(input_label(&app, t), "In 2");
@@ -2430,10 +2448,19 @@ mod output_paths {
     #[test]
     fn path_labels_say_the_channels_and_main_is_left_out() {
         let io = map();
-        let out: Vec<_> = path_choices(&io, IoDirection::Output).into_iter().map(|(l, v)| format!("{l}={v}")).collect();
+        let out: Vec<_> = path_choices(&io, IoDirection::Output)
+            .into_iter()
+            .map(|choice| match choice {
+                RoutingChoice::Entry { label, value } => format!("{label}={value}"),
+                RoutingChoice::Separator => panic!("path choices have no separators"),
+            })
+            .collect();
         assert_eq!(out, ["Headphones (Out 3-4)=Headphones", "Out 5-6=Out 5-6"]);
         let ins = path_choices(&io, IoDirection::Input);
-        assert!(ins.contains(&("Guitar (In 5)".to_string(), "Guitar".to_string())) && ins.contains(&("In 1-2".to_string(), "In 1-2".to_string())));
+        assert!(
+            ins.contains(&RoutingChoice::Entry { label: "Guitar (In 5)".into(), value: "Guitar".into() })
+                && ins.contains(&RoutingChoice::Entry { label: "In 1-2".into(), value: "In 1-2".into() })
+        );
     }
 
     #[test]
@@ -2442,7 +2469,14 @@ mod output_paths {
         let t = new_track(&mut app, json!({"kind": "audio"}));
         let fx = app.add_fx_channel().unwrap();
         let s = app.engine.session_arc();
-        let values = |v: Vec<(String, String)>| v.into_iter().map(|(l, _)| l).collect::<Vec<_>>();
+        let values = |v: Vec<RoutingChoice>| {
+            v.into_iter()
+                .map(|choice| match choice {
+                    RoutingChoice::Separator => String::new(),
+                    RoutingChoice::Entry { label, .. } => label,
+                })
+                .collect::<Vec<_>>()
+        };
         let out = values(output_choices(&s, s.track(t).unwrap(), &map()));
         assert_eq!(out, ["Main", "FX 1", "", "Headphones (Out 3-4)", "Out 5-6", "No output"]);
         let other = new_track(&mut app, json!({"kind": "audio"}));
@@ -2452,6 +2486,32 @@ mod output_paths {
         // No paths beyond Main: no separator.
         let plain = values(output_choices(&s, s.track(fx).unwrap(), &IoMap::default()));
         assert!(!plain.contains(&String::new()), "{plain:?}");
+    }
+
+    #[test]
+    fn a_route_named_like_the_old_separator_is_selectable_beside_a_separator() {
+        for send in [false, true] {
+            let (mut app, ctx, mut time, t) = mixer_app();
+            let name = "\u{1}separator";
+            let label = format!("{name} (Out 3-4)");
+            let mut io = map();
+            io.rename_path("Headphones", name).unwrap();
+            let s = app.engine.session();
+            let track = s.track(t).unwrap();
+            let choices = if send { send_targets(s, track, None, &io) } else { output_choices(s, track, &io) };
+            let separator = choices.iter().position(|choice| *choice == RoutingChoice::Separator).unwrap();
+            assert_eq!(choices[separator + 1], RoutingChoice::Entry { label: label.clone(), value: name.into() });
+            app.engine.set_io_map(io);
+            frames(&mut app, &ctx, 3, &mut time);
+            let before = undo_len(&mut app);
+            let at = mid(if send { strip(&app, t).add_send } else { strip(&app, t).output });
+            click(&mut app, at);
+            click_item(&mut app, &ctx, &mut time, &label);
+            let track = app.engine.session().track(t).unwrap();
+            let route = if send { &track.mixer.sends[0].as_ref().unwrap().target } else { &track.mixer.output };
+            assert_eq!(route, &Route::Hardware(name.into()));
+            assert_eq!(undo_len(&mut app), before + 1, "one routing command");
+        }
     }
 
     #[test]
@@ -2489,7 +2549,13 @@ mod output_paths {
         let t = new_audio(&mut app, r);
         app.engine.set_io_map(map());
         let s = app.engine.session_arc();
-        let labels: Vec<String> = input_choices(&s, s.track(t).unwrap(), 8, app.engine.io_map()).into_iter().map(|c| c.0).collect();
+        let labels: Vec<String> = input_choices(&s, s.track(t).unwrap(), 8, app.engine.io_map())
+            .into_iter()
+            .map(|choice| match choice {
+                RoutingChoice::Entry { label, .. } => label,
+                RoutingChoice::Separator => String::new(),
+            })
+            .collect();
         assert!(labels.contains(&"Guitar (In 5)".to_string()), "{labels:?}");
         assert!(!labels.contains(&"In 5".to_string()), "{labels:?}");
         assert_eq!(labels.iter().filter(|l| *l == "In 4").count(), 1, "a path named like its label is listed once: {labels:?}");
@@ -2987,7 +3053,10 @@ fn routing_menus_reject_loops_through_sidechain_keys() {
     let track = s.track(source).unwrap();
     let io = app.engine.io_map().clone();
     for choices in [output_choices(s, track, &io), send_targets(s, track, None, &io)] {
-        assert!(!choices.iter().any(|(_, value)| value == "FX 1"), "a key edge returns to Source");
+        assert!(
+            !choices.iter().any(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if value == "FX 1")),
+            "a key edge returns to Source"
+        );
     }
     // Reversing the dependency: Source now feeds FX 1, so FX 1 cannot key Source
     // through a bus that Source listens to.
@@ -2997,7 +3066,11 @@ fn routing_menus_reject_loops_through_sidechain_keys() {
     app.new_fx_channel(None, 0.0).unwrap();
     app.set_output(fx, "FX 2").unwrap();
     let s = app.engine.session();
-    assert!(!input_choices(s, s.track(source).unwrap(), 2, &io).iter().any(|(_, value)| value == "FX 2"));
+    assert!(
+        !input_choices(s, s.track(source).unwrap(), 2, &io)
+            .iter()
+            .any(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if value == "FX 2"))
+    );
 }
 
 #[test]
@@ -3009,6 +3082,6 @@ fn audio_bus_input_policy_is_preserved_when_the_input_is_chosen_first() {
     let s = app.engine.session();
     let track = s.track(source).unwrap();
     for choices in [crate::mixer::output_choices(s, track, app.engine.io_map()), crate::mixer::send_targets(s, track, None, app.engine.io_map())] {
-        assert!(!choices.iter().any(|(_, value)| value == "FX 1"));
+        assert!(!choices.iter().any(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if value == "FX 1")));
     }
 }

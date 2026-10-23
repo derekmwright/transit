@@ -1,6 +1,7 @@
 //! Recording and device-boundary regressions. Stand-in input counts, synthetic egui events,
 //! and pure capture planning exercise the real dispatch paths without opening audio devices.
 
+use crate::mixer::RoutingChoice;
 use crate::{Services, StudioApp};
 use serde_json::{Value, json};
 use soundcraft_model::{ChannelFormat, Route, TrackId};
@@ -75,7 +76,11 @@ fn width_conversion_and_input_choices_use_only_available_channels() {
         let tr = app.engine.session().track(t).unwrap();
         let mapped = format!("In {}-{last}", last - 1);
         assert_eq!(tr.mixer.input, Route::Hardware(mapped.clone()));
-        assert!(crate::mixer::input_choices(app.engine.session(), tr, inputs, app.engine.io_map()).iter().any(|(_, value)| value == &mapped));
+        assert!(
+            crate::mixer::input_choices(app.engine.session(), tr, inputs, app.engine.io_map())
+                .iter()
+                .any(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if value == &mapped))
+        );
         assert_eq!(capture_inputs(&app), [vec![last - 2, last - 1]]);
     }
     for inputs in [0, 1] {

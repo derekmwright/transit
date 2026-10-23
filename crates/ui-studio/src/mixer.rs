@@ -347,10 +347,10 @@ fn heard(s: &Session, bus: BusId) -> bool {
 }
 
 /// Ends a routing menu with "Remove unused buses (n)" when the session has orphans.
-fn push_unused_entry(s: &Session, choices: &mut Vec<(String, String)>) {
+fn push_unused_entry(s: &Session, choices: &mut Vec<RoutingChoice>) {
     let n = orphan_busses(s).len();
     if n > 0 {
-        choices.push((format!("Remove unused buses ({n})"), REMOVE_UNUSED.into()));
+        choices.push(RoutingChoice::Entry { label: format!("Remove unused buses ({n})"), value: REMOVE_UNUSED.into() });
     }
 }
 
@@ -425,15 +425,15 @@ pub fn takes_sends(kind: TrackKind) -> bool {
     matches!(kind, TrackKind::Audio | TrackKind::Instrument | TrackKind::Aux | TrackKind::Folder)
 }
 
-/// Where a send from `t` can go: `(label, bus name)` for every bus that is not already one of its
-/// sends (`except` slot aside) and would not close a loop.
-pub fn send_targets(s: &Session, t: &Track, except: Option<usize>, io: &IoMap) -> Vec<(String, String)> {
+/// Where a send from `t` can go: buses that are not already sends (`except` slot aside) and
+/// would not close a loop, then a separator and the available output paths.
+pub fn send_targets(s: &Session, t: &Track, except: Option<usize>, io: &IoMap) -> Vec<RoutingChoice> {
     let Some(slot) = except.filter(|&slot| slot < t.mixer.sends.len()).or_else(|| t.mixer.sends.iter().position(Option::is_none)) else {
         return Vec::new();
     };
     let taken: Vec<&Route> =
         t.mixer.sends.iter().enumerate().filter(|(i, _)| Some(*i) != except).filter_map(|(_, x)| x.as_ref()).map(|x| &x.target).collect();
-    let mut v: Vec<(String, String)> = s
+    let mut v: Vec<RoutingChoice> = s
         .busses
         .iter()
         .filter(|b| {
@@ -442,21 +442,27 @@ pub fn send_targets(s: &Session, t: &Track, except: Option<usize>, io: &IoMap) -
                 && !route_loops(s, soundcraft_model::RouteChange::Send { track: t.id, slot, route: Route::Bus(b.id) })
                 && heard(s, b.id)
         })
-        .map(|b| (bus_label(s, b.id), b.name.clone()))
+        .map(|b| RoutingChoice::Entry { label: bus_label(s, b.id), value: b.name.clone() })
         .collect();
-    let paths: Vec<(String, String)> =
-        path_choices(io, IoDirection::Output).into_iter().filter(|(_, name)| !taken.contains(&&Route::Hardware(name.clone()))).collect();
+    let paths = path_choices(io, IoDirection::Output)
+        .into_iter()
+        .filter(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if !taken.contains(&&Route::Hardware(value.clone()))))
+        .collect();
     push_paths(&mut v, paths);
     v
 }
 
-/// A dropdown entry that draws a separator line and picks nothing.
-const SEPARATOR: &str = "\u{1}separator";
+/// A routing menu row: a separator picks nothing; an entry carries its label and command value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutingChoice {
+    Separator,
+    Entry { label: String, value: String },
+}
 
 /// A separator, then `paths`, when there are any.
-fn push_paths(v: &mut Vec<(String, String)>, paths: Vec<(String, String)>) {
+fn push_paths(v: &mut Vec<RoutingChoice>, paths: Vec<RoutingChoice>) {
     if !paths.is_empty() {
-        v.push((String::new(), SEPARATOR.into()));
+        v.push(RoutingChoice::Separator);
         v.extend(paths);
     }
 }
@@ -469,12 +475,12 @@ fn path_label(p: &IoPath) -> String {
     if p.name.eq_ignore_ascii_case(&channels) { p.name.clone() } else { format!("{} ({channels})", p.name) }
 }
 
-/// The I/O map's paths of one direction as `(label, path name)`, in the map's order; Main's path
-/// is left out of the outputs (that is the "Main" entry).
-pub fn path_choices(io: &IoMap, direction: IoDirection) -> Vec<(String, String)> {
+/// The I/O map's paths of one direction as entries with path names as values, in the map's order.
+/// Main's path is left out of the outputs (that is the "Main" entry).
+pub fn path_choices(io: &IoMap, direction: IoDirection) -> Vec<RoutingChoice> {
     io.paths_of(direction)
         .filter(|p| direction == IoDirection::Input || !p.name.eq_ignore_ascii_case(&io.main))
-        .map(|p| (path_label(p), p.name.clone()))
+        .map(|p| RoutingChoice::Entry { label: path_label(p), value: p.name.clone() })
         .collect()
 }
 
@@ -514,23 +520,23 @@ pub fn route_label(s: &Session, r: &Route, input: bool, format_channels: usize) 
     }
 }
 
-/// The outputs a track can pick: `(label, value for track.output)`.
-pub fn output_choices(s: &Session, t: &Track, io: &IoMap) -> Vec<(String, String)> {
-    let mut v = vec![("Main".to_string(), "main".to_string())];
+/// The outputs a track can pick, with values for `track.output`.
+pub fn output_choices(s: &Session, t: &Track, io: &IoMap) -> Vec<RoutingChoice> {
+    let mut v = vec![RoutingChoice::Entry { label: "Main".into(), value: "main".into() }];
     for b in &s.busses {
         // Never a bus that comes back to this track's input, however many hops away.
         if feeding_loops(s, t, b.id) || (!heard(s, b.id) && t.mixer.output != Route::Bus(b.id)) {
             continue;
         }
-        v.push((bus_label(s, b.id), b.name.clone()));
+        v.push(RoutingChoice::Entry { label: bus_label(s, b.id), value: b.name.clone() });
     }
     push_paths(&mut v, path_choices(io, IoDirection::Output));
-    v.push(("No output".into(), "none".into()));
+    v.push(RoutingChoice::Entry { label: "No output".into(), value: "none".into() });
     v
 }
 
 /// The inputs a track can pick: hardware inputs (`In 1`.. or `In 1-2`..) and busses.
-pub fn input_choices(s: &Session, t: &Track, device_inputs: usize, io: &IoMap) -> Vec<(String, String)> {
+pub fn input_choices(s: &Session, t: &Track, device_inputs: usize, io: &IoMap) -> Vec<RoutingChoice> {
     let mut v = Vec::new();
     let n = device_inputs;
     if t.kind == TrackKind::Audio || t.kind == TrackKind::Aux {
@@ -538,26 +544,26 @@ pub fn input_choices(s: &Session, t: &Track, device_inputs: usize, io: &IoMap) -
         // The map's named paths of the strip's width first; a legacy "In N" label stays only for
         // channels no named path covers, so a renamed path replaces its label.
         let named: Vec<&IoPath> = io.paths_of(IoDirection::Input).filter(|p| p.channels.len() == width).collect();
-        v.extend(named.iter().map(|p| (path_label(p), p.name.clone())));
+        v.extend(named.iter().map(|p| RoutingChoice::Entry { label: path_label(p), value: p.name.clone() }));
         let covered = |first: usize| {
             let want: Vec<u16> = (first - 1..first - 1 + width).filter_map(|c| u16::try_from(c).ok()).collect();
             named.iter().any(|p| p.channels == want)
         };
         for i in (1..=n).step_by(width).filter(|&i| i + width - 1 <= n && !covered(i)) {
             let label = if width == 2 { format!("In {i}-{}", i + 1) } else { format!("In {i}") };
-            v.push((label.clone(), label));
+            v.push(RoutingChoice::Entry { label: label.clone(), value: label });
         }
     }
     for b in &s.busses {
         if listening_loops(s, t, b.id) || !heard(s, b.id) {
             continue;
         }
-        v.push((format!("Bus: {}", b.name), b.name.clone()));
+        v.push(RoutingChoice::Entry { label: format!("Bus: {}", b.name), value: b.name.clone() });
     }
     // An audio track with no input still records from input 1 (see `route_label`), so only an
     // FX or group channel is offered "No input".
     if t.kind == TrackKind::Aux {
-        v.push(("No input".into(), "none".into()));
+        v.push(RoutingChoice::Entry { label: "No input".into(), value: "none".into() });
     }
     v
 }
@@ -721,8 +727,13 @@ impl StudioApp {
         let s = self.engine.session_arc();
         if let Some(tr) = s.track(t) {
             let cur = route_label(&s, &tr.mixer.output, false, tr.channels());
-            let label =
-                output_choices(&s, tr, self.engine.io_map()).into_iter().find(|(_, v)| v == value).map_or_else(|| value.to_string(), |(l, _)| l);
+            let label = output_choices(&s, tr, self.engine.io_map())
+                .into_iter()
+                .find_map(|choice| match choice {
+                    RoutingChoice::Entry { label, value: v } if v == value => Some(label),
+                    _ => None,
+                })
+                .unwrap_or_else(|| value.to_string());
             if same_route(&s, &tr.mixer.output, &cur, value, &label) {
                 return Ok(json!({"unchanged": true}));
             }
@@ -739,8 +750,11 @@ impl StudioApp {
             let cur = route_label(&s, &tr.mixer.input, true, ch);
             let label = input_choices(&s, tr, self.device_inputs(), self.engine.io_map())
                 .into_iter()
-                .find(|(_, v)| v == value)
-                .map_or_else(|| value.to_string(), |(l, _)| l);
+                .find_map(|choice| match choice {
+                    RoutingChoice::Entry { label, value: v } if v == value => Some(label),
+                    _ => None,
+                })
+                .unwrap_or_else(|| value.to_string());
             if same_route(&s, &tr.mixer.input, &cur, value, &label) {
                 return Ok(json!({"unchanged": true}));
             }
@@ -1195,7 +1209,7 @@ fn dropdown(
     id: egui::Id,
     current: &str,
     tip: Option<&str>,
-    choices: &[(String, String)],
+    choices: &[RoutingChoice],
     menu: &mut Vec<MenuItem>,
 ) -> Option<String> {
     let mut resp = ui.interact(r.intersect(clip), id, Sense::click());
@@ -1215,19 +1229,22 @@ fn dropdown(
     choice_menu(&resp, current, choices, menu)
 }
 
-/// The menu of a dropdown-like field: `choices` as `(label, value)`, the `current` label marked.
+/// The menu of a dropdown-like field: routing entries and separators, the `current` label marked.
 /// A [`NEW_FX`] entry comes after a separator. Returns the value picked.
-fn choice_menu(resp: &egui::Response, current: &str, choices: &[(String, String)], menu: &mut Vec<MenuItem>) -> Option<String> {
+fn choice_menu(resp: &egui::Response, current: &str, choices: &[RoutingChoice], menu: &mut Vec<MenuItem>) -> Option<String> {
     let mut picked = None;
     egui::Popup::menu(resp).width(150.0).show(|ui| {
         if choices.is_empty() {
             ui.weak("Nothing to pick");
         }
-        for (label, value) in choices {
-            if value == SEPARATOR {
-                ui.separator();
-                continue;
-            }
+        for choice in choices {
+            let (label, value) = match choice {
+                RoutingChoice::Separator => {
+                    ui.separator();
+                    continue;
+                }
+                RoutingChoice::Entry { label, value } => (label, value),
+            };
             if value == NEW_FX || value == REMOVE_UNUSED {
                 ui.separator();
             }
@@ -1346,8 +1363,10 @@ pub(crate) fn send_row(
     p.with_clip_rect(text_r.intersect(clip)).text(text_r.left_center(), Align2::LEFT_CENTER, &target, FontId::proportional(10.5), TOKENS.text);
     row.target_rect = r4(th);
     let mut choices = send_targets(s, t, Some(slot), app.engine.io_map());
-    if !choices.iter().any(|(l, v)| *l == target || matches!(&snd.target, Route::Hardware(h) if h.eq_ignore_ascii_case(v))) {
-        choices.insert(0, (target.clone(), String::new()));
+    if !choices.iter().any(|choice| {
+        matches!(choice, RoutingChoice::Entry { label, value } if *label == target || matches!(&snd.target, Route::Hardware(h) if h.eq_ignore_ascii_case(value)))
+    }) {
+        choices.insert(0, RoutingChoice::Entry { label: target.clone(), value: String::new() });
     }
     push_unused_entry(s, &mut choices);
     if let Some(v) = choice_menu(&resp, &target, &choices, menu)
@@ -1497,7 +1516,7 @@ pub(crate) fn add_send_row(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Tr
     }
     crate::icons::paint_labeled(&p, r, true, crate::icons::Icon::Plus, 11.0, "Send", FontId::proportional(10.5), TOKENS.text_dim);
     let mut choices = send_targets(s, t, None, app.engine.io_map());
-    choices.push(("New FX Channel…".into(), NEW_FX.into()));
+    choices.push(RoutingChoice::Entry { label: "New FX Channel…".into(), value: NEW_FX.into() });
     push_unused_entry(s, &mut choices);
     if let Some(v) = choice_menu(&resp, "", &choices, menu) {
         if v == REMOVE_UNUSED {
