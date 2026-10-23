@@ -1610,7 +1610,14 @@ fn inserts_block(
         p.rect_filled(rr, crate::theme::RADIUS_SM, if resp.hovered() { TOKENS.button_hover } else { TOKENS.bg });
         let text_r = rr.shrink2(vec2(4.0, 0.0));
         let loading = app.player.as_ref().is_some_and(|pl| pl.loading(id, *slot));
-        let shown = if loading { format!("{name} ({})", crate::devices::LOADING) } else { name.clone() };
+        let stuck = app.player.as_ref().is_some_and(|pl| pl.stuck(id, *slot));
+        let shown = if stuck {
+            format!("{name} ({})", crate::devices::NOT_RESPONDING)
+        } else if loading {
+            format!("{name} ({})", crate::devices::LOADING)
+        } else {
+            name.clone()
+        };
         p.with_clip_rect(text_r.intersect(clip)).text(
             text_r.left_center(),
             Align2::LEFT_CENTER,

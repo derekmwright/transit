@@ -335,6 +335,8 @@ pub struct StudioApp {
     /// as a clip click, a lane click or Select All, clears it. View state, not the document.
     pub tracks_selected_by_header: bool,
     editors: Vec<EditorWanted>,
+    /// Plug-in host threads already reported as wedged in the status line (ADR 0018).
+    host_wedged_shown: usize,
     /// The arrangement: gesture in progress, scroll, and last frame's layout (for `ui.inspect`).
     pub arrange: arrange::ArrangeState,
     /// What the last Copy took, so a Paste onto the original is refused (UX gap, plan 06).
@@ -432,6 +434,7 @@ impl StudioApp {
             dialog: None,
             tracks_selected_by_header: false,
             editors: Vec::new(),
+            host_wedged_shown: 0,
             arrange: arrange::ArrangeState::default(),
             copied: Vec::new(),
             mixer: mixer::MixerState::default(),
@@ -732,6 +735,25 @@ impl StudioApp {
         }
         self.editors = keep;
         self.ui.plugin_windows.retain(|k| !closed.contains(k));
+        self.plugin_host_status();
+    }
+
+    /// Puts what the plug-in host thread reports (ADR 0018) in the status line: an editor that
+    /// failed after its open was accepted, and a plug-in that stopped responding.
+    fn plugin_host_status(&mut self) {
+        let Some(p) = &self.player else { return };
+        for (_, _, e) in p.take_editor_errors() {
+            self.status = format!("Plug-in editor: {e}");
+        }
+        let wedged = p.plugin_host_wedged();
+        if wedged > self.host_wedged_shown {
+            self.host_wedged_shown = wedged;
+            self.status = if p.any_stuck() {
+                "A plug-in did not finish loading within 10 s and was left out (Not responding); remove it and add it again, or reopen the session, to retry".into()
+            } else {
+                "A plug-in stopped responding; its editor and state can no longer be reached until the session is reopened".into()
+            };
+        }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -1037,6 +1059,8 @@ fn service_plugin_requests() -> bool {
     clap.pending + vst3.pending > 0
 }
 
+#[cfg(test)]
+mod plugin_host_tests;
 #[cfg(test)]
 mod plugin_requests_tests;
 #[cfg(test)]

@@ -392,7 +392,15 @@ fn card_body(
     };
     // The plug-in is still being made (a heavy library can take seconds): say so until it is bound.
     let loading = app.player.as_ref().is_some_and(|pl| pl.loading(t, slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT)));
-    let kind = if loading { LOADING.to_string() } else { kind };
+    // It did not load within the plug-in host's timeout (ADR 0018): the slot is empty.
+    let stuck = app.player.as_ref().is_some_and(|pl| pl.stuck(t, slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT)));
+    let kind = if stuck {
+        NOT_RESPONDING.to_string()
+    } else if loading {
+        LOADING.to_string()
+    } else {
+        kind
+    };
     pc.text(pos2(r.min.x + 8.0, title.max.y + 12.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.0), TOKENS.text_dim);
     if c.bypass {
         pc.text(pos2(r.min.x + 8.0, title.max.y + 28.0), Align2::LEFT_CENTER, "Bypassed", FontId::proportional(10.0), TOKENS.mute);
@@ -448,11 +456,13 @@ fn card_body(
     let key_slot = slot.unwrap_or(soundcraft_mix::INSTRUMENT_SLOT);
     // A built-in's editor is our own window, so it needs no player and no loaded instance.
     let builtin = app.builtin_at((t, key_slot)).is_some();
-    let enabled = builtin || (!loading && app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot)));
+    let enabled = builtin || (!loading && !stuck && app.player.as_ref().is_some_and(|pl| hosted(&plugin) || pl.has_editor(t, key_slot)));
     let open = app.ui.plugin_windows.contains(&(t, key_slot));
     let resp = ui.interact(eb.intersect(lane), ui.id().with(("editor", t.0, salt)), Sense::click());
     pc.rect_filled(eb, crate::theme::RADIUS, if resp.hovered() && enabled { TOKENS.button_hover } else { TOKENS.button });
-    let label = if loading && !builtin {
+    let label = if stuck && !builtin {
+        NOT_RESPONDING
+    } else if loading && !builtin {
         LOADING
     } else if open {
         "Close editor"
@@ -465,7 +475,9 @@ fn card_body(
     let x0 = eb.center().x - w / 2.0;
     crate::icons::paint(&pc, pos2(x0 + 6.0, eb.center().y), Icon::OpenEditor, 12.0, ink);
     pc.text(pos2(x0 + 16.0, eb.center().y), Align2::LEFT_CENTER, label, font, ink);
-    let tip = if loading && !builtin {
+    let tip = if stuck && !builtin {
+        "The plug-in did not finish loading within 10 s and was left out; remove it and add it again, or reopen the session, to retry"
+    } else if loading && !builtin {
         "The plug-in is still loading; its editor opens when it is ready"
     } else if !enabled {
         "No editor window (no audio device)"
@@ -522,6 +534,10 @@ fn hardware_state(
 
 /// What a device card and an insert slot say while the plug-in is being made.
 pub(crate) const LOADING: &str = "Loading…";
+
+/// What a device card and an insert slot say when the plug-in did not load within the plug-in
+/// host's timeout (ADR 0018): the slot is empty until the plug-in is added again.
+pub(crate) const NOT_RESPONDING: &str = "Not responding";
 
 /// What an insert's key dropdown reads: "Key: None", or "Key: Kick (post)" naming the source
 /// track or bus and the tap (a bus key is always post-fader).
