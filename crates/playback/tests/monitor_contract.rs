@@ -272,7 +272,9 @@ fn concurrent_publication_reads_and_clears_conserve_aligned_ordered_frames() {
     });
     let mut output = vec![vec![0.0; 400]; 3];
     let (mut consumed, mut last, mut ordered, mut heap_free) = (0u64, 0.0, true, true);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // A hang guard only: the producer does finite work, so this is never reached unless it is stuck
+    // (a short wall-clock limit made the test fail when the process was starved under load).
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut calls = 0;
     while !done.load(Ordering::Acquire) && Instant::now() < deadline {
         let frames = [53, 1, 255, 7, 400][calls % 5];

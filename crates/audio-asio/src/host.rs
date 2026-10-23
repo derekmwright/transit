@@ -637,20 +637,25 @@ mod tests {
         spec.init_gate = Some(Arc::clone(&gate));
         let slow = entry("Slow", 3);
         let slot = Slot::default();
-        let (host, observed) = host(vec![(slow.clone(), spec)], slot.clone(), Duration::from_millis(300));
+        // The host thread starts under a generous timeout (a starved process may need seconds); only
+        // the request timeout under test is short.
+        let (mut host, observed) = host(vec![(slow.clone(), spec)], slot.clone(), Duration::from_secs(60));
+        host.timeout = Duration::from_millis(300);
         let started = Instant::now();
         let e = slow.clone();
         let err = host.call("load Slow", move |s| s.load(&e)).unwrap_err();
         let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(5), "{waited:?}");
+        assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(30), "{waited:?}");
         assert!(matches!(&err, ab::OpenError::Other(t) if t.contains("did not answer load Slow")), "{err:?}");
         assert!(host.is_stuck());
+        // Failing at once is shown against a long timeout, not a tight wall-clock bound.
+        host.timeout = Duration::from_secs(60);
         let quick = Instant::now();
         let err = host.call("list", |s| s.list()).unwrap_err();
-        assert!(quick.elapsed() < Duration::from_millis(100), "fails at once while stuck");
+        assert!(quick.elapsed() < Duration::from_secs(30), "fails at once while stuck");
         assert!(matches!(&err, ab::OpenError::Other(t) if t.contains("still blocked in load Slow")), "{err:?}");
         gate.open();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while host.is_stuck() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }

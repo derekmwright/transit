@@ -65,6 +65,8 @@ pub fn run(config: &Config) -> Result<report::Row, String> {
             let period = config.request.period.unwrap_or(FAKE_DEFAULT_PERIOD);
             let fake_backend = fake::backend(&config.request, period);
             let script = fake::Script { seconds: config.seconds, ..config.fake.clone() };
+            // Virtual time: the body time of a callback is not a measurement here.
+            shared.measure_body.store(false, std::sync::atomic::Ordering::Relaxed);
             let handle = fake_backend.clone();
             let opened = session::run(&fake_backend, &config.request, &shared, &mut || fake::drive(&handle, &config.request, period, &script))?;
             (ab::Backend::system(&fake_backend).to_string(), opened)

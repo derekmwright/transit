@@ -2,7 +2,7 @@
 //! stream starts, logs are fixed-size and single-writer, and nothing locks or allocates.
 
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use transit_audio_backend as ab;
@@ -152,6 +152,9 @@ pub struct Shared {
     pub input_peaks: [AtomicU32; MAX_PEAK_CHANNELS],
     /// Channels the capture stream delivered (at most [`MAX_PEAK_CHANNELS`]).
     pub input_channels: AtomicUsize,
+    /// Whether a callback's body time is measured on the wall clock. A fake run turns this off:
+    /// its clock is virtual, so a body preempted under load must not read as an overrun xrun.
+    pub measure_body: AtomicBool,
 }
 
 impl Shared {
@@ -167,7 +170,13 @@ impl Shared {
             capture_click: OnceLock::new(),
             input_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
             input_channels: AtomicUsize::new(0),
+            measure_body: AtomicBool::new(true),
         })
+    }
+
+    /// The time spent in a callback since `started`, or 0 when the run is on a virtual clock.
+    fn body_ns(&self, started: Instant) -> u64 {
+        if self.measure_body.load(Ordering::Relaxed) { nanos(started) } else { 0 }
     }
 }
 
@@ -211,7 +220,7 @@ pub fn render_callback(shared: Arc<Shared>, channel: usize, loopback: bool) -> a
             done += chunk.len() / channels;
         });
         position += frames as u64;
-        shared.render.record(&stamp, frames, nanos(started));
+        shared.render.record(&stamp, frames, shared.body_ns(started));
     })
 }
 
@@ -287,6 +296,6 @@ pub fn capture_callback(shared: Arc<Shared>, channel: usize) -> ab::CaptureCallb
         for (slot, peak) in shared.input_peaks.iter().zip(&peaks[..tracked]) {
             slot.fetch_max(peak.to_bits(), Ordering::Relaxed);
         }
-        shared.capture.record(&stamp, frames, nanos(started));
+        shared.capture.record(&stamp, frames, shared.body_ns(started));
     })
 }
