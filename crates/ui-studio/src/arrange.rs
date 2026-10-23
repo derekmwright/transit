@@ -7,11 +7,17 @@ use crate::StudioApp;
 use crate::theme::{self, CLIP_NAME_H, RULER_H, TOKENS};
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
-use soundcraft_model::{Clip, ClipContent, ClipId, Session, Track, TrackId, TrackKind};
+use soundcraft_model::{Clip, ClipContent, ClipId, ClipLoop, Session, Track, TrackId, TrackKind};
 use soundcraft_time::{BarBeat, Samples};
 
 /// How close (points) to a clip edge a press trims instead of moving.
 const EDGE: f32 = 6.0;
+
+/// Width (points) of the loop handle's hot zone, measured back from a clip's right edge.
+const LOOP_ZONE_W: f32 = 20.0;
+
+/// Most repeats one loop drag shows or lays down (the engine caps `clip.loop_to` at the same).
+const MAX_LOOP_REPEATS: usize = 1000;
 
 /// What a drag on a clip does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -19,6 +25,39 @@ pub enum DragKind {
     Move,
     TrimStart,
     TrimEnd,
+    /// The loop handle: the upper right corner of the header strip (Logic's loop corner).
+    Loop,
+}
+
+/// What a press at `pos` on a clip drawn in `rect` (`[x0, y0, x1, y1]`) would do. The edges trim
+/// (`EDGE` wide, as before); the loop handle is the header strip's part of the last
+/// `LOOP_ZONE_W` points before the right-edge trim handle; everything else moves. Narrow clips
+/// shrink the edges and the loop zone so the middle still moves.
+pub fn zone(rect: R4, pos: Pos2) -> DragKind {
+    let w = rect[2] - rect[0];
+    let edge = EDGE.min(w / 4.0);
+    if pos.x - rect[0] <= edge {
+        DragKind::TrimStart
+    } else if rect[2] - pos.x <= edge {
+        DragKind::TrimEnd
+    } else if pos.y - rect[1] <= CLIP_NAME_H && rect[2] - pos.x <= LOOP_ZONE_W.min(w / 3.0) {
+        DragKind::Loop
+    } else {
+        DragKind::Move
+    }
+}
+
+/// The repeats a loop drag lays down: back-to-back copies of length `len` from `from` up to `to`,
+/// the last one trimmed at `to`. Empty when `to` is not past `from`.
+pub fn loop_ghosts(from: Samples, len: Samples, to: Samples) -> Vec<(Samples, Samples)> {
+    let len = len.max(1);
+    let mut out = Vec::new();
+    let mut a = from;
+    while a < to && out.len() < MAX_LOOP_REPEATS {
+        out.push((a, a.saturating_add(len).min(to)));
+        a = a.saturating_add(len);
+    }
+    out
 }
 
 /// A mouse gesture in progress.
@@ -777,6 +816,7 @@ fn drag_preview(app: &StudioApp, ui: &Ui, map: Map, rows: &[&Track], tl: Rect, g
         }
         DragKind::TrimStart => (clip, track, (start + dx).clamp(0, end - 1), end, false),
         DragKind::TrimEnd => (clip, track, start, (end + dx).max(start + 1), false),
+        DragKind::Loop => return None,
     })
 }
 
@@ -786,6 +826,7 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
     let p = ui.painter().with_clip_rect(tl);
     let sel = &s.edit.selected_clips;
     let preview = drag_preview(app, ui, map, rows, tl, geo);
+    let looping = loop_drag(app, ui, map);
     let rh = geo.rh;
     let row_y = |t: TrackId| rows.iter().position(|r| r.id == t).map(|i| tl.min.y + geo.tops[i] - app.arrange.vscroll);
     for t in rows {
@@ -798,6 +839,35 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
             }
             let moving = preview.is_some_and(|(id, _, _, _, copy)| id == c.id && !copy);
             draw_clip(&p, s, map, tl, t, c, rect, sel.contains(&c.id), if moving { 0.35 } else { 1.0 });
+        }
+    }
+    // A loop drag: the cycles (or copies) it would add as ghosts in the clip color at reduced alpha, and
+    // the part it would cut off shaded.
+    if let Some(l) = &looping
+        && let Some((track, base)) = s.find_clip(l.clip).map(|(t, c)| (t, c.clone()))
+        && let (Some(y0), Some(t)) = (row_y(track), s.track(track))
+    {
+        let span = |a: Samples, b: Samples| Rect::from_min_max(pos2(map.x(a), y0 + 1.0), pos2(map.x(b).max(map.x(a) + 2.0), y0 + rh - 1.0));
+        for (a, b) in l.ghosts() {
+            let mut g = base.clone();
+            // The ghost plays the cycle as it would: its audio starts at the loop phase of `a`.
+            let mut virt = base.clone();
+            virt.looping = Some(base.looping.unwrap_or(ClipLoop { start: 0, end: base.length }));
+            if let ClipContent::Audio { source, offset } = base.content {
+                g.content = ClipContent::Audio { source, offset: offset.saturating_add(virt.content_pos(a - base.start)) };
+            }
+            g.start = a;
+            g.length = b - a;
+            g.looping = None;
+            g.fade_in = Default::default();
+            g.fade_out = Default::default();
+            let rect = span(a, b);
+            if rect.max.x >= tl.min.x && rect.min.x <= tl.max.x {
+                draw_clip(&p, s, map, tl, t, &g, rect, false, 0.45);
+            }
+        }
+        if let Some((a, b)) = l.cut() {
+            p.rect_filled(span(a, b), crate::theme::RADIUS, TOKENS.header.gamma_multiply(0.6));
         }
     }
     // The dragged clip where it would land.
@@ -823,7 +893,9 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
     p.with_clip_rect(strip.intersect(tl)).text(pos2(name_x, strip.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(11.0), name_col);
     let body = Rect::from_min_max(pos2(rect.min.x, strip.max.y), rect.max).shrink2(vec2(0.0, 2.0));
     let ink = theme::darken(body_col, 0.62).gamma_multiply(alpha);
-    if body.height() > 4.0 {
+    if let Some(l) = c.looping.filter(|l| l.is_valid()) {
+        draw_cycles(&p, s, map, tl, t, c, l, rect, strip, body, ink);
+    } else if body.height() > 4.0 {
         match &c.content {
             ClipContent::Audio { source, .. } => {
                 if let Some(audio) = s.pool.get(*source) {
@@ -853,22 +925,103 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
     p.rect_stroke(rect, crate::theme::RADIUS, stroke, StrokeKind::Inside);
 }
 
+/// A looped clip's cycles (ADR 0019): the first pass `0..loop.end`, then one segment per cycle,
+/// each (clip-relative start, end, content position at its start), cut at the clip's length.
+pub(crate) fn cycle_segments(c: &Clip, l: ClipLoop) -> impl Iterator<Item = (Samples, Samples, Samples)> {
+    let (length, end, cycle) = (c.length, l.end, l.cycle());
+    std::iter::once((0, end.min(length), 0)).chain(
+        std::iter::successors(Some(end), move |x| x.checked_add(cycle)).take_while(move |x| *x < length).map(move |a| {
+            let b = a.saturating_add(cycle).min(length);
+            (a, b, l.start)
+        }),
+    )
+}
+
+/// Draw a looped clip's content once per cycle, with a divider tick at every seam.
+#[allow(clippy::too_many_arguments)]
+fn draw_cycles(
+    p: &egui::Painter,
+    s: &Session,
+    map: Map,
+    tl: Rect,
+    t: &Track,
+    c: &Clip,
+    l: ClipLoop,
+    rect: Rect,
+    strip: Rect,
+    body: Rect,
+    ink: Color32,
+) {
+    let sx = |rel: Samples| rect.min.x + (rel as f64 / map.spp) as f32;
+    for (i, (a, b, phase)) in cycle_segments(c, l).enumerate() {
+        let (x0, x1) = (sx(a), sx(b).max(sx(a) + 1.0));
+        if x1 < tl.min.x || x0 > tl.max.x {
+            continue;
+        }
+        if i > 0 {
+            // The seam: a tick through the header strip and a faint line down the body.
+            p.line_segment([pos2(x0, strip.min.y), pos2(x0, strip.max.y)], Stroke::new(1.5, TOKENS.text_dim));
+            p.line_segment([pos2(x0, strip.max.y), pos2(x0, rect.max.y)], Stroke::new(1.0, ink.gamma_multiply(0.6)));
+        }
+        if body.height() <= 4.0 {
+            continue;
+        }
+        let seg = Rect::from_min_max(pos2(x0, body.min.y), pos2(x1, body.max.y));
+        match &c.content {
+            ClipContent::Audio { source, offset } => {
+                if let Some(audio) = s.pool.get(*source) {
+                    // The segment as a clip of its own that plays the file from its cycle phase.
+                    let mut g = c.clone();
+                    g.start = c.start.saturating_add(a);
+                    g.length = (b - a).max(1);
+                    g.looping = None;
+                    g.content = ClipContent::Audio { source: *source, offset: offset.saturating_add(phase) };
+                    if i > 0 {
+                        g.fade_in = Default::default();
+                    }
+                    if b < c.length {
+                        g.fade_out = Default::default();
+                    }
+                    let wp = p.with_clip_rect(seg.intersect(tl));
+                    crate::waveform::draw(&wp, s, tl, &g, audio, t.channels().min(2), seg, ink);
+                }
+            }
+            ClipContent::Midi { sequence } => {
+                let notes = &sequence.notes;
+                if let (Some(lo), Some(hi)) = (notes.iter().map(|n| n.pitch).min(), notes.iter().map(|n| n.pitch).max()) {
+                    let span = f32::from(hi.saturating_sub(lo)).max(11.0);
+                    let clip_tick = s.tempo.samples_to_ticks(c.start, s.sample_rate);
+                    let wp = p.with_clip_rect(seg.intersect(tl));
+                    for n in notes.iter().take(5000) {
+                        let on = s.tempo.tick_to_samples(clip_tick.saturating_add(n.start), s.sample_rate) - c.start;
+                        let off = s.tempo.tick_to_samples(clip_tick.saturating_add(n.end()), s.sample_rate) - c.start;
+                        // Cycle 0 plays what starts before the loop end; later cycles what starts inside the range.
+                        if on >= l.end || (i > 0 && on < l.start) || (i == 0 && on < 0) {
+                            continue;
+                        }
+                        let (from, to) = (a + on - phase, a + off.min(l.end) - phase);
+                        let fy = 1.0 - f32::from(n.pitch.saturating_sub(lo)) / span;
+                        let y = body.min.y + 2.0 + fy * (body.height() - 6.0);
+                        let r = Rect::from_min_max(pos2(sx(from), y), pos2(sx(to.min(b)).max(sx(from) + 2.0), y + 2.5));
+                        wp.rect_filled(r, 0.0, ink);
+                    }
+                }
+            }
+            ClipContent::Video { .. } => {}
+        }
+    }
+}
+
 /// What is under a point: a clip (and whether near its start or end edge) and the row's track.
 fn hit(layout: &Layout, pos: Pos2) -> (Option<(ClipId, TrackId, DragKind, Samples, Samples)>, Option<TrackId>) {
     let track = layout.tracks.iter().find(|r| pos.y >= r.lane[1] && pos.y < r.lane[3]).map(|r| TrackId(r.id));
     // Topmost (last drawn) first.
-    let clip = layout.clips.iter().rev().find(|c| pos.x >= c.rect[0] && pos.x <= c.rect[2] && pos.y >= c.rect[1] && pos.y <= c.rect[3]).map(|c| {
-        let w = c.rect[2] - c.rect[0];
-        let edge = EDGE.min(w / 4.0);
-        let kind = if pos.x - c.rect[0] <= edge {
-            DragKind::TrimStart
-        } else if c.rect[2] - pos.x <= edge {
-            DragKind::TrimEnd
-        } else {
-            DragKind::Move
-        };
-        (ClipId(c.id), TrackId(c.track), kind, c.start, c.end)
-    });
+    let clip = layout
+        .clips
+        .iter()
+        .rev()
+        .find(|c| pos.x >= c.rect[0] && pos.x <= c.rect[2] && pos.y >= c.rect[1] && pos.y <= c.rect[3])
+        .map(|c| (ClipId(c.id), TrackId(c.track), zone(c.rect, pos), c.start, c.end));
     (clip, track)
 }
 
@@ -880,9 +1033,16 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     {
         match hit(layout, pos).0 {
             Some((_, _, DragKind::TrimStart | DragKind::TrimEnd, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
+            Some((_, _, DragKind::Loop, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::Alias),
             Some(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
             None => {}
         }
+    }
+    if app.arrange.gesture.is_none()
+        && let Some(pos) = resp.hover_pos()
+        && let Some((_, _, DragKind::Loop, _, _)) = hit(layout, pos).0
+    {
+        resp.clone().on_hover_text("Drag right to loop this clip (Shift: no snap, Alt: independent copies). Drag back to shorten or unloop.");
     }
     if resp.drag_started()
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
@@ -897,9 +1057,16 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         let copy = ui.input(|i| drag_copies(i.modifiers));
         ui.ctx().set_cursor_icon(if copy { CursorIcon::Copy } else { CursorIcon::Grabbing });
     }
+    if resp.dragged() && matches!(app.arrange.gesture, Some(Gesture::Clip { kind: DragKind::Loop, .. })) {
+        ui.ctx().set_cursor_icon(CursorIcon::Alias);
+    }
     if resp.drag_stopped() {
         let preview = drag_preview(app, ui, map, rows, tl, geo);
+        let looped = loop_drag(app, ui, map);
         let gesture = app.arrange.gesture.take();
+        if let Some(l) = looped {
+            commit_loop(app, &l);
+        }
         if let (Some(Gesture::Clip { kind, track, start, end, .. }), Some((clip, dest, a, b, copy))) = (gesture, preview) {
             commit_drag(app, kind, clip, track, dest, start, end, a, b, copy);
         }
@@ -961,6 +1128,82 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
             ui.close();
         }
     });
+}
+
+/// A loop-handle drag as it would land.
+struct LoopDrag {
+    clip: ClipId,
+    /// The clip's end now, and the drop point (snapped unless Shift is held): the new end.
+    from: Samples,
+    to: Samples,
+    /// A cycle's length, and the clip-time end of the first pass (where unlooping cuts to).
+    cycle: Samples,
+    first_end: Samples,
+    /// The clip starts here.
+    start: Samples,
+    looped: bool,
+    /// Alt: plain copies instead of cycles.
+    independent: bool,
+}
+
+impl LoopDrag {
+    /// The ghost spans, in timeline samples: beyond the clip's end the cycles (or copies) it
+    /// would gain, the last one cut at the drop point.
+    fn ghosts(&self) -> Vec<(Samples, Samples)> {
+        if self.to <= self.from {
+            return Vec::new();
+        }
+        if self.independent {
+            return loop_ghosts(self.from, self.from - self.start, self.to);
+        }
+        // Cycle boundaries sit at first_end + k * cycle; the first ghost starts where the clip ends.
+        let seam = self.start + self.first_end;
+        let mut out = Vec::new();
+        let mut a = self.from;
+        while a < self.to && out.len() < MAX_LOOP_REPEATS {
+            let next = seam + ((a - seam).div_euclid(self.cycle.max(1)) + 1) * self.cycle.max(1);
+            out.push((a, next.min(self.to)));
+            a = next;
+        }
+        out
+    }
+    /// The part of the clip the drop would cut off (dragging left).
+    fn cut(&self) -> Option<(Samples, Samples)> {
+        let to = if self.looped && !self.independent && self.to <= self.start + self.first_end { self.start + self.first_end } else { self.to };
+        (!self.independent && self.looped && to < self.from).then_some((to, self.from))
+    }
+    /// Does dropping here change anything?
+    fn changes(&self) -> bool {
+        if self.independent {
+            self.to > self.from
+        } else if self.looped {
+            self.to != self.from
+        } else {
+            self.to > self.from
+        }
+    }
+}
+
+/// The loop handle drag in progress, from the pointer: its travel moves the clip's end.
+fn loop_drag(app: &StudioApp, ui: &Ui, map: Map) -> Option<LoopDrag> {
+    let Some(Gesture::Clip { clip, kind: DragKind::Loop, press, end, .. }) = app.arrange.gesture.clone() else { return None };
+    let (pos, m) = ui.input(|i| (i.pointer.latest_pos(), i.modifiers));
+    let s = app.engine.session();
+    let c = s.find_clip(clip)?.1;
+    let dx = (f64::from(pos?.x - press.x) * map.spp).round() as Samples;
+    let to = end.saturating_add(dx).max(0);
+    let to = if m.shift { to } else { crate::automation::snap_delta(s, map.spp, &map.grid, 0, to) };
+    let l = c.looping.filter(|l| l.is_valid());
+    let (cycle, first_end) = l.map_or((c.length, c.length), |l| (l.cycle(), l.end));
+    Some(LoopDrag { clip, from: c.end(), to, cycle, first_end, start: c.start, looped: l.is_some(), independent: m.alt })
+}
+
+/// Commit a loop drag: one `clip.loop_to`, so one undo step.
+fn commit_loop(app: &mut StudioApp, l: &LoopDrag) {
+    if !l.changes() {
+        return;
+    }
+    let _ = app.run("clip.loop_to", json!({"clip": l.clip.0, "to": l.to, "independent": l.independent}));
 }
 
 /// Turn a finished drag into commands.

@@ -3122,3 +3122,155 @@ fn a_midi_strip_has_the_output_destination_button_next_to_its_input() {
     assert_eq!(s.midi_output_label, "MIDI to Synth OUT · Ch 2");
     assert!(!s.midi_output_missing, "without a player nothing is known to be missing");
 }
+
+#[test]
+fn the_loop_handle_is_the_header_corner_clear_of_the_trim_edge_and_the_move_area() {
+    use crate::arrange::{DragKind, loop_ghosts, zone};
+    use egui::pos2;
+    // A 200-point wide clip at x 100..300, y 50..110 (the header strip is its top 14 points).
+    let r = [100.0, 50.0, 300.0, 110.0];
+    assert_eq!(zone(r, pos2(290.0, 55.0)), DragKind::Loop, "upper right of the header");
+    assert_eq!(zone(r, pos2(281.0, 63.0)), DragKind::Loop, "the zone is 20 points wide, the strip tall");
+    assert_eq!(zone(r, pos2(299.0, 55.0)), DragKind::TrimEnd, "the right edge still trims, in the header too");
+    assert_eq!(zone(r, pos2(294.0, 55.0)), DragKind::TrimEnd, "up to the edge width");
+    assert_eq!(zone(r, pos2(290.0, 80.0)), DragKind::Move, "below the strip: move");
+    assert_eq!(zone(r, pos2(270.0, 55.0)), DragKind::Move, "the rest of the header moves");
+    assert_eq!(zone(r, pos2(200.0, 55.0)), DragKind::Move);
+    assert_eq!(zone(r, pos2(101.0, 55.0)), DragKind::TrimStart);
+    // A narrow clip keeps a move area between the edges and the loop zone.
+    let n = [0.0, 0.0, 24.0, 60.0];
+    assert_eq!(zone(n, pos2(12.0, 5.0)), DragKind::Move);
+    assert_eq!(zone(n, pos2(23.0, 5.0)), DragKind::TrimEnd);
+    // The ghosts: whole repeats, then a tail trimmed at the drop point; nothing at or before the end.
+    assert_eq!(loop_ghosts(100, 100, 450), vec![(100, 200), (200, 300), (300, 400), (400, 450)]);
+    assert_eq!(loop_ghosts(100, 100, 300), vec![(100, 200), (200, 300)]);
+    assert!(loop_ghosts(100, 100, 100).is_empty());
+    assert!(loop_ghosts(100, 100, 40).is_empty());
+}
+
+/// The loop-handle rig: a bar-long clip and the point in its header corner.
+fn loop_rig() -> (CopyRig, ClipId, (f32, f32), f32) {
+    let r = copy_rig();
+    let clip = ClipId(clips_on(&r.app, r.t)[0].0);
+    let rect = r.app.arrange.layout.clips.iter().find(|c| c.id == clip.0).unwrap().rect;
+    let handle = (rect[2] - 12.0, rect[1] + 5.0);
+    let px_bar = r.px_per_beat * 4.0;
+    (r, clip, handle, px_bar)
+}
+
+fn spans(app: &StudioApp, t: TrackId) -> Vec<(i64, i64)> {
+    clips_on(app, t).iter().map(|c| (c.1, c.2)).collect()
+}
+
+fn the_clip(app: &StudioApp, id: ClipId) -> soundcraft_model::Clip {
+    app.engine.session().find_clip(id).unwrap().1.clone()
+}
+
+/// The point on the clip that now ends furthest right, in its header corner.
+fn handle_of_last(r: &CopyRig) -> (f32, f32) {
+    let rect = r.app.arrange.layout.clips.iter().map(|c| c.rect).fold([0.0_f32; 4], |a, b| if b[2] > a[2] { b } else { a });
+    (rect[2] - 12.0, rect[1] + 5.0)
+}
+
+#[test]
+fn dragging_the_loop_handle_extends_the_clip_as_cycles_in_one_undo_step() {
+    let (mut r, clip, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    let before = undo_len(&mut r.app);
+    // Two bars right at the beat grid: one clip, three cycles long.
+    drag(&mut r.app, handle, (handle.0 + 2.0 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 3 * bar)], "a looped clip, not copies");
+    let c = the_clip(&r.app, clip);
+    assert_eq!(c.looping, Some(soundcraft_model::ClipLoop { start: 0, end: bar }));
+    assert_eq!(c.loop_id, None);
+    assert_eq!(c.cycle_starts(0, c.length).collect::<Vec<_>>(), vec![bar, 2 * bar], "two seams");
+    assert_eq!(undo_len(&mut r.app), before + 1, "one undo step");
+    r.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar)], "one undo restores the clip");
+    assert_eq!(the_clip(&r.app, clip).looping, None);
+}
+
+#[test]
+fn a_loop_drag_off_the_grid_cuts_the_last_cycle_and_shift_leaves_it_at_the_pointer() {
+    let (mut r, clip, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    // 2.5 bars: on a beat, so the last cycle is half a bar.
+    drag(&mut r.app, handle, (handle.0 + 2.5 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 3 * bar + bar / 2)]);
+    r.app.run("edit.undo", json!({})).unwrap();
+    // 2.37 bars with snap on: the clip ends on the grid.
+    drag(&mut r.app, handle, (handle.0 + 2.37 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let end = the_clip(&r.app, clip).end();
+    assert_eq!(end % r.beat, 0, "ends on the grid: {end}");
+    r.app.run("edit.undo", json!({})).unwrap();
+    // Shift: cut at the pointer.
+    drag(&mut r.app, handle, (handle.0 + 2.37 * px_bar, handle.1), json!({"shift": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let end = the_clip(&r.app, clip).end();
+    assert!((end - (3.37 * bar as f64) as i64).abs() < r.beat / 8, "Shift cuts at the pointer: {end}");
+    assert_ne!(end % r.beat, 0);
+}
+
+#[test]
+fn dragging_the_loop_handle_back_shortens_and_back_to_the_first_cycle_unloops() {
+    let (mut r, clip, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    drag(&mut r.app, handle, (handle.0 + 3.0 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 4 * bar)]);
+    let h2 = handle_of_last(&r);
+    let before = undo_len(&mut r.app);
+    drag(&mut r.app, h2, (h2.0 - px_bar, h2.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 3 * bar)], "one cycle shorter, still a loop");
+    assert!(the_clip(&r.app, clip).looping.is_some());
+    assert_eq!(undo_len(&mut r.app), before + 1);
+    let h3 = handle_of_last(&r);
+    drag(&mut r.app, h3, (h3.0 - 2.0 * px_bar, h3.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar)], "back to the first cycle unloops");
+    assert_eq!(the_clip(&r.app, clip).looping, None);
+}
+
+#[test]
+fn alt_on_the_loop_handle_makes_repeats_as_independent_copies() {
+    let (mut r, _, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    let before = undo_len(&mut r.app);
+    drag(&mut r.app, handle, (handle.0 + 2.0 * px_bar, handle.1), json!({"alt": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar), (bar, 2 * bar), (2 * bar, 3 * bar)]);
+    assert_eq!(undo_len(&mut r.app), before + 1);
+    let s = r.app.engine.session();
+    assert!(clips_on(&r.app, r.t).iter().all(|c| {
+        let c = s.find_clip(ClipId(c.0)).unwrap().1;
+        c.loop_id.is_none() && c.looping.is_none()
+    }));
+}
+
+#[test]
+fn a_loop_drag_that_changes_nothing_adds_no_undo_step() {
+    let (mut r, _, handle, px_bar) = loop_rig();
+    let before = undo_len(&mut r.app);
+    // Left on an unlooped clip: nothing to loop, nothing cut.
+    drag(&mut r.app, handle, (handle.0 - 0.5 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(clips_on(&r.app, r.t).len(), 1);
+    assert_eq!(undo_len(&mut r.app), before);
+}
+
+#[test]
+fn a_looped_clip_is_one_region_divided_into_cycles() {
+    let (mut r, clip, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    drag(&mut r.app, handle, (handle.0 + 1.5 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    let c = the_clip(&r.app, clip);
+    let l = c.looping.unwrap();
+    let segs: Vec<_> = crate::arrange::cycle_segments(&c, l).collect();
+    assert_eq!(segs, vec![(0, bar, 0), (bar, 2 * bar, 0), (2 * bar, 2 * bar + bar / 2, 0)], "the last cycle is cut");
+    assert_eq!(r.app.arrange.layout.clips.len(), 1, "one clip rect");
+}
