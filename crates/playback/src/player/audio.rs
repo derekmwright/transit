@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 mod phase;
 use phase::Phase;
 #[cfg(not(target_arch = "wasm32"))]
+mod external;
+#[cfg(not(target_arch = "wasm32"))]
 mod midi;
 
 #[derive(Debug, Clone, Copy)]
@@ -477,6 +479,9 @@ pub(super) struct Audio {
     midi: Option<action_lane::Audio<super::ingress::Packet, ActionResult>>,
     #[cfg(not(target_arch = "wasm32"))]
     midi_inbox: midi::Inbox,
+    /// Clip events for external MIDI destinations (#61), to the MIDI output thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    external: Option<external::External>,
     /// Live MIDI copied out for a MIDI recording (preallocated by Main).
     capture: Option<crate::midi_capture::Sink>,
     /// The hardware-insert round-trip probe (control arms it; this thread plays and records).
@@ -584,6 +589,8 @@ impl Audio {
                 midi: None,
                 #[cfg(not(target_arch = "wasm32"))]
                 midi_inbox: midi::Inbox::new(),
+                #[cfg(not(target_arch = "wasm32"))]
+                external: None,
                 capture: None,
                 probe: None,
                 probe_block: None,
@@ -634,6 +641,12 @@ impl Audio {
     #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn set_midi(&mut self, midi: action_lane::Audio<super::ingress::Packet, ActionResult>) {
         self.midi = Some(midi);
+    }
+
+    /// The MIDI output thread's playback producer (#61). Main, before the callback starts.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn set_midi_out(&mut self, out: super::midi_out::Producer) {
+        self.external = Some(external::External::new(out));
     }
 
     pub(super) fn set_probe(&mut self, probe: Arc<crate::hardware_probe::HwProbe>) {
@@ -734,7 +747,15 @@ impl Audio {
             let Some(output) = output.checked_add(u64::from(packet.lookahead)) else {
                 return ActionResult::MidiTimeline(timeline_map::MapError::Arithmetic);
             };
-            let result = inbox.admit(packet, output, mapped.is_none(), sources);
+            // A track with an external destination (#61) gets its live input from the MIDI
+            // output thread's echo; here it is only captured for a recording.
+            let result = if packet.deliver {
+                inbox.admit(packet, output, mapped.is_none(), sources)
+            } else if mapped.is_none() {
+                ActionResult::MidiBufferedApproximate
+            } else {
+                ActionResult::MidiBuffered
+            };
             // A MIDI recording keeps what the instrument is given, at the frame it is given it:
             // only while the transport records (not during the count-in), and never blocking.
             if matches!(result, ActionResult::MidiBuffered | ActionResult::MidiBufferedApproximate)
@@ -833,6 +854,14 @@ impl Audio {
         )?;
         #[cfg(target_arch = "wasm32")]
         let _ = actions;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.external.is_some() {
+            let block = self.external_block(frames);
+            if let Some(external) = &mut self.external {
+                external.block(self.plans.engine().session(), block);
+            }
+        }
+        let state = &mut self.transport;
         // The mixer owns each processor's suspension rules. A completed note
         // release does not prove that its envelope or any downstream tail ended.
         self.plans.render(state.render_position, frames);
@@ -850,6 +879,30 @@ impl Audio {
                 state.render_position.checked_add(frames as i64).filter(|p| *p <= MAX_POSITION).ok_or(timeline_map::MapError::Arithmetic)?;
         }
         Ok(())
+    }
+
+    /// The block about to render as the external MIDI scheduler sees it: its first sample's
+    /// presentation time from the device clock map (else the callback-entry fallback).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn external_block(&self, frames: usize) -> external::Block {
+        let state = &self.transport;
+        let step = u64::from(self.sample_rate) * u64::from(self.speed);
+        let output = state.timeline.next_output();
+        let ns_per_output = 1e9 / f64::from(self.device_rate.max(1));
+        let base = match (state.clock_map, state.clock_now) {
+            (Some(map), Some(now)) => map.frame_to_host(state.clock_key, output, now).ok(),
+            _ => None,
+        }
+        .or_else(|| self.external.as_ref().and_then(|e| e.fallback_host(output, ns_per_output)));
+        let lead = self.read.lead(step) * ns_per_output;
+        let host_ns = base.map(|base| if lead < 0.0 { base.saturating_sub((-lead) as u64) } else { base.saturating_add(lead as u64) });
+        external::Block {
+            playing: state.playing,
+            position: state.render_position,
+            frames,
+            host_ns,
+            ns_per_frame: self.read.ratio(step) * ns_per_output,
+        }
     }
 
     /// One device callback shares these budgets across all scratch chunks and mix blocks.
@@ -913,6 +966,11 @@ impl Audio {
         if let Some(reader) = &mut self.clock_reader {
             self.transport.clock_map = reader.poll().map;
             self.transport.clock_now = self.clock_origin.now_ns();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(external) = &mut self.external {
+            let now = self.transport.clock_now.or_else(|| self.clock_origin.now_ns());
+            external.callback(now, self.transport.timeline.next_output());
         }
         let channels = channels.max(1);
         self.service_actions(actions);

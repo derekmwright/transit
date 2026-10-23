@@ -1,8 +1,8 @@
 //! Native MIDI device ownership. Enumeration/open/close run off Main; the
 //! independent ingress worker handles timestamped input even while UI is busy.
-use super::{ActionResult, RuntimeControl, ingress, sources};
+use super::{ActionResult, RuntimeControl, ingress, midi_out, sources};
 use crate::{device_clock::HostOrigin, player::audio::Command};
-use soundcraft_mix::{EngineEpoch, INSTRUMENT_SLOT};
+use soundcraft_mix::{EngineEpoch, INSTRUMENT_SLOT, SlotGen};
 use soundcraft_model::{MidiInput, MidiPort};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,8 @@ pub struct Status {
     pub timing_quality: Option<crate::device_clock::Quality>,
     /// The bound of a `Measured` map: the calibration's uncertainty in nanoseconds.
     pub timing_uncertainty_ns: Option<u64>,
+    /// External MIDI destinations (#61): output ports, per-track state, counters.
+    pub output: midi_out::OutputStatus,
 }
 
 impl Status {
@@ -178,6 +180,9 @@ struct Input {
 
 pub(super) struct Native {
     worker: ingress::Worker,
+    /// The MIDI output thread (#61) and, until the audio side takes it, its playback producer.
+    out: midi_out::Out,
+    playback: Option<midi_out::Producer>,
     io: Option<IoThread>,
     inputs: Vec<Input>,
     retired: Vec<sources::Revocation>,
@@ -188,8 +193,13 @@ pub(super) struct Native {
 
 impl Native {
     pub(super) fn new(lane: crate::action_lane::Control<ingress::Packet, ActionResult>, origin: HostOrigin) -> std::io::Result<Self> {
+        let mut worker = ingress::Worker::start(lane)?;
+        let (out, playback, echo) = midi_out::Out::new();
+        worker.set_echo(echo).map_err(std::io::Error::other)?;
         Ok(Self {
-            worker: ingress::Worker::start(lane)?,
+            worker,
+            out,
+            playback: Some(playback),
             io: None,
             inputs: Vec::with_capacity(sources::PORTS),
             retired: Vec::with_capacity(sources::PORTS),
@@ -200,10 +210,23 @@ impl Native {
     }
 
     pub(super) fn enable(&mut self, io: MidiIo) {
+        if let Err(error) = self.out.start(io.clone(), self.origin) {
+            self.status.error = Some(error.to_string());
+        }
         match IoThread::start(io, self.origin) {
             Ok(thread) => self.io = Some(thread),
             Err(error) => self.status.error = Some(error.to_string()),
         }
+    }
+
+    /// The playback producer for the audio side, once.
+    pub(super) fn take_playback(&mut self) -> Option<midi_out::Producer> {
+        self.playback.take()
+    }
+
+    /// All notes off on every external destination now (Stop, the panic button).
+    pub(super) fn panic_outputs(&self) {
+        self.out.panic();
     }
 
     pub(super) fn take_notes(&self) -> Vec<super::PlayedNote> {
@@ -213,6 +236,7 @@ impl Native {
     pub(super) fn status(&self) -> Status {
         let mut status = self.status.clone();
         status.counts = self.worker.counters();
+        status.output = self.out.status();
         status.open_inputs = self.inputs.iter().filter(|input| input.attached.is_some()).count();
         status.routes = self
             .inputs
@@ -282,6 +306,7 @@ impl Native {
         self.retired.retain(|request| {
             if owner.source_status(*request) == Ok(sources::State::Revoked) { owner.release_source(*request).is_err() } else { true }
         });
+        self.out.configure(midi_out::Destination::of_session(owner.requested_session()));
         let routes: Vec<_> = owner
             .requested_session()
             .tracks
@@ -293,9 +318,17 @@ impl Native {
                     Some(channel) if channel < 16 => 1 << channel,
                     Some(_) => return None,
                 };
-                owner
-                    .binding(track.id, INSTRUMENT_SLOT)
-                    .map(|target| (track.midi_input.clone(), ingress::Route { engine: epoch, target, channels, lookahead: LOOKAHEAD }))
+                // An external destination (#61) echoes live input through the output thread and
+                // keeps it from the instrument; the route still feeds a MIDI recording, so it
+                // needs no instrument binding.
+                let external = track.midi_output.is_external();
+                let target = if external { Some((track.id, INSTRUMENT_SLOT, SlotGen::VACANT)) } else { owner.binding(track.id, INSTRUMENT_SLOT) };
+                target.map(|target| {
+                    (
+                        track.midi_input.clone(),
+                        ingress::Route { engine: epoch, target, channels, lookahead: LOOKAHEAD, deliver: !external, echo: external },
+                    )
+                })
             })
             .collect();
         for input in &mut self.inputs {

@@ -26,6 +26,9 @@ pub struct Packet {
     pub raw: InputEvent,
     /// Explicit monitoring lookahead in output-device frames, never callbacks.
     pub lookahead: u32,
+    /// False for a track with an external MIDI destination (#61): the audio thread only
+    /// captures the event for a MIDI recording; the instrument does not play it.
+    pub deliver: bool,
 }
 const _: () = assert!(std::mem::size_of::<Packet>() <= 128);
 
@@ -103,6 +106,11 @@ pub struct Route {
     pub target: SlotBinding,
     pub channels: u16,
     pub lookahead: u32,
+    /// Play the event on the target instrument (false: capture only, see [`Packet::deliver`]).
+    pub deliver: bool,
+    /// Forward the event to the track's external MIDI destination through the output thread's
+    /// echo ring, as soon as it is popped here (#61).
+    pub echo: bool,
 }
 
 struct Input {
@@ -128,6 +136,7 @@ impl Drop for Input {
 
 enum Update {
     Input(Input),
+    Echo(super::midi_out::Producer),
     Routes { id: u64, routes: Vec<(sources::Permit, Route)>, applied: Arc<AtomicBool> },
 }
 
@@ -144,7 +153,7 @@ impl Worker {
     pub fn start(lane: action_lane::Control<Packet, ActionResult>) -> std::io::Result<Self> {
         let (attach, receive) = mpsc::sync_channel(sources::PORTS);
         let shared = Arc::new(Shared::default());
-        let mut pump = Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::clone(&shared) };
+        let mut pump = Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::clone(&shared), echo: None };
         let thread = std::thread::Builder::new().name("soundcraft-midi-ingress".into()).spawn(move || {
             while !pump.shared.stop.load(Ordering::Acquire) {
                 pump.step();
@@ -214,6 +223,13 @@ impl Worker {
         Ok(applied)
     }
 
+    /// Hands the worker the output thread's echo producer (#61).
+    pub(super) fn set_echo(&mut self, echo: super::midi_out::Producer) -> Result<(), &'static str> {
+        self.attach.try_send(Update::Echo(echo)).map_err(|_| "MIDI echo queue unavailable")?;
+        self.thread.thread().unpark();
+        Ok(())
+    }
+
     /// The notes played since the last call, oldest first.
     pub fn take_notes(&self) -> Vec<PlayedNote> {
         self.shared.tap.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
@@ -250,6 +266,7 @@ struct Pump {
     inputs: Vec<Input>,
     cursor: usize,
     shared: Arc<Shared>,
+    echo: Option<super::midi_out::Producer>,
 }
 impl Shared {
     fn tap(&self, message: Message) {
@@ -283,6 +300,7 @@ impl Pump {
                         self.inputs.push(input);
                     }
                 }
+                Ok(Update::Echo(echo)) => self.echo = Some(echo),
                 Ok(Update::Routes { id, routes, applied }) => {
                     if let Some(input) = self.inputs.iter_mut().find(|input| input.id == id) {
                         for (old, _) in &input.routes {
@@ -372,6 +390,17 @@ impl Pump {
                     self.shared.filtered.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                if route.echo
+                    && let Some(echo) = &mut self.echo
+                {
+                    echo.push(super::midi_out::OutEvent {
+                        kind: super::midi_out::Kind::Message,
+                        track: route.target.0.0,
+                        at_ns: raw.host_arrival_ns,
+                        bytes: raw.bytes,
+                        len: raw.len,
+                    });
+                }
                 let release = raw.is_release();
                 let credits = self.lane.note_credits();
                 if credits == 0 || (!release && credits <= RELEASE_RESERVE) {
@@ -389,6 +418,7 @@ impl Pump {
                     message,
                     raw,
                     lookahead: route.lookahead,
+                    deliver: route.deliver,
                 };
                 if self.lane.send_note(packet, if release { NoteKind::Off } else { NoteKind::On }).is_ok() {
                     self.shared.admitted.fetch_add(1, Ordering::Relaxed);
@@ -414,6 +444,7 @@ impl Drop for Pump {
         for _ in 0..sources::PORTS {
             match self.receive.try_recv() {
                 Ok(Update::Input(input)) => drop(input),
+                Ok(Update::Echo(echo)) => drop(echo),
                 Ok(Update::Routes { routes, .. }) => {
                     for (permit, _) in routes {
                         permit.invalidate();

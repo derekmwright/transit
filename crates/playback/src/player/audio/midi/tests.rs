@@ -61,6 +61,7 @@ impl Rig {
                 len: 3,
             },
             lookahead: 0,
+            deliver: true,
         }
     }
     fn send(&mut self, output: u64, sequence: u64, release: bool) -> Packet {

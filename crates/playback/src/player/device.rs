@@ -293,8 +293,11 @@ impl Player {
         #[cfg(not(target_arch = "wasm32"))]
         match owner.midi_lane() {
             Ok((control, endpoint)) => match super::native::Native::new(control, player.origin) {
-                Ok(native) => {
+                Ok(mut native) => {
                     audio.set_midi(endpoint);
+                    if let Some(out) = native.take_playback() {
+                        audio.set_midi_out(out);
+                    }
                     *player.midi.get_mut() = Some(native);
                 }
                 Err(error) => player.midi_error = Some(error.to_string()),
@@ -923,6 +926,7 @@ impl Player {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(midi) = &*self.midi.try_borrow().map_err(|_| PlayerError::Busy)? {
             midi.cutoff(&mut owner)?;
+            midi.panic_outputs();
         }
         owner.stop()
     }
@@ -931,6 +935,7 @@ impl Player {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(midi) = &*self.midi.try_borrow().map_err(|_| PlayerError::Busy)? {
             midi.cutoff(&mut owner)?;
+            midi.panic_outputs();
         }
         owner.all_notes_off()
     }
@@ -1546,3 +1551,5 @@ mod rate_tests {
 mod calibrate;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod external_tests;

@@ -7,7 +7,7 @@ use transit_midi_io::{InputConfig, fake::Fake};
 use transit_rt::testing::measure;
 
 fn route() -> Route {
-    Route { engine: EngineEpoch(1), target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: u16::MAX, lookahead: 128 }
+    Route { engine: EngineEpoch(1), target: (TrackId(7), soundcraft_mix::INSTRUMENT_SLOT, SlotGen::VACANT), channels: u16::MAX, lookahead: 128, deliver: true, echo: false }
 }
 fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
     plan_bridge::pair(
@@ -17,7 +17,7 @@ fn bridge() -> (plan_bridge::Control, plan_bridge::Audio) {
 }
 fn pump(lane: action_lane::Control<Packet, ActionResult>) -> (SyncSender<Update>, Pump) {
     let (send, receive) = mpsc::sync_channel(sources::PORTS);
-    (send, Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::default() })
+    (send, Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::default(), echo: None })
 }
 fn input(consumer: InputConsumer, permit: sources::Permit) -> Update {
     Update::Input(Input { id: 1, consumer, routes: vec![(permit, route())] })
