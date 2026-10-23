@@ -1341,6 +1341,108 @@ fn a_device_that_does_not_reopen_is_tried_three_times_then_left_to_reconnect() {
     assert!(t.app.reopen.status(false).unwrap().ends_with("use Reconnect (resets 1, stalls 0, reopened 0)"));
 }
 
+/// A latch the scripted ASIO lister waits on, as a slow driver would hold the probe.
+#[derive(Default)]
+struct Latch {
+    open: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl Latch {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.changed.wait(open).unwrap();
+        }
+    }
+}
+
+/// The ASIO system a lister answers: both drivers by name, only the probed one described.
+fn asio_listing_for(selected: Option<&str>) -> soundcraft_playback::devices::AudioSystem {
+    let device = |name: &str| soundcraft_playback::devices::DeviceInfo {
+        name: name.into(),
+        is_default: false,
+        max_channels: if selected == Some(name) { 2 } else { 0 },
+        sample_rates: vec![44_100, 48_000],
+        buffer_min: None,
+        buffer_max: None,
+    };
+    let list = vec![device("Focusrite USB ASIO"), device("Model Mixer ASIO Driver")];
+    soundcraft_playback::devices::AudioSystem { name: "ASIO".into(), is_default: false, outputs: list.clone(), inputs: list, diagnostics: Vec::new() }
+}
+
+/// A scripted ASIO lister that records what it was asked to probe and waits on `latch`.
+fn slow_lister(latch: &std::sync::Arc<Latch>, asked: &std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>) -> crate::audio_devices::AsioLister {
+    let (latch, asked) = (std::sync::Arc::clone(latch), std::sync::Arc::clone(asked));
+    std::sync::Arc::new(move |selected: Option<String>| {
+        asked.lock().unwrap().push(selected.clone());
+        latch.wait();
+        Some(asio_listing_for(selected.as_deref()))
+    })
+}
+
+/// Draws frames until `done` holds, at most five seconds.
+fn frames_until(t: &mut T, done: impl Fn(&T) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done(t) && std::time::Instant::now() < deadline {
+        t.frames(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn the_asio_listing_runs_off_the_ui_thread_probes_the_selected_driver_and_lists_again_for_another() {
+    use crate::audio_devices::ASIO_LISTING;
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    let (latch, asked) = (std::sync::Arc::new(Latch::default()), std::sync::Arc::default());
+    t.app.audio_devices.machine = Some((Vec::new(), slow_lister(&latch, &asked)));
+    t.app.open_audio_devices();
+    let frame = std::time::Instant::now();
+    t.frames(1);
+    assert!(frame.elapsed() < std::time::Duration::from_secs(2), "the frame did not wait for the driver: {:?}", frame.elapsed());
+    assert_eq!(t.app.audio_devices.layout.listing.as_deref(), Some(ASIO_LISTING), "the window says it is listing");
+    assert!(t.app.audio_devices.systems.as_ref().unwrap().iter().any(|s| s.name == "ASIO" && s.outputs.is_empty()));
+    latch.open();
+    frames_until(&mut t, |t| t.app.audio_devices.asio_listing.is_none());
+    t.frames(1);
+    assert_eq!(t.app.audio_devices.layout.listing, None);
+    assert_eq!(*asked.lock().unwrap(), [Some("Focusrite USB ASIO".to_string())], "only the selected driver is probed");
+    let asio = t.app.audio_devices.systems.as_ref().unwrap().iter().find(|s| s.name == "ASIO").cloned().unwrap();
+    let outputs: Vec<(&str, u16)> = asio.outputs.iter().map(|d| (d.name.as_str(), d.max_channels)).collect();
+    assert_eq!(outputs, [("Focusrite USB ASIO", 2), ("Model Mixer ASIO Driver", 0)], "the others by name only");
+    // Choosing the other driver lists the ASIO system again, probing that one.
+    t.app.audio_devices.draft.output = Some("Model Mixer ASIO Driver".into());
+    frames_until(&mut t, |t| t.app.audio_devices.asio_listing.is_none() && asked.lock().unwrap().len() == 2);
+    t.frames(1);
+    assert_eq!(asked.lock().unwrap().last().cloned().flatten().as_deref(), Some("Model Mixer ASIO Driver"));
+    let asio = t.app.audio_devices.systems.as_ref().unwrap().iter().find(|s| s.name == "ASIO").cloned().unwrap();
+    assert_eq!(asio.outputs[1].max_channels, 2, "the newly chosen driver is described");
+}
+
+#[test]
+fn an_asio_listing_that_does_not_answer_is_given_up_with_a_note_not_waited_for() {
+    let driver = scarlett_driver();
+    let again = driver.clone();
+    let mut t = asio_rig(&driver, move |session, cfg| soundcraft_playback::Player::open_fake_native_asio(session, cfg, &again).unwrap());
+    let (latch, asked) = (std::sync::Arc::new(Latch::default()), std::sync::Arc::default());
+    t.app.audio_devices.machine = Some((Vec::new(), slow_lister(&latch, &asked)));
+    t.app.audio_devices.asio_listing_limit = Some(std::time::Duration::from_millis(50));
+    t.app.open_audio_devices();
+    t.frames(1);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    t.frames(2);
+    let note = t.app.audio_devices.layout.listing.clone().unwrap_or_default();
+    assert!(note.starts_with("The ASIO drivers did not answer within") && note.ends_with("Use Rescan Devices to try again."), "{note}");
+    assert!(t.app.audio_devices.asio_listing.is_none());
+    latch.open();
+}
+
 /// A saved ASIO driver that is no longer installed opens nothing else: the status says so and
 /// lists the installed drivers.
 #[test]

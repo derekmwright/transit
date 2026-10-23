@@ -2,9 +2,13 @@
 //! kept as `UiState.audio` (saved in `ui.json` with the other preferences). Every choice starts at
 //! "System default".
 //!
-//! The lists come from [`soundcraft_playback::devices::audio_systems`], read when the window opens
-//! and on Rescan, never per frame. Without a player (`--no-audio`, tests) nothing is enumerated
-//! (listing ASIO loads each driver): the choices are only saved, for the next start.
+//! The lists come from [`soundcraft_playback::devices::cpal_audio_systems`] and, in a build with
+//! the native ASIO backend, [`soundcraft_playback::devices::native_asio_system`], read when the
+//! window opens and on Rescan, never per frame. The ASIO system is listed on a worker thread (it
+//! probes the selected driver, which can take seconds): the window says "Listing the ASIO
+//! drivers…" until it answers, stops waiting after [`ASIO_LISTING_LIMIT`], and lists it again
+//! when another driver is chosen. Without a player (`--no-audio`, tests) nothing is enumerated:
+//! the choices are only saved, for the next start.
 //!
 //! Apply reopens the devices through [`StudioApp::reconnect_audio`] (plug-in editors close first,
 //! on the main thread, and the old device closes before the new one opens: an ASIO driver is
@@ -27,6 +31,20 @@ pub const REFUSED_RECORDING: &str = "Stop recording before changing the audio de
 /// panel holds the driver's host thread, which each of them would wait on.
 pub const PANEL_OPEN_FIRST: &str = "Close the driver settings panel first";
 pub const SYSTEM_DEFAULT: &str = "System default";
+/// Said under the Output list while the ASIO drivers are listed (off the UI thread).
+pub const ASIO_LISTING: &str = "Listing the ASIO drivers…";
+/// How long the window waits for an ASIO listing before it stops waiting: each request to the
+/// driver's host thread waits at most ten seconds, and a listing makes a few.
+pub const ASIO_LISTING_LIMIT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Lists the ASIO system probing the driver given (`devices::native_asio_system`), on a worker.
+pub(crate) type AsioLister = std::sync::Arc<dyn Fn(Option<String>) -> Option<AudioSystem> + Send + Sync>;
+
+/// An ASIO listing running on a worker thread: its answer, and when it started.
+pub(crate) struct AsioListing {
+    rx: std::sync::mpsc::Receiver<Option<AudioSystem>>,
+    started: std::time::Instant,
+}
 const CHOOSE_ANOTHER: &str = "Choose another in Audio › Audio Devices.";
 
 /// Where the window and its controls were last drawn, for `ui.inspect` and tests.
@@ -55,6 +73,9 @@ pub struct AudioDevicesLayout {
     /// The drivers of the chosen system that failed to load, as said under the Output list
     /// (native ASIO's per-driver diagnostics).
     pub diagnostics: Vec<String>,
+    /// The ASIO listing's state under the Output list: [`ASIO_LISTING`] while it runs, or why it
+    /// stopped waiting.
+    pub listing: Option<String>,
     /// The Hardware inserts subsection as drawn.
     pub hardware: crate::audio_devices_io::HardwareLayout,
 }
@@ -125,6 +146,16 @@ pub struct AudioDevicesState {
     /// The ASIO driver the listing probed (the selected one, else the running one; `None`: none),
     /// so choosing another driver lists again for it.
     asio_listed_for: Option<Option<String>>,
+    /// The ASIO listing in flight (off the UI thread), if any.
+    pub(crate) asio_listing: Option<AsioListing>,
+    /// Why the last ASIO listing was given up (it did not answer in time).
+    asio_listing_note: Option<String>,
+    /// How long to wait for an ASIO listing ([`ASIO_LISTING_LIMIT`]; tests shorten it).
+    pub(crate) asio_listing_limit: Option<std::time::Duration>,
+    /// The machine's listing standing in for the real one (tests): the systems listed at once, and
+    /// the ASIO lister the worker runs.
+    #[cfg(test)]
+    pub(crate) machine: Option<(Vec<AudioSystem>, AsioLister)>,
 }
 
 /// The device loop's wake counter at the last sample, and the rate it gave.
@@ -456,21 +487,99 @@ impl StudioApp {
     }
 
     /// The devices to offer: the fake's, else the machine's (only with a player). The native ASIO
-    /// system names every installed driver and probes only [`Self::asio_selection`].
+    /// system names every installed driver and probes only [`Self::asio_selection`], on a worker
+    /// thread ([`Self::start_asio_listing`]): until it answers the ASIO system is listed empty and
+    /// the window says [`ASIO_LISTING`].
     fn listing(&mut self) -> Vec<AudioSystem> {
-        let selected = self.asio_selection();
-        self.audio_devices.asio_listed_for = Some(selected.clone());
         match (&mut self.audio_devices.fake, &self.player) {
             (Some(f), _) => {
                 f.enumerations += 1;
                 f.systems.clone()
             }
             (None, Some(_)) => {
-                let mut systems = devices::cpal_audio_systems();
-                systems.extend(devices::native_asio_system(selected.as_deref()));
+                let (mut systems, lister) = self.machine_listing();
+                if let Some(lister) = lister {
+                    systems.retain(|s| s.name != devices::ASIO_SYSTEM);
+                    systems.push(AudioSystem {
+                        name: devices::ASIO_SYSTEM.into(),
+                        is_default: false,
+                        outputs: Vec::new(),
+                        inputs: Vec::new(),
+                        diagnostics: Vec::new(),
+                    });
+                    self.start_asio_listing(lister);
+                }
                 systems
             }
             (None, None) => Vec::new(),
+        }
+    }
+
+    /// The systems listed at once (cpal's) and the native ASIO lister, when this build has one.
+    fn machine_listing(&self) -> (Vec<AudioSystem>, Option<AsioLister>) {
+        #[cfg(test)]
+        if let Some((systems, lister)) = &self.audio_devices.machine {
+            return (systems.clone(), Some(std::sync::Arc::clone(lister)));
+        }
+        let lister: Option<AsioLister> =
+            devices::NATIVE_ASIO_COMPILED.then(|| std::sync::Arc::new(|selected: Option<String>| devices::native_asio_system(selected.as_deref())) as AsioLister);
+        (devices::cpal_audio_systems(), lister)
+    }
+
+    /// Lists the ASIO system for [`Self::asio_selection`] on a worker thread (probing a driver can
+    /// take seconds); [`Self::poll_asio_listing`] takes the answer. A listing already in flight is
+    /// dropped (its answer is not waited for).
+    fn start_asio_listing(&mut self, lister: AsioLister) {
+        let selected = self.asio_selection();
+        self.audio_devices.asio_listed_for = Some(selected.clone());
+        self.audio_devices.asio_listing_note = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("transit-asio-listing".into()).spawn(move || {
+            let _ = tx.send(lister(selected));
+        });
+        match spawned {
+            Ok(_) => self.audio_devices.asio_listing = Some(AsioListing { rx, started: std::time::Instant::now() }),
+            Err(e) => {
+                self.audio_devices.asio_listing = None;
+                self.audio_devices.asio_listing_note = Some(format!("The ASIO drivers could not be listed: {e}."));
+            }
+        }
+    }
+
+    /// Lists the ASIO system again for another chosen driver, keeping the rest of the listing.
+    fn relist_asio(&mut self) {
+        if let (None, Some(_)) = (&self.audio_devices.fake, &self.player)
+            && let (_, Some(lister)) = self.machine_listing()
+        {
+            self.start_asio_listing(lister);
+        }
+    }
+
+    /// Takes the ASIO listing's answer when it has come (never waits): it replaces the ASIO system
+    /// of the listing. Past the limit the window stops waiting and says so.
+    pub(crate) fn poll_asio_listing(&mut self) {
+        let Some(listing) = &self.audio_devices.asio_listing else { return };
+        let limit = self.audio_devices.asio_listing_limit.unwrap_or(ASIO_LISTING_LIMIT);
+        match listing.rx.try_recv() {
+            Ok(system) => {
+                self.audio_devices.asio_listing = None;
+                if let (Some(systems), Some(system)) = (self.audio_devices.systems.as_mut(), system) {
+                    match systems.iter_mut().find(|s| s.name == system.name) {
+                        Some(slot) => *slot = system,
+                        None => systems.push(system),
+                    }
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) if listing.started.elapsed() < limit => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.audio_devices.asio_listing = None;
+                self.audio_devices.asio_listing_note =
+                    Some(format!("The ASIO drivers did not answer within {} s. Use Rescan Devices to try again.", limit.as_secs()));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.audio_devices.asio_listing = None;
+                self.audio_devices.asio_listing_note = Some("The ASIO drivers could not be listed. Use Rescan Devices to try again.".into());
+            }
         }
     }
 
@@ -737,13 +846,19 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
         app.audio_devices.draft = app.ui.audio.clone();
         app.audio_devices.base = Some(app.ui.audio.clone());
     }
-    if app.audio_devices.systems.is_some() && app.audio_devices.fake.is_none() && app.asio_selection_changed() {
-        // Another ASIO driver was chosen: list again, probing that one.
-        app.audio_devices.forget_listing();
-    }
     if app.audio_devices.systems.is_none() && app.audio_devices.panel.is_none() {
         app.audio_devices.systems = Some(app.listing());
     }
+    if app.audio_devices.systems.is_some() && app.audio_devices.panel.is_none() && app.asio_selection_changed() {
+        // Another ASIO driver was chosen: list the ASIO system again, probing that one.
+        app.relist_asio();
+    }
+    app.poll_asio_listing();
+    let asio_listing = if app.audio_devices.asio_listing.is_some() {
+        Some(ASIO_LISTING.to_owned())
+    } else {
+        app.audio_devices.asio_listing_note.clone()
+    };
     let systems = app.audio_devices.systems.clone().unwrap_or_default();
     let mut draft = app.audio_devices.draft.clone();
     let mut lay = AudioDevicesLayout { open: true, systems: systems.iter().map(|s| s.name.clone()).collect(), ..Default::default() };
@@ -836,6 +951,13 @@ pub fn window(app: &mut StudioApp, ctx: &egui::Context) {
                 let selected_problem = selected_output
                     .as_deref()
                     .and_then(|name| sys.and_then(|s| s.diagnostics.iter().find(|p| p.strip_prefix(name).is_some_and(|r| r.starts_with(": ")))));
+                if asio && let Some(text) = &asio_listing {
+                    ui.label("");
+                    let shown = ui.label(egui::RichText::new(text).color(TOKENS.text_dim).size(11.0));
+                    controls.push((text.clone(), "listing", shown.rect));
+                    lay.listing = Some(text.clone());
+                    ui.end_row();
+                }
                 if let Some(problem) = selected_problem {
                     ui.label("");
                     let line = short_problem(problem);

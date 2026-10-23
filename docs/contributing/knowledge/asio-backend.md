@@ -268,6 +268,14 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
   under the Output list as "Not loaded: <driver>: <problem>" (a driver blocked because this process
   holds another one is not a failure). While cpal's ASIO host holds a driver nothing is probed (the
   registry names only), so two drivers are never loaded at once.
+- **Off the UI thread** (slice d2). The ASIO listing runs on a worker thread (`transit-asio-listing`;
+  the probe itself is a request to the host thread): the window lists the other systems at once,
+  shows the ASIO system empty with "Listing the ASIO drivers…" under the Output list, and takes the
+  answer at a later frame without waiting. After 25 s (`ASIO_LISTING_LIMIT`) it stops waiting and
+  says "The ASIO drivers did not answer within 25 s. Use Rescan Devices to try again." Tests
+  `the_asio_listing_runs_off_the_ui_thread_*`, `an_asio_listing_that_does_not_answer_*`. Opening the
+  device (Apply, Reconnect, a reopen) still runs on the UI thread, bounded by the host's 10 s
+  timeout per request.
 - **A driver that is gone.** A named driver is opened by its registry name only, never replaced:
   `plan_render`/`plan_capture` of a name that is not installed fail with the list of installed
   drivers, one that failed to load fails with its problem. The Player asks
