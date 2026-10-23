@@ -862,11 +862,18 @@ mod hardware {
         let (render, ren) = backend.open_stream(&endpoint, &render_request, Callback::Render(render), error()).expect("open render");
         println!("{driver}: capture {cap:?}");
         println!("{driver}: render {ren:?}");
-        let started = Instant::now();
         ab::Stream::start(&capture).expect("start capture");
         ab::Stream::start(&render).expect("start render");
+        // Count from the first callback on: a driver's start can take a good part of a second
+        // before its first buffer switch (the Model 12), which is not a stall.
+        let waiting = Instant::now();
+        while tally.render.load(Relaxed) == 0 && waiting.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        println!("{driver}: first buffer switch {:?} after the start", waiting.elapsed());
+        let (r0, c0, started) = (tally.render.load(Relaxed), tally.capture.load(Relaxed), Instant::now());
         std::thread::sleep(Duration::from_secs(2));
-        let elapsed = started.elapsed();
+        let (r1, c1, elapsed) = (tally.render.load(Relaxed), tally.capture.load(Relaxed), started.elapsed());
         let (rs, cs) = (ab::Stream::stats(&render).expect("stats"), ab::Stream::stats(&capture).expect("stats"));
         let running = ab::Stream::thread_priority(&render);
         ab::Stream::stop(&render).expect("stop render");
@@ -878,15 +885,31 @@ mod hardware {
         println!("{driver}: systemTime step {:?} ns; first stamps {:?}", render.system_time_step_ns(), tally.first.lock().map(|f| f.clone()));
         drop(render);
         drop(capture);
-        let frames = ren.period.frames().expect("frames");
-        let expected = elapsed.as_secs_f64() * f64::from(rate) / f64::from(frames);
-        let (r, c) = (tally.render.load(Relaxed), tally.capture.load(Relaxed));
-        println!("{driver}: {r} render and {c} capture callbacks in {elapsed:?}; about {expected:.0} expected");
+        let expected = expected_callbacks(elapsed, ren.format.rate, ren.period.frames().expect("frames"));
+        let (r, c) = (r1 - r0, c1 - c0);
+        println!(
+            "{driver}: {r} render and {c} capture callbacks in {elapsed:?} after the first; about {expected:.0} expected at {} Hz, {} frames",
+            ren.format.rate,
+            ren.period.frames().unwrap_or(0)
+        );
         assert!(r as f64 > expected * 0.8 && (r as f64) < expected * 1.2, "render callbacks {r} against {expected:.0}");
         assert!(c as f64 > expected * 0.8, "capture callbacks {c}");
         assert_eq!((tally.invalid.load(Relaxed), tally.errors.load(Relaxed)), (0, 0), "invalid stamps, stream errors");
         assert_eq!(rs.overloads, 0);
         assert_mmcss(driver, running, stopped);
+    }
+
+    /// How many buffer switches `elapsed` holds at the stream's own rate and buffer size.
+    fn expected_callbacks(elapsed: Duration, rate: u32, frames: u32) -> f64 {
+        elapsed.as_secs_f64() * f64::from(rate) / f64::from(frames.max(1))
+    }
+
+    #[test]
+    fn the_expected_callback_count_follows_the_streams_rate_and_buffer() {
+        let two = Duration::from_secs(2);
+        assert_eq!(expected_callbacks(two, 44_100, 256).round(), 345.0, "the Model 12");
+        assert_eq!(expected_callbacks(two, 48_000, 64).round(), 1500.0, "the Scarlett at 64 frames");
+        assert_eq!(expected_callbacks(two, 48_000, 256).round(), 375.0);
     }
 
     /// The buffer-switch thread either joined "Pro Audio" through us and left it at the stop, or
