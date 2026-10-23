@@ -54,6 +54,8 @@ the current speed. The output thread sends it at `H + destination offset`.
   not established by the fake-backend tests; it needs Derek's hardware check.
 - Echo ignores the offset and goes out at once. Its latency is the ingress worker's poll plus the
   output thread's poll (two 1 ms loops; the ingress park can round to the system timer tick).
+- With no external destination the thread parks between port polls (4 per second, for the
+  picker's list) instead of waking every millisecond.
 - The output thread runs at normal priority; promoting it is a follow-up if jitter under load
   matters.
 
@@ -68,10 +70,17 @@ the current speed. The output thread sends it at `H + destination offset`.
   (`chase`). The same chase runs at play start.
 - **Destination change** (port or channel, or back to internal): the track's held notes end on the
   old port, then Sustain off and All Notes Off on the channels that track used.
+- **Echo route revoked** (disarm, monitor off, a MIDI input or channel filter change, the input
+  controller unplugged): the key-up can no longer be echoed, so the output thread ends every note
+  and pedal the echo holds for that track (note-offs, Sustain off), as revoking the source does for
+  an instrument. `Native::service` sends `release_echo` for each revoked echo route; the
+  destination's `echo` flag (armed or monitored) also releases when it goes false, and while it is
+  false a late echo may only end notes, never start them.
 - **Device loss**: any `PortWatcher` poll (the output thread polls every 250 ms) flags the handle;
   the port is closed and marked missing, held state is forgotten and sends are counted as unsent.
   When the port appears again it reopens and first gets Sustain off and All Notes Off on its used
-  channels. A failed open is retried only when ports change.
+  channels. A used port that is missing or failed to open is retried on every poll, so a port an
+  old output thread still held (stuck in a driver at a device reopen) opens once it lets go.
 - **Exit**: dropping the Player stops the thread, which releases everything on every open port; the
   drop waits up to 500 ms for that and never joins a stuck driver.
 
