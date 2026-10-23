@@ -223,6 +223,40 @@ mod track_render_state {
     fn state(gain: f64) -> Vec<u8> {
         [gain.to_le_bytes(), 0.0f64.to_le_bytes()].concat()
     }
+    /// Frames until the player's instance is made on the plug-in host thread (ADR 0018) and its
+    /// plan is confirmed for the app's document, then a few more.
+    fn settle(app: &mut SoundApp, track: soundcraft_model::TrackId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut extra = 4;
+        while extra > 0 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+            let p = app.player.as_ref().unwrap();
+            if !p.any_loading() && p.has_editor(track, 0) && p.capture_states(&app.engine.session_arc()).is_ok() {
+                extra -= 1;
+            }
+            assert!(std::time::Instant::now() < deadline, "the fixture never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    /// Opens the fixture's window-free editor, which edits gain to 0.25 when it opens. The open
+    /// runs on the plug-in host thread and the edit reaches the plug-in's state with the next
+    /// block, so render until a state read through that thread shows it; returns that state.
+    fn open_editor_and_render(app: &SoundApp, track: soundcraft_model::TrackId) -> Vec<u8> {
+        let player = app.player.as_ref().unwrap();
+        player.open_editor(track, 0).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            player.step_device_free();
+            let now = player.capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+            if now == state(0.25) || std::time::Instant::now() > deadline {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     fn run_alias(alias: &str) {
         fixture();
         let mut engine = soundcraft_engine::Engine::default();
@@ -242,17 +276,9 @@ mod track_render_state {
         session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(soundcraft_model::Clip::audio(clip, "DC", source, 0, 0, 4_800));
         let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
         let mut app = SoundApp::new(engine, Some(player), crate::Services::default());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
-        let player = app.player.as_ref().unwrap();
+        settle(&mut app, track);
         // This fixture's floating GUI has no native window. Showing it edits gain internally.
-        player.open_editor(track, 0).unwrap();
-        player.step_device_free();
-        assert_eq!(player.capture_states(&app.engine.session_arc()).unwrap()[0].2, state(0.25));
+        assert_eq!(open_editor_and_render(&app, track), state(0.25));
         assert_eq!(app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap(), state(1.0));
         let result = app.run(alias, serde_json::json!({"tracks": [track.0]})).unwrap();
         let id = soundcraft_model::TrackId(result["tracks"][0].as_u64().unwrap());
@@ -279,37 +305,19 @@ mod track_render_state {
         session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
         let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
         let mut app = SoundApp::new(engine, Some(player), crate::Services::default());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
-        let player = app.player.as_ref().unwrap();
-        player.open_editor(track, 0).unwrap(); // fixture's window-free GUI edits gain
-        player.step_device_free();
-        let before = player.capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+        settle(&mut app, track);
+        let before = open_editor_and_render(&app, track); // fixture's window-free GUI edits gain
         assert_eq!(before, state(0.25));
         assert_eq!(app.engine.session().track(track).unwrap().mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap(), state(1.0));
         app.apply_audio_config_using(soundcraft_playback::AudioConfig::default(), |session, _| {
             soundcraft_playback::Player::prepare_device_free(session).unwrap()
         })
         .unwrap();
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
+        settle(&mut app, track);
         let after = app.player.as_ref().unwrap().capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
         assert_eq!(after, before, "Apply audio discarded unsaved native plug-in state");
         assert!(app.reconnect_audio_using(true, |session, _| soundcraft_playback::Player::prepare_device_free(session).unwrap()).unwrap());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
+        settle(&mut app, track);
         let confirmed = app.engine.session_arc();
         assert_eq!(app.player.as_ref().unwrap().capture_states(&confirmed).unwrap()[0].2, before);
         app.engine.session_mut().track_mut(track).unwrap().name = "Pending".into();
