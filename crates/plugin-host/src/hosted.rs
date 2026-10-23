@@ -3,7 +3,10 @@
 
 use crate::{Host, Inner, Status, Worker, lock};
 use soundcraft_dsp::event::PluginEvent;
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginStateReader, ProcessStatus, SampleSource, StateBusy, Transport};
+use soundcraft_dsp::{
+    EditorHeader, HeaderAction, JobPoll, LoadedValues, Plugin, PluginEditor, PluginInfo, PluginStateReader, ProcessStatus, SampleSource, StateBusy,
+    StateJob, Transport,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -21,13 +24,22 @@ pub(crate) struct EditorShared {
     closing: AtomicBool,
     edits: Mutex<Vec<(String, f32)>>,
     error: Mutex<Option<String>>,
+    /// What the user did in the window's header strip (issue #68), for the UI to take.
+    actions: Mutex<Vec<HeaderAction>>,
 }
 
 impl EditorShared {
-    /// From the host thread's tick: the editor's edits and whether its window is open.
-    pub(crate) fn publish(&self, edits: Vec<(String, f32)>, open: bool) {
+    /// From the host thread's tick: the editor's edits, its header actions and whether its window
+    /// is open.
+    pub(crate) fn publish(&self, edits: Vec<(String, f32)>, actions: Vec<HeaderAction>, open: bool) {
         if !edits.is_empty() {
             lock(&self.edits).extend(edits);
+        }
+        if !actions.is_empty() {
+            let mut a = lock(&self.actions);
+            if a.len() < 64 {
+                a.extend(actions);
+            }
         }
         if !self.opening.load(Ordering::Acquire) && !self.closing.load(Ordering::Acquire) {
             self.open.store(open, Ordering::Release);
@@ -196,7 +208,7 @@ impl Plugin for Hosted {
         }
     }
     fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
-        self.has_editor.then(|| Box::new(RemoteEditor { token: Arc::clone(&self.token) }) as Box<dyn PluginEditor>)
+        self.has_editor.then(|| Box::new(RemoteEditor { token: Arc::clone(&self.token), header: None }) as Box<dyn PluginEditor>)
     }
     fn state_reader(&mut self) -> Option<Box<dyn PluginStateReader>> {
         self.has_state.then(|| Box::new(RemoteState { token: Arc::clone(&self.token) }) as Box<dyn PluginStateReader>)
@@ -207,6 +219,8 @@ impl Plugin for Hosted {
 /// not waited for; the window state and the edits come back through [`EditorShared`].
 struct RemoteEditor {
     token: Arc<Token>,
+    /// The header last sent to the host thread (a new one is sent only when it differs).
+    header: Option<EditorHeader>,
 }
 
 impl PluginEditor for RemoteEditor {
@@ -268,6 +282,29 @@ impl PluginEditor for RemoteEditor {
     fn take_error(&mut self) -> Option<String> {
         lock(&self.token.shared.error).take()
     }
+
+    /// Sent to the host thread when it changed (fire and forget, like a parameter echo); the
+    /// window shows it on the thread's next tick.
+    fn set_header(&mut self, header: &EditorHeader) {
+        if self.header.as_ref() == Some(header) {
+            return;
+        }
+        self.header = Some(header.clone());
+        let header = header.clone();
+        self.token.with_editor(move |editor, _| {
+            if let Some(e) = editor {
+                e.set_header(&header);
+            }
+        });
+    }
+
+    fn take_header_actions(&mut self) -> Vec<HeaderAction> {
+        std::mem::take(&mut *lock(&self.token.shared.actions))
+    }
+
+    fn available(&self) -> Result<(), String> {
+        if self.token.worker.responsive() { Ok(()) } else { Err(NOT_RESPONDING.into()) }
+    }
 }
 
 /// The UI's state reader: a request to the host thread, waited for up to the timeout (the one
@@ -312,6 +349,28 @@ impl RemoteState {
     }
 }
 
+impl RemoteState {
+    /// Runs `job` with this instance's state handle on its host thread and returns the job to
+    /// poll once per frame: failed at once while the thread is wedged or gone, and as soon as it
+    /// wedges or the request runs past the host's timeout (issue #68: a preset save or load never
+    /// waits for a plug-in).
+    fn begin<T: Send + 'static>(&self, job: impl FnOnce(&mut dyn PluginStateReader) -> T + Send + 'static) -> StateJob<Option<T>> {
+        let worker = Arc::clone(&self.token.worker);
+        if !worker.responsive() {
+            return StateJob::failed(NOT_RESPONDING);
+        }
+        let Some(inner) = self.token.host.upgrade() else { return StateJob::failed("the plug-in host has shut down") };
+        let key = self.token.key;
+        let pending = Host { inner }.submit_to(&worker, move |ctx| ctx.local(key).and_then(|l| l.state.as_mut()).map(|s| job(s.as_mut())));
+        StateJob::remote(move || match pending.poll() {
+            Status::Ready(v) => JobPoll::Ready(v),
+            Status::Waiting { .. } if worker.responsive() => JobPoll::Waiting,
+            Status::Waiting { .. } | Status::Stuck => JobPoll::Failed(NOT_RESPONDING.into()),
+            Status::Failed => JobPoll::Failed("the plug-in host could not reach the plug-in".into()),
+        })
+    }
+}
+
 impl PluginStateReader for RemoteState {
     fn save_state(&mut self) -> Option<Vec<u8>> {
         self.read(self.token.timeout).ok().flatten()
@@ -319,5 +378,23 @@ impl PluginStateReader for RemoteState {
 
     fn save_state_within(&mut self, busy: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
         self.read(busy)
+    }
+
+    fn begin_save(&mut self) -> StateJob<Option<Vec<u8>>> {
+        let mut job = self.begin(|s| s.save_state());
+        StateJob::remote(move || match job.poll() {
+            JobPoll::Ready(v) => JobPoll::Ready(v.flatten()),
+            JobPoll::Waiting => JobPoll::Waiting,
+            JobPoll::Failed(e) => JobPoll::Failed(e),
+        })
+    }
+
+    fn begin_load(&mut self, data: Vec<u8>) -> StateJob<Option<LoadedValues>> {
+        let mut job = self.begin(move |s| s.load_state(&data));
+        StateJob::remote(move || match job.poll() {
+            JobPoll::Ready(v) => JobPoll::Ready(v.flatten()),
+            JobPoll::Waiting => JobPoll::Waiting,
+            JobPoll::Failed(e) => JobPoll::Failed(e),
+        })
     }
 }

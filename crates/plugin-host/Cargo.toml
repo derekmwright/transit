@@ -21,6 +21,9 @@ testing = []
 [dev-dependencies]
 transit-rt = { workspace = true, features = ["testing"] }
 transit-plugin-host = { path = ".", features = ["testing"] }
+# The fixture plug-ins' scan stays in their folders (tests/presets.rs).
+soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
+soundcraft-vst3-host = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

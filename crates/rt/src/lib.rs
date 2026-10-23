@@ -34,6 +34,10 @@ pub mod handoff;
 /// thread, ADR 0018): attach, wait, dispatch, and a cross-thread waker.
 pub mod gui_thread;
 
+/// The window a hosted plug-in's editor lives in, with its header strip (issue #68): created and
+/// driven on the plug-in host thread.
+pub mod editor_window;
+
 mod shell;
 pub use shell::set_app_user_model_id;
 

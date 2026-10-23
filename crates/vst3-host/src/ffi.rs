@@ -47,13 +47,14 @@ pub(crate) const PARAM_POINTS: usize = 4096;
 pub(crate) const RELEASE_RESERVE: usize = 257;
 /// MIDI channels the controller mapping covers.
 pub(crate) const MIDI_CHANNELS: usize = 16;
-/// Largest plugin state we buffer (component or controller state).
-const MAX_STATE_BYTES: usize = 64 << 20;
+// Largest plugin state we buffer (component or controller state).
+use crate::preset::MAX_STATE_BYTES;
 /// Most editor parameter edits buffered between two UI frames.
 const EDIT_CAP: usize = 256;
-/// Magic of SoundCraft's state container: `SCV3` + u32 LE component length + component state +
-/// u32 LE controller length + controller state.
-const STATE_MAGIC: &[u8; 4] = b"SCV3";
+// Magic of SoundCraft's state container: SCV3 + u32 LE component length + component state +
+// u32 LE controller length + controller state (crate::preset::join_state).
+#[cfg(test)]
+use crate::preset::STATE_MAGIC;
 
 // ---- strings -------------------------------------------------------------------------------
 
@@ -633,6 +634,7 @@ impl Bundle {
         inst.editor = Arc::new(EditorLink {
             main: std::thread::current().id(),
             inner: Mutex::new(EditorInner { component: Some(inst.component.clone()), controller: inst.controller.clone(), ..EditorInner::default() }),
+            header: transit_rt::editor_window::HeaderCell::new(),
         });
         Ok(inst)
     }
@@ -2246,20 +2248,7 @@ impl Drop for Instance {
 /// Splits a state blob into (component, controller) parts. A blob without SoundCraft's container
 /// header is taken as a bare component state.
 fn split_state(data: &[u8]) -> Option<(&[u8], &[u8])> {
-    if data.len() > MAX_STATE_BYTES.saturating_mul(2) {
-        return None;
-    }
-    let Some(rest) = data.strip_prefix(STATE_MAGIC) else { return (!data.is_empty()).then_some((data, &[][..])) };
-    let take = |b: &[u8]| -> Option<(usize, usize)> {
-        let n = u32::from_le_bytes(b.get(..4)?.try_into().ok()?) as usize;
-        (n <= MAX_STATE_BYTES && b.len() >= 4 + n).then_some((4, 4 + n))
-    };
-    let (a, b) = take(rest)?;
-    let comp = rest.get(a..b)?;
-    let rest = rest.get(b..)?;
-    let (c, d) = take(rest)?;
-    let ctrl = rest.get(c..d)?;
-    (d == rest.len()).then_some((comp, ctrl))
+    crate::preset::split_state(data)
 }
 
 // ---- editor (IPlugView) --------------------------------------------------------------------
@@ -2317,11 +2306,13 @@ pub(crate) struct EditorLink {
     /// GUI/controller calls belong to the instance's creating thread, regardless of its name.
     main: std::thread::ThreadId,
     inner: Mutex<EditorInner>,
+    /// The editor window's header strip (issue #68): kept across opens, read by the window.
+    header: Arc<transit_rt::editor_window::HeaderCell>,
 }
 
 impl Default for EditorLink {
     fn default() -> Self {
-        Self { main: std::thread::current().id(), inner: Mutex::new(EditorInner::default()) }
+        Self { main: std::thread::current().id(), inner: Mutex::new(EditorInner::default()), header: transit_rt::editor_window::HeaderCell::new() }
     }
 }
 
@@ -2336,6 +2327,11 @@ impl EditorLink {
 
     fn has_controller(&self) -> bool {
         self.lock().controller.is_some()
+    }
+
+    /// The header strip's model (any thread).
+    pub fn header(&self) -> &transit_rt::editor_window::HeaderCell {
+        &self.header
     }
 
     fn create_view(g: &EditorInner) -> Result<ComPtr<sb::IPlugView>, String> {
@@ -2392,7 +2388,9 @@ impl EditorLink {
         // SAFETY: valid view; `r` is writable. On failure the default size stays.
         unsafe { view.getSize(&mut r) };
         let (w, h) = rect_size(&r);
-        let win = window::HostWindow::new(title, w, h)?;
+        let shown = self.header.view().title;
+        let title = if shown.is_empty() { title } else { shown.as_str() };
+        let win = window::HostWindow::new(title, w, h, Some(Arc::clone(&self.header)))?;
         let frame = ComWrapper::new(PlugFrame { window: std::sync::atomic::AtomicPtr::new(win.raw()) });
         if let Some(f) = frame.as_com_ref::<sb::IPlugFrame>() {
             // SAFETY: valid view; the frame outlives the view's attachment (kept in `g.frame`
@@ -2454,13 +2452,7 @@ impl EditorLink {
             Some(c) => Instance::read_state(|s| unsafe { c.getState(s) }).unwrap_or_default(),
             None => Vec::new(),
         };
-        let mut out = Vec::with_capacity(12 + comp.len() + ctrl.len());
-        out.extend_from_slice(STATE_MAGIC);
-        out.extend_from_slice(&u32::try_from(comp.len()).ok()?.to_le_bytes());
-        out.extend_from_slice(&comp);
-        out.extend_from_slice(&u32::try_from(ctrl.len()).ok()?.to_le_bytes());
-        out.extend_from_slice(&ctrl);
-        Some(out)
+        crate::preset::join_state(&comp, &ctrl)
     }
 
     /// Closes the editor. Main thread only (no-op elsewhere).
@@ -2485,8 +2477,11 @@ impl EditorLink {
             return;
         }
         let mut g = self.lock();
-        if g.window.as_ref().is_some_and(|w| !w.is_visible()) {
-            EditorLink::teardown(&mut g);
+        match &g.window {
+            Some(w) if !w.is_visible() => EditorLink::teardown(&mut g),
+            // The strip's changes and the size follow (issue #68).
+            Some(w) => w.sync(),
+            None => {}
         }
     }
 
@@ -2583,7 +2578,13 @@ mod window {
             unsafe { self.window.as_ref() }
         }
 
-        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
+        /// _header: no strip on this platform (the plug-in's view fills the window).
+        pub fn new(
+            title: &str,
+            w: f64,
+            h: f64,
+            _header: Option<std::sync::Arc<transit_rt::editor_window::HeaderCell>>,
+        ) -> Result<HostWindow, String> {
             let mtm = MainThreadMarker::new().ok_or_else(|| "not on the main thread".to_string())?;
             let _app = NSApplication::sharedApplication(mtm);
             let rect = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(w, h));
@@ -2627,6 +2628,9 @@ mod window {
             self.get().is_some_and(|w| w.isVisible())
         }
 
+        /// Nothing to keep in step: no strip here.
+        pub fn sync(&self) {}
+
         pub fn close(self) {
             if let Some(w) = self.get() {
                 w.orderOut(None);
@@ -2651,22 +2655,15 @@ mod window {
     }
 }
 
-/// The Windows host window: a top-level window owned by the app's active window (so it stays
-/// above it and has no taskbar button) whose client area is the plugin view's `HWND` parent.
-/// Closing it only hides it; the editor link notices in `idle`, detaches the view, then destroys
-/// the window. Messages are dispatched by the app's own event loop on the main thread.
+/// The Windows host window: `transit_rt`'s editor window (issue #68), a top-level window on the
+/// plug-in host thread whose client area is a header strip above the plugin view's `HWND` parent
+/// and nothing else. Closing it only hides it; the editor link notices in `idle`, detaches the
+/// view, then destroys the window.
 #[cfg(windows)]
 mod window {
-    use std::ffi::{c_char, c_void};
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE,
-        GetWindowLongPtrW, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SetForegroundWindow, SetWindowPos, ShowWindow, WM_CLOSE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN, WS_OVERLAPPED, WS_SYSMENU,
-    };
+    use std::ffi::c_char;
+
+    pub use transit_rt::editor_window::{EditorWindow as HostWindow, resize_content as resize};
 
     pub const PLATFORM_TYPE: Option<*const c_char> = Some(vst3::Steinberg::kPlatformTypeHWND);
 
@@ -2674,165 +2671,7 @@ mod window {
     pub fn on_main_thread() -> bool {
         true
     }
-
-    fn owns_window(hwnd: HWND) -> bool {
-        // SAFETY: these Win32 queries accept any handle (invalid returns 0), require no buffers,
-        // and only compare the window's owning thread with the caller before GUI operations.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, std::ptr::null_mut())
-                == windows_sys::Win32::System::Threading::GetCurrentThreadId()
-        }
-    }
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().filter(|&c| c != 0).chain(Some(0)).collect()
-    }
-
-    const STYLE: u32 = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-
-    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if msg == WM_CLOSE {
-            // SAFETY: `hwnd` is the window this procedure was called for.
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
-            return 0;
-        }
-        // SAFETY: default handling of a message for the window it was sent to.
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-    }
-
-    /// Registers the window class once; the name lives for the whole process.
-    fn class_name() -> Option<&'static [u16]> {
-        static CLASS: OnceLock<Option<Vec<u16>>> = OnceLock::new();
-        CLASS
-            .get_or_init(|| {
-                let name = wide("SoundCraftVst3Editor");
-                // SAFETY: null asks for this process's module handle.
-                let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-                let wc = WNDCLASSEXW {
-                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    style: CS_HREDRAW | CS_VREDRAW,
-                    lpfnWndProc: Some(wndproc),
-                    cbClsExtra: 0,
-                    cbWndExtra: 0,
-                    hInstance: instance,
-                    hIcon: std::ptr::null_mut(),
-                    // SAFETY: a system cursor (null instance + predefined id).
-                    hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
-                    hbrBackground: std::ptr::null_mut(),
-                    lpszMenuName: std::ptr::null(),
-                    lpszClassName: name.as_ptr(),
-                    hIconSm: std::ptr::null_mut(),
-                };
-                // SAFETY: a fully initialised class description whose strings outlive the call
-                // (the name is kept for the process lifetime in this `OnceLock`).
-                (unsafe { RegisterClassExW(&wc) } != 0).then_some(name)
-            })
-            .as_deref()
-    }
-
-    /// Outer window size for a client area of `w`×`h`.
-    fn outer_size(style: u32, ex_style: u32, w: f64, h: f64) -> (i32, i32) {
-        let mut r = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
-        // SAFETY: `r` is a valid, writable rect.
-        unsafe { AdjustWindowRectEx(&mut r, style, 0, ex_style) };
-        (r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
-    }
-
-    /// Owns the window handle; destroyed in `close` (main thread only).
-    pub struct HostWindow {
-        hwnd: HWND,
-    }
-
-    // SAFETY: the handle is only used on the main thread (every method checks); the struct
-    // merely carries it between threads' locks.
-    unsafe impl Send for HostWindow {}
-
-    impl HostWindow {
-        fn live(&self) -> Option<HWND> {
-            // SAFETY: `IsWindow` accepts any value and only reports whether it names a window.
-            (owns_window(self.hwnd) && unsafe { IsWindow(self.hwnd) } != 0).then_some(self.hwnd)
-        }
-
-        pub fn new(title: &str, w: f64, h: f64) -> Result<HostWindow, String> {
-            if !on_main_thread() {
-                return Err("not on the main thread".into());
-            }
-            let class = class_name().ok_or_else(|| "cannot register the editor window class".to_string())?;
-            let title = wide(title);
-            let (ow, oh) = outer_size(STYLE, 0, w, h);
-            // SAFETY: main thread; the active window (or null) of this thread's queue.
-            let owner = unsafe { GetActiveWindow() };
-            // SAFETY: registered class and NUL-terminated strings that outlive the call; the
-            // owner is null or a window of this thread.
-            let hwnd = unsafe {
-                CreateWindowExW(
-                    0,
-                    class.as_ptr(),
-                    title.as_ptr(),
-                    STYLE,
-                    CW_USEDEFAULT,
-                    CW_USEDEFAULT,
-                    ow,
-                    oh,
-                    owner,
-                    std::ptr::null_mut(),
-                    GetModuleHandleW(std::ptr::null()),
-                    std::ptr::null(),
-                )
-            };
-            if hwnd.is_null() {
-                return Err("cannot create the editor window".into());
-            }
-            Ok(HostWindow { hwnd })
-        }
-
-        /// The window handle (for the plug frame's resizes).
-        pub fn raw(&self) -> *mut c_void {
-            self.hwnd
-        }
-
-        /// The `HWND` the plugin view creates its child window in.
-        pub fn parent(&self) -> *mut c_void {
-            self.live().unwrap_or(std::ptr::null_mut())
-        }
-
-        pub fn raise(&self) {
-            if let Some(h) = self.live() {
-                // SAFETY: a live window of this thread.
-                unsafe {
-                    ShowWindow(h, SW_SHOW);
-                    SetForegroundWindow(h);
-                }
-            }
-        }
-
-        pub fn is_visible(&self) -> bool {
-            // SAFETY: a live window of this thread.
-            self.live().is_some_and(|h| unsafe { IsWindowVisible(h) } != 0)
-        }
-
-        pub fn close(self) {
-            if let Some(h) = self.live() {
-                // SAFETY: our own live window; the view was detached before (see `teardown`).
-                unsafe { DestroyWindow(h) };
-            }
-        }
-    }
-
-    /// Resizes a host window's client area (`window` from [`HostWindow::raw`]); main thread only.
-    pub fn resize(window: *mut c_void, w: f64, h: f64) {
-        // SAFETY: `IsWindow` accepts any value.
-        if !owns_window(window) || window.is_null() || unsafe { IsWindow(window) } == 0 {
-            return;
-        }
-        // SAFETY: a live window of this thread; style values are read, not changed.
-        let (style, ex) = unsafe { (GetWindowLongPtrW(window, GWL_STYLE) as u32, GetWindowLongPtrW(window, GWL_EXSTYLE) as u32) };
-        let (ow, oh) = outer_size(style, ex, w, h);
-        // SAFETY: as above; only the size changes.
-        unsafe { SetWindowPos(window, std::ptr::null_mut(), 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) };
-    }
 }
-
 /// Other platforms: no editor windows yet (opening reports "unsupported").
 #[cfg(not(any(target_os = "macos", windows)))]
 mod window {
@@ -2847,7 +2686,12 @@ mod window {
     pub struct HostWindow;
 
     impl HostWindow {
-        pub fn new(_title: &str, _w: f64, _h: f64) -> Result<HostWindow, String> {
+        pub fn new(
+            _title: &str,
+            _w: f64,
+            _h: f64,
+            _header: Option<std::sync::Arc<transit_rt::editor_window::HeaderCell>>,
+        ) -> Result<HostWindow, String> {
             Err("VST3 editors are not hosted on this platform yet".into())
         }
         pub fn raw(&self) -> *mut c_void {
@@ -2860,6 +2704,7 @@ mod window {
         pub fn is_visible(&self) -> bool {
             false
         }
+        pub fn sync(&self) {}
         pub fn close(self) {}
     }
 

@@ -435,7 +435,8 @@ impl Ctx {
         for local in self.entries.values_mut() {
             if let Some(editor) = &mut local.editor {
                 let edits = editor.idle();
-                local.shared.publish(edits, editor.is_open());
+                let actions = editor.take_header_actions();
+                local.shared.publish(edits, actions, editor.is_open());
             }
         }
     }

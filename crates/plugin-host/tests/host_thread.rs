@@ -359,3 +359,128 @@ fn a_job_sent_after_shutdown_is_never_run() {
     assert_eq!(log.thread_of("destroy"), None, "the destroy job sent after shutdown never ran");
     assert!(matches!(host.submit(|_| ()).poll(), Status::Failed), "no job runs after shutdown");
 }
+
+/// Issue #68: the header strip's model goes to the editor on the host thread, only when it
+/// changes, and what the user did there comes back through the proxy; a wedged thread disables it.
+#[test]
+fn the_header_reaches_the_editor_on_the_host_thread_and_its_actions_come_back() {
+    use soundcraft_dsp::{EditorHeader, HeaderAction};
+    let host = host(Duration::from_millis(300));
+    let log = Arc::new(Log::default());
+    let l = Arc::clone(&log);
+    let mut plugin = host.submit(move |ctx| ctx.adopt(Fake::make(&l, Duration::ZERO, Duration::ZERO))).wait(Duration::from_secs(5)).unwrap();
+    let mut editor = plugin.editor().unwrap();
+    assert_eq!(editor.available(), Ok(()));
+    let header = EditorHeader { title: "Drums · Insert A · Fake".into(), user: vec!["Kit".into()], ..EditorHeader::default() };
+    let t = Instant::now();
+    editor.set_header(&header);
+    editor.set_header(&header);
+    assert!(t.elapsed() < FRAME_BUDGET, "never waits for the plug-in");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log.thread_of("set_header").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(log.thread_of("set_header"), log.thread_of("create"), "on the host thread");
+    assert_eq!(*log.headers.lock().unwrap(), vec![header.clone()], "sent once: the second was the same");
+    log.actions.lock().unwrap().push(HeaderAction::User(0));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut actions = Vec::new();
+    while actions.is_empty() && Instant::now() < deadline {
+        actions = editor.take_header_actions();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(actions, vec![HeaderAction::User(0)], "taken from the editor by the host thread's tick");
+    // A wedged thread: the strip is disabled with the reason, at once.
+    let (release, hang) = mpsc::channel::<()>();
+    let stuck = host.submit(move |_| {
+        let _ = hang.recv();
+    });
+    assert!(matches!(frames(&stuck, Duration::from_secs(5)).0, Status::Stuck));
+    let t = Instant::now();
+    let why = editor.available().unwrap_err();
+    assert!(why.contains("not responding"), "{why}");
+    assert!(t.elapsed() < FRAME_BUDGET);
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while editor.available().is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(editor.available(), Ok(()), "available again once the thread returns");
+    drop((editor, plugin));
+    assert!(host.shutdown(Duration::from_secs(5)));
+}
+
+/// Issue #68: a preset save reads the state and a preset load loads it into the live instance,
+/// both on the host thread and polled once per frame; a wedged thread fails them at once.
+#[test]
+fn preset_state_jobs_run_on_the_host_thread_and_never_block_a_frame() {
+    use soundcraft_dsp::JobPoll;
+    fn finish<T>(job: &mut soundcraft_dsp::StateJob<T>) -> (JobPoll<T>, Duration) {
+        let (deadline, mut worst) = (Instant::now() + Duration::from_secs(5), Duration::ZERO);
+        loop {
+            let t = Instant::now();
+            let r = job.poll();
+            worst = worst.max(t.elapsed());
+            if !matches!(r, JobPoll::Waiting) || Instant::now() > deadline {
+                return (r, worst);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let host = host(Duration::from_millis(400));
+    let log = Arc::new(Log::default());
+    let l = Arc::clone(&log);
+    let mut plugin = host
+        .submit(move |ctx| {
+            let mut p = Fake::make(&l, Duration::ZERO, Duration::ZERO);
+            assert!(p.load_state(b"before"));
+            ctx.adopt(p)
+        })
+        .wait(Duration::from_secs(5))
+        .unwrap();
+    let mut reader = plugin.state_reader().unwrap();
+    let (saved, worst) = finish(&mut reader.begin_save());
+    assert_eq!(saved, JobPoll::Ready(Some(b"before".to_vec())));
+    assert!(worst < FRAME_BUDGET, "a poll took {worst:?}");
+    let (loaded, _) = finish(&mut reader.begin_load(b"my kit".to_vec()));
+    assert_eq!(loaded, JobPoll::Ready(Some(vec![("len".to_string(), 6.0)])), "the values after the load come back");
+    assert_eq!(*log.state.lock().unwrap(), b"my kit");
+    assert_eq!(log.thread_of("live_load"), log.thread_of("create"), "loaded on the host thread");
+    let (refused, _) = finish(&mut reader.begin_load(b"refuse".to_vec()));
+    assert_eq!(refused, JobPoll::Ready(None), "a refused load says so");
+    // Wedged: both fail at once, with the reason.
+    let (release, hang) = mpsc::channel::<()>();
+    let stuck = host.submit(move |_| {
+        let _ = hang.recv();
+    });
+    assert!(matches!(frames(&stuck, Duration::from_secs(5)).0, Status::Stuck));
+    let t = Instant::now();
+    assert!(matches!(reader.begin_save().poll(), JobPoll::Failed(e) if e.contains("not responding")));
+    assert!(matches!(reader.begin_load(b"x".to_vec()).poll(), JobPoll::Failed(e) if e.contains("not responding")));
+    assert!(t.elapsed() < FRAME_BUDGET);
+    drop(release);
+    // A load queued behind one that hangs (on the instance's own thread) fails as soon as the
+    // thread is wedged, and is cancelled: it does not load later behind the UI's back.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.wedged() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (release, hang) = mpsc::channel::<()>();
+    *log.hang.lock().unwrap() = Some(hang);
+    let mut hanging = reader.begin_load(b"hang".to_vec());
+    let mut queued = reader.begin_load(b"late".to_vec());
+    let (r, worst) = finish(&mut queued);
+    assert!(matches!(&r, JobPoll::Failed(e) if e.contains("not responding")), "{r:?}");
+    assert!(worst < FRAME_BUDGET);
+    assert!(matches!(finish(&mut hanging).0, JobPoll::Failed(_)), "the hung load reads failed too");
+    drop((queued, hanging));
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.wedged() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (after, _) = finish(&mut reader.begin_save());
+    assert_eq!(after, JobPoll::Ready(Some(b"hang".to_vec())), "the cancelled load never ran");
+    drop((reader, plugin));
+    assert!(host.shutdown(Duration::from_secs(5)));
+}

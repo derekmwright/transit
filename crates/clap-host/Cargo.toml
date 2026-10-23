@@ -24,6 +24,8 @@ harness = false
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 serde_json.workspace = true
 clap-sys = "=0.5.0"
+# The editor window with its header strip (issue #68).
+transit-rt.workspace = true
 libloading = "=0.8.9"
 
 # The isolated unsafe helper crate (craftrules never-crash): this crate opts out of the workspace

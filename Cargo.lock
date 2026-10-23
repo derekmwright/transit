@@ -3893,6 +3893,7 @@ dependencies = [
  "soundcraft-clap-host",
  "soundcraft-dsp",
  "thiserror 2.0.21",
+ "transit-rt",
  "windows-sys 0.61.2",
 ]
 
@@ -4065,6 +4066,7 @@ dependencies = [
  "soundcraft-dsp",
  "soundcraft-vst3-host",
  "thiserror 2.0.21",
+ "transit-rt",
  "vst3",
  "windows-sys 0.61.2",
 ]

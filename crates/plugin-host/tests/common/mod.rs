@@ -2,7 +2,7 @@
 //! state reader that record the thread they run on.
 #![allow(dead_code, clippy::unwrap_used)]
 
-use soundcraft_dsp::{Category, Plugin, PluginEditor, PluginInfo, PluginStateReader};
+use soundcraft_dsp::{Category, EditorHeader, HeaderAction, LoadedValues, Plugin, PluginEditor, PluginInfo, PluginStateReader};
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -23,6 +23,12 @@ pub struct Log {
     pub calls: Mutex<Vec<(&'static str, ThreadId)>>,
     pub state: Mutex<Vec<u8>>,
     pub editor_params: Mutex<Vec<(String, f32)>>,
+    /// The headers the editor was given (issue #68).
+    pub headers: Mutex<Vec<EditorHeader>>,
+    /// Header actions the editor reports on its next `take_header_actions`.
+    pub actions: Mutex<Vec<HeaderAction>>,
+    /// A live load of `b"hang"` waits on this until its sender is dropped.
+    pub hang: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl Log {
@@ -84,11 +90,33 @@ impl Plugin for Fake {
         Some(Box::new(FakeEditor { log: Arc::clone(&self.log), open: false, fails: self.editor_fails, sent: false }))
     }
     fn state_reader(&mut self) -> Option<Box<dyn PluginStateReader>> {
-        let log = Arc::clone(&self.log);
-        Some(Box::new(move || {
-            log.note("save_state");
-            Some(log.state.lock().unwrap().clone())
-        }))
+        Some(Box::new(FakeState { log: Arc::clone(&self.log) }))
+    }
+}
+
+/// The fake's state handle: the state is the log's bytes; a live load reports one value, the
+/// state's length.
+pub struct FakeState {
+    log: Arc<Log>,
+}
+
+impl PluginStateReader for FakeState {
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self.log.note("save_state");
+        Some(self.log.state.lock().unwrap().clone())
+    }
+    fn load_state(&mut self, data: &[u8]) -> Option<LoadedValues> {
+        self.log.note("live_load");
+        if data == b"refuse" {
+            return None;
+        }
+        if data == b"hang"
+            && let Some(rx) = self.log.hang.lock().unwrap().take()
+        {
+            let _ = rx.recv();
+        }
+        *self.log.state.lock().unwrap() = data.to_vec();
+        Some(vec![("len".into(), data.len() as f32)])
     }
 }
 
@@ -127,5 +155,12 @@ impl PluginEditor for FakeEditor {
     fn set_param(&mut self, id: &str, value: f32) {
         self.log.note("editor_set_param");
         self.log.editor_params.lock().unwrap().push((id.to_owned(), value));
+    }
+    fn set_header(&mut self, header: &EditorHeader) {
+        self.log.note("set_header");
+        self.log.headers.lock().unwrap().push(header.clone());
+    }
+    fn take_header_actions(&mut self) -> Vec<HeaderAction> {
+        std::mem::take(&mut *self.log.actions.lock().unwrap())
     }
 }

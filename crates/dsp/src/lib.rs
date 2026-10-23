@@ -14,6 +14,7 @@
 //! Audio is planar `f32`: `io[channel][frame]`.
 
 pub mod biquad;
+pub mod editor_header;
 pub mod event;
 pub mod meter;
 pub mod offline;
@@ -25,6 +26,7 @@ pub mod plugins;
 pub mod spectrum;
 mod util;
 
+pub use editor_header::{EditorHeader, HeaderAction, JobPoll, LoadedValues, StateJob};
 pub use offline::FadeShape;
 pub use osc::Waveform;
 pub use plugins::eq::{eq1_response, eq7_response};
@@ -387,6 +389,19 @@ pub trait PluginEditor: Send {
     fn take_error(&mut self) -> Option<String> {
         None
     }
+    /// What the header strip above the plug-in's UI shows (issue #68). Editors whose window has
+    /// no header (floating windows, macOS) ignore it (the default).
+    fn set_header(&mut self, _header: &EditorHeader) {}
+    /// What the user did in the header strip since the last call, in order (the default: none).
+    fn take_header_actions(&mut self) -> Vec<HeaderAction> {
+        Vec::new()
+    }
+    /// `Err(reason)` while the editor cannot be driven now (its plug-in host thread is not
+    /// responding, ADR 0018): the header shows its controls disabled with the reason. Editors
+    /// driven on the calling thread are always available (the default).
+    fn available(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Reads a plugin's state on the main (UI) thread while the instance processes on the audio
@@ -402,6 +417,23 @@ pub trait PluginStateReader: Send {
     fn save_state_within(&mut self, busy: std::time::Duration) -> Result<Option<Vec<u8>>, StateBusy> {
         let _ = busy;
         Ok(self.save_state())
+    }
+    /// Loads a state blob (as [`Self::save_state`] returns) into the live instance while it
+    /// processes, on the thread that may call the plug-in's state interface, as plug-in formats
+    /// allow (a user preset, issue #68). `Some(values)`: the parameter values the plug-in reports
+    /// after the load; `None`: unsupported or refused (the plug-in keeps its previous state). The
+    /// data is hostile input. The default supports no live load.
+    fn load_state(&mut self, _data: &[u8]) -> Option<LoadedValues> {
+        None
+    }
+    /// [`Self::save_state`] without blocking the caller: poll the job once per frame. The default
+    /// reads at once.
+    fn begin_save(&mut self) -> StateJob<Option<Vec<u8>>> {
+        StateJob::ready(self.save_state())
+    }
+    /// [`Self::load_state`] without blocking the caller. The default loads at once.
+    fn begin_load(&mut self, data: Vec<u8>) -> StateJob<Option<LoadedValues>> {
+        StateJob::ready(self.load_state(&data))
     }
 }
 
