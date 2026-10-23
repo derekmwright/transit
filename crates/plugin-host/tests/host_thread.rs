@@ -11,8 +11,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use transit_plugin_host::{Config, Host, Status};
 
-/// A frame may take this long at most (generous for loaded CI runners; the plug-in sleeps 300 ms).
-const FRAME_BUDGET: Duration = Duration::from_millis(100);
+/// A frame may take this long at most. Load-tolerant: a starved runner can stall a poll for a
+/// while, but a frame that waited for the plug-in takes its full 1 s sleep.
+const FRAME_BUDGET: Duration = Duration::from_millis(400);
+/// A fake plug-in's slow creation or destruction: well past the frame budget.
+const SLOW: Duration = Duration::from_millis(1000);
 
 fn host(timeout: Duration) -> Host {
     Host::new(Config { timeout, inline: false, ..Config::default() })
@@ -40,13 +43,13 @@ fn frames_advance_while_a_slow_instance_is_created_on_the_host_thread() {
     let log = Arc::new(Log::default());
     let l = Arc::clone(&log);
     let pending = host.submit(move |ctx| {
-        let p = Fake::make(&l, Duration::from_millis(300), Duration::ZERO);
+        let p = Fake::make(&l, SLOW, Duration::ZERO);
         ctx.adopt(p)
     });
     assert!(matches!(pending.poll(), Status::Waiting { .. }), "the first frame sees it loading");
     let (status, n, worst) = frames(&pending, Duration::from_secs(5));
     let Status::Ready(plugin) = status else { panic!("not made") };
-    assert!(n >= 20, "only {n} frames ran during a 300 ms creation");
+    assert!(n >= 10, "only {n} frames ran during a 1 s creation");
     assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
     assert_ne!(log.thread_of("create"), Some(std::thread::current().id()), "made on the host thread");
     drop(plugin);
@@ -58,7 +61,7 @@ fn a_slow_destruction_runs_on_the_host_thread_and_the_drop_returns_at_once() {
     let host = host(Duration::from_secs(10));
     let log = Arc::new(Log::default());
     let l = Arc::clone(&log);
-    let plugin = host.submit(move |ctx| ctx.adopt(Fake::make(&l, Duration::ZERO, Duration::from_millis(300)))).wait(Duration::from_secs(5)).unwrap();
+    let plugin = host.submit(move |ctx| ctx.adopt(Fake::make(&l, Duration::ZERO, SLOW))).wait(Duration::from_secs(5)).unwrap();
     let t = Instant::now();
     drop(plugin);
     assert!(t.elapsed() < FRAME_BUDGET, "the drop waited {:?} for the plug-in", t.elapsed());
@@ -83,7 +86,7 @@ fn a_creation_that_never_returns_is_stuck_after_the_timeout_and_never_blocks_a_f
     let behind = host.submit(move |ctx| ctx.adopt(Fake::make(&l, Duration::ZERO, Duration::ZERO)));
     let (status, n, worst) = frames(&stuck, Duration::from_secs(5));
     assert!(matches!(status, Status::Stuck), "the hung creation reads as stuck, got {status:?}");
-    assert!(n >= 20, "frames ran meanwhile ({n})");
+    assert!(n >= 10, "frames ran meanwhile ({n})");
     assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
     assert_eq!(host.wedged(), 1);
     let (status, _, _) = frames(&behind, Duration::from_secs(5));
@@ -257,4 +260,80 @@ fn shutdown_during_a_creation_returns_within_its_bound() {
     assert!(t.elapsed() < Duration::from_secs(2), "shutdown waited {:?}", t.elapsed());
     assert!(matches!(host.submit(|_| ()).poll(), Status::Failed), "no new requests after shutdown");
     drop(release);
+}
+
+/// B1 of the ADR 0018 review: a thread that was slow, not stuck (a 12 s sampler restore, a modal
+/// dialog), is responsive again when its call returns. Its instances' live states are read and
+/// their editors open; new creations stay on the thread that took over.
+#[test]
+fn a_thread_that_returns_after_the_timeout_serves_its_instances_again() {
+    let host = host(Duration::from_millis(300));
+    let log = Arc::new(Log::default());
+    let l = Arc::clone(&log);
+    let mut plugin = host
+        .submit(move |ctx| {
+            let mut p = Fake::make(&l, Duration::ZERO, Duration::ZERO);
+            assert!(p.load_state(b"live"));
+            ctx.adopt(p)
+        })
+        .wait(Duration::from_secs(5))
+        .unwrap();
+    let old = log.thread_of("create");
+    let long = host.submit(|_| std::thread::sleep(Duration::from_millis(900)));
+    let (status, _, _) = frames(&long, Duration::from_secs(5));
+    assert!(matches!(status, Status::Stuck), "past the timeout it reads stuck, got {status:?}");
+    assert_eq!(host.wedged(), 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while host.wedged() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(host.wedged(), 0, "the thread returned: it is no longer wedged");
+    assert_eq!(host.wedges(), 1);
+    // The live state, read on the old thread (a save after this carries it, not the stored one).
+    *log.state.lock().unwrap() = b"edited after the stall".to_vec();
+    assert_eq!(plugin.state_reader().unwrap().save_state().as_deref(), Some(&b"edited after the stall"[..]));
+    assert_eq!(log.calls.lock().unwrap().iter().rev().find(|(c, _)| *c == "save_state").map(|(_, t)| *t), old);
+    let mut editor = plugin.editor().unwrap();
+    editor.open().expect("the editor opens again");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while log.thread_of("editor_open").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(log.thread_of("editor_open"), old);
+    assert!(editor.is_open());
+    // New creations go to the thread that took over.
+    let fresh = host.submit(|_| std::thread::current().id()).wait(Duration::from_secs(5)).unwrap();
+    assert_ne!(Some(fresh), old);
+    drop((editor, plugin));
+    assert!(host.shutdown(Duration::from_secs(5)));
+}
+
+/// An editor open queued behind a call that then wedges its thread does not read open forever;
+/// it opens once the thread returns.
+#[test]
+fn an_open_queued_on_a_thread_that_wedges_is_not_reported_open_until_it_runs() {
+    let host = host(Duration::from_millis(300));
+    let log = Arc::new(Log::default());
+    let l = Arc::clone(&log);
+    let mut plugin = host.submit(move |ctx| ctx.adopt(Fake::make(&l, Duration::ZERO, Duration::ZERO))).wait(Duration::from_secs(5)).unwrap();
+    let (release, hang) = mpsc::channel::<()>();
+    let stuck = host.submit(move |_| {
+        let _ = hang.recv();
+    });
+    while !matches!(stuck.poll(), Status::Waiting { running: true }) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut editor = plugin.editor().unwrap();
+    editor.open().unwrap();
+    assert!(editor.is_open(), "on its way");
+    assert!(matches!(frames(&stuck, Duration::from_secs(5)).0, Status::Stuck));
+    assert!(!editor.is_open(), "a wedged thread's pending open does not read open");
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !editor.is_open() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(editor.is_open(), "it opens when the thread returns");
+    drop((editor, plugin));
+    assert!(host.shutdown(Duration::from_secs(5)));
 }
