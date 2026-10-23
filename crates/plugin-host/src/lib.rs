@@ -134,12 +134,19 @@ pub(crate) struct Worker {
     tx: mpsc::Sender<Arc<JobCell>>,
     waker: QueueWaker,
     epoch: Instant,
-    /// Milliseconds since `epoch` plus one when the current job, tick or dispatch began; 0 idle.
+    /// Milliseconds since `epoch` plus one when the current job, tick or dispatch began. Valid
+    /// only for the section `section` names (read with [`Worker::busy_section`]).
     busy_since: AtomicU64,
+    /// Busy sections so far, counted twice: odd while a job, tick or dispatch runs, even idle.
+    /// Its value while busy names the section, so a check and the section's end agree on which
+    /// section was marked (issue #56).
+    section: AtomicU64,
     /// The current busy section is a window-message dispatch (its own, longer budget).
     dispatching: AtomicBool,
-    /// Busy past its budget and not yet back; cleared as soon as the call returns.
-    wedged: AtomicBool,
+    /// The section (a `section` value) found busy past its budget; 0 none. The thread is wedged
+    /// only while that section still runs ([`Worker::is_wedged`]), so a mark that lands just
+    /// after the call returned never reads as wedged.
+    wedged: AtomicU64,
     /// The thread's loop runs (false once it has shut down).
     running: AtomicBool,
     /// Jobs that may move to a fresh thread if this one wedges (creation jobs).
@@ -152,12 +159,23 @@ impl Worker {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX - 1)
     }
 
+    /// The current busy section and how long it has run (`None` while idle, or when the section
+    /// changed while it was read).
+    fn busy_section(&self) -> Option<(u64, Duration)> {
+        let section = self.section.load(Ordering::SeqCst);
+        if section.is_multiple_of(2) {
+            return None;
+        }
+        let since = self.busy_since.load(Ordering::Acquire);
+        if self.section.load(Ordering::SeqCst) != section {
+            return None;
+        }
+        Some((section, Duration::from_millis(self.now_ms().saturating_sub(since.saturating_sub(1)))))
+    }
+
     /// How long the current job has run (`None` while idle).
     fn busy_for(&self) -> Option<Duration> {
-        match self.busy_since.load(Ordering::Acquire) {
-            0 => None,
-            t => Some(Duration::from_millis(self.now_ms().saturating_sub(t - 1))),
-        }
+        self.busy_section().map(|(_, ran)| ran)
     }
 
     fn busy<R>(&self, f: impl FnOnce() -> R) -> R {
@@ -167,14 +185,49 @@ impl Worker {
     /// Runs `f` on the clock (`dispatch`: the window-message budget). A thread marked wedged
     /// meanwhile is responsive again once `f` returns: it was slow, not stuck.
     fn busy_as<R>(&self, dispatch: bool, f: impl FnOnce() -> R) -> R {
+        let section = self.enter(dispatch);
+        let r = f();
+        self.leave(section);
+        r
+    }
+
+    /// Starts a busy section; returns its name (odd).
+    fn enter(&self, dispatch: bool) -> u64 {
         self.dispatching.store(dispatch, Ordering::Release);
         self.busy_since.store(self.now_ms() + 1, Ordering::Release);
-        let r = f();
-        self.busy_since.store(0, Ordering::Release);
-        if self.wedged.swap(false, Ordering::AcqRel) {
+        self.section.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Ends busy section `section`, and the wedge mark on it if there is one.
+    fn leave(&self, section: u64) {
+        self.section.store(section + 1, Ordering::SeqCst);
+        if self.wedged.compare_exchange(section, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             log::warn!("plug-in host: a host thread that was not responding has returned; its plug-ins are reachable again");
         }
-        r
+    }
+
+    /// The section running past `budget`, if one is and it is not marked yet.
+    fn overdue(&self, budget: Duration) -> Option<u64> {
+        let (section, ran) = self.busy_section()?;
+        (ran >= budget && self.wedged.load(Ordering::SeqCst) != section).then_some(section)
+    }
+
+    /// Marks `section` wedged. False when it ended meanwhile: the check and the section's end
+    /// raced, and the mark is taken back (or the end already cleared it), so an idle thread is
+    /// never declared wedged and no takeover starts for it.
+    fn mark_wedged(&self, section: u64) -> bool {
+        self.wedged.store(section, Ordering::SeqCst);
+        if self.section.load(Ordering::SeqCst) == section {
+            return true;
+        }
+        let _ = self.wedged.compare_exchange(section, 0, Ordering::SeqCst, Ordering::SeqCst);
+        false
+    }
+
+    /// Busy past its budget in a section that has not returned.
+    fn is_wedged(&self) -> bool {
+        let wedged = self.wedged.load(Ordering::SeqCst);
+        wedged != 0 && self.section.load(Ordering::SeqCst) == wedged
     }
 
     /// The budget of the current busy section.
@@ -213,7 +266,7 @@ impl Worker {
     }
 
     pub(crate) fn responsive(&self) -> bool {
-        self.running.load(Ordering::Acquire) && !self.wedged.load(Ordering::Acquire)
+        self.running.load(Ordering::Acquire) && !self.is_wedged()
     }
 }
 
@@ -462,8 +515,9 @@ impl Host {
             waker,
             epoch: Instant::now(),
             busy_since: AtomicU64::new(0),
+            section: AtomicU64::new(0),
             dispatching: AtomicBool::new(false),
-            wedged: AtomicBool::new(false),
+            wedged: AtomicU64::new(0),
             running: AtomicBool::new(true),
             movable: Mutex::new(Vec::new()),
             thread: OnceLock::new(),
@@ -553,21 +607,19 @@ impl Host {
         // A thread that is no longer current (it wedged once and came back) is only marked: its
         // state reads and editors answer at once while it is stuck again.
         for w in lock(&self.inner.workers).iter() {
-            if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, w)) || w.wedged.load(Ordering::Acquire) {
+            if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, w)) {
                 continue;
             }
-            if w.busy_for().is_some_and(|d| d >= w.budget(&self.inner.config)) {
-                w.wedged.store(true, Ordering::Release);
+            if w.overdue(w.budget(&self.inner.config)).is_some_and(|section| w.mark_wedged(section)) {
                 self.inner.wedged.fetch_add(1, Ordering::AcqRel);
                 log::error!("plug-in host: an older host thread stopped responding; its plug-ins are unreachable until it returns");
             }
         }
         let Some(current) = current else { return };
         let budget = current.budget(&self.inner.config);
-        if current.wedged.load(Ordering::Acquire) || current.busy_for().is_none_or(|d| d < budget) {
+        if !current.overdue(budget).is_some_and(|section| current.mark_wedged(section)) {
             return;
         }
-        current.wedged.store(true, Ordering::Release);
         self.inner.wedged.fetch_add(1, Ordering::AcqRel);
         log::error!(
             "plug-in host: a plug-in has not returned for {budget:?}; a new host thread takes over new plug-ins, and the old one's plug-ins are unreachable until it returns"
@@ -590,7 +642,7 @@ impl Host {
     /// status line says so while it is not 0; it goes back down when a thread returns.
     #[must_use]
     pub fn wedged(&self) -> usize {
-        lock(&self.inner.workers).iter().filter(|w| w.running.load(Ordering::Acquire) && w.wedged.load(Ordering::Acquire)).count()
+        lock(&self.inner.workers).iter().filter(|w| w.running.load(Ordering::Acquire) && w.is_wedged()).count()
     }
 
     /// How many times a host thread has wedged in this process (returned or not).
@@ -688,4 +740,66 @@ fn shared_cell() -> &'static OnceLock<Host> {
 /// exit once the instances are gone, before the main thread's own module exits.
 pub fn shutdown_shared(timeout: Duration) -> bool {
     shared_cell().get().is_none_or(|h| h.shutdown(timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn worker(queue: &MessageQueue) -> Worker {
+        let (tx, _) = mpsc::channel();
+        Worker {
+            tx,
+            waker: queue.waker(),
+            epoch: Instant::now(),
+            busy_since: AtomicU64::new(0),
+            section: AtomicU64::new(0),
+            dispatching: AtomicBool::new(false),
+            wedged: AtomicU64::new(0),
+            running: AtomicBool::new(true),
+            movable: Mutex::new(Vec::new()),
+            thread: OnceLock::new(),
+        }
+    }
+
+    /// Issue #56 (c), the race the review found, in a fixed order: the check sees a section past
+    /// its budget, the call returns, then the check marks it. The thread is idle: it must not
+    /// read wedged, and the check must not count a wedge (no takeover thread starts).
+    #[test]
+    fn a_check_that_marks_a_section_after_it_returned_does_not_wedge_the_thread() {
+        let queue = MessageQueue::attach();
+        let w = worker(&queue);
+        let section = w.enter(false);
+        let seen = w.overdue(Duration::ZERO);
+        assert_eq!(seen, Some(section), "the check sees the section past its budget");
+        w.leave(section);
+        assert!(!w.mark_wedged(section), "the section ended: the mark is taken back");
+        assert!(!w.is_wedged() && w.responsive(), "an idle thread is not wedged");
+        assert_eq!(w.wedged.load(Ordering::SeqCst), 0);
+        // The next section is not wedged by the stale observation either.
+        let next = w.enter(false);
+        assert!(!w.is_wedged());
+        w.leave(next);
+    }
+
+    /// The other orders: marked while the section runs, the thread reads wedged until the call
+    /// returns; a mark that lands just after the end reads idle even before it is taken back.
+    #[test]
+    fn a_mark_holds_while_its_section_runs_and_ends_with_it() {
+        let queue = MessageQueue::attach();
+        let w = worker(&queue);
+        let section = w.enter(true);
+        let seen = w.overdue(Duration::ZERO).unwrap();
+        assert!(w.mark_wedged(seen));
+        assert!(w.is_wedged() && !w.responsive());
+        assert_eq!(w.overdue(Duration::ZERO), None, "marked once");
+        w.leave(section);
+        assert!(!w.is_wedged() && w.responsive(), "the call returned");
+        assert_eq!(w.wedged.load(Ordering::SeqCst), 0, "the end cleared its mark");
+        // The window between a late store and its take-back: a stale mark on an ended section.
+        w.wedged.store(section, Ordering::SeqCst);
+        assert!(!w.is_wedged(), "a mark on a section that ended never reads wedged");
+        assert_eq!(w.busy_section(), None);
+    }
 }
