@@ -26,6 +26,7 @@ soundcraft-clap-host = { path = "crates/clap-host" }
 soundcraft-asio-panel = { path = "crates/asio-panel" }
 soundcraft-vst3-host = { path = "crates/vst3-host" }
 soundcraft-au-host = { path = "crates/au-host" }
+transit-plugin-host = { path = "crates/plugin-host" }
 soundcraft-model = { path = "crates/model" }
 soundcraft-mix = { path = "crates/mix" }
 soundcraft-engine = { path = "crates/engine" }

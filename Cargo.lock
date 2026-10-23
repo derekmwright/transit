@@ -4615,6 +4615,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "transit-plugin-host"
+version = "0.2.0-alpha.1"
+dependencies = [
+ "log",
+ "soundcraft-clap-host",
+ "soundcraft-dsp",
+ "soundcraft-vst3-host",
+ "transit-rt",
+]
+
+[[package]]
 name = "transit-rt"
 version = "0.2.0-alpha.1"
 dependencies = [

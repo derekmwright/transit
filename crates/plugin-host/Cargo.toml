@@ -1,0 +1,21 @@
+[package]
+name = "transit-plugin-host"
+description = "transit plug-in host thread (ADR 0018): owns hosted plug-in instances (creation, state, editors, destruction) on a thread of their own, so the UI only sends requests and polls results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+soundcraft-dsp.workspace = true
+soundcraft-clap-host.workspace = true
+soundcraft-vst3-host.workspace = true
+transit-rt.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+transit-rt = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

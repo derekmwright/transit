@@ -38,6 +38,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("soundcraft-clap-host", 1),
     ("soundcraft-vst3-host", 1),
     ("soundcraft-au-host", 1),
+    ("transit-plugin-host", 1),
     ("soundcraft-asio-panel", 1),
     ("soundcraft-model", 2),
     ("soundcraft-mix", 3),
