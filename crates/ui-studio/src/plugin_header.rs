@@ -491,7 +491,9 @@ impl StudioApp {
                 },
                 Step::Restore { ref mut job } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
-                    JobPoll::Ready(Some(_)) if !self.still_holds(key, &op) => {}
+                    JobPoll::Ready(Some(_)) if !self.still_holds(key, &op) => {
+                        log::debug!("a live restore finished after its slot changed; dropped");
+                    }
                     JobPoll::Ready(Some(values)) => {
                         // The undone (or redone) step's parameters may not match the state it
                         // stored; the plug-in's own values after the load are the ones to keep.

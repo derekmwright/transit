@@ -838,7 +838,7 @@ mod tests {
     fn editor_windows_have_no_owner_and_outlive_each_other() {
         use windows_sys::Win32::UI::WindowsAndMessaging::GW_OWNER;
         let a = EditorWindow::new("A", 200.0, 100.0, Some(HeaderCell::new())).unwrap();
-        a.raise(); // the active window of this thread, if the system lets it be
+
         let b = EditorWindow::new("B", 200.0, 100.0, Some(HeaderCell::new())).unwrap();
         for w in [&a, &b] {
             // SAFETY: a live window of this thread; a query.
@@ -852,8 +852,10 @@ mod tests {
         b.close();
     }
 
-    /// The focus redirection does not recurse: a "plug-in" child that hands focus back to the
-    /// frame on `WM_SETFOCUS` ends after one redirection.
+    /// The focus redirection does not ping-pong: a "plug-in" child that hands focus back to the
+    /// frame on `WM_SETFOCUS` gets one redirection, and the frame then keeps the focus. Without
+    /// the guard, Windows itself stops the bounce after a bounded number of nested calls and the
+    /// focus ends on the child, so the frame holding the focus is what shows the guard worked.
     #[test]
     fn a_plugin_that_bounces_focus_back_does_not_recurse() {
         use windows_sys::Win32::UI::WindowsAndMessaging::WM_SETFOCUS as SETFOCUS;
@@ -886,8 +888,12 @@ mod tests {
             )
         };
         assert!(!child.is_null());
-        // SAFETY: a live window of this thread. Without the guard this would overflow the stack.
+        // SAFETY: a live window of this thread. The child bounces the focus back once; the guard
+        // makes the frame keep it (without it, Windows caps the nested bounce and the child ends
+        // with the focus).
         unsafe { SetFocus(win.raw()) };
+        // SAFETY: no arguments; the focus window of this thread.
+        assert_eq!(unsafe { GetFocus() }, win.raw(), "the frame keeps the focus after one redirection");
         let d = data(win.raw()).unwrap();
         assert!(!d.focusing.get(), "the guard is released");
         win.close();
