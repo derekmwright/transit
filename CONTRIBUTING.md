@@ -22,8 +22,7 @@ cargo xtask assets
 
 Rules:
 
-- No `unsafe` outside `crates/rt` and the plug-in host crates' FFI modules (ADR 0013: unsafe only where it
-  is reviewed and tested, with safe fallbacks).
+- `unsafe` only in the crates on the xtask allowlist (`cargo xtask layers` enforces it): `rt`, the native audio backends `audio-wasapi` and `audio-asio` (COM, Win32 and ASIO driver calls), and the plug-in host crates' SDK-interface code (`clap-host`, `vst3-host`, `au-host`, plus the older `asio-panel` helper). Every block carries a `// SAFETY:` comment, and the refutation review quotes each one (ADR 0013 and its amendments).
 - No panics in non-test code; return errors.
 - Use American English in code, comments, UI strings and docs.
 - Do not add assets without a row in `ATTRIBUTION.md`.

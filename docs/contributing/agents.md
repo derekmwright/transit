@@ -44,8 +44,7 @@ A good brief is the biggest token saver. Include:
 ## Repo rules agents must know
 
 - Commit by pathspec (`git commit -- <paths>`), never `git add -A`. No attribution or co-author lines.
-- `unsafe` only in `crates/rt` and the plug-in host crates' FFI modules, each block with a quoted
-  `// SAFETY:` review and a safe fallback ([ADR 0013](../adr/0013-unsafe-only-in-soundcraft-rt.md)).
+- `unsafe` only in the crates on the xtask allowlist (`cargo xtask layers` enforces it): `rt`, the native audio backends `audio-wasapi` and `audio-asio` (COM, Win32 and ASIO driver calls), and the plug-in host crates' SDK-interface code (`clap-host`, `vst3-host`, `au-host`, plus the older `asio-panel` helper). Every block carries a `// SAFETY:` comment, and the refutation review quotes each one ([ADR 0013](../adr/0013-unsafe-only-in-soundcraft-rt.md) and its amendments).
 - American English in code, comments, UI strings and docs.
 - An escaped defect gets an escape record and a gate-class rule
   ([escape record](evidence/escape-record.md)); never patch around a defect, keep the repro.
