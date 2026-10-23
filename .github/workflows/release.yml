@@ -123,7 +123,7 @@ jobs:
           @"
           transit for Windows (pre-alpha)
 
-          - Audio: native WASAPI and native ASIO (experimental) are included, plus the standard WASAPI host.
+          - Audio: native WASAPI and native ASIO are included, plus the standard WASAPI host.
           - Install: run the .msi (the installer, with the Start Menu shortcut and .transit/.transitz file associations). This zip is the portable form: unzip and run transit.exe.
           - The program and the installer are unsigned. If SmartScreen blocks them, click "More info", then "Run anyway".
           - Settings and logs: %APPDATA%\transit (set TRANSIT_CONFIG_DIR to change).
@@ -240,7 +240,7 @@ jobs:
             Windows: the `.msi` installs transit and `audio-bench.exe` to Program Files (per-machine, needs administrator approval), with a Start Menu shortcut and the `.transit` and `.transitz` file associations; the `.zip` is the portable form. Both are unsigned unless these notes say signed: SmartScreen will warn, so click "More info", then "Run anyway".
 
             Each archive also carries `audio-bench` and `BENCH-README.txt`: cable an output to an input and measure your interface without building anything.
-            - windows-x86_64: transit with native WASAPI and native ASIO (experimental); `audio-bench.exe` with native WASAPI, native ASIO and cpal WASAPI.
+            - windows-x86_64: transit with native WASAPI and native ASIO; `audio-bench.exe` with native WASAPI, native ASIO and cpal WASAPI.
             - macos-arm64: `audio-bench` (cpal, Core Audio), in the tarball only, not in the DMG.
             - linux-x86_64: `audio-bench` (cpal, ALSA).
           draft: false

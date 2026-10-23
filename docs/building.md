@@ -57,7 +57,7 @@ no C++ compile, no bindgen, no libclang, no `CPAL_ASIO_DIR` and no environment v
 compiled only on 64-bit Windows (`cfg(all(windows, target_pointer_width = "64"))`; the crate is empty
 elsewhere) and builds with a plain `cargo build`. The app uses it with the `native-asio` feature
 (`cargo build --release -p transit --features native-asio`, usually beside `native-wasapi`): choose
-Audio system ASIO, then Backend "Native ASIO (experimental)" in Audio Devices. Without the feature the
+Audio system ASIO, then Backend "Native ASIO" in Audio Devices. Without the feature the
 app's ASIO path is cpal's (below). The benchmark uses it through the `audio-bench/native-asio`
 feature:
 

@@ -14,7 +14,7 @@ compiled only under `cfg(all(windows, target_pointer_width = "64"))`, so a plain
 `audio-bench --backend asio --device "<driver registry name>"`. The hardware tests are ignored by
 default: `cargo test -p transit-audio-asio -- --ignored hardware_ --nocapture --test-threads 1`, or
 one by name (for example `hardware_scarlett_duplex_streams_two_seconds`). The app uses it with the
-`transit/native-asio` feature (`soundcraft-playback/native-asio`), as "Native ASIO (experimental)"
+`transit/native-asio` feature (`soundcraft-playback/native-asio`), as "Native ASIO"
 under Audio system ASIO; see [In the app](#in-the-app-slice-c). The legacy cpal ASIO feature and its
 SDK build are in [docs/building.md](../../building.md).
 
@@ -259,7 +259,7 @@ listing), `crates/playback/src/player/device.rs` (`open_native`, `open_stepped`)
 `crates/ui-studio/src/audio_devices.rs` (the window).
 
 - **Selection.** `AudioConfig.backend` is `NativeAsio` (saved as `"native_asio"`), offered in Audio
-  Devices as "Native ASIO (experimental)" when Audio system is ASIO, in a 64-bit Windows build with
+  Devices as "Native ASIO" when Audio system is ASIO, in a 64-bit Windows build with
   `transit/native-asio`. Each system offers only its own native backend (`Backend::offered`); a native
   choice that does not serve a newly chosen system goes back to Auto. Without the feature the choice
   is not offered and a saved `NativeAsio` opens cpal.

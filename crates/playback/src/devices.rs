@@ -44,9 +44,9 @@ impl Backend {
     pub const fn label(self) -> &'static str {
         match self {
             Backend::Auto => "Auto",
-            Backend::Cpal => "cpal",
-            Backend::NativeWasapi => "Native WASAPI (experimental)",
-            Backend::NativeAsio => "Native ASIO (experimental)",
+            Backend::Cpal => "cpal (legacy)",
+            Backend::NativeWasapi => "Native WASAPI",
+            Backend::NativeAsio => "Native ASIO",
         }
     }
 

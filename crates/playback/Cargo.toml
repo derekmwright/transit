@@ -46,10 +46,10 @@ cpal = { workspace = true, features = ["wasm-bindgen"] }
 [features]
 # Device-free callback probes used only by dependent crates' tests.
 test-hooks = []
-# The native WASAPI render backend (ADR 0016 slice c): the "Native WASAPI (experimental)" choice in
+# The native WASAPI render backend (ADR 0016 slice c): the "Native WASAPI" choice in
 # Audio Devices. Off by default; without it the choice is not offered and `Backend::NativeWasapi` opens cpal.
 native-wasapi = ["dep:transit-audio-wasapi"]
-# The native ASIO backend (no Steinberg SDK, no LLVM): the "Native ASIO (experimental)" choice in
+# The native ASIO backend (no Steinberg SDK, no LLVM): the "Native ASIO" choice in
 # Audio Devices on the ASIO system. Off by default; without it the choice is not offered and
 # `Backend::NativeAsio` opens cpal.
 native-asio = ["dep:transit-audio-asio"]

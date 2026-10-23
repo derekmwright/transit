@@ -292,7 +292,7 @@ fn native_asio_is_chosen_on_the_asio_system_with_its_calibration_line_and_driver
         .filter(|i| i["value"] == "backend")
         .map(|i| i["label"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(offered, ["Auto", "cpal", Backend::NativeAsio.label()], "ASIO offers its own native backend, not WASAPI's");
+    assert_eq!(offered, ["Auto", "cpal (legacy)", Backend::NativeAsio.label()], "ASIO offers its own native backend, not WASAPI's");
     t.click(mid(T::rect(&t.layout()["items"], Some(Backend::NativeAsio.label()), "backend")));
     assert_eq!(t.app.audio_devices.draft.backend, Backend::NativeAsio);
     assert!(!has_control(&t, "paired_input") && !has_control(&t, "share_device"), "no pairing and no sharing choice on ASIO");
