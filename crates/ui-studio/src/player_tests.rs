@@ -259,7 +259,13 @@ mod reopen_state {
                 .unwrap();
             assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             // The filter must name the test exactly, or the child runs nothing and passes.
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the child ran no test");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child ran no test:
+{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
         fixture();

@@ -63,7 +63,13 @@ fn the_frame_loop_restarts_a_gui_less_clap_plugin_with_no_audio_running() {
             .unwrap();
         assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         // E46: the filter must name the test exactly, or the child runs nothing and passes.
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the child ran no test");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child ran no test:
+{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     requests_fixture();
