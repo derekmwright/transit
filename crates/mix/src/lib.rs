@@ -2313,6 +2313,41 @@ fn played_note(
     (on < clip.end()).then_some((n, on, off))
 }
 
+/// Every span `(on, off)` a note sounds in a clip, as playback and the external chase both need it,
+/// for the cycles that touch `pos..end` (the first pass is always visited). `on`/`off` are the
+/// note's first-pass times from [`played_note`]; each span is cut at the clip end.
+///
+/// A looped clip (ADR 0019): the first pass plays what starts before the loop end; later cycles
+/// play what starts inside the range. A note crossing the seam ends at it and sounds again at its
+/// own position in the next cycle. One implementation, so playback and the chase cannot drift.
+fn note_spans(clip: &Clip, looping: Option<ClipLoop>, on: Samples, off: Samples, pos: Samples, end: Samples, mut f: impl FnMut(Samples, Samples)) {
+    let mut emit = |on: Samples, off: Samples| {
+        let off = off.min(clip.end());
+        if on < clip.end() {
+            f(on, off);
+        }
+    };
+    let Some(l) = looping else {
+        emit(on, off);
+        return;
+    };
+    let (rel_on, seam) = (on.saturating_sub(clip.start), clip.start.saturating_add(l.end));
+    if rel_on >= l.end {
+        return;
+    }
+    // A note the start trim cut off the front (negative position) only sounds in later cycles.
+    if rel_on >= 0 {
+        emit(on, off.min(seam));
+    }
+    if rel_on >= l.start {
+        let span = off.min(seam).saturating_sub(on).max(0);
+        for k in cycles_touching(clip.start, l, rel_on, span, pos, end) {
+            let at = cycle_at(clip.start, l, rel_on, k);
+            emit(at, at.saturating_add(span));
+        }
+    }
+}
+
 /// Visit candidates without mutating delivery state. At each offset all nonzero-length offs
 /// precede ons; a note whose on and off round to the same sample keeps on-then-off.
 fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut visit: impl FnMut(usize, ClipEvent)) {
@@ -2343,11 +2378,7 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             let looping = clip.looping.filter(|l| l.is_valid());
             for n0 in &sequence.notes {
                 let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, looping.is_some()) else { continue };
-                let mut emit = |on: Samples, off: Samples| {
-                    let off = off.min(clip.end());
-                    if on >= clip.end() {
-                        return;
-                    }
+                note_spans(clip, looping, on, off, pos, end, |on, off| {
                     if ons && on >= pos && on < end {
                         let at = usize::try_from(on - pos).unwrap_or(0);
                         visit(at, ClipEvent::On(n.pitch, n.velocity, n.channel));
@@ -2356,29 +2387,7 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
                         let at = usize::try_from(off - pos).unwrap_or(0);
                         visit(at, ClipEvent::Off(n.pitch, n.channel));
                     }
-                };
-                let Some(l) = looping else {
-                    emit(on, off);
-                    continue;
-                };
-                // A looped clip (ADR 0019): the first pass plays what starts before the loop end;
-                // later cycles play what starts inside the range. A note crossing the seam ends at
-                // it and sounds again at its own position in the next cycle.
-                let (rel_on, seam) = (on.saturating_sub(clip.start), clip.start.saturating_add(l.end));
-                if rel_on >= l.end {
-                    continue;
-                }
-                // A note the start trim cut off the front (negative position) only sounds in later cycles.
-                if rel_on >= 0 {
-                    emit(on, off.min(seam));
-                }
-                if rel_on >= l.start {
-                    let span = off.min(seam).saturating_sub(on).max(0);
-                    for k in cycles_touching(clip.start, l, rel_on, span, pos, end) {
-                        let at = cycle_at(clip.start, l, rel_on, k);
-                        emit(at, at.saturating_add(span));
-                    }
-                }
+                });
             }
             if !ons {
                 continue;

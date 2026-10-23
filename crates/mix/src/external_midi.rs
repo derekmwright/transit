@@ -4,7 +4,7 @@
 //! real-time properties, muted clips, clip-end clamping and off-before-on at one sample all match
 //! what the hosted instrument would have played. Runs on the audio thread: no allocation, no lock.
 
-use super::{ClipEvent, Rtp, midi_offset, played_note, sorted_clip_events};
+use super::{ClipEvent, Rtp, midi_offset, note_spans, played_note, sorted_clip_events};
 use soundcraft_model::{ClipContent, MidiOutChannel, MidiOutput, Session, Track};
 use soundcraft_time::Samples;
 
@@ -63,7 +63,9 @@ pub fn external_midi_events(s: &Session, t: &Track, pos: Samples, frames: usize,
     }
 }
 
-/// Notes of `t` that started before `pos` and are still sounding at it.
+/// Notes of `t` that started before `pos` and are still sounding at it, as playback (loop cycles
+/// included) would have them. Runs where the chase does (the external driver, possibly the audio
+/// thread): no allocation, no lock.
 fn sounding_notes(s: &Session, t: &Track, pos: Samples, mut visit: impl FnMut(u8, u8, u8)) {
     let pos = pos.saturating_sub(midi_offset(s, t));
     let rtp = Rtp::of(s, t);
@@ -73,13 +75,16 @@ fn sounding_notes(s: &Session, t: &Track, pos: Samples, mut visit: impl FnMut(u8
         }
         let ClipContent::Midi { sequence } = &clip.content else { continue };
         let base = s.tempo.samples_to_ticks(clip.start, s.sample_rate);
+        let looping = clip.looping.filter(|l| l.is_valid());
         for n0 in &sequence.notes {
-            if let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, false)
-                && on < pos
-                && off > pos
-            {
-                visit(n.pitch, n.velocity, n.channel);
-            }
+            let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, looping.is_some()) else { continue };
+            // The same spans playback plays (loop cycles, seam cuts, negative-tick rule), looked up
+            // for the one sample `pos`.
+            note_spans(clip, looping, on, off, pos, pos.saturating_add(1), |on, off| {
+                if on < pos && off > pos {
+                    visit(n.pitch, n.velocity, n.channel);
+                }
+            });
         }
     }
 }
@@ -147,5 +152,61 @@ mod tests {
         let (mut s, t) = session(MidiOutChannel::AsRecorded);
         s.track_mut(t).unwrap().midi_output = MidiOutput::Internal;
         assert!(events(&s, t, 0, 48_000, true).is_empty());
+    }
+
+    /// A looped clip (loop 0..4 beats, length 6) with E64 from beat 3 to 5 (crosses the seam) and a
+    /// note a start trim moved before the clip start (-1 beat, 3 beats long).
+    fn looped() -> (Session, soundcraft_model::TrackId, i64) {
+        let (mut s, t) = session(MidiOutChannel::AsRecorded);
+        let ppq = soundcraft_time::TICKS_PER_QUARTER;
+        let beat = s.tempo.tick_to_samples(ppq, s.sample_rate);
+        let mut seq = Sequence::default();
+        seq.notes.push(Note { pitch: 64, velocity: 100, release_velocity: 64, channel: 5, start: 3 * ppq, length: 2 * ppq });
+        let track = s.track_mut(t).unwrap();
+        let mut c = Clip::midi(ClipId(2), "loop", 0, 6 * beat, seq);
+        c.looping = Some(soundcraft_model::ClipLoop { start: 0, end: 4 * beat });
+        let clips = &mut track.playlist_mut().unwrap().clips;
+        clips.clear();
+        clips.push(c);
+        (s, t, beat)
+    }
+
+    #[test]
+    fn chase_follows_the_loop_cut_at_the_seam_and_restarted_in_later_cycles() {
+        let (s, t, beat) = looped();
+        // Playing from 0 sounds E on at 3, off at the seam (4), on again at 7 (cut by the clip end at 6).
+        let all: Vec<_> = events(&s, t, 0, 8 * beat as usize, false).into_iter().map(|(at, m)| (at as i64 / beat, m[0])).collect();
+        assert_eq!(all, vec![(3, 0x95), (4, 0x85)]);
+        // 4.5: the loop is not sounding E (cycle 1 restarts it at 7, past the clip end): nothing chased.
+        assert!(events(&s, t, 4 * beat + beat / 2, 512, true).is_empty());
+        // 3.5: inside the first pass, E sounds; its off at 4 follows in the next block.
+        let at = 3 * beat + beat / 2;
+        assert_eq!(events(&s, t, at, 512, true), vec![(0, vec![0x95, 64, 100])]);
+        let off = events(&s, t, 4 * beat - 10, 512, false);
+        assert_eq!(off, vec![(10, vec![0x85, 64, 64])]);
+    }
+
+    #[test]
+    fn chase_into_a_later_cycle_restarts_a_note_the_loop_sounds_there_once() {
+        let (mut s, t, beat) = looped();
+        s.find_clip_mut(ClipId(2)).unwrap().length = 12 * beat;
+        // Cycle 1 sounds E from 7 to 8 (cut at its seam 8): at 7.5 it is chased exactly once.
+        assert_eq!(events(&s, t, 7 * beat + beat / 2, 512, true), vec![(0, vec![0x95, 64, 100])]);
+        // 8.5 is past the seam: not sounding.
+        assert!(events(&s, t, 8 * beat + beat / 2, 512, true).is_empty());
+    }
+
+    #[test]
+    fn chase_skips_a_trimmed_negative_tick_note_in_the_first_pass() {
+        let (mut s, t, beat) = looped();
+        let ppq = soundcraft_time::TICKS_PER_QUARTER;
+        let c = s.find_clip_mut(ClipId(2)).unwrap();
+        let ClipContent::Midi { sequence: seq } = &mut c.content else { panic!() };
+        seq.notes.clear();
+        seq.notes.push(Note { pitch: 70, velocity: 80, release_velocity: 64, channel: 0, start: -ppq, length: 3 * ppq });
+        // The note starts before the clip and before the loop range: the loop plays it nowhere, so no
+        // position inside it, in the first pass or a later cycle, chases it.
+        assert!(events(&s, t, beat / 2, 512, true).is_empty());
+        assert!(events(&s, t, 4 * beat + beat / 2, 512, true).is_empty());
     }
 }
