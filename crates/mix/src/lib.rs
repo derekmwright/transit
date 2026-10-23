@@ -2290,7 +2290,14 @@ impl Rtp {
 
 /// A clip note as it plays: real-time properties applied, its on and off in session samples (the
 /// off clamped to the clip end). `None` when it starts at or after the clip end.
-fn played_note(s: &Session, clip: &Clip, base: i64, rtp: Rtp, n0: &soundcraft_midi::Note, keep_negative: bool) -> Option<(soundcraft_midi::Note, Samples, Samples)> {
+fn played_note(
+    s: &Session,
+    clip: &Clip,
+    base: i64,
+    rtp: Rtp,
+    n0: &soundcraft_midi::Note,
+    keep_negative: bool,
+) -> Option<(soundcraft_midi::Note, Samples, Samples)> {
     let sr = s.sample_rate;
     let mut n = *n0;
     n.velocity = (i64::from(n.velocity) + rtp.velocity).clamp(1, 127) as u8;
