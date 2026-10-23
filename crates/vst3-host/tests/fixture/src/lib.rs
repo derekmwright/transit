@@ -1511,6 +1511,17 @@ fn os_thread() -> usize {
 }
 
 fn module_entry() -> bool {
+    // A module entry that hangs (K38): with `VST3_FIXTURE_ENTRY_GATE` set to a folder, the first
+    // entry in the process to claim it writes `entered` there and waits while `hold` exists.
+    if let Some(gate) = std::env::var_os("VST3_FIXTURE_ENTRY_GATE").map(std::path::PathBuf::from)
+        && std::fs::OpenOptions::new().write(true).create_new(true).open(gate.join("claimed")).is_ok()
+    {
+        let _ = std::fs::write(gate.join("entered"), b"");
+        let start = std::time::Instant::now();
+        while gate.join("hold").exists() && start.elapsed() < std::time::Duration::from_secs(60) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     if ENTERED.fetch_add(1, Ordering::SeqCst) == 0 {
         ENTRY_THREAD.store(os_thread(), Ordering::SeqCst);
     }

@@ -16,7 +16,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, mpsc};
 use std::time::Duration;
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
@@ -125,6 +125,25 @@ pub(crate) struct Bundle {
 fn loaded() -> &'static Mutex<Vec<(PathBuf, Arc<Bundle>)>> {
     static L: OnceLock<Mutex<Vec<(PathBuf, Arc<Bundle>)>>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Binaries whose module entry runs now, outside the [`loaded`] lock (K38): a module entry that
+/// hangs holds back only later loads of the same binary, not every VST3 load.
+fn opening() -> &'static (Mutex<Vec<PathBuf>>, Condvar) {
+    static O: OnceLock<(Mutex<Vec<PathBuf>>, Condvar)> = OnceLock::new();
+    O.get_or_init(|| (Mutex::new(Vec::new()), Condvar::new()))
+}
+
+/// This thread's claim on opening one binary ([`opening`]); dropping it lets other loaders of
+/// that binary find it in the cache (or open it themselves if this load failed).
+struct Opening<'a>(&'a Path);
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        let (list, done) = opening();
+        list.lock().unwrap_or_else(PoisonError::into_inner).retain(|p| p != self.0);
+        done.notify_all();
+    }
 }
 
 /// Set once the module exits have run: loading another module after that is refused.
@@ -385,15 +404,31 @@ fn register_exit_hook() {
 
 impl Bundle {
     /// Loads (once per path, then cached for the life of the process) a `.vst3`.
+    ///
+    /// The module entry and `GetPluginFactory` run without the cache lock (K38): a module entry
+    /// that never returns blocks later loads of the same binary only, which wait for it; other
+    /// binaries load meanwhile. The bundle is cached under the lock once it is open.
     pub fn load(path: &Path) -> Result<Arc<Bundle>, Vst3Error> {
-        let mut cache = loaded().lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, b)) = cache.iter().find(|(p, _)| p == path) {
-            return Ok(b.clone());
-        }
         let err = |m: &str| Vst3Error::Load(path.display().to_string(), m.to_string());
-        if MODULES_EXITED.load(Ordering::Acquire) {
-            return Err(err("plugin hosting has shut down"));
-        }
+        let cached = || loaded().lock().unwrap_or_else(PoisonError::into_inner).iter().find(|(p, _)| p == path).map(|(_, b)| b.clone());
+        // Claim the binary, or wait for the thread that is opening it and take its result.
+        let claim = {
+            let (list, done) = opening();
+            let mut list = list.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(b) = cached() {
+                    return Ok(b);
+                }
+                if MODULES_EXITED.load(Ordering::Acquire) {
+                    return Err(err("plugin hosting has shut down"));
+                }
+                if !list.iter().any(|p| p == path) {
+                    list.push(path.to_path_buf());
+                    break Opening(path);
+                }
+                list = done.wait(list).unwrap_or_else(PoisonError::into_inner);
+            }
+        };
         let b = if on_main_thread() {
             Bundle::open(path, EntryThread::Here(os_thread()))?
         } else {
@@ -401,9 +436,15 @@ impl Bundle {
             on_module_thread(move || Bundle::open(&p, EntryThread::Modules), None).ok_or_else(|| err("the module thread is not running"))??
         };
         let b = Arc::new(b);
-        cache.push((path.to_path_buf(), b.clone()));
+        loaded().lock().unwrap_or_else(PoisonError::into_inner).push((path.to_path_buf(), b.clone()));
         // After every new module, so that the exits run before its static destructors.
         register_exit_hook();
+        drop(claim);
+        // Entered while the module exits ran: it stays cached, so the exit handler (or the next
+        // shutdown call) still balances its entry, but hosting is over.
+        if MODULES_EXITED.load(Ordering::Acquire) {
+            return Err(err("plugin hosting has shut down"));
+        }
         Ok(b)
     }
 
