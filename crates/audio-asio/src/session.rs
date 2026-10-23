@@ -377,8 +377,14 @@ impl Session {
         }
     }
 
-    /// The host thread's periodic duty: a `kAsioLatenciesChanged` refetch, and the watchdog.
+    /// The host thread's periodic duty: the stops asked for from inside a driver callback, a
+    /// `kAsioLatenciesChanged` refetch, and the watchdog.
     pub(crate) fn tend(&mut self, name: &str, driver: &mut Driver) {
+        for direction in [ab::Direction::Output, ab::Direction::Input] {
+            if self.side(direction).is_some_and(|side| side.take_stop_request()) {
+                self.stop(name, driver, direction);
+            }
+        }
         if self.installed.state().latencies_dirty.swap(false, Ordering::Relaxed) {
             self.refresh_latencies(name, driver);
         }

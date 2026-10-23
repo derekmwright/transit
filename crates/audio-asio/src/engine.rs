@@ -44,6 +44,9 @@ pub(crate) struct SideShared {
     /// A buffer switch is inside this direction's part (set before it reads `state`, cleared after
     /// the user callback returned): what [`SideShared::quiesce`] waits for.
     in_switch: AtomicBool,
+    /// The owner asked for a stop from inside a driver callback: the direction is already
+    /// [`STOPPED`], and the host thread finishes the stop (the driver's `stop` when it was the last).
+    stop_requested: AtomicBool,
     /// The `(QPC in 100 ns, host-origin ns)` pair of the stream's `start()`, written before
     /// `state` becomes [`STARTED`] (release) and read after it is seen (acquire).
     origin_qpc: AtomicU64,
@@ -56,6 +59,7 @@ impl SideShared {
         Self {
             state: AtomicU8::new(OPENED),
             in_switch: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
             origin_qpc: AtomicU64::new(0),
             origin_ns: AtomicI64::new(0),
             stats: LoopStats::new(events),
@@ -101,6 +105,21 @@ impl SideShared {
 
     pub(crate) fn state(&self) -> u8 {
         self.state.load(Ordering::Acquire)
+    }
+
+    /// A stop asked for from inside a driver callback, where waiting for the host thread (or the
+    /// driver's `stop`) would re-enter the driver: the direction leaves [`STARTED`] at once, so no
+    /// later buffer switch calls it, and the stop is left to the host thread
+    /// ([`SideShared::take_stop_request`]). Never blocks or allocates.
+    pub(crate) fn request_stop(&self) {
+        let _ = self.state.compare_exchange(OPENED, STOPPED, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self.state.compare_exchange(STARTED, STOPPED, Ordering::SeqCst, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Host thread: whether a stop from inside a callback is waiting to be finished (cleared).
+    pub(crate) fn take_stop_request(&self) -> bool {
+        self.stop_requested.swap(false, Ordering::SeqCst)
     }
 
     fn origin(&self) -> (u64, i64) {
@@ -412,7 +431,9 @@ impl Engine {
             }
         }
         match (self.render.as_mut(), render_stamp) {
-            (Some(side), Some((origin_qpc, origin_ns, backend))) => {
+            // Checked again: the capture callback of this switch may have stopped the render
+            // stream (a stop from inside the callback, `SideShared::request_stop`).
+            (Some(side), Some((origin_qpc, origin_ns, backend))) if side.shared.state() == STARTED => {
                 side.shared.stats.wake();
                 if let Some(late) = late {
                     side.shared.stats.wake_late(late);

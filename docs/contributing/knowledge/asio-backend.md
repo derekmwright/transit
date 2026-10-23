@@ -114,6 +114,14 @@ Code: `src/session.rs` (host thread), `src/callback.rs` (driver thread, `unsafe`
   callback: the switch marks a direction in flight before it reads whether the direction runs, the
   control side changes the state before it reads the mark, both `SeqCst`, so one of them sees the
   other. The last stream's `stop` is the driver's `stop`, which the SDK makes synchronous.
+- **Stop from inside a callback** (slice d2). `stop` called inside a driver callback (a render or
+  capture callback stopping its own stream, an error callback) or on the host thread cannot wait
+  for the host, and the driver's `stop` must not run inside its own buffer switch. The direction
+  leaves `STARTED` at once (no later switch calls it, and a render stream stopped by this switch's
+  capture callback is not called in it either), `stop` returns without blocking or allocating, and
+  the host thread finishes the stop between requests: the driver's `stop` when it was the last
+  running stream, after the switch has returned. Dropping a stream inside a callback is still not
+  allowed. Test: `a_stop_from_inside_the_callback_returns_at_once_and_the_host_stops_the_driver_after_the_switch`.
 - **Orphaned sessions.** A stream dropped while the host thread is stuck in a driver call cannot send
   its detach; its direction is still marked detached, and the host ends a session whose directions
   are all detached between requests and before every open, so a later open is not refused by a
@@ -392,7 +400,6 @@ Code: `crates/audio-asio/src/mmcss.rs` (the state, safe), `com.rs` (`avrt.dll` b
 ## Next (slice d2 and later)
 
 - **Listing:** probe only the selected driver, and list off the UI thread.
-- **Stop from inside the callback.**
 - **Calibration:** the stamp-time loopback calibration cannot pair clicks while the drivers'
   `getLatencies` figures over-report the loop (known issue K31: the Focusrite driver always, the
   Model 12 in the phase that measures 22 ms); the frame-time formulas need the measured offset before

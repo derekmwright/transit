@@ -30,7 +30,7 @@ use crate::convert::{InputPlanes, OutputPlanes};
 use crate::engine::{Engine, Time};
 use crate::mmcss::Mmcss;
 use crate::stats::DriverEvents;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -42,6 +42,19 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 static CURRENT: AtomicPtr<CallbackState> = AtomicPtr::new(std::ptr::null_mut());
 /// Callbacks between their entry and their exit, counted before `CURRENT` is read.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// How many of this crate's driver callbacks the calling thread is inside (a const-initialized
+    /// `Cell`: no allocation and no destructor).
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Whether the calling thread is inside a driver callback (a buffer switch, `asioMessage`,
+/// `sampleRateDidChange`): a control call made there must not wait for the host thread or call
+/// the driver ([`crate::AsioStream`]'s `stop` defers to the host thread instead).
+pub(crate) fn in_driver_callback() -> bool {
+    DEPTH.with(Cell::get) > 0
+}
+
 /// How long [`Installed`]'s drop waits for callbacks still inside the state before it leaks it.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -386,6 +399,7 @@ struct Flight;
 
 impl Flight {
     fn enter() -> Self {
+        DEPTH.with(|depth| depth.set(depth.get() + 1));
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         Flight
     }
@@ -402,6 +416,7 @@ impl Flight {
 impl Drop for Flight {
     fn drop(&mut self) {
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 

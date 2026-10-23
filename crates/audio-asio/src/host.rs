@@ -38,7 +38,7 @@ use crate::driver::{self, BufferSize, DriverEntry, DriverInfo, asio_error};
 use crate::session::{Callback, Opened, Session};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
@@ -335,6 +335,8 @@ struct Shared {
     stuck: AtomicBool,
     /// The label of the request the host is serving.
     busy: Mutex<Option<String>>,
+    /// The host thread's id, once it runs (0 before).
+    thread: AtomicU32,
 }
 
 /// The answer cell of one request: the caller waits on it, the host fills it unless the caller
@@ -374,7 +376,8 @@ impl Host {
         let (started_tx, started_rx) = mpsc::channel();
         let (exited_tx, exited) = mpsc::channel();
         let wake = Arc::new(Event::new()?);
-        let shared = Arc::new(Shared { quit: AtomicBool::new(false), stuck: AtomicBool::new(false), busy: Mutex::new(None) });
+        let shared =
+            Arc::new(Shared { quit: AtomicBool::new(false), stuck: AtomicBool::new(false), busy: Mutex::new(None), thread: AtomicU32::new(0) });
         let (thread_wake, thread_shared) = (Arc::clone(&wake), Arc::clone(&shared));
         let thread = std::thread::Builder::new()
             .name("transit-asio-host".into())
@@ -454,6 +457,18 @@ impl Host {
         )))
     }
 
+    /// Wakes the host thread for its work between requests (a stop asked for from inside a
+    /// driver callback); never blocks or allocates.
+    pub(crate) fn wake(&self) {
+        self.wake.set();
+    }
+
+    /// Whether the calling thread is the host thread (a request to it from there would wait for
+    /// itself).
+    pub(crate) fn on_host_thread(&self) -> bool {
+        self.shared.thread.load(Ordering::Acquire) == crate::com::current_thread_id()
+    }
+
     /// Whether a request timed out and the host thread has not finished it yet.
     pub(crate) fn is_stuck(&self) -> bool {
         self.shared.stuck.load(Ordering::Acquire)
@@ -498,6 +513,7 @@ fn run(
     shared: &Shared,
     started: &Sender<Result<(), ab::OpenError>>,
 ) {
+    shared.thread.store(crate::com::current_thread_id(), Ordering::Release);
     let com = match StaGuard::new() {
         Ok(com) => com,
         Err(e) => {

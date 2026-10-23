@@ -767,6 +767,88 @@ fn stop_waits_for_a_callback_in_flight_while_the_other_direction_keeps_the_drive
     drop((capture, render));
 }
 
+/// A stream a callback can reach, taken out at the end so the session can end.
+type StreamSlot = Arc<Mutex<Option<crate::AsioStream>>>;
+
+/// Stops the stream in `slot` from inside a callback: how long `stop` took, and whether the
+/// driver's `stop` had been called by the time it returned.
+fn stop_from_inside(slot: &StreamSlot, observed: &Observed) -> (Duration, bool) {
+    let started = std::time::Instant::now();
+    let guard = slot.lock().unwrap();
+    ab::Stream::stop(guard.as_ref().expect("the stream is in its slot")).expect("a stop from inside the callback");
+    (started.elapsed(), observed.call_names().contains(&"stop"))
+}
+
+#[test]
+fn a_stop_from_inside_the_callback_returns_at_once_and_the_host_stops_the_driver_after_the_switch() {
+    use crate::session::Callback;
+    let _guard = lock();
+    let rig = rig(scarlett());
+    let seen = seen();
+    let (render_slot, capture_slot): (StreamSlot, StreamSlot) = (Arc::default(), Arc::default());
+    let stops: Arc<Mutex<Vec<(ab::Direction, Duration, bool)>>> = Arc::default();
+    let (render_calls, capture_calls) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let render: ab::RenderCallback = {
+        let (slot, stops, calls, observed) = (Arc::clone(&render_slot), Arc::clone(&stops), Arc::clone(&render_calls), Arc::clone(&rig.observed));
+        Box::new(move |block| {
+            block.render(&mut |chunk| chunk.fill(0.0));
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                let (took, driver_stopped) = stop_from_inside(&slot, &observed);
+                stops.lock().unwrap().push((ab::Direction::Output, took, driver_stopped));
+            }
+        })
+    };
+    let capture: ab::CaptureCallback = {
+        let (slot, stops, calls, observed) = (Arc::clone(&capture_slot), Arc::clone(&stops), Arc::clone(&capture_calls), Arc::clone(&rig.observed));
+        Box::new(move |block| {
+            block.chunks(&mut |_, _| {});
+            if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                let (took, driver_stopped) = stop_from_inside(&slot, &observed);
+                stops.lock().unwrap().push((ab::Direction::Input, took, driver_stopped));
+            }
+        })
+    };
+    let (c, _) = rig
+        .backend
+        .open_stream(&rig.endpoint, &request(&rig, ab::Direction::Input, 48_000, Some(64)), Callback::Capture(capture), error_cb(&seen, ab::Direction::Input))
+        .expect("open capture");
+    let (r, _) = rig
+        .backend
+        .open_stream(&rig.endpoint, &request(&rig, ab::Direction::Output, 48_000, Some(64)), Callback::Render(render), error_cb(&seen, ab::Direction::Output))
+        .expect("open render");
+    *capture_slot.lock().unwrap() = Some(c);
+    *render_slot.lock().unwrap() = Some(r);
+    for slot in [&capture_slot, &render_slot] {
+        ab::Stream::start(slot.lock().unwrap().as_ref().unwrap()).expect("start");
+    }
+    // The second render callback stops its own stream; the capture keeps the driver running.
+    drive(&rig, 64, 0, 2, &[]);
+    drive(&rig, 64, 128, 1, &[]);
+    assert_eq!(render_calls.load(Ordering::SeqCst), 2, "no render callback after the stop from inside it");
+    assert_eq!(capture_calls.load(Ordering::SeqCst), 3);
+    // The third capture callback stopped the last running stream: the host stops the driver once
+    // the buffer switch has returned, never from inside it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !rig.observed.call_names().contains(&"stop") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let stops = stops.lock().unwrap().clone();
+    assert_eq!(stops.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(), [ab::Direction::Output, ab::Direction::Input]);
+    for (direction, took, driver_stopped) in &stops {
+        assert!(*took < Duration::from_millis(100), "{direction:?}: stop returned at once, not after the host: {took:?}");
+        assert!(!driver_stopped, "{direction:?}: the driver's stop was not called from inside its buffer switch");
+    }
+    let calls = rig.observed.calls.lock().unwrap().clone();
+    let (_, thread) = calls.iter().find(|(n, _)| *n == "stop").expect("the host stopped the driver");
+    assert_ne!(*thread, std::thread::current().id(), "on the host thread, not the driver's");
+    drive(&rig, 64, 192, 1, &[]);
+    assert_eq!((render_calls.load(Ordering::SeqCst), capture_calls.load(Ordering::SeqCst)), (2, 3), "nothing called after the stops");
+    assert!(seen.errors.lock().unwrap().is_empty());
+    let (c, r) = (capture_slot.lock().unwrap().take(), render_slot.lock().unwrap().take());
+    drop((c, r));
+    assert!(!testing::installed(), "the session ended with its streams");
+}
+
 #[test]
 fn latencies_changed_refetches_on_the_host_thread() {
     let _guard = lock();
