@@ -159,7 +159,7 @@ impl StudioApp {
     }
 
     /// Run `f` as one undo step; when it fails, take back what it did.
-    fn composite<T>(&mut self, what: &str, f: impl FnOnce(&mut StudioApp, &str) -> Result<T, EngineError>) -> Result<T, String> {
+    pub(crate) fn composite<T>(&mut self, what: &str, f: impl FnOnce(&mut StudioApp, &str) -> Result<T, EngineError>) -> Result<T, String> {
         let before = self.engine.session_arc();
         self.arrange.serial += 1;
         let key = format!("group:{what}:{}", self.arrange.serial);
@@ -199,6 +199,35 @@ impl StudioApp {
     pub fn group_selected(&mut self) -> Result<TrackId, String> {
         let tracks = self.chosen_tracks();
         self.group_tracks(&tracks)
+    }
+
+    /// Track > New Group Track, the header menu's entry and "+ Group": an empty folder ("Group n"),
+    /// appended like every other new track, selected and focused. One undo step.
+    pub fn new_group_track(&mut self) -> Result<TrackId, String> {
+        let s = self.engine.session_arc();
+        let name = (1..).map(|i| format!("Group {i}")).find(|n| s.track_by_name(n).is_none()).unwrap_or_else(|| "Group".into());
+        let r = self.add_track_with(json!({"kind": "folder", "name": name}))?;
+        let id = TrackId(r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64).unwrap_or(0));
+        if self.engine.session().track(id).is_none() {
+            return Err("New Group Track: the engine made no track".into());
+        }
+        self.ui.collapsed.retain(|x| *x != id);
+        self.focus(id);
+        self.status = format!("Added {name}");
+        Ok(id)
+    }
+
+    /// Track > Edit Group: the Pro Tools style edit/mix group (`track.group`) over `tracks`,
+    /// named "Group n" by the engine. Not the folder `Group Tracks` makes.
+    pub fn edit_group(&mut self, tracks: &[TrackId]) -> Result<Value, String> {
+        if tracks.is_empty() {
+            self.status = "Edit Group: select the tracks first".into();
+            return Err(self.status.clone());
+        }
+        let list: Vec<u64> = tracks.iter().map(|t| t.0).collect();
+        let r = self.run("track.group", json!({"tracks": list, "edit": true, "mix": true}))?;
+        self.status = format!("Edit group of {} track{}", list.len(), if list.len() == 1 { "" } else { "s" });
+        Ok(r)
     }
 
     /// Make a group ("Group n") of `tracks`, placed where the first of them was, as one undo step.
@@ -535,14 +564,26 @@ pub fn menu_items(app: &mut StudioApp, ui: &mut egui::Ui, on: Option<TrackId>) {
         }
         _ => app.ungroup_targets(),
     };
+    let new = ui.button("New Group Track");
     let group =
         ui.add_enabled(!tracks.is_empty(), egui::Button::new("Group Tracks").shortcut_text(crate::shortcuts::label(crate::shortcuts::Action::Group)));
     let ungroup =
         ui.add_enabled(!groups.is_empty(), egui::Button::new("Ungroup").shortcut_text(crate::shortcuts::label(crate::shortcuts::Action::Ungroup)));
+    let edit = ui.add_enabled(!tracks.is_empty(), egui::Button::new("Edit Group…"));
     let list = if on.is_some() { &mut app.arrange.menu } else { &mut app.arrange.bar_menu };
-    list.retain(|m| m.label != "Group Tracks" && m.label != "Ungroup");
+    list.retain(|m| !matches!(m.label.as_str(), "Group Tracks" | "Ungroup" | "New Group Track" | "Edit Group…"));
+    list.push(crate::mixer::MenuItem::at(ui, "New Group Track".into(), String::new(), new.rect));
+    list.push(crate::mixer::MenuItem::at(ui, "Edit Group…".into(), String::new(), edit.rect));
     list.push(crate::mixer::MenuItem::at(ui, "Group Tracks".into(), String::new(), group.rect));
     list.push(crate::mixer::MenuItem::at(ui, "Ungroup".into(), String::new(), ungroup.rect));
+    if new.clicked() {
+        let _ = app.new_group_track();
+        ui.close();
+    }
+    if edit.clicked() {
+        let _ = app.edit_group(&tracks);
+        ui.close();
+    }
     if group.clicked() {
         let _ = app.group_tracks(&tracks);
         ui.close();

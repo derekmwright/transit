@@ -9,7 +9,7 @@ fn press(h: &mut Harness<'_, SoundApp>, pos: Pos2, pressed: bool) {
     h.run_steps(2);
 }
 
-/// #399: in Track > Group..., dragging down the Tracks list adds every track it passes, and OK
+/// #399: in Track > Edit Group..., dragging down the Tracks list adds every track it passes, and OK
 /// groups them all.
 #[test]
 fn dragging_down_the_group_dialogs_track_list_adds_each_track() {
@@ -17,7 +17,7 @@ fn dragging_down_the_group_dialogs_track_list_adds_each_track() {
     let tracks: Vec<(u64, String)> = app.engine.session().tracks.iter().map(|t| (t.id.0, t.name.clone())).collect();
     assert!(tracks.len() >= 4);
     app.run("edit.select", json!({"tracks": [tracks[0].0], "exact": true})).unwrap();
-    menus::invoke_menu(&mut app, "track.group", "Track > Group...");
+    menus::invoke_menu(&mut app, "track.group", "Track > Edit Group...");
     let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
         |ui, app: &mut SoundApp| {
             let ctx = ui.ctx().clone();

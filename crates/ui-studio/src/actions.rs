@@ -511,7 +511,7 @@ impl StudioApp {
         self.add_track_with(json!({"kind": "audio", "format": format}))
     }
 
-    fn add_track_with(&mut self, p: Value) -> Result<Value, String> {
+    pub(crate) fn add_track_with(&mut self, p: Value) -> Result<Value, String> {
         let r = self.run("track.new", p)?;
         if let Some(id) = r.get("tracks").and_then(|t| t.get(0)).and_then(Value::as_u64) {
             let at = self.cursor();

@@ -142,6 +142,8 @@ pub struct Layout {
     pub add_audio: R4,
     pub add_instrument: R4,
     pub add_midi: R4,
+    pub add_group: R4,
+    pub add_more: R4,
     /// Transport bar buttons (`play`, `stop`, `record`, `rtz`, `cycle`).
     pub transport: std::collections::BTreeMap<String, R4>,
     /// The icon each transport button shows (its Lucide name, e.g. `play`).
@@ -320,6 +322,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let add_a = Rect::from_min_size(pos2(list.min.x + 8.0, below), vec2((hw - 24.0) / 2.0, 22.0));
     let add_i = Rect::from_min_size(pos2(add_a.max.x + 8.0, below), add_a.size());
     let add_m = Rect::from_min_size(pos2(add_a.min.x, below + 30.0), add_a.size());
+    let add_g = Rect::from_min_size(pos2(add_i.min.x, below + 30.0), add_a.size());
+    let add_more = Rect::from_min_size(pos2(add_a.min.x, below + 60.0), add_a.size());
     if add_a.min.y < list.max.y {
         let clip = ui.painter().with_clip_rect(list);
         // Audio adds a mono track (the common case: one guitar or mic); its chevron picks mono or stereo.
@@ -357,10 +361,32 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         if resp.clicked() {
             let _ = app.add_track("midi");
         }
+        let resp = ui.interact(add_g.intersect(list), ui.id().with("add_group"), Sense::click());
+        clip.rect_filled(add_g, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        crate::icons::paint_labeled(&clip, add_g, false, crate::icons::Icon::Plus, 12.0, "Group", FontId::proportional(12.0), TOKENS.text);
+        if resp.clicked() {
+            let _ = app.new_group_track();
+        }
+        // "+ ..." lists the kinds the quick buttons leave out (the studio has no New Track dialog).
+        let resp = ui.interact(add_more.intersect(list), ui.id().with("add_more"), Sense::click());
+        clip.rect_filled(add_more, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+        crate::icons::paint_labeled(&clip, add_more, false, crate::icons::Icon::Plus, 12.0, "…", FontId::proportional(12.0), TOKENS.text);
+        egui::Popup::menu(&resp).width(130.0).show(|ui| {
+            if ui.button("Stereo Audio Track").clicked() {
+                let _ = app.add_audio_track("stereo");
+                ui.close();
+            }
+            if ui.button("FX Channel").clicked() {
+                let _ = app.add_fx_channel();
+                ui.close();
+            }
+        });
     }
     layout.add_audio = r4(add_a);
     layout.add_instrument = r4(add_i);
     layout.add_midi = r4(add_m);
+    layout.add_group = r4(add_g);
+    layout.add_more = r4(add_more);
     ui.painter().line_segment([pos2(list.max.x, full.min.y), pos2(list.max.x, full.max.y)], Stroke::new(1.0, TOKENS.line));
 
     grid_and_ruler(app, ui, &s, map, ruler, tl);

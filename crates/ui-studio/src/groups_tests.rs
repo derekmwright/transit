@@ -580,3 +580,72 @@ fn ungroup_reroutes_an_outside_track_that_fed_the_group_bus() {
     assert_eq!(t.app.status, "Ungrouped Group 1; C now outputs to Main");
     assert_eq!(t.undo_len(), u0 + 1);
 }
+
+#[test]
+fn new_group_track_is_an_empty_selected_folder_in_one_undo_step() {
+    let mut t = T::new();
+    let u0 = t.undo_len();
+    let g = t.app.new_group_track().unwrap();
+    let s = t.app.engine.session();
+    assert_eq!(s.track(g).unwrap().kind, TrackKind::Folder);
+    assert_eq!(s.track(g).unwrap().name, "Group 1");
+    assert!(s.tracks.iter().all(|x| x.folder != Some(g)), "empty");
+    assert_eq!(s.edit.selected_tracks, vec![g]);
+    assert_eq!(t.app.focus_track(), Some(g));
+    assert_eq!(t.undo_len(), u0 + 1);
+    let g2 = t.app.new_group_track().unwrap();
+    assert_eq!(t.app.engine.session().track(g2).unwrap().name, "Group 2");
+}
+
+#[test]
+fn quick_add_buttons_create_the_right_kinds() {
+    let mut t = T::new();
+    // Room for the buttons below the rows.
+    t.app.ui.show_mixer = false;
+    t.app.ui.show_devices = false;
+    t.frames(4);
+    for (name, kind) in [("audio", TrackKind::Audio), ("instrument", TrackKind::Instrument), ("midi", TrackKind::Midi), ("group", TrackKind::Folder)]
+    {
+        // The buttons sit below the rows: they move down as tracks arrive.
+        let l = t.app.arrange.layout.clone();
+        let rect = match name {
+            "audio" => l.add_audio,
+            "instrument" => l.add_instrument,
+            "midi" => l.add_midi,
+            _ => l.add_group,
+        };
+        let n = t.app.engine.session().tracks.len();
+        // The audio button's chevron sits at its right end: click left of it.
+        let at = if name == "audio" { (rect[0] + 10.0, (rect[1] + rect[3]) / 2.0) } else { mid(rect) };
+        t.click(at, json!({}));
+        let s = t.app.engine.session();
+        assert_eq!(s.tracks.len(), n + 1, "{name}: one track");
+        assert_eq!(s.tracks.last().unwrap().kind, kind, "{name}");
+        t.frames(2);
+    }
+    let first = t.app.arrange.layout.add_audio;
+    let more = t.app.arrange.layout.add_more;
+    assert!(more[1] > first[3], "the small button wraps into a row of its own");
+    let w = t.app.ui.header_width;
+    assert!(more[2] <= t.app.arrange.layout.track_list[0] + w, "inside the header column");
+}
+
+#[test]
+fn the_track_menus_offer_new_group_track_and_edit_group() {
+    let mut t = T::new();
+    t.right_click(t.header(t.b, 0.5));
+    let item = |t: &T, l: &str| t.app.arrange.menu.iter().find(|m| m.label == l).map(|m| mid(m.rect));
+    let new = item(&t, "New Group Track").expect("header menu has New Group Track");
+    assert!(item(&t, "Edit Group…").is_some());
+    t.click(new, json!({}));
+    assert_eq!(t.groups().len(), 1);
+    assert_eq!(t.app.engine.session().groups.len(), 0);
+    t.click(t.header(t.a, 0.5), json!({}));
+    t.click(t.header(t.b, 0.5), json!({"shift": true}));
+    let u0 = t.undo_len();
+    t.app.edit_group(&[t.a, t.b]).unwrap();
+    let s = t.app.engine.session();
+    assert_eq!(s.groups.len(), 1, "an edit/mix group, not a folder");
+    assert_eq!(s.groups[0].members.len(), 2);
+    assert_eq!(t.undo_len(), u0 + 1);
+}

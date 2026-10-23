@@ -1423,7 +1423,7 @@ pub(crate) fn track_context_menu(app: &mut SoundApp, ui: &mut Ui, id: TrackId) {
         ("Unfreeze", "track.unfreeze"),
         ("Flatten", "track.flatten"),
         ("Move to New Folder...", "track.move_to_new_folder"),
-        ("Group...", "track.group"),
+        ("Edit Group...", "track.group"),
     ];
     let selection: Vec<u64> = {
         let selected = &app.engine.session().edit.selected_tracks;

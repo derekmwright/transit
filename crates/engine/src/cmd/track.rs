@@ -16,7 +16,7 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             new_track
         ),
-        cmd!("track.group", "Group...", ["Track"], Some("Cmd+G"), "{name?, tracks?, edit?: true, mix?: true}", has_selection, group),
+        cmd!("track.group", "Edit Group...", ["Track"], Some("Cmd+Shift+G"), "{name?, tracks?, edit?: true, mix?: true}", has_selection, group),
         cmd!("track.ungroup", "Delete Group", [], None, "{group: id|name}", always, delete_group),
         cmd!("track.group_toggle", "Toggle Group Active", [], None, "{group: id|name}", always, toggle_group),
         cmd!(
