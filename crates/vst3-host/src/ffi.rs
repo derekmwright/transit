@@ -132,22 +132,33 @@ static MODULES_EXITED: AtomicBool = AtomicBool::new(false);
 
 /// Where a module's entry ran. Its exit must run on the same thread: Qt-based modules tie their
 /// application object to it (Native Instruments' Massive X crashes in `bundleExit` on another
-/// thread). Modules wanted on the main thread are entered there; any other thread's requests go
-/// to the module thread, because the asking thread may be gone by the time the process exits.
+/// thread). Modules wanted on a plug-in main thread (the thread named `main`, or one that called
+/// [`adopt_main_thread`], the host thread of ADR 0018) are entered there; any other thread's
+/// requests go to the module thread, because the asking thread may be gone by the time the
+/// process exits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntryThread {
-    Main,
+    /// A plug-in main thread, by its OS id ([`os_thread`]).
+    Here(usize),
     Modules,
 }
 
-/// Whether this is the main thread. Not for exit handlers, where `std::thread::current` panics
-/// (its thread-local data is gone by then): compare [`os_thread`] with [`MAIN_OS_THREAD`] there.
-fn on_main_thread() -> bool {
-    std::thread::current().name() == Some("main")
+thread_local! {
+    /// This thread called [`adopt_main_thread`]. `const`-initialized and without a destructor.
+    static ADOPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The OS id of the main thread, recorded when it loads a module (0 until then).
-static MAIN_OS_THREAD: AtomicUsize = AtomicUsize::new(0);
+/// Makes the calling thread a plug-in main thread for module entry and exit (see [`EntryThread`]).
+pub(crate) fn adopt_main_thread() {
+    ADOPTED.with(|a| a.set(true));
+}
+
+/// Whether this is a plug-in main thread. Not for exit handlers, where `std::thread::current`
+/// panics (its thread-local data is gone by then): compare [`os_thread`] with a bundle's
+/// [`EntryThread::Here`] there.
+fn on_main_thread() -> bool {
+    ADOPTED.with(std::cell::Cell::get) || std::thread::current().name() == Some("main")
+}
 
 /// The OS id of the calling thread, which (unlike `std::thread::current`) exit handlers can use.
 fn os_thread() -> usize {
@@ -319,27 +330,27 @@ fn open_library(bundle: &Path, exe: &Path) -> Result<(libloading::Library, Optio
 /// entry. VST3 modules expect their exit before their static destructors run, and some crash in
 /// those destructors without it (seen with Steinberg's HALion Sonic, after a plain scan). A module
 /// with a live instance or leaked objects keeps running and is not exited, and so is one entered
-/// on the main thread when the process exits from another thread. Runs once; later loads are
-/// refused.
+/// on another plug-in main thread than the calling one (that thread's own call exits it). The
+/// first call refuses later loads.
 pub(crate) fn exit_modules() {
-    if MODULES_EXITED.swap(true, Ordering::AcqRel) {
-        return;
-    }
+    // Later loads are refused. A later call (another main thread, or the exit handler) still
+    // exits what is left that it may: each bundle is exited at most once, it leaves the cache.
+    MODULES_EXITED.store(true, Ordering::Release);
     let mut cache = match loaded().try_lock() {
         Ok(g) => g,
         Err(TryLockError::Poisoned(p)) => p.into_inner(),
         // Another thread is loading a module right now: leave every module as it is.
         Err(TryLockError::WouldBlock) => return,
     };
-    let main = MAIN_OS_THREAD.load(Ordering::Acquire) == os_thread();
+    let me = EntryThread::Here(os_thread());
     let (mut kept, mut here, mut there) = (Vec::new(), Vec::new(), Vec::new());
     while let Some((path, b)) = cache.pop() {
-        if b.leaked.load(Ordering::Acquire) || (b.entered_on == EntryThread::Main && !main) {
+        if b.leaked.load(Ordering::Acquire) || (b.entered_on != EntryThread::Modules && b.entered_on != me) {
             kept.push((path, b));
             continue;
         }
         match Arc::try_unwrap(b) {
-            Ok(bundle) if bundle.entered_on == EntryThread::Main => here.push(bundle),
+            Ok(bundle) if bundle.entered_on == me => here.push(bundle),
             Ok(bundle) => there.push(bundle),
             Err(b) => kept.push((path, b)),
         }
@@ -384,8 +395,7 @@ impl Bundle {
             return Err(err("plugin hosting has shut down"));
         }
         let b = if on_main_thread() {
-            MAIN_OS_THREAD.store(os_thread(), Ordering::Release);
-            Bundle::open(path, EntryThread::Main)?
+            Bundle::open(path, EntryThread::Here(os_thread()))?
         } else {
             let p = path.to_path_buf();
             on_module_thread(move || Bundle::open(&p, EntryThread::Modules), None).ok_or_else(|| err("the module thread is not running"))??

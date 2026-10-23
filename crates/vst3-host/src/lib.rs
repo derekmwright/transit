@@ -121,6 +121,7 @@ pub enum Vst3Error {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod api {
+    pub(crate) use super::ffi::adopt_main_thread;
     pub(crate) use super::ffi::exit_modules as shutdown;
     pub(crate) use super::plugin::service_requests;
     pub use super::registry::*;
@@ -176,6 +177,7 @@ mod api {
         None
     }
     pub fn shutdown() {}
+    pub fn adopt_main_thread() {}
     pub fn service_requests() -> Serviced {
         Serviced::default()
     }
@@ -325,12 +327,21 @@ pub fn cached() -> Option<Vec<Vst3Descriptor>> {
 }
 
 /// Shuts plugin hosting down: runs the module exit of every loaded binary that has no live
-/// instance left, each on the thread that loaded it; later loads fail. Call it on the main
-/// thread once the plugin instances are gone, before the process exits. Without it the exits
+/// instance left and was entered on the calling thread or the module thread; later loads fail.
+/// Call it on each plug-in main thread (the main thread, and the plug-in host thread, see
+/// [`adopt_main_thread`]) once the plugin instances are gone, before the process exits. Without it the exits
 /// run from an exit handler, by which time some plugins have already torn down state they need
 /// (HALion Sonic crashes in its module exit after it has been used).
 pub fn shutdown() {
     api::shutdown()
+}
+
+/// Makes the calling thread a plug-in main thread, like the thread named `main`: the modules it
+/// loads run their entry on it, and their exit when it calls [`shutdown`]. The plug-in host
+/// thread (ADR 0018) calls it before it loads anything, so that the module entry, the instances
+/// and their editors share one thread.
+pub fn adopt_main_thread() {
+    api::adopt_main_thread()
 }
 
 /// The audio module classes in one `.vst3` bundle or file.
