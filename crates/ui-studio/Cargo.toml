@@ -29,6 +29,7 @@ image.workspace = true
 [dev-dependencies]
 soundcraft-playback = { workspace = true, features = ["test-hooks"] }
 soundcraft-clap-host = { workspace = true, features = ["test-hooks"] }
+soundcraft-vst3-host = { workspace = true, features = ["test-hooks"] }
 transit-audio-backend.workspace = true
 
 [lints]

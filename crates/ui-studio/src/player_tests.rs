@@ -225,6 +225,24 @@ mod reopen_state {
     fn state(gain: f64) -> Vec<u8> {
         [gain.to_le_bytes(), 0.0f64.to_le_bytes()].concat()
     }
+    /// Frames until the player's instances are made on the plug-in host thread (ADR 0018) and
+    /// its plan is confirmed for the app's document, then a few more.
+    fn settle(app: &mut StudioApp, track: soundcraft_model::TrackId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut extra = 4;
+        while extra > 0 {
+            app.player.as_ref().unwrap().step_device_free();
+            app.apply_editor_edits();
+            app.poll_player();
+            app.sync_player_session();
+            let p = app.player.as_ref().unwrap();
+            if !p.any_loading() && p.has_editor(track, 0) && p.capture_states(&app.engine.session_arc()).is_ok() {
+                extra -= 1;
+            }
+            assert!(std::time::Instant::now() < deadline, "the fixture never loaded");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     #[test]
     fn audio_reopen_preserves_live_state_and_refuses_pending_document_without_teardown() {
         // The host registry is process-global. Keep this real CLAP fixture out
@@ -233,13 +251,15 @@ mod reopen_state {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "player_tests::reopen_state::audio_reopen_preserves_live_state_and_refuses_pending_document_without_teardown",
+                    "host::player_tests::reopen_state::audio_reopen_preserves_live_state_and_refuses_pending_document_without_teardown",
                     "--nocapture",
                 ])
                 .env("TRANSIT_REOPEN_FIXTURE_CHILD", "1")
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            // The filter must name the test exactly, or the child runs nothing and passes.
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the child ran no test");
             return;
         }
         fixture();
@@ -251,34 +271,30 @@ mod reopen_state {
         session.track_mut(track).unwrap().mixer.inserts[0] = Some(insert);
         let player = soundcraft_playback::Player::prepare_device_free(engine.session_arc()).unwrap();
         let mut app = StudioApp::new(engine, Some(player), crate::Services::default());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
+        settle(&mut app, track);
         let player = app.player.as_ref().unwrap();
-        player.open_editor(track, 0).unwrap(); // fixture's window-free GUI edits gain
-        player.step_device_free();
-        let before = player.capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+        // The fixture's window-free GUI edits gain when it opens; the edit reaches the plug-in's
+        // state with the next block. The open runs on the plug-in host thread (ADR 0018), so
+        // render until the state read through that thread shows it.
+        player.open_editor(track, 0).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let before = loop {
+            let player = app.player.as_ref().unwrap();
+            player.step_device_free();
+            let now = player.capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
+            if now == state(0.25) || std::time::Instant::now() > deadline {
+                break now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert_eq!(before, state(0.25));
         assert_eq!(app.engine.session().track(track).unwrap().mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap(), state(1.0));
         assert!(app.reconnect_audio_using(true, |session, _| soundcraft_playback::Player::prepare_device_free(session).unwrap()).unwrap());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
+        settle(&mut app, track);
         let after = app.player.as_ref().unwrap().capture_states(&app.engine.session_arc()).unwrap()[0].2.clone();
         assert_eq!(after, before, "Apply audio discarded unsaved native plug-in state");
         assert!(app.reconnect_audio_using(true, |session, _| soundcraft_playback::Player::prepare_device_free(session).unwrap()).unwrap());
-        for _ in 0..4 {
-            app.player.as_ref().unwrap().step_device_free();
-            app.apply_editor_edits();
-            app.poll_player();
-            app.sync_player_session();
-        }
+        settle(&mut app, track);
         let confirmed = app.engine.session_arc();
         assert_eq!(app.player.as_ref().unwrap().capture_states(&confirmed).unwrap()[0].2, before);
         app.engine.session_mut().track_mut(track).unwrap().name = "Pending".into();
