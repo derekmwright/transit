@@ -247,7 +247,9 @@ impl PluginEditor for RemoteEditor {
 
     fn is_open(&self) -> bool {
         let shared = &self.token.shared;
-        shared.open.load(Ordering::Acquire) || shared.opening.load(Ordering::Acquire)
+        // An open still on its way counts only while its thread can run it (a wedged thread's
+        // pending open would otherwise read open forever; it clears the flag when it returns).
+        shared.open.load(Ordering::Acquire) || (shared.opening.load(Ordering::Acquire) && self.token.worker.responsive())
     }
 
     fn idle(&mut self) -> Vec<(String, f32)> {

@@ -11,11 +11,14 @@
 //! and whose drop sends the instance back to its host thread to be destroyed there. Its editor
 //! and state reader stay on the host thread; the wrapper hands out proxies that send requests.
 //!
-//! **Stuck plug-ins.** A job (or a tick, or a window message) that runs longer than
-//! [`Config::timeout`] wedges its thread: [`Host::check`] marks it, starts a fresh host thread for
-//! new jobs, and moves the jobs that had not started to it. The wedged thread is abandoned, never
-//! joined; its instances are leaked rather than destroyed elsewhere. If the call returns, the
-//! thread goes on serving its own instances.
+//! **Stuck plug-ins.** A job or tick that runs longer than [`Config::timeout`], or a window
+//! message (a plug-in's modal dialog runs inside one) that runs longer than
+//! [`Config::dispatch_timeout`], wedges its thread: [`Host::check`] marks it, starts a fresh host
+//! thread for new creations, and moves the creations that had not started to it. A wedged
+//! thread is never joined. **When the call returns, the thread is responsive again** and goes on
+//! serving its own instances (state reads, editors, destruction); only new creations stay on the
+//! fresh thread. A thread that never returns keeps its instances, leaked rather than destroyed
+//! elsewhere.
 //!
 //! **Inline mode.** On macOS (AppKit wants editors on the process main thread, and both SDKs want
 //! the editor and the instance on one thread) and on `wasm32` the host runs every job at once on
@@ -39,6 +42,9 @@ use hosted::EditorShared;
 
 /// How long a request may run before its host thread counts as wedged (ADR 0018).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one window-message dispatch (a modal dialog) may run before its thread counts as
+/// wedged.
+pub const DEFAULT_DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the host thread services plug-in requests and editor `idle` calls.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(15);
 
@@ -73,8 +79,12 @@ impl Hooks {
 /// How a [`Host`] runs.
 #[derive(Clone)]
 pub struct Config {
-    /// Longest a job, tick or message dispatch may run before the thread counts as wedged.
+    /// Longest a job or tick may run before the thread counts as wedged.
     pub timeout: Duration,
+    /// Longest one window-message dispatch may run before the thread counts as wedged. Longer
+    /// than `timeout`: a plug-in's modal file dialog or message box runs inside a dispatch for as
+    /// long as the user leaves it open.
+    pub dispatch_timeout: Duration,
     /// Period of the request servicing and editor `idle` calls.
     pub tick: Duration,
     pub hooks: Hooks,
@@ -86,6 +96,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             timeout: DEFAULT_TIMEOUT,
+            dispatch_timeout: DEFAULT_DISPATCH_TIMEOUT,
             tick: DEFAULT_TICK,
             hooks: Hooks::default(),
             inline: cfg!(any(target_os = "macos", target_arch = "wasm32")),
@@ -120,6 +131,9 @@ pub(crate) struct Worker {
     epoch: Instant,
     /// Milliseconds since `epoch` plus one when the current job, tick or dispatch began; 0 idle.
     busy_since: AtomicU64,
+    /// The current busy section is a window-message dispatch (its own, longer budget).
+    dispatching: AtomicBool,
+    /// Busy past its budget and not yet back; cleared as soon as the call returns.
     wedged: AtomicBool,
     /// The thread's loop runs (false once it has shut down).
     running: AtomicBool,
@@ -142,10 +156,25 @@ impl Worker {
     }
 
     fn busy<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.busy_as(false, f)
+    }
+
+    /// Runs `f` on the clock (`dispatch`: the window-message budget). A thread marked wedged
+    /// meanwhile is responsive again once `f` returns: it was slow, not stuck.
+    fn busy_as<R>(&self, dispatch: bool, f: impl FnOnce() -> R) -> R {
+        self.dispatching.store(dispatch, Ordering::Release);
         self.busy_since.store(self.now_ms() + 1, Ordering::Release);
         let r = f();
         self.busy_since.store(0, Ordering::Release);
+        if self.wedged.swap(false, Ordering::AcqRel) {
+            log::warn!("plug-in host: a host thread that was not responding has returned; its plug-ins are reachable again");
+        }
         r
+    }
+
+    /// The budget of the current busy section.
+    fn budget(&self, config: &Config) -> Duration {
+        if self.dispatching.load(Ordering::Acquire) { config.dispatch_timeout } else { config.timeout }
     }
 
     /// Queues a job; `Err` gives it back when the thread is gone.
@@ -420,6 +449,7 @@ impl Host {
             waker,
             epoch: Instant::now(),
             busy_since: AtomicU64::new(0),
+            dispatching: AtomicBool::new(false),
             wedged: AtomicBool::new(false),
             running: AtomicBool::new(true),
             movable: Mutex::new(Vec::new()),
@@ -506,15 +536,28 @@ impl Host {
     /// timeout, it is marked, a fresh thread takes over, and the creation jobs it had not started
     /// move there. Cheap; the UI calls it every frame (polling a [`Pending`] does too).
     pub fn check(&self) {
-        let Some(current) = lock(&self.inner.current).clone() else { return };
-        if current.wedged.load(Ordering::Acquire) || current.busy_for().is_none_or(|d| d < self.inner.config.timeout) {
+        let current = lock(&self.inner.current).clone();
+        // A thread that is no longer current (it wedged once and came back) is only marked: its
+        // state reads and editors answer at once while it is stuck again.
+        for w in lock(&self.inner.workers).iter() {
+            if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, w)) || w.wedged.load(Ordering::Acquire) {
+                continue;
+            }
+            if w.busy_for().is_some_and(|d| d >= w.budget(&self.inner.config)) {
+                w.wedged.store(true, Ordering::Release);
+                self.inner.wedged.fetch_add(1, Ordering::AcqRel);
+                log::error!("plug-in host: an older host thread stopped responding; its plug-ins are unreachable until it returns");
+            }
+        }
+        let Some(current) = current else { return };
+        let budget = current.budget(&self.inner.config);
+        if current.wedged.load(Ordering::Acquire) || current.busy_for().is_none_or(|d| d < budget) {
             return;
         }
         current.wedged.store(true, Ordering::Release);
         self.inner.wedged.fetch_add(1, Ordering::AcqRel);
         log::error!(
-            "plug-in host: a plug-in has not returned for {:?}; its host thread is abandoned and a new one takes over",
-            self.inner.config.timeout
+            "plug-in host: a plug-in has not returned for {budget:?}; a new host thread takes over new plug-ins, and the old one's plug-ins are unreachable until it returns"
         );
         if self.inner.closed.load(Ordering::Acquire) {
             return;
@@ -530,9 +573,16 @@ impl Host {
         }
     }
 
-    /// How many host threads have wedged so far (the status line says so while it is not 0).
+    /// How many host threads are wedged now (busy past their budget and not yet returned). The
+    /// status line says so while it is not 0; it goes back down when a thread returns.
     #[must_use]
     pub fn wedged(&self) -> usize {
+        lock(&self.inner.workers).iter().filter(|w| w.running.load(Ordering::Acquire) && w.wedged.load(Ordering::Acquire)).count()
+    }
+
+    /// How many times a host thread has wedged in this process (returned or not).
+    #[must_use]
+    pub fn wedges(&self) -> usize {
         self.inner.wedged.load(Ordering::Acquire)
     }
 
@@ -581,7 +631,7 @@ fn run(worker: &Arc<Worker>, rx: &mpsc::Receiver<Arc<JobCell>>, queue: &MessageQ
         if ctx.exit {
             break;
         }
-        worker.busy(|| catch_unwind(AssertUnwindSafe(|| queue.dispatch(256))).is_ok());
+        worker.busy_as(true, || catch_unwind(AssertUnwindSafe(|| queue.dispatch(256))).is_ok());
         if last_tick.elapsed() >= config.tick {
             last_tick = Instant::now();
             worker.busy(|| {
@@ -597,6 +647,11 @@ fn run(worker: &Arc<Worker>, rx: &mpsc::Receiver<Arc<JobCell>>, queue: &MessageQ
         queue.wait(config.tick.saturating_sub(last_tick.elapsed()).max(Duration::from_millis(1)));
     }
     worker.running.store(false, Ordering::Release);
+    // Jobs queued behind the shutdown (an instance dropped late) are leaked: their plug-ins'
+    // modules have exited, and the apartment ends with this thread.
+    while let Ok(cell) = rx.try_recv() {
+        std::mem::forget(cell.take());
+    }
     drop(ctx);
 }
 
