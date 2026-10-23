@@ -165,9 +165,11 @@ L is the effective compensation offset for the chain: what an External Instrumen
 land the synth on the grid. It does **not** isolate MIDI transport accuracy. The instant the OS and
 the interface actually transmit the bytes is not observable here. The send instant is
 sample-accurate only in the scheduling and timestamp sense. No audio output is in the chain, so the
-driver's output latency plays no part. The run also prints L minus the driver's reported input
+driver's output latency plays no part. The input side is counted from the driver's position time,
+so "audio input" means the driver's input latency plus any constant offset between the driver's
+position time and its callback dispatch. The run also prints L minus the driver's reported input
 latency, as an *estimate* of MIDI delivery plus synth response. The driver's figure is unverified
-(known issue K31).
+(known issue K31), and the dispatch offset is not in it.
 
 Wiring: the interface's (or a USB) MIDI out goes to the synth's MIDI in, and the synth's audio out
 goes to an interface input (`--in 1`, or `--in 1,2` to sum a stereo pair). Set the synth to a patch
@@ -188,19 +190,32 @@ Method:
 - **Send instant.** The control thread reads the host clock (`HostOrigin`, QPC) right before the
   send call. A `ClockFitter` (the clock map the app's MIDI output thread uses, ADR 0017) is fitted to
   the capture blocks' sample position, position time and arrival. That map turns the send instant
-  into the device's sample position: the position clock, not the presentation clock.
+  into the device's sample position: the position clock, not the presentation clock. The fit's
+  residual at each send is printed and written to the JSON. A send is refused when it is above
+  0.5 ms. The send call's own time is inside L, because the instant is read before the call.
 - **Onset.** The input is recorded by sample position. The detector takes a 0.25 ms causal envelope
   (the mean absolute value). Its threshold is the envelope peak of 100 ms of noise floor measured
   before the first note, plus 12 dB (never below -60 dBFS). The detector finds the first crossing,
   then refines it to the first sample where the envelope exceeds 10 percent of the attack's peak
   within the next 20 ms. That refined sample is the onset. The distance between the two crossings is
-  printed as the detector's uncertainty.
+  printed as the detector's uncertainty. It bounds the late side only: the true start, before the
+  threshold crossing, is not bounded. A trial whose onset lies more than 1 ms after its crossing
+  gets a slow-attack warning.
+- **Detector bias.** The onset is late by the attack's rise to 10 percent of its peak, plus up to one
+  envelope window less one sample (11 samples at 48 kHz) of envelope lag. The run prints this bias
+  on its own line. It is part of L, and nothing is subtracted for it. A fast attack keeps it to a
+  sample or two.
 - **Per trial.** The 100 ms before each send must be at the noise floor (within 6 dB). If not, the
   run is refused: the previous release is still sounding, so raise `--gap-ms` or shorten the release.
   A trial with no onset within `--max-ms` is also refused, with the level heard. That points to the
   channel, the port, the input or the level.
 - **Safety.** Every exit path sends the note-off and All Notes Off (CC 123) on the channel: errors, a
-  refusal and Ctrl+C included. A second Ctrl+C exits at once.
+  refusal and Ctrl+C included. The Ctrl+C handler only sets flags. The first press stops the run,
+  which releases the note and exits with status 130. A stop seen before a note-on means that note is
+  never sent, including a Ctrl+C during the device open. A further press exits at once only while
+  no note-on is outstanding. While one is, the press waits for the release. Closing the console
+  window, killing the process or a power loss are not covered. In those cases, silence the synth by
+  hand.
 
 The output lists every trial (samples, ms, detector uncertainty). It then gives the distribution:
 mean, median, min, max and standard deviation, with the trials beyond 2 standard deviations listed
