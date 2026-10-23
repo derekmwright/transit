@@ -215,6 +215,9 @@ pub struct PlanCompiler {
     io: Arc<IoMap>,
     /// Where the scope taps of the instances are found (see [`ScopeHub`]).
     scopes: Arc<ScopeHub>,
+    /// Vacant active slots the next compile asks the factory for again
+    /// ([`PlanCompiler::retry_vacant`]).
+    retry: Vec<(TrackId, usize)>,
 }
 
 /// The planned content of one slot cell.
@@ -418,6 +421,7 @@ impl PlanCompiler {
             loops: Vec::new(),
             io: Arc::new(IoMap::default()),
             scopes: Arc::new(ScopeHub::default()),
+            retry: Vec::new(),
         }
     }
 
@@ -471,9 +475,30 @@ impl PlanCompiler {
     pub fn reuses(&self, spec: &InstanceSpec) -> bool {
         let same = |o: &ShadowSlot| o.spec.id == spec.id && o.spec.uid == spec.uid && o.spec.ch == spec.ch;
         let key = (spec.track, spec.slot);
+        if self.retry.contains(&key) {
+            return false;
+        }
         self.active.slots.get(&key).is_some_and(same)
             || (spec.uid != 0 && self.active.slots.iter().any(|(k, o)| k.0 == spec.track && o.kind == CellKind::Insert && same(o)))
             || self.pool.iter().any(|p| p.key == key && p.spec == *spec)
+    }
+
+    /// Asks the next compile to call the factory again for `spec`'s slot, which the active plan
+    /// holds vacant because the factory made nothing for it then (issue #56: the control thread
+    /// left an instance it did not predict to be made on the plug-in host thread, and it is
+    /// ready now). [`Self::reuses`] is false for it until that compile. False when the active
+    /// plan has no vacant slot for this spec (the spec changed meanwhile).
+    pub fn retry_vacant(&mut self, spec: &InstanceSpec) -> bool {
+        let key = (spec.track, spec.slot);
+        let vacant = self
+            .active
+            .slots
+            .get(&key)
+            .is_some_and(|o| o.generation == SlotGen::VACANT && o.spec.id == spec.id && o.spec.uid == spec.uid && o.spec.ch == spec.ch);
+        if vacant && !self.retry.contains(&key) {
+            self.retry.push(key);
+        }
+        vacant
     }
 
     /// Every instance of the confirmed active plan, sorted. After a torn reclaim
@@ -679,7 +704,7 @@ impl PlanCompiler {
             log_loops(&session, &loops);
             self.loops = loops;
         }
-        if mode == CompileMode::Update && self.active.desc.as_ref() == Some(&description.desc) {
+        if mode == CompileMode::Update && self.active.desc.as_ref() == Some(&description.desc) && self.retry.is_empty() {
             let plan = PreparedPlan {
                 id,
                 session,
@@ -696,6 +721,8 @@ impl PlanCompiler {
             return Ok(PlanEnvelope::new(plan));
         }
         let built = self.build(&session, description, make, need, mode);
+        // A retry is for this compile only (made or not, the slot's outcome is in its shadow).
+        self.retry.clear();
         let BuiltPlan { tables, moves, attach, shadow } = match built {
             Ok(b) => b,
             Err(e) => {
@@ -836,15 +863,19 @@ impl PlanCompiler {
             && old.layout == layout
         {
             if old.generation == SlotGen::VACANT {
-                p.plan = SlotPlan::Absent;
-                return Ok(());
-            }
-            let sampler = old.spec.id == SAMPLER;
-            if old.sample == sample || sampler {
-                let applied = (long > 0 && long != old.heap).then_some(long);
-                let sample = (old.sample != sample).then(|| p.sample.clone());
-                p.plan = SlotPlan::Move { old: old_key, from: old.cell, generation: old.generation, applied, sample };
-                return Ok(());
+                // Left vacant unless a retry asks the factory again (`retry_vacant`).
+                if !self.retry.contains(&p.key) {
+                    p.plan = SlotPlan::Absent;
+                    return Ok(());
+                }
+            } else {
+                let sampler = old.spec.id == SAMPLER;
+                if old.sample == sample || sampler {
+                    let applied = (long > 0 && long != old.heap).then_some(long);
+                    let sample = (old.sample != sample).then(|| p.sample.clone());
+                    p.plan = SlotPlan::Move { old: old_key, from: old.cell, generation: old.generation, applied, sample };
+                    return Ok(());
+                }
             }
         }
         let slot =

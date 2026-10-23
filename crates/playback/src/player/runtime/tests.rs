@@ -996,3 +996,63 @@ fn a_save_during_a_long_plug_in_call_returns_within_its_deadline_and_names_the_p
     assert!(runtime.take_unrefreshed_states().is_empty());
     runtime.retire(ports);
 }
+
+/// Issue #56 (e): an instance the compile asks for that staging did not predict (the track's
+/// layout changed with its channel count, so the slot is planned afresh) is made on the plug-in
+/// host thread without any frame waiting for it: the plan is published with the slot vacant and
+/// reading "Loading…", and the same document is compiled again once the instance is ready.
+#[test]
+fn an_instance_the_compile_did_not_predict_loads_without_blocking_a_frame() {
+    let mut session = Session::default();
+    let track = session.add_track(TrackKind::Instrument, ChannelFormat::Quad, Some("keys"));
+    session.track_mut(track).unwrap().instrument = Some(Insert::new("subtractive_synth"));
+    let (mut runtime, mut ports) = RuntimeControl::<u8, u8>::new(Arc::new(session), None, target(), PlanLimits::default()).unwrap();
+    runtime.handles =
+        Handles::with_host(transit_plugin_host::Host::new(transit_plugin_host::Config { inline: false, ..transit_plugin_host::Config::default() }));
+    let made = Arc::new(AtomicUsize::new(0));
+    let factory = slow_factory(std::time::Duration::from_millis(500), &made);
+    let third_party = |id: &str| id == "subtractive_synth";
+    let slot = soundcraft_mix::INSTRUMENT_SLOT;
+    // One UI frame: the Player's service (republish included) and an audio block that adopts.
+    let frame = |runtime: &mut RuntimeControl<u8, u8>, ports: &mut AudioPorts<u8, u8>| {
+        let t = std::time::Instant::now();
+        runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+        let mut report = runtime.after_service();
+        runtime.republish(&mut report);
+        let took = t.elapsed();
+        ports.plans.service(&mut plan_bridge::callback_scope(), true);
+        took
+    };
+    let settle = |runtime: &mut RuntimeControl<u8, u8>, ports: &mut AudioPorts<u8, u8>, until: &dyn Fn(&RuntimeControl<u8, u8>) -> bool| {
+        let (start, mut worst, mut loading_frames) = (std::time::Instant::now(), std::time::Duration::ZERO, 0u32);
+        while !until(runtime) && start.elapsed() < std::time::Duration::from_secs(20) {
+            worst = worst.max(frame(runtime, ports));
+            loading_frames += u32::from(runtime.loading(track, slot));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (worst, loading_frames)
+    };
+    settle(&mut runtime, &mut ports, &|r| made.load(Ordering::SeqCst) == 1 && !r.any_loading() && r.binding(track, slot).is_some());
+    assert!(runtime.binding(track, slot).is_some(), "the first instance is bound");
+    assert!(play(&mut ports.plans, track) > 0.0);
+
+    // Same channel count, another layout: `reuses` says yes, the compile plans the slot afresh.
+    let mut edited = (**runtime.requested_session()).clone();
+    edited.track_mut(track).unwrap().format = ChannelFormat::Lcrs;
+    runtime.update_session(Arc::new(edited)).unwrap();
+    let first = frame(&mut runtime, &mut ports);
+    assert!(first < FRAME_BUDGET, "the compiling frame waited for the plug-in: {first:?}");
+    assert_eq!(runtime.handles.retrying(), 1, "staging did not predict it: the compile submitted it");
+    assert!(runtime.loading(track, slot), "its slot reads as loading");
+    let (worst, loading_frames) = settle(&mut runtime, &mut ports, &|r| {
+        made.load(Ordering::SeqCst) == 2 && !r.any_loading() && r.binding(track, slot).is_some() && r.handles.retrying() == 0
+    });
+    assert!(loading_frames > 0, "the slot read as loading while the late instance was made");
+    assert!(loading_frames >= 10, "only {loading_frames} frames ran during the 500 ms creation");
+    assert!(worst < FRAME_BUDGET, "a frame waited for the plug-in: {worst:?}");
+    assert_eq!(made.load(Ordering::SeqCst), 2, "made once more, for the new layout");
+    assert!(!runtime.stuck(track, slot));
+    assert!(runtime.binding(track, slot).is_some(), "the late instance is bound after the republish");
+    assert!(play(&mut ports.plans, track) > 0.0, "and it sounds");
+    runtime.retire(ports);
+}

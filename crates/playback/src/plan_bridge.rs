@@ -422,6 +422,11 @@ impl Control {
     pub(super) fn reuses(&self, spec: &InstanceSpec) -> bool {
         self.compiler.reuses(spec)
     }
+    /// Asks the next compile to make `spec`'s vacant slot again (see
+    /// [`PlanCompiler::retry_vacant`]).
+    pub(super) fn retry_vacant(&mut self, spec: &InstanceSpec) -> bool {
+        self.compiler.retry_vacant(spec)
+    }
     pub(super) fn can_prepare(&self) -> bool {
         self.port.credits() != 0
     }

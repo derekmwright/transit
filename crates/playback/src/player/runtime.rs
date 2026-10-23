@@ -160,6 +160,7 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         let (pending, failed, other_thread) = host_requests();
         self.handles.service(&mut self.control);
         let mut report = self.after_service();
+        self.republish(&mut report);
         report.plugin_pending = pending;
         report.plugin_failed = failed;
         report.plugin_other_thread = other_thread;
@@ -206,6 +207,31 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         report.preparing = matches!(self.state, RequestState::Preparing | RequestState::Published(_));
         report
+    }
+
+    /// Issue #56: an instance the compile did not predict was made on the plug-in host thread
+    /// after its plan was published with the slot vacant. The same document is requested again
+    /// (as a latency refresh is: the lineage is kept), and that compile takes the instance.
+    fn republish(&mut self, report: &mut ServiceReport) {
+        if !self.handles.take_republish() || self.faulted() {
+            return;
+        }
+        if matches!(self.state, RequestState::Preparing | RequestState::Published(_)) {
+            // A request is on its way; ask again once it is done.
+            self.handles.keep_republish();
+            return;
+        }
+        match self.control.request(Arc::clone(&self.requested), self.input.clone()) {
+            Ok(request) => {
+                self.request = request;
+                self.state = RequestState::Preparing;
+                report.preparing = true;
+            }
+            Err(error) => {
+                self.handles.keep_republish();
+                report.refresh_error = Some(error);
+            }
+        }
     }
 
     pub fn requested_state(&self) -> (SessionRequestId, RequestState) {
