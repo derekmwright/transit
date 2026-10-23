@@ -248,6 +248,10 @@ pub struct Track {
     /// MIDI hardware input and channel filter (old documents accept every input).
     #[serde(default)]
     pub midi_input: crate::MidiInput,
+    /// Where the track's MIDI goes: its hosted instrument (default) or an external port (#61).
+    /// Not written while internal, so files without external routing stay as older builds wrote them.
+    #[serde(default, skip_serializing_if = "crate::MidiOutput::is_internal")]
+    pub midi_output: crate::MidiOutput,
     pub automation: Vec<AutomationLane>,
     /// Which lane the track shows: `waveform`/`blocks`/`notes`/`regions` or an automation param id.
     pub view: String,
@@ -306,6 +310,7 @@ impl Track {
             active_playlist: 0,
             mixer: Mixer::new(format),
             midi_input: crate::MidiInput::default(),
+            midi_output: crate::MidiOutput::Internal,
             automation: Vec::new(),
             view: view.into(),
             hidden: false,

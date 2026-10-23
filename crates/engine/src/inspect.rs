@@ -67,6 +67,9 @@ fn track_json(e: &Engine, t: &Track, full: bool) -> Value {
     if !t.comments.is_empty() {
         v["comments"] = json!(t.comments);
     }
+    if t.kind.is_midi() {
+        v["midi_output"] = json!(t.midi_output);
+    }
     v
 }
 

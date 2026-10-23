@@ -12,6 +12,7 @@ mod ids;
 mod io_map;
 mod markers;
 mod midi_input;
+mod midi_output;
 mod mixer;
 mod route_graph;
 mod session;
@@ -24,6 +25,7 @@ pub use ids::{BusId, ClipId, GroupId, MarkerId, SourceId, TrackId};
 pub use io_map::{HardwareLatency, IoDirection, IoError, IoMap, IoPath, MAX_DEVICE_CHANNELS, MAX_PATH_WIDTH, input_channel};
 pub use markers::{Group, MarkerKind, MemoryLocation};
 pub use midi_input::{MidiInput, MidiPort};
+pub use midi_output::{MAX_MIDI_OUT_OFFSET_MS, MidiOutChannel, MidiOutPort, MidiOutput};
 pub use mixer::{
     Bus, ChannelFormat, HARDWARE_PLUGIN, HardwareInsert, INSERT_SLOTS, Insert, InsertUid, KeyFrom, KeySource, Mixer, OutputPath, Route, SEND_SLOTS,
     SendSlot, Speaker, SurroundPan, Tap, fader_db_to_pos, fader_pos_to_db,
