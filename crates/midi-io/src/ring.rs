@@ -2,8 +2,9 @@
 
 use crate::clock::host_ns_since;
 use crate::event::{InputEvent, is_release};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 use std::time::Instant;
 
 /// How an input port is opened.
@@ -92,6 +93,9 @@ pub(crate) struct PortShared {
     offered: AtomicU64,
     /// Set by a [`PortWatcher`](crate::PortWatcher) when the port leaves the backend's list.
     pub(crate) disconnected: AtomicBool,
+    /// The consumer's worker thread, set once by [`InputConsumer::wake_on`]. The callback reads it
+    /// lock-free and unparks the thread after publishing, so the worker never polls on a timer.
+    wake: OnceLock<Thread>,
 }
 
 impl PortShared {
@@ -224,12 +228,24 @@ impl InputSink {
             after_publish: None,
             in_sysex: false,
         };
-        (sink, InputConsumer { consumer, shared: Arc::clone(&shared) }, shared)
+        (sink, InputConsumer { consumer, shared: Arc::clone(&shared), origin: config.host_origin }, shared)
     }
 
     /// One backend callback: `data` holds one or more messages (or a SysEx chunk) the backend
     /// observed at `backend_time_us`. Running status is honored within one callback only.
     pub(crate) fn push(&mut self, backend_time_us: u64, data: &[u8]) {
+        let published = self.shared.counters.delivered.load(Ordering::Relaxed);
+        self.push_bytes(backend_time_us, data);
+        // Wake the consumer's worker after the ring holds the events (`unpark` is lock- and
+        // allocation-free; a token left by an early unpark makes the next park return at once).
+        if self.shared.counters.delivered.load(Ordering::Relaxed) != published
+            && let Some(thread) = self.shared.wake.get()
+        {
+            thread.unpark();
+        }
+    }
+
+    fn push_bytes(&mut self, backend_time_us: u64, data: &[u8]) {
         let host = host_ns_since(self.origin);
         bump(&self.shared.counters.callbacks, 1);
         let mut running: Option<u8> = None;
@@ -362,9 +378,22 @@ impl InputSink {
 pub struct InputConsumer {
     consumer: rtrb::Consumer<InputEvent>,
     shared: Arc<PortShared>,
+    origin: Instant,
 }
 
 impl InputConsumer {
+    /// Ask the callback to unpark `thread` after it publishes events, so a worker can park
+    /// without a timeout. Set once per open input; later calls are ignored.
+    pub fn wake_on(&self, thread: Thread) {
+        let _ = self.shared.wake.set(thread);
+    }
+
+    /// Nanoseconds from `event`'s callback arrival to now: how long it waited for its consumer.
+    #[must_use]
+    pub fn age_ns(&self, event: &InputEvent) -> u64 {
+        host_ns_since(self.origin).saturating_sub(event.host_arrival_ns)
+    }
+
     /// The oldest pending event, if any.
     pub fn pop(&mut self) -> Option<InputEvent> {
         self.consumer.pop().ok()

@@ -52,8 +52,10 @@ the current speed. The output thread sends it at `H + destination offset`.
   is well under 1 ms on an idle machine; the OS MIDI driver and USB add their own. A send more than
   2 ms late is counted (`late`, `max_late_ns`, in the Out button's tooltip). Hardware accuracy is
   not established by the fake-backend tests; it needs Derek's hardware check.
-- Echo ignores the offset and goes out at once. Its latency is the ingress worker's poll plus the
-  output thread's poll (two 1 ms loops; the ingress park can round to the system timer tick).
+- Echo ignores the offset and goes out at once. Its latency is the ingress worker's wake plus the
+  output thread's poll. The ingress worker parks without polling and the input callback unparks it
+  after publishing (#62), so only the output thread's 1 ms loop remains. The worker records
+  callback-to-pop latency (`Counters::latency_last_ns`, `latency_max_ns`).
 - With no external destination the thread parks between port polls (4 per second, for the
   picker's list) instead of waking every millisecond.
 - The output thread runs at normal priority; promoting it is a follow-up if jitter under load

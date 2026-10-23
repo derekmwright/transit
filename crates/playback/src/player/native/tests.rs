@@ -178,6 +178,40 @@ fn selections_channels_monitoring_and_disabled_tracks_are_independent() {
     f.finish();
 }
 
+/// #62: an idle worker wakes on the input callback instead of polling on a park timeout, which
+/// Windows rounds to the ~15.6 ms system tick. Latency is the worker's own measure: backend
+/// callback entry to the worker popping the event.
+#[test]
+fn an_idle_ingress_worker_wakes_on_the_input_callback_not_on_a_timer() {
+    let fake = Fake::default();
+    let key = fake.add_input("Wake keys");
+    let mut session = Session::default();
+    track(&mut session, MidiInput::default());
+    let mut f = Fixture::new(session, fake.io());
+    f.ready(1, 1);
+    let backend = fake.input_port(&key).unwrap();
+    let mut ages = Vec::new();
+    for n in 0..25u64 {
+        // Long enough for the worker to leave its post-work stepping and park idle.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(backend.deliver(n * 1_000, &[0x90, 60, 100]));
+        until(|| f.native.status().counts.offered == n + 1);
+        ages.push(f.native.status().counts.latency_last_ns);
+        // Drain the lane so credits never run out.
+        f.packets(1);
+        f.tick();
+    }
+    ages.sort_unstable();
+    let (median, max) = (Duration::from_nanos(ages[ages.len() / 2]), Duration::from_nanos(ages[ages.len() - 1]));
+    eprintln!("ingress wake latency over {} events: median {median:?}, max {max:?}", ages.len());
+    let bound = if cfg!(windows) { Duration::from_millis(2) } else { Duration::from_millis(5) };
+    assert!(median < bound, "median wake latency {median:?} (max {max:?}); a timer poll would show ~15 ms on Windows");
+    // Scheduler noise on a loaded machine; a tick-rounded poll would put most samples near 15 ms.
+    assert!(max < Duration::from_millis(14), "max wake latency {max:?}");
+    assert_eq!(f.native.status().counts.latency_max_ns, ages[ages.len() - 1]);
+    f.finish();
+}
+
 #[test]
 fn native_stop_cutoff_covers_every_route_and_retains_future_input() {
     let fake = Fake::default();

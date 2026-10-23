@@ -13,7 +13,14 @@ use transit_midi_io::{InputBoundary, InputConsumer, InputEvent};
 
 const BATCH: usize = 256;
 const RELEASE_RESERVE: usize = 32;
-const PERIOD: Duration = Duration::from_millis(1);
+/// After work, the worker keeps stepping at this interval for `LINGER` rounds so the audio
+/// thread's receipts (credits, release bookkeeping) are reclaimed promptly. `thread::sleep` uses a
+/// high-resolution timer on Windows; a park timeout would round up to the system tick (#62).
+const LINGER_PERIOD: Duration = Duration::from_micros(250);
+const LINGER: u32 = 16;
+/// Idle safety net only: input data, attachments, route edits and stop all unpark the worker.
+/// Port health (unplug, close) is also noticed within this period.
+const IDLE: Duration = Duration::from_millis(20);
 
 /// Original timestamps and raw sequence survive scheduling. Audio maps H into
 /// its consumed-output/converter phase and rechecks the source cutoff there.
@@ -45,6 +52,10 @@ pub struct Counters {
     pub refused: u64,
     /// Audio-admitted packets using approximate callback-relative timing.
     pub approximate: u64,
+    /// Input-to-worker latency (backend callback entry to the worker popping the event) of the
+    /// latest event, and the largest seen. Add the audio block period for input-to-sound.
+    pub latency_last_ns: u64,
+    pub latency_max_ns: u64,
 }
 
 /// The most notes held for the UI between its polls; the oldest are dropped past this.
@@ -64,6 +75,9 @@ struct Shared {
     recovered: AtomicU64,
     refused: AtomicU64,
     approximate: AtomicU64,
+    /// Callback-to-worker-pop age of the latest and the largest popped event (#62).
+    latency_last_ns: AtomicU64,
+    latency_max_ns: AtomicU64,
 }
 
 /// Main's per-open cancellation identity. Capture/publish all port cutoffs
@@ -155,9 +169,18 @@ impl Worker {
         let shared = Arc::new(Shared::default());
         let mut pump = Pump { lane, receive, inputs: Vec::with_capacity(sources::PORTS), cursor: 0, shared: Arc::clone(&shared), echo: None };
         let thread = std::thread::Builder::new().name("soundcraft-midi-ingress".into()).spawn(move || {
+            let mut linger = 0u32;
             while !pump.shared.stop.load(Ordering::Acquire) {
-                pump.step();
-                std::thread::park_timeout(PERIOD);
+                if pump.step() {
+                    linger = LINGER;
+                }
+                if linger > 0 {
+                    linger -= 1;
+                    std::thread::sleep(LINGER_PERIOD);
+                } else {
+                    // Woken by the input callback (`InputConsumer::wake_on`) or an attach.
+                    std::thread::park_timeout(IDLE);
+                }
             }
         })?;
         Ok(Self { attach, permits: Vec::with_capacity(sources::PORTS), next_input: 0, shared, thread })
@@ -178,6 +201,7 @@ impl Worker {
         if self.permits.iter().any(|old| old.token() == permit.token()) {
             return Err("MIDI source already attached");
         }
+        consumer.wake_on(self.thread.thread().clone());
         let port = Port { boundary: consumer.boundary(), permit: permit.clone() };
         let id = self.next_input.checked_add(1).ok_or("MIDI input identities exhausted")?;
         self.next_input = id;
@@ -196,6 +220,7 @@ impl Worker {
         }
         let id = self.next_input.checked_add(1).ok_or("MIDI input identities exhausted")?;
         self.next_input = id;
+        consumer.wake_on(self.thread.thread().clone());
         self.attach.try_send(Update::Input(Input { id, consumer, routes: Vec::new() })).map_err(|_| "MIDI attachment queue unavailable")?;
         self.thread.thread().unpark();
         Ok(id)
@@ -247,6 +272,8 @@ impl Worker {
             recovered: s.recovered.load(Ordering::Relaxed),
             refused: s.refused.load(Ordering::Relaxed),
             approximate: s.approximate.load(Ordering::Relaxed),
+            latency_last_ns: s.latency_last_ns.load(Ordering::Relaxed),
+            latency_max_ns: s.latency_max_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -284,7 +311,9 @@ impl Shared {
     }
 }
 impl Pump {
-    fn step(&mut self) {
+    /// One pass; true when it popped at least one event.
+    fn step(&mut self) -> bool {
+        let mut worked = false;
         // Drop only raw ring consumers here, never the native device handles.
         self.inputs.retain(|input| {
             let keep = input.healthy();
@@ -375,6 +404,10 @@ impl Pump {
                 continue;
             }
             let Some(raw) = input.consumer.pop() else { continue };
+            worked = true;
+            let age = input.consumer.age_ns(&raw);
+            self.shared.latency_last_ns.store(age, Ordering::Relaxed);
+            self.shared.latency_max_ns.fetch_max(age, Ordering::Relaxed);
             self.shared.offered.fetch_add(1, Ordering::Relaxed);
             let Some((channel, message)) = decode(raw) else {
                 self.shared.filtered.fetch_add(1, Ordering::Relaxed);
@@ -432,6 +465,7 @@ impl Pump {
                 }
             }
         }
+        worked
     }
 }
 impl Drop for Pump {

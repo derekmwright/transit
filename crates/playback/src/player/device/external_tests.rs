@@ -124,8 +124,9 @@ fn live_input_on_an_armed_external_track_is_echoed_without_an_instrument() {
     assert!(fake.input_port(&input).unwrap().deliver(0, &[0x90, 60, 100]));
     until("the echo", || fake.sent(&key).contains(&vec![0x91, 60, 100]));
     let latency = fake.sends(&key).iter().find(|s| s.message == vec![0x91, 60, 100]).unwrap().at - played;
-    // Two 1 ms polling threads (ingress, output); generous for a loaded CI machine.
-    assert!(latency < Duration::from_millis(50), "echo took {latency:?}");
+    // The ingress worker wakes on data (#62); only the output thread's 1 ms poll remains.
+    // Generous for a loaded CI machine.
+    assert!(latency < Duration::from_millis(10), "echo took {latency:?}");
     assert!(fake.input_port(&input).unwrap().deliver(1_000, &[0x80, 60, 0]));
     until("the echoed release", || fake.sent(&key).contains(&vec![0x81, 60, 0]));
 }
