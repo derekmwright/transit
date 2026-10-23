@@ -153,6 +153,73 @@ does not read it yet (it arrives with the native backend).
 
 Runs: [2026-10-22 AMD Ryzen 9 5900X, Scarlett 2i2, WASAPI shared (native and cpal), WASAPI exclusive, ASIO buffer sweep, re-measured with the drift detector, native ASIO sweep](2026-10-22-ryzen-5900x-scarlett-2i2.md); [2026-10-22 AMD Ryzen 9 5900X, TASCAM Model 12, WASAPI shared (native and cpal), WASAPI exclusive and mixed modes, native ASIO](2026-10-22-ryzen-5900x-tascam-model12.md); [2026-10-23 AMD Ryzen 9 5900X, Scarlett 2i2, ASIO driver-reported vs measured round trip (K31)](2026-10-23-ryzen-5900x-scarlett-2i2-asio-reported-vs-measured.md).
 
+## MIDI-to-audio onset latency
+
+`--midi-roundtrip` (issue #71) times a hardware synth played over MIDI: the note goes out of a MIDI
+output port and the synth's audio comes back into an input of the interface. It measures the
+**end-to-end MIDI-to-audio onset latency** of that chain:
+
+    L = MIDI delivery + synth response + audio input
+
+L is the effective compensation offset for the chain: what an External Instrument track needs to
+land the synth on the grid. It does **not** isolate MIDI transport accuracy. The instant the OS and
+the interface actually transmit the bytes is not observable here. The send instant is
+sample-accurate only in the scheduling and timestamp sense. No audio output is in the chain, so the
+driver's output latency plays no part. The run also prints L minus the driver's reported input
+latency, as an *estimate* of MIDI delivery plus synth response. The driver's figure is unverified
+(known issue K31).
+
+Wiring: the interface's (or a USB) MIDI out goes to the synth's MIDI in, and the synth's audio out
+goes to an interface input (`--in 1`, or `--in 1,2` to sum a stereo pair). Set the synth to a patch
+with its **fastest attack and shortest release**, no delay or reverb, no arpeggiator, and receiving on
+`--midi-channel`. Turn its volume and the input gain so a note peaks well above the noise (around
+-20 to -6 dBFS). Keep the monitors low. Close transit and other audio programs, then run from the
+repository root:
+
+```
+cargo run -p audio-bench --features native-asio --release -- --midi-roundtrip --midi-out "<port name or part>" --midi-channel 1 --in 1 --backend asio --device "<ASIO driver>" --rate 44100 --buffer 256 --trials 10 --gap-ms 750 --json docs/benchmarks/<date>-<machine>-<synth>.json
+```
+
+Native ASIO only: both ends are counted in the driver's sample positions. Defaults: note 60,
+velocity 100, 10 trials, 750 ms gap, 1000 ms window (`--max-ms`).
+
+Method:
+
+- **Send instant.** The control thread reads the host clock (`HostOrigin`, QPC) right before the
+  send call. A `ClockFitter` (the clock map the app's MIDI output thread uses, ADR 0017) is fitted to
+  the capture blocks' sample position, position time and arrival. That map turns the send instant
+  into the device's sample position: the position clock, not the presentation clock.
+- **Onset.** The input is recorded by sample position. The detector takes a 0.25 ms causal envelope
+  (the mean absolute value). Its threshold is the envelope peak of 100 ms of noise floor measured
+  before the first note, plus 12 dB (never below -60 dBFS). The detector finds the first crossing,
+  then refines it to the first sample where the envelope exceeds 10 percent of the attack's peak
+  within the next 20 ms. That refined sample is the onset. The distance between the two crossings is
+  printed as the detector's uncertainty.
+- **Per trial.** The 100 ms before each send must be at the noise floor (within 6 dB). If not, the
+  run is refused: the previous release is still sounding, so raise `--gap-ms` or shorten the release.
+  A trial with no onset within `--max-ms` is also refused, with the level heard. That points to the
+  channel, the port, the input or the level.
+- **Safety.** Every exit path sends the note-off and All Notes Off (CC 123) on the channel: errors, a
+  refusal and Ctrl+C included. A second Ctrl+C exits at once.
+
+The output lists every trial (samples, ms, detector uncertainty). It then gives the distribution:
+mean, median, min, max and standard deviation, with the trials beyond 2 standard deviations listed
+separately as outliers. There is no pass or fail. USB MIDI moves in 1 ms frames, so a spread of
+about 1 ms is expected. Last come the input-latency estimate and the exact command. `--json` writes
+the same figures, every trial and the command line.
+
+Results entry (one per synth and chain; keep the JSON next to this README):
+
+```
+### <Synth>, <MIDI interface or port> -> <audio interface> input <n>, <rate> Hz, buffer <frames>
+- Date, machine: <date>, <CPU>, <OS>
+- Patch: <name; attack, release>
+- Effective compensation offset: mean <x> ms (<n> samples), median <x> ms, min <x>, max <x>, std dev <x> ms, n = <n>
+- Outliers: <none | trial k, ...>; detector uncertainty max <n> samples
+- Driver input latency <n> samples; estimated delivery + synth response <x> ms (estimate)
+- Command: `<as printed>`; JSON: [<file>](<file>)
+```
+
 ## Call for testers
 
 Hardware numbers from other machines are the most useful addition to this folder. See
