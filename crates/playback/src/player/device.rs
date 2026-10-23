@@ -1031,8 +1031,8 @@ impl Player {
     pub fn any_stuck(&self) -> bool {
         self.owner().is_ok_and(|owner| owner.any_stuck())
     }
-    /// How many plug-in host threads have wedged in this process (a plug-in call that never
-    /// returned); 0 normally.
+    /// How many plug-in host threads are not responding now (a plug-in call past its timeout
+    /// that has not returned yet); 0 normally, and back to 0 when the call returns.
     pub fn plugin_host_wedged(&self) -> usize {
         self.owner().map_or(0, |owner| owner.plugin_host_wedged())
     }

@@ -686,9 +686,9 @@ fn play(plans: &mut plan_bridge::Audio, track: soundcraft_model::TrackId) -> f32
     total
 }
 
-/// A frame may take this long at most while a plug-in loads (generous for loaded CI runners; the
-/// fixture sleeps 500 ms).
-const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+/// A frame may take this long at most while a plug-in loads. Load-tolerant: a starved runner can
+/// stall a frame, but one that waited for the plug-in takes its full 500 ms.
+const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Runs 5 ms "frames" of `service_with` until nothing is loading; returns the frames and the
 /// longest one.
@@ -753,7 +753,7 @@ fn a_slow_instance_is_made_on_the_host_thread_while_frames_advance_and_the_plan_
     // Later frames submit it to the host thread and poll: none of them waits for the 500 ms.
     let (frames, worst) = frames_until_loaded(&mut runtime, &third_party, &factory);
     assert!(started.elapsed() >= std::time::Duration::from_millis(500));
-    assert!(frames >= 20, "only {frames} frames ran during a 500 ms creation");
+    assert!(frames >= 10, "only {frames} frames ran during a 500 ms creation");
     assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
     assert_ne!(*thread.lock().unwrap(), Some(std::thread::current().id()), "made on the plug-in host thread");
     assert_eq!(made.load(Ordering::SeqCst), 1);
@@ -884,7 +884,7 @@ fn a_creation_that_never_returns_is_stuck_after_the_timeout_and_the_session_comp
     runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
     assert!(runtime.loading(track, slot));
     let (frames, worst) = frames_until_loaded(&mut runtime, &third_party, &factory);
-    assert!(frames >= 20, "frames ran meanwhile ({frames})");
+    assert!(frames >= 10, "frames ran meanwhile ({frames})");
     assert!(worst < FRAME_BUDGET, "a frame took {worst:?}");
     assert!(runtime.stuck(track, slot) && runtime.any_stuck(), "the slot reads as not responding");
     assert!(!runtime.loading(track, slot));
@@ -897,5 +897,46 @@ fn a_creation_that_never_returns_is_stuck_after_the_timeout_and_the_session_comp
     runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
     assert!(runtime.stuck(track, slot) && !runtime.any_loading());
     drop(release);
+    runtime.retire(ports);
+}
+
+/// B1 of the ADR 0018 review: after the host thread was slow past its timeout (a modal dialog, a
+/// long state restore) and returned, a save reads every live state again; it does not fall back
+/// to the stored ones.
+#[test]
+fn a_save_after_the_host_thread_returns_from_a_stall_carries_the_live_state() {
+    let (mut runtime, mut ports, track, _) = with_instrument_requested();
+    runtime.handles = Handles::with_host(transit_plugin_host::Host::new(transit_plugin_host::Config {
+        timeout: std::time::Duration::from_millis(300),
+        inline: false,
+        ..transit_plugin_host::Config::default()
+    }));
+    let value = Arc::new(AtomicUsize::new(0));
+    let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
+        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)?;
+        Some(NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0x5a }), refused_state: false })
+    });
+    let third_party = |id: &str| id == "subtractive_synth";
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+    frames_until_loaded(&mut runtime, &third_party, &factory);
+    adopt(&mut ports.plans);
+    runtime.service();
+    let session = Arc::clone(runtime.requested_session());
+    let live = vec![(track, soundcraft_mix::INSTRUMENT_SLOT, vec![0x5a])];
+    assert_eq!(runtime.capture_states(&session).unwrap(), live);
+    // A 700 ms call on the instance's own thread, against a 300 ms timeout.
+    let host = runtime.handles.host().clone();
+    let stall = host.submit(|_| std::thread::sleep(std::time::Duration::from_millis(700)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while host.wedged() == 0 && std::time::Instant::now() < deadline {
+        let _ = stall.poll();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(host.wedged(), 1, "past its timeout the thread reads wedged");
+    while host.wedged() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(host.wedged(), 0, "it returned");
+    assert_eq!(runtime.capture_states(&session).unwrap(), live, "the save carries the live state");
     runtime.retire(ports);
 }

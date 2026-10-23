@@ -240,9 +240,16 @@ impl Handles {
         !self.stuck.is_empty()
     }
 
-    /// How many plug-in host threads have wedged in this process (the status line says so).
+    /// How many plug-in host threads are not responding now (the status line says so); it goes
+    /// back down when a thread returns from the long call.
     pub fn host_wedged(&self) -> usize {
         self.host.wedged()
+    }
+
+    /// The plug-in host these handles use (the tests stall it).
+    #[cfg(test)]
+    pub(crate) fn host(&self) -> &Host {
+        &self.host
     }
 
     /// Editor opens that failed after they were accepted: (track, slot, why), each once.
