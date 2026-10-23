@@ -947,3 +947,52 @@ fn a_save_after_the_host_thread_returns_from_a_stall_carries_the_live_state() {
     assert_eq!(runtime.capture_states(&session).unwrap(), live, "the save carries the live state");
     runtime.retire(ports);
 }
+
+/// Issue #56 (a): a save while a plug-in's thread is inside a long call (a modal dialog) waits at
+/// most the save deadline in all, keeps that plug-in's stored state (it is left out of the
+/// capture) and names it once; after the call returns, the next save carries the live state.
+#[test]
+fn a_save_during_a_long_plug_in_call_returns_within_its_deadline_and_names_the_plug_in() {
+    let (mut runtime, mut ports, track, _) = with_instrument_requested();
+    // The request timeout stays long: the thread is busy, not wedged.
+    runtime.handles =
+        Handles::with_host(transit_plugin_host::Host::new(transit_plugin_host::Config { inline: false, ..transit_plugin_host::Config::default() }));
+    let value = Arc::new(AtomicUsize::new(0));
+    let factory: super::handles::Factory = Arc::new(move |spec: &soundcraft_mix::InstanceSpec| {
+        let made = soundcraft_mix::create_instance(&spec.id, spec.state.as_deref(), 48_000.0, 512, spec.ch)?;
+        Some(NewInstance { plugin: Box::new(Latency { inner: made.plugin, value: Arc::clone(&value), state: 0x5a }), refused_state: false })
+    });
+    let third_party = |id: &str| id == "subtractive_synth";
+    runtime.handles.service_with(&mut runtime.control, &third_party, &factory);
+    frames_until_loaded(&mut runtime, &third_party, &factory);
+    adopt(&mut ports.plans);
+    runtime.service();
+    let session = Arc::clone(runtime.requested_session());
+    let live = vec![(track, soundcraft_mix::INSTRUMENT_SLOT, vec![0x5a])];
+    assert_eq!(runtime.capture_states(&session).unwrap(), live);
+    assert!(runtime.take_unrefreshed_states().is_empty());
+
+    let deadline = super::handles::DEFAULT_SAVE_DEADLINE;
+    let host = runtime.handles.host().clone();
+    let stall = host.submit(|_| std::thread::sleep(std::time::Duration::from_millis(700)));
+    while !matches!(stall.poll(), transit_plugin_host::Status::Waiting { running: true }) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let t = std::time::Instant::now();
+    let states = runtime.capture_states(&session).unwrap();
+    let took = t.elapsed();
+    assert!(states.is_empty(), "the busy plug-in is left out, so its stored state is kept: {states:?}");
+    // Load-tolerant: the deadline plus a starved poll, well short of the 700 ms stall.
+    assert!(took < deadline + std::time::Duration::from_millis(150), "the save waited {took:?}");
+    let named = runtime.take_unrefreshed_states();
+    assert_eq!(named.len(), 1, "one notice: {named:?}");
+    assert!(!named[0].is_empty());
+    assert!(runtime.take_unrefreshed_states().is_empty(), "reported once");
+
+    while matches!(stall.poll(), transit_plugin_host::Status::Waiting { .. }) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(runtime.capture_states(&session).unwrap(), live, "after the stall the save has the live state");
+    assert!(runtime.take_unrefreshed_states().is_empty());
+    runtime.retire(ports);
+}

@@ -380,6 +380,15 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         }
         Err(PlayerError::SessionPending)
     }
+    /// The plug-ins the last state capture could not read within the save deadline (their
+    /// stored states were kept), once.
+    pub fn take_unrefreshed_states(&mut self) -> Vec<String> {
+        self.handles.take_unrefreshed()
+    }
+    /// How long one state capture waits for plug-ins in all.
+    pub fn set_save_deadline(&mut self, deadline: std::time::Duration) {
+        self.handles.set_save_deadline(deadline);
+    }
     pub fn idle_editors(&mut self) -> Vec<EditorEdit> {
         // Service and drain the old editors, but do not apply their parameter edits
         // to a replacement document before its instances have been adopted.

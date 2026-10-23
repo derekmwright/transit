@@ -3,7 +3,7 @@
 
 use crate::{Host, Inner, Worker, lock};
 use soundcraft_dsp::event::PluginEvent;
-use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginStateReader, ProcessStatus, SampleSource, Transport};
+use soundcraft_dsp::{Plugin, PluginEditor, PluginInfo, PluginStateReader, ProcessStatus, SampleSource, StateBusy, Transport};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -272,25 +272,36 @@ impl PluginEditor for RemoteEditor {
 
 /// The UI's state reader: a request to the host thread, waited for up to the timeout (the one
 /// place the UI waits on a plug-in, ADR 0018 section 6). A wedged or gone thread answers `None`
-/// at once.
+/// at once. A save uses [`PluginStateReader::save_state_within`] with its own deadline instead.
 struct RemoteState {
     token: Arc<Token>,
 }
 
-impl PluginStateReader for RemoteState {
-    fn save_state(&mut self) -> Option<Vec<u8>> {
+impl RemoteState {
+    /// Reads the state on the host thread, waiting at most `timeout`; `Err` when it did not
+    /// answer in time, its thread is wedged or gone, or the thread has been inside one window
+    /// message (a modal dialog) for longer than the request timeout: that one answers at once.
+    fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
         let worker = &self.token.worker;
-        if !worker.responsive() {
-            return None;
+        if !worker.responsive() || worker.in_dispatch_longer_than(self.token.timeout) {
+            return Err(StateBusy);
         }
         if worker.is_current_thread() {
             log::error!("plug-in host: a state read from the host thread itself would wait for itself");
-            return None;
+            return Err(StateBusy);
         }
-        let host = Host { inner: self.token.host.upgrade()? };
+        let host = Host { inner: self.token.host.upgrade().ok_or(StateBusy)? };
         let key = self.token.key;
-        host.submit_to(worker, move |ctx| ctx.local(key).and_then(|l| l.state.as_mut()).and_then(|s| s.save_state()))
-            .wait(self.token.timeout)
-            .flatten()
+        host.submit_to(worker, move |ctx| ctx.local(key).and_then(|l| l.state.as_mut()).and_then(|s| s.save_state())).wait(timeout).ok_or(StateBusy)
+    }
+}
+
+impl PluginStateReader for RemoteState {
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self.read(self.token.timeout).ok().flatten()
+    }
+
+    fn save_state_within(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, StateBusy> {
+        self.read(timeout.min(self.token.timeout))
     }
 }

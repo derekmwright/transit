@@ -206,6 +206,12 @@ impl Worker {
         self.thread.get() == Some(&std::thread::current().id())
     }
 
+    /// Whether the thread is inside one window-message dispatch (a plug-in's modal dialog) that
+    /// has run longer than `limit`.
+    pub(crate) fn in_dispatch_longer_than(&self, limit: Duration) -> bool {
+        self.dispatching.load(Ordering::Acquire) && self.busy_for().is_some_and(|d| d >= limit)
+    }
+
     pub(crate) fn responsive(&self) -> bool {
         self.running.load(Ordering::Acquire) && !self.wedged.load(Ordering::Acquire)
     }

@@ -7,11 +7,16 @@
 //! state go to the host thread too, and a retired instance is destroyed there.
 use super::*;
 use crate::{EditorEdit, PluginStates};
-use soundcraft_dsp::{PluginEditor, PluginStateReader};
+use soundcraft_dsp::{PluginEditor, PluginStateReader, StateBusy};
 use soundcraft_mix::InstanceSpec;
 use soundcraft_model::TrackId;
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use transit_plugin_host::{Ctx, Host, Pending, Status};
+
+/// How long one save waits for every plug-in's state in all (issue #56). A plug-in that has not
+/// answered by then keeps its stored state and the status line names it.
+pub const DEFAULT_SAVE_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Makes one instance for a spec, on whichever thread runs it (the plug-in host thread for hosted
 /// plug-ins).
@@ -43,6 +48,8 @@ struct Entry {
     refused: bool,
     /// The plug-in has a sidechain input (read once, at creation).
     key_input: bool,
+    /// The plug-in's name, for the status line.
+    name: &'static str,
 }
 
 /// Where a third-party instance the next plan needs is on its way to being made.
@@ -70,6 +77,11 @@ pub struct Handles {
     stuck: Vec<InstanceSpec>,
     /// Why editors that accepted an open request then failed, for the status line.
     editor_errors: Vec<(TrackId, usize, String)>,
+    /// How long one [`Self::capture_states`] may wait for plug-ins in all.
+    save_deadline: Duration,
+    /// The plug-ins whose state the last capture could not read in time (their stored state is
+    /// kept), for the status line.
+    unrefreshed: Vec<String>,
     host: Host,
     /// Keyed by (track, generation): the generation is the instance's identity and survives a
     /// reorder, while the slot it sits at does not.
@@ -92,6 +104,8 @@ impl Handles {
             staged: Vec::new(),
             stuck: Vec::new(),
             editor_errors: Vec::new(),
+            save_deadline: DEFAULT_SAVE_DEADLINE,
+            unrefreshed: Vec::new(),
             host,
             entries: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -267,7 +281,8 @@ impl Handles {
         let editor = made.plugin.editor();
         let state = made.plugin.state_reader();
         let key_input = made.plugin.has_key_input();
-        self.entries.insert(key, Entry { editor, state, refused: made.refused_state, key_input });
+        let name = made.plugin.info().name;
+        self.entries.insert(key, Entry { editor, state, refused: made.refused_state, key_input, name });
         Some(made)
     }
 
@@ -346,17 +361,43 @@ impl Handles {
             editor.set_param(id, value);
         }
     }
+    /// Reads every live plug-in's state for a save, waiting at most the save deadline in all
+    /// (issue #56): a plug-in whose thread is inside a long call or a modal dialog is left out,
+    /// so the caller keeps its stored state, and is named by [`Self::take_unrefreshed`].
     pub fn capture_states(&mut self) -> PluginStates {
-        self.active
+        let deadline = Instant::now() + self.save_deadline;
+        let mut unrefreshed = Vec::new();
+        let states = self
+            .active
             .iter()
             .filter_map(|(&(track, slot), &generation)| {
                 let entry = self.entries.get_mut(&(track, generation))?;
                 if entry.refused {
                     return None;
                 }
-                Some((track, slot, entry.state.as_mut()?.save_state()?))
+                let left = deadline.saturating_duration_since(Instant::now());
+                match entry.state.as_mut()?.save_state_within(left) {
+                    Ok(state) => Some((track, slot, state?)),
+                    Err(StateBusy) => {
+                        log::warn!("{}: state not read within the save deadline; its stored state is kept", entry.name);
+                        unrefreshed.push(entry.name.to_owned());
+                        None
+                    }
+                }
             })
-            .collect()
+            .collect();
+        self.unrefreshed = unrefreshed;
+        states
+    }
+
+    /// The plug-ins the last [`Self::capture_states`] could not read in time, once.
+    pub fn take_unrefreshed(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.unrefreshed)
+    }
+
+    /// How long one save waits for plug-in states in all ([`DEFAULT_SAVE_DEADLINE`]).
+    pub fn set_save_deadline(&mut self, deadline: Duration) {
+        self.save_deadline = deadline;
     }
     pub fn idle(&mut self) -> Vec<EditorEdit> {
         let mut out = Vec::new();

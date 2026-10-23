@@ -378,7 +378,14 @@ impl StudioApp {
         }
         let Some(p) = &self.player else { return Ok(()) };
         let states = p.capture_states(&self.engine.session_arc());
-        self.store_plugin_states(states)
+        let busy = p.take_unrefreshed_states();
+        self.store_plugin_states(states)?;
+        // A plug-in inside a long call or a modal dialog did not answer within the save
+        // deadline: its stored state goes into the save (issue #56).
+        if !busy.is_empty() {
+            self.status = format!("State of {} not refreshed: plug-in busy", busy.join(", "));
+        }
+        Ok(())
     }
 
     fn preserve_audio_state(&mut self) -> Result<bool, String> {
