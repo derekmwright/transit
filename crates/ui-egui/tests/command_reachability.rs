@@ -24,6 +24,7 @@ const KNOWN_UNREACHED: &[&str] = &[
     "markers.next",
     "markers.previous",
     "midi.chord_add", // assistant/control-first (#45): the chord track is written through the control channel and MCP; no chord editor in the UI yet
+    "midi.output",    // studio UI only (#61: the MIDI strip's Out button); the old UI has no MIDI output picker
     "mix.clear_mutes",
     "mix.clear_solos",
     "mix.insert_copy", // studio UI only (Alt-drag in the device chain); the old UI has no device reorder

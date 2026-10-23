@@ -33,6 +33,7 @@ mod loopbar;
 pub mod menus;
 pub mod metronome;
 mod midi_input;
+mod midi_output;
 pub mod mixer;
 pub mod panel;
 pub mod plugin_scan;

@@ -3101,3 +3101,24 @@ fn audio_bus_input_policy_is_preserved_when_the_input_is_chosen_first() {
         assert!(!choices.iter().any(|choice| matches!(choice, RoutingChoice::Entry { value, .. } if value == "FX 1")));
     }
 }
+
+#[test]
+fn a_midi_strip_has_the_output_destination_button_next_to_its_input() {
+    // #61: the destination picker lives on the mixer strip; the header picker is a follow-up.
+    let (mut app, ctx, mut time, _) = mixer_app();
+    let t = TrackId(app.run("track.new", json!({"kind": "midi", "name": "Synth"})).unwrap()["tracks"][0].as_u64().unwrap());
+    frames(&mut app, &ctx, 3, &mut time);
+    let s = strip(&app, t);
+    assert!(
+        s.midi_output[2] > s.midi_output[0] && s.midi_output[0] >= s.input[2],
+        "Out sits right of the MIDI input: {:?} {:?}",
+        s.midi_output,
+        s.input
+    );
+    assert_eq!(s.midi_output_label, "MIDI to the track's instrument");
+    app.run("midi.output", json!({"track": t.0, "port": {"backend": "winmm", "name": "Synth OUT"}, "channel": 2})).unwrap();
+    frames(&mut app, &ctx, 2, &mut time);
+    let s = strip(&app, t);
+    assert_eq!(s.midi_output_label, "MIDI to Synth OUT · Ch 2");
+    assert!(!s.midi_output_missing, "without a player nothing is known to be missing");
+}

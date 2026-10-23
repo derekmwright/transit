@@ -108,6 +108,11 @@ pub struct StripLayout {
     pub output: R4,
     pub input_label: String,
     pub output_label: String,
+    /// MIDI tracks: the output destination button (#61), what it says, and whether its device is
+    /// missing.
+    pub midi_output: R4,
+    pub midi_output_label: String,
+    pub midi_output_missing: bool,
     pub knob: R4,
     pub mute: R4,
     pub solo: R4,
@@ -1778,6 +1783,11 @@ fn strip(
         sl.input = r4(in_r);
         sl.input_label = cur;
     } else if t.kind.is_midi() {
+        // The MIDI output destination (#61) is the small Out button at the row's end.
+        let out_w = 22.0;
+        let out_r = Rect::from_min_max(pos2(in_r.max.x - out_w, in_r.min.y), in_r.max);
+        let in_r = Rect::from_min_max(in_r.min, pos2(in_r.max.x - out_w - 2.0, in_r.max.y));
+        midi_output_button(app, ui, &p, clip, t, out_r, &mut sl);
         let view = crate::midi_input::InputView::read(app.player.as_ref());
         let label = view.label(&t.midi_input);
         let resp = ui.interact(in_r.intersect(clip), ui.id().with(("midi-input", id.0)), Sense::click());
@@ -1961,6 +1971,38 @@ fn strip(
 }
 
 /// A held peak (linear) as the readout shows it: "-3.2", "0.0", "+1.4" (red from 0 dBFS), "-inf".
+/// A MIDI strip's output destination button (#61): "Out" in the accent color when the track
+/// sends to an external port, red with a warning when that port's device is missing.
+fn midi_output_button(app: &mut StudioApp, ui: &mut Ui, p: &egui::Painter, clip: Rect, t: &Track, r: Rect, sl: &mut StripLayout) {
+    let view = crate::midi_output::OutputView::read(app.player.as_ref());
+    let missing = view.missing(t.id, &t.midi_output);
+    let resp = ui.interact(r.intersect(clip), ui.id().with(("midi-output", t.id.0)), Sense::click());
+    let fill = if missing {
+        TOKENS.record
+    } else if t.midi_output.is_external() {
+        TOKENS.accent
+    } else if resp.hovered() {
+        TOKENS.button_hover
+    } else {
+        TOKENS.bg
+    };
+    p.rect_filled(r, crate::theme::RADIUS_SM, fill);
+    let ink = if missing || t.midi_output.is_external() { theme::text_on(fill) } else { TOKENS.text };
+    if missing {
+        crate::icons::paint(p, r.center(), crate::icons::Icon::Warning, 11.0, ink);
+    } else {
+        p.with_clip_rect(r.intersect(clip)).text(r.center(), Align2::CENTER_CENTER, "Out", FontId::proportional(9.5), ink);
+    }
+    let label = view.header_badge(t.id, &t.midi_output).unwrap_or_else(|| view.label(t.id, &t.midi_output));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "MIDI output"));
+    if let Some(params) = view.popup(&resp, t.id, &t.midi_output) {
+        let _ = app.run("midi.output", params);
+    }
+    sl.midi_output = r4(r);
+    sl.midi_output_label = label;
+    sl.midi_output_missing = missing;
+}
+
 pub fn peak_text(lin: f32) -> (String, bool) {
     if lin <= 0.0 {
         return ("-inf".into(), false);
