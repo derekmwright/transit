@@ -1676,6 +1676,10 @@ pub fn mark_audio_thread() {
 /// Takes the mark of [`mark_audio_thread`] off the calling thread. For a thread that stood in for
 /// the audio callback for a while (device-free test stepping) and then goes back to being an
 /// ordinary thread, whose panics and log records must then be reported normally.
+///
+/// Exists for device-free tests only (`Player::step_device_free`); a real audio thread keeps
+/// its mark for its whole life.
+#[doc(hidden)]
 pub fn unmark_audio_thread() {
     AUDIO_THREAD.set(false);
 }
