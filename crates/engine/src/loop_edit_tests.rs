@@ -159,3 +159,57 @@ fn set_loop_checks_the_file_through_the_stretch() {
     assert!(e.execute("clip.set_loop", &json!({"clip": id.0, "start": 0, "end": 2000})).is_ok());
     assert!(e.execute("clip.set_loop", &json!({"clip": id.0, "start": 0, "end": 2100})).is_err());
 }
+
+#[test]
+fn remove_pitch_shift_of_a_looped_stretched_clip_reads_the_file_at_the_stretch() {
+    let (mut e, t, id) = audio();
+    e.session_mut().find_clip_mut(id).unwrap().stretch = 2.0;
+    // Clip time 0..100 is file 0..50 at stretch 2; loop it out to 800.
+    e.execute("clip.loop_to", &json!({"clip": id.0, "to": 800})).unwrap();
+    let before = render(&e, t, 800);
+    let peak = |v: &[f32]| v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    e.execute("clip.remove_pitch_shift", &json!({"clip": id.0})).unwrap();
+    let c = e.session().track(t).unwrap().clips()[0].clone();
+    assert_eq!(c.looping, None);
+    let after = render(&e, t, c.length);
+    // The source ramps to 0.05 inside a cycle's file range; reading past it (the old bug) reaches 0.1.
+    assert!(peak(&after) < peak(&before) * 1.3, "{} vs {}", peak(&after), peak(&before));
+}
+
+/// A time-locked empty clip (when `with_lock`) and the looped clip of `midi()` at beat 8, retimed
+/// from 120 to 240 bpm.
+fn retime_rig(lock_beats: i64, with_lock: bool) -> (Session, TrackId, Samples) {
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+    let beat = s.tempo.tick_to_samples(Q, s.sample_rate);
+    if with_lock {
+        let id = s.new_clip_id();
+        let mut a = Clip::midi(id, "lock", 0, lock_beats * beat, Sequence::default());
+        a.time_locked = true;
+        crate::edit::place_clip(&mut s, t, a);
+    }
+    let mut seq = Sequence::default();
+    seq.notes.push(note(60, 0));
+    seq.notes.push(note(64, 2));
+    let id = s.new_clip_id();
+    let mut b = Clip::midi(id, "m", 8 * beat, 16 * beat, seq);
+    b.looping = Some(soundcraft_model::ClipLoop { start: 0, end: 4 * beat });
+    crate::edit::place_clip(&mut s, t, b);
+    let old = s.tempo.clone();
+    s.tempo.set_tempo(0, 240.0).unwrap();
+    crate::retime::retime_to_tempo(&mut s, &old).unwrap();
+    (s, t, beat)
+}
+
+#[test]
+fn retime_trims_a_looped_midi_clip_through_the_start_helper() {
+    // At 240 bpm the looped clip starts at beat 8 and the time-locked clip ends at beat 10.
+    let (s, t, beat) = retime_rig(5, true);
+    let (r, rt, _) = retime_rig(5, false);
+    let half = beat / 2;
+    let ons = |s: &Session, t: TrackId| -> Vec<(f64, u8)> {
+        soundcraft_mix::clip_note_ons(s, t, 0, (40 * half) as usize).into_iter().map(|(a, k)| (a as f64 / half as f64, k)).collect()
+    };
+    let want: Vec<(f64, u8)> = ons(&r, rt).into_iter().filter(|(a, _)| *a >= 10.0).collect();
+    assert_eq!(ons(&s, t), want);
+}

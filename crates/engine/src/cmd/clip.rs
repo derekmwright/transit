@@ -71,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Loop To",
             [],
             None,
-            "{clip, to: position, independent?: bool} - the loop handle: sets the clip's arrangement length to `to`, cycling its content (an unlooped clip is first looped over its whole length); at or before the first cycle's end it unloops. independent = lay plain copies up to `to` instead (a trimmed last copy)",
+            "{clip, to: position, independent?: bool} - the loop handle: sets the clip's arrangement length to `to`, cycling its content (an unlooped clip is first looped over its whole length, which must be at least 64 samples); at or before the first cycle's end it unloops. independent = lay plain copies up to `to` instead (a trimmed last copy)",
             always,
             loop_to
         ),
@@ -80,7 +80,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Loop",
             [],
             None,
-            "{clips?, start?: samples, end?: samples} - loops the part of the clip from `start` to `end` (clip time, default the whole clip); the clip keeps its length and cycles the range once playback reaches `end`",
+            "{clips?, start?: samples, end?: samples} - loops the part of the clip from `start` to `end` (clip time, default the whole clip; at least 64 samples long); the clip keeps its length and cycles the range once playback reaches `end`",
             always,
             set_loop
         ),

@@ -959,7 +959,15 @@ fn consolidate(e: &mut Engine, p: &Value) -> Result<Value> {
     if r.is_empty() {
         return Err(bad("edit.consolidate", "selection is empty"));
     }
-    let midi = tracks.iter().filter(|&&t| crate::edit::consolidate_midi(e.session_mut(), t, r)).count();
+    let mut midi = 0;
+    for &t in &tracks {
+        if crate::edit::consolidate_midi(e.session_mut(), t, r) {
+            midi += 1;
+        } else if e.session().track(t).is_some_and(|tr| tr.kind.is_midi() && tr.clips().iter().any(|c| c.looping.is_some() && c.range().overlaps(&r)))
+        {
+            return Err(bad("edit.consolidate", "a looped MIDI clip would unroll to too many events; shorten the range or clear the loop first"));
+        }
+    }
     let mut n = 0;
     for t in tracks {
         if crate::io::consolidate(e, "edit.consolidate", t, r)? {
