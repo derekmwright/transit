@@ -3658,3 +3658,47 @@ fn the_last_add_track_row_is_inside_the_scrollable_content_at_the_minimum_header
     assert!(l.add_more[3] <= l.track_list[3], "the \"+ ...\" row {:?} is inside the list {:?}", l.add_more, l.track_list);
     assert!(l.add_more[2] <= l.track_list[2] && l.add_group[2] <= l.track_list[2], "and inside its width");
 }
+
+// ---- #70: loop follow-ups ----
+
+fn two_note_clip(s: &soundcraft_model::Session, notes: &[(u8, i64)]) -> (soundcraft_model::Clip, i64) {
+    let q = soundcraft_time::TICKS_PER_QUARTER;
+    let seq = soundcraft_midi::Sequence {
+        notes: notes
+            .iter()
+            .map(|&(pitch, beat)| soundcraft_midi::Note { pitch, velocity: 100, release_velocity: 64, channel: 0, start: beat * q, length: q })
+            .collect(),
+        ..Default::default()
+    };
+    let beat = s.tempo.tick_to_samples(q, s.sample_rate);
+    (soundcraft_model::Clip::midi(ClipId(900), "m", 0, 2 * beat, seq), beat)
+}
+
+#[test]
+fn loop_ghost_cycles_show_the_notes_that_cycle_plays() {
+    let app = app();
+    let s = app.engine.session();
+    let (c, beat) = two_note_clip(s, &[(60, 0), (64, 1)]);
+    let l = soundcraft_model::ClipLoop { start: 0, end: 2 * beat };
+    // A ghost cycle that begins at the seam plays both notes at their own offsets.
+    let spans = crate::arrange::loop_note_spans(s, &c, l, true, 0, 2 * beat);
+    assert_eq!(spans, vec![(2 * beat, 3 * beat, 60), (3 * beat, 4 * beat, 64)]);
+    // A loop range that starts at beat 1: later cycles skip the intro note, and a ghost that starts
+    // at the loop start (phase 1 beat) puts the beat 1 note at the ghost's left edge.
+    let l = soundcraft_model::ClipLoop { start: beat, end: 2 * beat };
+    let spans = crate::arrange::loop_note_spans(s, &c, l, true, beat, 2 * beat);
+    assert_eq!(spans, vec![(2 * beat, 3 * beat, 64)], "the intro note is not in a ghost cycle");
+    // The first pass (not a later cycle) keeps the intro note.
+    let first = crate::arrange::loop_note_spans(s, &c, l, false, 0, 0);
+    assert_eq!(first.len(), 2);
+    // A note that crosses the seam ends at it.
+    let (long, beat) = {
+        let mut x = c.clone();
+        if let soundcraft_model::ClipContent::Midi { sequence } = &mut x.content {
+            sequence.notes[1].length = 3 * soundcraft_time::TICKS_PER_QUARTER;
+        }
+        (x, beat)
+    };
+    let spans = crate::arrange::loop_note_spans(s, &long, soundcraft_model::ClipLoop { start: 0, end: 2 * beat }, true, 0, 2 * beat);
+    assert_eq!(spans[1], (3 * beat, 4 * beat, 64));
+}

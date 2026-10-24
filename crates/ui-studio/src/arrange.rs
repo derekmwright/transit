@@ -13,6 +13,8 @@ use soundcraft_time::{BarBeat, Samples};
 /// How close (points) to a clip edge a press trims instead of moving.
 const EDGE: f32 = 6.0;
 
+/// Opacity of a loop-drag ghost cycle and the notes drawn in it.
+const GHOST_ALPHA: f32 = 0.45;
 /// Width (points) of the loop handle's hot zone, measured back from a clip's right edge.
 const LOOP_ZONE_W: f32 = 20.0;
 /// Audio clips: the fade handle zones are this wide (from inside the trim edge) and this tall
@@ -1019,6 +1021,10 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
             if let ClipContent::Audio { source, offset } = base.content {
                 g.content = ClipContent::Audio { source, offset: offset.saturating_add(virt.content_pos(a - base.start)) };
             }
+            // A MIDI ghost's notes are drawn below from the cycle math; the body draws none.
+            if let ClipContent::Midi { sequence } = &mut g.content {
+                sequence.notes.clear();
+            }
             g.start = a;
             g.length = b - a;
             g.looping = None;
@@ -1026,7 +1032,31 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
             g.fade_out = Default::default();
             let rect = span(a, b);
             if rect.max.x >= tl.min.x && rect.min.x <= tl.max.x {
-                draw_clip(&p, s, map, tl, t, &g, rect, false, 0.45, false);
+                draw_clip(&p, s, map, tl, t, &g, rect, false, GHOST_ALPHA, false);
+                // MIDI notes of the cycle the ghost plays, dimmed like the ghost body.
+                if let ClipContent::Midi { sequence } = &base.content
+                    && let Some((lo, span)) = pitch_span(&sequence.notes)
+                {
+                    let body = Rect::from_min_max(pos2(rect.min.x, rect.min.y + CLIP_NAME_H), rect.max).shrink2(vec2(0.0, 2.0));
+                    if body.height() > 4.0 {
+                        let (body_col, ..) = theme::clip_colors(clip_base_color(&base, t), false);
+                        let ink = theme::darken(body_col, 0.62).gamma_multiply(GHOST_ALPHA);
+                        let wp = p.with_clip_rect(rect.intersect(tl));
+                        for (from, to, pitch) in loop_note_spans(
+                            s,
+                            &virt,
+                            virt.looping.unwrap_or(ClipLoop { start: 0, end: base.length }),
+                            true,
+                            virt.content_pos(a - base.start),
+                            a - base.start,
+                        ) {
+                            let (x0, x1) = (map.x(base.start + from), map.x(base.start + to));
+                            let fy = 1.0 - f32::from(pitch.saturating_sub(lo)) / span;
+                            let y = body.min.y + 2.0 + fy * (body.height() - 6.0);
+                            wp.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1.max(x0 + 2.0), y + 2.5)), 0.0, ink);
+                        }
+                    }
+                }
             }
         }
         if let Some((a, b)) = l.cut() {
@@ -1045,8 +1075,7 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
 
 #[allow(clippy::too_many_arguments)]
 fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &Clip, rect: Rect, selected: bool, alpha: f32, hot: bool) {
-    let base = theme::rgb(c.color.unwrap_or(t.color));
-    let base = if c.muted { theme::darken(base, 0.5) } else { base };
+    let base = clip_base_color(c, t);
     let (body_col, strip_col, name_col) = theme::clip_colors(base, selected);
     let p = p.with_clip_rect(rect.intersect(tl));
     p.rect_filled(rect, crate::theme::RADIUS, body_col.gamma_multiply(alpha));
@@ -1161,20 +1190,10 @@ fn draw_cycles(
                 }
             }
             ClipContent::Midi { sequence } => {
-                let notes = &sequence.notes;
-                if let (Some(lo), Some(hi)) = (notes.iter().map(|n| n.pitch).min(), notes.iter().map(|n| n.pitch).max()) {
-                    let span = f32::from(hi.saturating_sub(lo)).max(11.0);
-                    let clip_tick = s.tempo.samples_to_ticks(c.start, s.sample_rate);
+                if let Some((lo, span)) = pitch_span(&sequence.notes) {
                     let wp = p.with_clip_rect(seg.intersect(tl));
-                    for n in notes.iter().take(5000) {
-                        let on = s.tempo.tick_to_samples(clip_tick.saturating_add(n.start), s.sample_rate) - c.start;
-                        let off = s.tempo.tick_to_samples(clip_tick.saturating_add(n.end()), s.sample_rate) - c.start;
-                        // Cycle 0 plays what starts before the loop end; later cycles what starts inside the range.
-                        if on >= l.end || (i > 0 && on < l.start) || (i == 0 && on < 0) {
-                            continue;
-                        }
-                        let (from, to) = (a + on - phase, a + off.min(l.end) - phase);
-                        let fy = 1.0 - f32::from(n.pitch.saturating_sub(lo)) / span;
+                    for (from, to, pitch) in loop_note_spans(s, c, l, i > 0, phase, a) {
+                        let fy = 1.0 - f32::from(pitch.saturating_sub(lo)) / span;
                         let y = body.min.y + 2.0 + fy * (body.height() - 6.0);
                         let r = Rect::from_min_max(pos2(sx(from), y), pos2(sx(to.min(b)).max(sx(from) + 2.0), y + 2.5));
                         wp.rect_filled(r, 0.0, ink);
@@ -1184,6 +1203,37 @@ fn draw_cycles(
             ClipContent::Video { .. } => {}
         }
     }
+}
+
+/// A clip's base color: its own or the track's, darkened when muted.
+fn clip_base_color(c: &Clip, t: &Track) -> Color32 {
+    let base = theme::rgb(c.color.unwrap_or(t.color));
+    if c.muted { theme::darken(base, 0.5) } else { base }
+}
+
+/// The lowest pitch and the pitch span (at least an octave) a MIDI clip's mini notes are laid out in.
+fn pitch_span(notes: &[soundcraft_midi::Note]) -> Option<(u8, f32)> {
+    let (lo, hi) = (notes.iter().map(|n| n.pitch).min()?, notes.iter().map(|n| n.pitch).max()?);
+    Some((lo, f32::from(hi.saturating_sub(lo)).max(11.0)))
+}
+
+/// The notes one cycle of a looped MIDI clip plays, as (clip-relative start, end, pitch) spans of
+/// the cycle that begins at clip time `a` with content position `phase` (ADR 0019): cycle 0 plays
+/// what starts before the loop end, a `later` cycle what starts inside the range, and a note
+/// crossing the seam ends there. Playback, the clip body and the loop-drag ghosts share this.
+pub(crate) fn loop_note_spans(s: &Session, c: &Clip, l: ClipLoop, later: bool, phase: Samples, a: Samples) -> Vec<(Samples, Samples, u8)> {
+    let ClipContent::Midi { sequence } = &c.content else { return Vec::new() };
+    let clip_tick = s.tempo.samples_to_ticks(c.start, s.sample_rate);
+    let mut out = Vec::new();
+    for n in sequence.notes.iter().take(5000) {
+        let on = s.tempo.tick_to_samples(clip_tick.saturating_add(n.start), s.sample_rate) - c.start;
+        let off = s.tempo.tick_to_samples(clip_tick.saturating_add(n.end()), s.sample_rate) - c.start;
+        if on >= l.end || (later && on < l.start) || (!later && on < 0) {
+            continue;
+        }
+        out.push((a + on - phase, a + off.min(l.end) - phase, n.pitch));
+    }
+    out
 }
 
 /// Smallest loop glyph (points) worth drawing; a clip too narrow for it shows no corner.
