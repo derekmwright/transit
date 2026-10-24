@@ -83,6 +83,9 @@ pub struct ParamInfo {
     pub taper: Taper,
     /// Labels for `Unit::Choice` parameters (value is the index).
     pub choices: &'static [&'static str],
+    /// The module (CLAP) or unit (VST3) path the parameter sits under, parts joined by `/`; empty
+    /// for built-in devices and plug-ins without groups.
+    pub group: &'static str,
 }
 
 impl ParamInfo {

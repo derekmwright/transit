@@ -370,6 +370,7 @@ fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
         unit,
         taper: Taper::Linear,
         choices,
+        group: leak(p.module.clone()),
     }
 }
 

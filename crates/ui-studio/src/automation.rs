@@ -300,8 +300,8 @@ pub fn device_info(plugin: &str) -> Option<&'static soundcraft_dsp::PluginInfo> 
         .or_else(|| plugin.starts_with(soundcraft_vst3_host::ID_PREFIX).then(|| soundcraft_vst3_host::cached_info(plugin)).flatten())
 }
 
-/// The lanes `t` can show, as (section, label, lane id): the mixer's, each send's, each device's.
-pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, String, String)> {
+/// The mixer's and the sends' lanes of `t`, as (section, label, lane id).
+fn base_choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, String, String)> {
     let mut v = Vec::new();
     for l in [Lane::Volume, Lane::Pan, Lane::Mute] {
         v.push(("Mixer".to_string(), l.label(app, s, t), l.id()));
@@ -315,12 +315,21 @@ pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, Stri
             v.push(("Sends".to_string(), l.label(app, s, t), l.id()));
         }
     }
-    let devices = t
-        .instrument
+    v
+}
+
+/// The devices of `t` (the instrument, then the inserts) as (slot, device).
+fn devices_of(t: &Track) -> impl Iterator<Item = (u8, &soundcraft_model::Insert)> {
+    t.instrument
         .iter()
         .map(|i| (AutoParam::INSTRUMENT_SLOT, i))
-        .chain(t.mixer.inserts.iter().enumerate().filter_map(|(slot, ins)| Some((u8::try_from(slot).unwrap_or(0), ins.as_ref()?))));
-    for (slot, ins) in devices {
+        .chain(t.mixer.inserts.iter().enumerate().filter_map(|(slot, ins)| Some((u8::try_from(slot).unwrap_or(0), ins.as_ref()?))))
+}
+
+/// The lanes `t` can show, as (section, label, lane id): the mixer's, each send's, each device's.
+pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, String, String)> {
+    let mut v = base_choices(app, s, t);
+    for (slot, ins) in devices_of(t) {
         let dev = app.plugin_name(&ins.plugin, false);
         let ids: Vec<(String, String)> = match device_info(&ins.plugin) {
             Some(info) => info.params.iter().map(|p| (p.id.to_string(), p.name.to_string())).collect(),
@@ -333,6 +342,75 @@ pub fn choices(app: &mut StudioApp, s: &Session, t: &Track) -> Vec<(String, Stri
         }
     }
     v
+}
+
+/// One device's parameter model for the picker: from the cached table (built once per table), or,
+/// for a plug-in whose table is not cached yet, the parameters the document holds.
+fn device_model(app: &mut StudioApp, ins: &soundcraft_model::Insert) -> std::sync::Arc<crate::automation_picker::DeviceModel> {
+    match device_info(&ins.plugin) {
+        Some(info) => app.auto.picker.model(&ins.plugin, info),
+        None => {
+            let names: Vec<String> = ins.params.keys().map(|k| format!("param {k}")).collect();
+            std::sync::Arc::new(crate::automation_picker::DeviceModel::build(
+                ins.params.keys().zip(&names).map(|(k, n)| (k.as_str(), n.as_str(), "")),
+            ))
+        }
+    }
+}
+
+/// The picker's popup body: the search box, the mixer and send lanes, then each device's
+/// parameters grouped (or matched, with a search). Returns the chosen lane id.
+fn picker_body(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, current: &str, menu: &mut Vec<MenuItem>) -> Option<String> {
+    use crate::automation_picker::{DeviceView, device};
+    let mut query = std::mem::take(&mut app.auto.picker.query);
+    let focus = std::mem::take(&mut app.auto.picker.focus);
+    let te = ui.add(egui::TextEdit::singleline(&mut query).hint_text("Search parameters").desired_width(f32::INFINITY));
+    if focus {
+        te.request_focus();
+    }
+    let enter = te.lost_focus() && crate::shortcuts::enter_pressed(ui);
+    let searching = !query.trim().is_empty();
+    let mut picked = None;
+    let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+    let devs: Vec<_> =
+        devices_of(t).map(|(slot, ins)| (slot, app.plugin_name(&ins.plugin, false), ins.plugin.clone(), device_model(app, ins))).collect();
+    let base = base_choices(app, s, t);
+    egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+        let mut section = String::new();
+        for (sec, label, id) in base {
+            if searching && !words.iter().all(|w| label.to_lowercase().contains(w)) {
+                continue;
+            }
+            if sec != section {
+                ui.label(egui::RichText::new(&sec).small().color(TOKENS.text_dim));
+                section = sec;
+            }
+            let b = crate::menus::check_button(ui, id == current, label.as_str());
+            menu.push(MenuItem::at(ui, label.clone(), id.clone(), b.rect));
+            if b.clicked() {
+                picked = Some(id);
+            }
+        }
+        for (slot, name, plugin, model) in &devs {
+            let recent = app.auto.picker.recent.get(plugin).map_or(&[][..], Vec::as_slice);
+            let v = DeviceView { name, slot: *slot, model, recent };
+            let found = searching.then(|| model.search(&query));
+            if let Some(id) = device(ui, &v, found.as_deref(), current, menu) {
+                picked = picked.take().or(Some(id));
+            }
+            if enter
+                && picked.is_none()
+                && let Some(&i) = found.as_ref().and_then(|f| f.first())
+            {
+                picked = Some(Lane::Plugin { slot: *slot, param: model.entries[i].id.clone() }.id());
+            }
+        }
+    });
+    app.auto.picker.query = query;
+    if picked.is_some() {
+        ui.close();
+    }
+    picked
 }
 
 /// A selected point.
@@ -475,6 +553,8 @@ pub struct AutoState {
     pub gesture: Option<AutoGesture>,
     /// The plug-in parameters being moved (see [`StudioApp::touch_param`]).
     pub(crate) touches: Vec<ParamTouch>,
+    /// The picker's grouped models, search text and recently touched parameters (#65).
+    pub(crate) picker: crate::automation_picker::PickerState,
     pub selection: Vec<PointRef>,
     /// The lane of the mixer control last clicked (the mixer link).
     pub highlight: Option<(TrackId, String)>,
@@ -544,6 +624,9 @@ impl StudioApp {
     /// value again afterwards.
     pub(crate) fn touch_param(&mut self, track: TrackId, slot: usize, param: &str, hosted: bool) {
         let Some((track, lane)) = Lane::of_param(track, slot, param) else { return };
+        if hosted && let Some(plugin) = self.engine.session().track(track).and_then(|t| lane.device(t)).map(|i| i.plugin.clone()) {
+            self.auto.picker.touched(&plugin, param);
+        }
         let hold = if hosted { Hold::Until(self.last_frame.unwrap_or_default() + HOSTED_HOLD_S) } else { Hold::Pointer };
         match self.auto.touches.iter_mut().find(|x| x.track == track && x.lane == lane) {
             Some(x) => x.hold = hold,
@@ -1116,24 +1199,13 @@ fn lane_header(
     let s = app.engine.session_arc();
     let mut picked = None;
     let resp = resp.on_hover_text("Pick the parameter this lane shows");
-    egui::Popup::menu(&resp).width(240.0).show(|ui| {
-        let list = choices(app, &s, t);
-        egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-            let mut section = String::new();
-            for (sec, label, id) in list {
-                if sec != section {
-                    ui.label(egui::RichText::new(&sec).small().color(TOKENS.text_dim));
-                    section = sec;
-                }
-                let b = crate::menus::check_button(ui, id == lid, label.as_str());
-                menu.push(MenuItem::at(ui, label.clone(), id.clone(), b.rect));
-                if b.clicked() {
-                    picked = Some(id);
-                    ui.close();
-                }
-            }
-        });
-    });
+    if resp.clicked() {
+        app.auto.picker.query.clear();
+        app.auto.picker.focus = true;
+    }
+    if let Some(id) = egui::Popup::menu(&resp).width(260.0).show(|ui| picker_body(app, ui, &s, t, &lid, menu)).and_then(|r| r.inner) {
+        picked = Some(id);
+    }
     if let Some(to) = picked {
         app.pick_lane(t.id, &lid, &to);
     }

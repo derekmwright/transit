@@ -433,3 +433,8 @@ pub fn filtered(query: &str) -> Vec<(Scope, Vec<&'static Shortcut>)> {
         .filter(|(_, r)| !r.is_empty())
         .collect()
 }
+
+/// Whether Enter was pressed this frame (a focused text field's accept; not a table shortcut).
+pub(crate) fn enter_pressed(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.key_pressed(egui::Key::Enter))
+}

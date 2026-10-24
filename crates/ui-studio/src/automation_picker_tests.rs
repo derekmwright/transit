@@ -92,3 +92,135 @@ fn a_mixed_case_parameter_id_gets_a_lane_that_round_trips() {
     };
     assert_eq!(back.track(t).unwrap().lane(&p).unwrap().points[0].value, 0.25);
 }
+
+// ---- Issue #65: grouped, searchable picker model ---------------------------------------------
+
+mod grouping {
+    use crate::automation_picker::{DeviceModel, PickerState, RECENT_MAX};
+    use soundcraft_dsp::{Category, ParamInfo, PluginInfo, Taper, Unit};
+
+    /// A Battery-like table: `cells` cells (A1, A2, ...), `per` parameters each, `Cell/<name>`
+    /// groups, CLAP-style names that carry their module.
+    fn rows(cells: usize, per: usize) -> Vec<(String, String, String)> {
+        let mut v = Vec::new();
+        for c in 0..cells {
+            let cell = format!("A{}", c + 1);
+            for p in 0..per {
+                let leaf = if p % 2 == 0 { "Poly Mode On".to_string() } else { format!("Param {p}") };
+                // "Poly Mode On" repeats per cell, as in Battery.
+                let leaf = if p == 0 { leaf } else { format!("{leaf} {p}") };
+                v.push((format!("{}", c * per + p), format!("Cell/{cell}/{leaf}"), format!("Cell/{cell}")));
+            }
+        }
+        v
+    }
+
+    fn model(r: &[(String, String, String)]) -> DeviceModel {
+        DeviceModel::build(r.iter().map(|(i, n, g)| (i.as_str(), n.as_str(), g.as_str())))
+    }
+
+    #[test]
+    fn four_thousand_parameters_group_into_nested_cells_and_search_narrows() {
+        let r = rows(125, 32);
+        assert_eq!(r.len(), 4000);
+        let m = model(&r);
+        assert!(m.grouped);
+        // One "Cell" group holding 125 cell groups of 32 leaves each; nothing at the root.
+        assert!(m.root.leaves.is_empty());
+        assert_eq!(m.root.children.len(), 1);
+        let cell = &m.root.children[0];
+        assert_eq!(cell.name, "Cell");
+        assert_eq!(cell.children.len(), 125);
+        assert!(cell.children.iter().all(|c| c.leaves.len() == 32 && c.children.is_empty()));
+        assert_eq!(cell.children[0].name, "A1");
+        // The CLAP module prefix is cut from the leaf, and the path reads "Cell > A1 > Poly Mode On".
+        assert_eq!(m.entries[0].leaf, "Poly Mode On");
+        assert_eq!(m.entries[0].path, "Cell > A1 > Poly Mode On");
+        // Search: case-insensitive over the full path, words in any order; it narrows.
+        let hits = m.search("POLY a1");
+        assert!(hits.iter().all(|&i| m.entries[i].path.to_lowercase().contains("poly") && m.entries[i].path.to_lowercase().contains("a1")));
+        assert!(hits.iter().any(|&i| m.entries[i].path == "Cell > A1 > Poly Mode On"));
+        assert!(hits.len() < 4000 / 5, "27 of 125 cells hold \"a1\", and only their Poly leaves match");
+        let narrow = m.search("cell > a7 > poly mode on");
+        assert!(narrow.contains(&m.by_id["192"]) && narrow.len() < hits.len());
+        assert!(m.search("no such parameter").is_empty());
+        assert!(m.search("   ").is_empty(), "an empty query is no search");
+    }
+
+    #[test]
+    fn a_table_without_groups_is_a_flat_list() {
+        let r: Vec<_> = (0..50).map(|i| (i.to_string(), format!("Knob {i}"), String::new())).collect();
+        let m = model(&r);
+        assert!(!m.grouped);
+        assert!(m.root.children.is_empty());
+        assert_eq!(m.root.leaves.len(), 50);
+        assert_eq!(m.leaf_label(3), "Knob 3");
+        assert_eq!(m.search("knob 4").len(), 14, "Knob 4, 14, 24, 34, 40..49");
+    }
+
+    #[test]
+    fn a_leaf_name_repeated_inside_a_group_shows_its_path() {
+        let m = DeviceModel::build([("1", "Level", "Osc/A"), ("2", "Level", "Osc/A"), ("3", "Level", "Osc/B")]);
+        assert_eq!(m.leaf_label(0), "Osc > A > Level");
+        assert_eq!(m.leaf_label(2), "Level");
+    }
+
+    #[test]
+    fn recent_keeps_the_last_eight_newest_first_without_repeats() {
+        let mut st = PickerState::default();
+        for i in 0..12 {
+            st.touched("clap:x", &i.to_string());
+        }
+        st.touched("clap:x", "5");
+        let r = &st.recent["clap:x"];
+        assert_eq!(r.len(), RECENT_MAX);
+        assert_eq!(r[0], "5");
+        assert_eq!(r[1], "11");
+        assert_eq!(r.iter().filter(|p| *p == "5").count(), 1);
+        assert!(!st.recent.contains_key("clap:y"));
+    }
+
+    fn leak_info(n: usize) -> &'static PluginInfo {
+        let params: Vec<ParamInfo> = (0..n)
+            .map(|i| ParamInfo {
+                id: Box::leak(i.to_string().into_boxed_str()),
+                name: Box::leak(format!("Cell/A{}/Poly Mode On", i % 100).into_boxed_str()),
+                min: 0.0,
+                max: 1.0,
+                default: 0.0,
+                unit: Unit::None,
+                taper: Taper::Linear,
+                choices: &[],
+                group: Box::leak(format!("Cell/A{}", i % 100).into_boxed_str()),
+            })
+            .collect();
+        Box::leak(Box::new(PluginInfo {
+            id: "clap:synthetic",
+            name: "Synthetic",
+            short_name: "Synth",
+            category: Category::Eq,
+            params: Box::leak(params.into_boxed_slice()),
+            is_instrument: false,
+            audiosuite: false,
+        }))
+    }
+
+    #[test]
+    fn the_model_is_built_once_per_cached_table() {
+        let mut st = PickerState::default();
+        let info = leak_info(4000);
+        let a = st.model("clap:synthetic", info);
+        for _ in 0..100 {
+            // A frame with the popup open: same table, same model, no rebuild.
+            let b = st.model("clap:synthetic", info);
+            assert!(std::sync::Arc::ptr_eq(&a, &b));
+        }
+        assert_eq!(st.builds, 1);
+        assert_eq!(a.entries.len(), 4000);
+        assert_eq!(a.root.children[0].children.len(), 100);
+        // The host replaced the table (a new generation): rebuilt.
+        let b = st.model("clap:synthetic", leak_info(10));
+        assert_eq!(st.builds, 2);
+        assert_eq!(b.entries.len(), 10);
+    }
+}

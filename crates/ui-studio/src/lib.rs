@@ -13,6 +13,7 @@ mod audio_connection;
 pub mod audio_devices;
 pub mod audio_devices_io;
 pub mod automation;
+mod automation_picker;
 pub mod browser;
 pub mod builtin_editor;
 pub mod control;

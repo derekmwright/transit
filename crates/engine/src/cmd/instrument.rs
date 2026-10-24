@@ -104,8 +104,17 @@ mod tests {
     fn hosted_plugins_start_with_an_empty_parameter_map() {
         use soundcraft_dsp::{Category, ParamInfo, PluginInfo, Taper, Unit};
         use soundcraft_model::Insert;
-        static PARAMS: [ParamInfo; 1] =
-            [ParamInfo { id: "volume", name: "Volume", min: 0.0, max: 1.0, default: 0.0, unit: Unit::None, taper: Taper::Linear, choices: &[] }];
+        static PARAMS: [ParamInfo; 1] = [ParamInfo {
+            id: "volume",
+            name: "Volume",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            unit: Unit::None,
+            taper: Taper::Linear,
+            choices: &[],
+            group: "",
+        }];
         let hosted = PluginInfo {
             id: "vst3:00000000000000000000000000000003",
             name: "Hosted",

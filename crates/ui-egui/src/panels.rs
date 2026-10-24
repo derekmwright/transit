@@ -714,7 +714,17 @@ mod tests {
 
     #[test]
     fn hosted_plugin_window_shows_reported_defaults_until_a_control_moves() {
-        let p = ParamInfo { id: "volume", name: "Volume", min: 0.0, max: 1.0, default: 0.0, unit: Unit::None, taper: Taper::Linear, choices: &[] };
+        let p = ParamInfo {
+            id: "volume",
+            name: "Volume",
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            unit: Unit::None,
+            taper: Taper::Linear,
+            choices: &[],
+            group: "",
+        };
         // A hosted plugin's map starts empty: the window shows the default the plugin reports,
         // even if the plugin loaded another value by itself (Rhapsody's volume is not 0).
         let mut ins = Insert::new("vst3:00000000000000000000000000000003");

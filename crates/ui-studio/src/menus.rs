@@ -690,7 +690,7 @@ pub fn shortcuts_window(app: &mut StudioApp, ctx: &egui::Context) {
 /// Keep this slot even for unchecked items and ordinary commands in the same menu.
 const MENU_CHECK_SIZE: f32 = 12.0;
 
-fn menu_contents(text: impl Into<egui::WidgetText>) -> (egui::Atom<'static>, egui::WidgetText) {
+pub(crate) fn menu_contents(text: impl Into<egui::WidgetText>) -> (egui::Atom<'static>, egui::WidgetText) {
     (egui::Atom::custom(egui::Id::new("menu_check"), egui::Vec2::splat(MENU_CHECK_SIZE)), text.into())
 }
 

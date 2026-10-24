@@ -21,7 +21,7 @@ use std::time::Duration;
 use vst3::Steinberg::Vst::{self as sv};
 use vst3::Steinberg::Vst::{
     IAttributeListTrait, IAudioProcessorTrait, IComponentHandlerTrait, IComponentTrait, IConnectionPointTrait, IEditControllerTrait, IEventListTrait,
-    IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait,
+    IHostApplicationTrait, IMessageTrait, IMidiMappingTrait, IParamValueQueueTrait, IParameterChangesTrait, IUnitInfoTrait,
 };
 use vst3::Steinberg::{self as sb};
 use vst3::Steinberg::{FUnknown, IBStreamTrait, IPlugFrameTrait, IPlugViewTrait, IPluginBaseTrait, IPluginFactory2Trait, IPluginFactoryTrait};
@@ -1753,6 +1753,8 @@ pub(crate) struct RawParam {
     pub step_count: i32,
     pub default_normalized: f64,
     pub flags: i32,
+    /// The `IUnitInfo` unit the parameter belongs to (0 is the root unit).
+    pub unit_id: i32,
 }
 
 pub(crate) const PARAM_HIDDEN: i32 = sv::ParameterInfo_::ParameterFlags_::kIsHidden;
@@ -1915,7 +1917,45 @@ impl Instance {
                 step_count: info.stepCount.max(0),
                 default_normalized: if d.is_finite() { d.clamp(0.0, 1.0) } else { 0.0 },
                 flags: info.flags,
+                unit_id: info.unitId,
             });
+        }
+        out
+    }
+
+    /// Each unit's path from the root (`IUnitInfo`), names joined by `/`; the root unit (id 0) is
+    /// the empty path and is left out. Empty when the controller has no unit info. Main thread.
+    pub fn unit_paths(&self) -> std::collections::HashMap<i32, String> {
+        let Some(u) = self.controller.as_ref().and_then(|c| c.cast::<sv::IUnitInfo>()) else { return Default::default() };
+        // SAFETY: valid unit-info interface on the main thread.
+        let n = unsafe { u.getUnitCount() }.clamp(0, MAX_PARAMS);
+        let mut raw: Vec<(i32, i32, String)> = Vec::new();
+        for i in 0..n {
+            // SAFETY: `UnitInfo` is plain data; all-zero is valid.
+            let mut info: sv::UnitInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: index below the count; `info` is writable.
+            if ok(unsafe { u.getUnitInfo(i, &mut info) }) {
+                raw.push((info.id, info.parentUnitId, read_c16(&info.name)));
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        for (id, ..) in &raw {
+            // Walk up the parents; the depth bound stops a cycle in a broken table.
+            let (mut names, mut cur) = (Vec::new(), *id);
+            for _ in 0..raw.len() {
+                let Some((_, parent, name)) = raw.iter().find(|r| r.0 == cur) else { break };
+                if cur == 0 {
+                    break;
+                }
+                if !name.is_empty() {
+                    names.push(name.clone());
+                }
+                cur = *parent;
+            }
+            names.reverse();
+            if !names.is_empty() {
+                out.insert(*id, names.join("/"));
+            }
         }
         out
     }

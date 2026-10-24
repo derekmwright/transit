@@ -363,7 +363,7 @@ pub(crate) fn unit_from_label(units: &str) -> Unit {
     }
 }
 
-fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
+fn param_info(inst: &Instance, p: &RawParam, units: &std::collections::HashMap<i32, String>) -> ParamInfo {
     let name = if p.title.is_empty() { format!("Param {}", p.id) } else { p.title.clone() };
     let base = ParamInfo {
         id: leak(p.id.to_string()),
@@ -374,6 +374,7 @@ fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
         unit: Unit::None,
         taper: Taper::Linear,
         choices: &[],
+        group: units.get(&p.unit_id).map_or("", |g| leak(g.clone())),
     };
     if p.step_count == 1 {
         return ParamInfo { unit: Unit::Toggle, default: p.default_normalized.round() as f32, ..base };
@@ -426,8 +427,13 @@ fn param_info(inst: &Instance, p: &RawParam) -> ParamInfo {
 
 /// Builds and leaks the `PluginInfo` for one plugin type. Called once per id (cached), outside the registry lock.
 fn build_info(d: &Vst3Descriptor, inst: &Instance) -> &'static PluginInfo {
-    let params: Vec<ParamInfo> =
-        inst.params().iter().filter(|p| p.flags & (PARAM_HIDDEN | PARAM_READ_ONLY | PARAM_BYPASS) == 0).map(|p| param_info(inst, p)).collect();
+    let units = inst.unit_paths();
+    let params: Vec<ParamInfo> = inst
+        .params()
+        .iter()
+        .filter(|p| p.flags & (PARAM_HIDDEN | PARAM_READ_ONLY | PARAM_BYPASS) == 0)
+        .map(|p| param_info(inst, p, &units))
+        .collect();
     let short: String = d.name.chars().take(8).collect();
     Box::leak(Box::new(PluginInfo {
         id: leak(d.id.clone()),
