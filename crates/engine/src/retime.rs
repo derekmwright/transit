@@ -109,7 +109,12 @@ pub fn move_material(s: &mut Session, at: &dyn Fn(Samples) -> Samples) -> Result
     let ticks: HashSet<TrackId> = s.tracks.iter().filter(|t| t.ticks_timebase).map(|t| t.id).collect();
     for tr in s.tracks.iter_mut().filter(|t| t.ticks_timebase) {
         for pl in &mut tr.playlists {
-            move_clips(&mut pl.clips, at, ctx).map_err(|clip| format!("the change squeezes clip `{clip}` on track `{}` to nothing", tr.name))?;
+            move_clips(&mut pl.clips, at, ctx).map_err(|why| match why {
+                Squeezed::Clip(clip) => format!("the change squeezes clip `{clip}` on track `{}` to nothing", tr.name),
+                Squeezed::Loop(clip) => {
+                    format!("the change squeezes the loop of clip `{clip}` on track `{}` below {} samples", tr.name, soundcraft_model::MIN_CYCLE)
+                }
+            })?;
             pl.sort();
         }
         for lane in &mut tr.automation {
@@ -134,10 +139,10 @@ pub fn move_material(s: &mut Session, at: &dyn Fn(Samples) -> Samples) -> Result
 
 /// Move a playlist's clips and restore the playlist rule. The error is the name of a clip that
 /// would vanish.
-fn move_clips(clips: &mut [Clip], at: &dyn Fn(Samples) -> Samples, ctx: TimeCtx<'_>) -> Result<(), String> {
+fn move_clips(clips: &mut [Clip], at: &dyn Fn(Samples) -> Samples, ctx: TimeCtx<'_>) -> Result<(), Squeezed> {
     let was: Vec<Range> = clips.iter().map(Clip::range).collect();
     for c in clips.iter_mut().filter(|c| !c.time_locked) {
-        move_clip(c, at);
+        move_clip(c, at)?;
     }
     // The order the clips now play in; a tie keeps the earlier clip first.
     let mut order: Vec<usize> = (0..clips.len()).collect();
@@ -157,14 +162,14 @@ fn move_clips(clips: &mut [Clip], at: &dyn Fn(Samples) -> Samples, ctx: TimeCtx<
             let end = b.start.saturating_add(keep);
             let Some(a) = clips.get_mut(ia) else { continue };
             if end <= a.start {
-                return Err(a.name.clone());
+                return Err(Squeezed::Clip(a.name.clone()));
             }
             a.trim_end_to(end);
         } else if !b.time_locked {
             let start = a.end() - keep;
             let Some(b) = clips.get_mut(ib) else { continue };
             if start >= b.end() {
-                return Err(b.name.clone());
+                return Err(Squeezed::Clip(b.name.clone()));
             }
             trim_start(b, start, ctx);
         }
@@ -173,11 +178,11 @@ fn move_clips(clips: &mut [Clip], at: &dyn Fn(Samples) -> Samples, ctx: TimeCtx<
     Ok(())
 }
 
-fn move_clip(c: &mut Clip, at: &dyn Fn(Samples) -> Samples) {
+fn move_clip(c: &mut Clip, at: &dyn Fn(Samples) -> Samples) -> Result<(), Squeezed> {
     let start = at(c.start);
     if !matches!(c.content, ClipContent::Midi { .. }) {
         c.start = start;
-        return;
+        return Ok(());
     }
     // A MIDI clip is musical from end to end: re-place every edge and offset as a musical position.
     let old = c.start;
@@ -191,12 +196,25 @@ fn move_clip(c: &mut Clip, at: &dyn Fn(Samples) -> Samples) {
     if c.sync_point != 0 {
         c.sync_point = rel(c.sync_point);
     }
+    // A loop the new tempo would squeeze under the minimum cycle is refused (ADR 0019): clearing it
+    // would silently turn a looped clip into a long silent one, and clamping it would move the
+    // loop off its bars. The command rolls back with the clip named, as for a squeezed clip.
     if let Some(l) = &mut c.looping {
-        (l.start, l.end) = (rel(l.start), rel(l.end));
+        let moved = soundcraft_model::ClipLoop { start: rel(l.start), end: rel(l.end) };
+        if !moved.is_valid() {
+            return Err(Squeezed::Loop(c.name.clone()));
+        }
+        *l = moved;
     }
     c.start = start;
     c.trim_end_to(start + end);
-    c.looping = c.looping.filter(|l| l.is_valid());
+    Ok(())
+}
+
+/// Why a retime was refused: a clip squeezed to nothing, or a loop squeezed under the minimum cycle.
+enum Squeezed {
+    Clip(String),
+    Loop(String),
 }
 
 /// Put back the material a tempo gesture started from (see `Engine::execute_merged`), so each

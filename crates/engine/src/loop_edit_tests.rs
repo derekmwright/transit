@@ -254,3 +254,28 @@ fn an_overwriting_loop_removes_covered_clips_and_stops_at_an_edit_locked_one() {
     e.execute("clip.loop_to", &json!({"clip": id.0, "to": 340, "overwrite": true})).unwrap();
     assert_eq!(neighbors(&e, t), vec![(0, 300), (300, 360)], "covered clips gone, the locked clip untouched");
 }
+
+/// A MIDI clip whose loop cycle is 100 samples: a tempo change that makes the cycle shorter than
+/// the 64-sample minimum is refused (K40, ADR 0019) instead of silently dropping the loop.
+fn tiny_loop() -> (Engine, TrackId, ClipId) {
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+    let id = s.new_clip_id();
+    let mut c = Clip::midi(id, "tiny", 0, 1000, Sequence::default());
+    c.looping = Some(soundcraft_model::ClipLoop { start: 0, end: 100 });
+    crate::edit::place_clip(&mut s, t, c);
+    (Engine::new(s), t, id)
+}
+
+#[test]
+fn a_tempo_change_that_squeezes_a_loop_below_the_minimum_cycle_is_refused_and_rolls_back() {
+    let (mut e, _, id) = tiny_loop();
+    let err = e.execute("event.tempo", &json!({"bpm": 240.0})).unwrap_err().to_string();
+    assert!(err.contains("loop") && err.contains("tiny") && err.contains("64"), "{err}");
+    let c = e.session().find_clip(id).unwrap().1.clone();
+    assert_eq!(c.looping, Some(soundcraft_model::ClipLoop { start: 0, end: 100 }), "the loop is kept");
+    assert_eq!((c.length, e.session().tempo.tempos()[0].bpm), (1000, 120.0), "nothing changed");
+    // A change that leaves the cycle valid still retimes it: 120 -> 160 bpm makes 100 samples 75.
+    e.execute("event.tempo", &json!({"bpm": 160.0})).unwrap();
+    assert_eq!(e.session().find_clip(id).unwrap().1.looping, Some(soundcraft_model::ClipLoop { start: 0, end: 75 }));
+}
