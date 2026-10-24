@@ -368,7 +368,7 @@ fn picker_body(app: &mut StudioApp, ui: &mut Ui, s: &Session, t: &Track, current
     if focus {
         te.request_focus();
     }
-    let enter = te.lost_focus() && crate::shortcuts::enter_pressed(ui);
+    let enter = te.lost_focus() && ui.input(|i| crate::shortcuts::hit(i, crate::shortcuts::Action::PickerPickFirst));
     let searching = !query.trim().is_empty();
     let mut picked = None;
     let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();

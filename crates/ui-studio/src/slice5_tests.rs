@@ -249,6 +249,7 @@ fn every_handler_takes_its_keys_from_the_table() {
         include_str!("lib.rs"),
         include_str!("finish.rs"),
         include_str!("automation.rs"),
+        include_str!("automation_picker.rs"),
     ];
     for src in sources {
         for raw in ["consume_key(", "key_pressed(", "shortcut_text(\"", "Key::"] {

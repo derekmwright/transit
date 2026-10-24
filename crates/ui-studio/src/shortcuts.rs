@@ -140,6 +140,7 @@ pub enum Action {
     StepThirtySecond,
     BrowserCancel,
     BrowserAddFolder,
+    PickerPickFirst,
     DialogConfirm,
     DialogCancel,
     ToggleAutomation,
@@ -352,6 +353,7 @@ pub const TABLE: &[Shortcut] = &[
     row(A::DeletePoints, "Delete Selected Points", NONE, Key::Delete, S::Automation, "All DAWs. Without selected points Delete takes clips."),
     row(A::DeletePoints, "Delete Selected Points", NONE, Key::Backspace, S::Automation, "Same as Delete."),
     row(A::DeselectPoints, "Deselect Points", NONE, Key::Escape, S::Automation, "Ours; a click on a clip or empty lane does the same."),
+    row(A::PickerPickFirst, "Pick First Match", NONE, Key::Enter, S::Automation, "In the lane picker's search field."),
     // Browser.
     row(A::BrowserCancel, "Cancel Drag, Add Folder or Import", NONE, Key::Escape, S::Browser, "Ours."),
     row(A::BrowserAddFolder, "Add the Typed Folder", NONE, Key::Enter, S::Browser, "In the Add Folder field."),
@@ -432,9 +434,4 @@ pub fn filtered(query: &str) -> Vec<(Scope, Vec<&'static Shortcut>)> {
         })
         .filter(|(_, r)| !r.is_empty())
         .collect()
-}
-
-/// Whether Enter was pressed this frame (a focused text field's accept; not a table shortcut).
-pub(crate) fn enter_pressed(ui: &egui::Ui) -> bool {
-    ui.input(|i| i.key_pressed(egui::Key::Enter))
 }

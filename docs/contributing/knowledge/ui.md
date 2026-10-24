@@ -21,6 +21,7 @@ UI code follows the same no-panic rule (`#![deny(clippy::unwrap_used, ...)]` in 
 - **Long work** (plug-in scan, import) runs off the UI thread. Known gap: a heavy plug-in create can
   still block it (`../../known-issues/README.md`).
 - **Transport wait:** Play draws muted and pulses, with the reason as its tooltip, while a Play request is pending or a plug-in is still loading (`transport_wait()` in `transport.rs`, derived from `player_requests.play` and `Player::any_loading`). Clicks while pending are ignored; Stop cancels.
+- Known issue: `audio_devices_io.rs` reads Enter directly (`key_pressed`) in the rename field; it predates the shortcut gate's scan list and should move to a table row.
 - Strings are American English.
 
 ## Tests

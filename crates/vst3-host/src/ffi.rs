@@ -1938,26 +1938,7 @@ impl Instance {
                 raw.push((info.id, info.parentUnitId, read_c16(&info.name)));
             }
         }
-        let mut out = std::collections::HashMap::new();
-        for (id, ..) in &raw {
-            // Walk up the parents; the depth bound stops a cycle in a broken table.
-            let (mut names, mut cur) = (Vec::new(), *id);
-            for _ in 0..raw.len() {
-                let Some((_, parent, name)) = raw.iter().find(|r| r.0 == cur) else { break };
-                if cur == 0 {
-                    break;
-                }
-                if !name.is_empty() {
-                    names.push(name.clone());
-                }
-                cur = *parent;
-            }
-            names.reverse();
-            if !names.is_empty() {
-                out.insert(*id, names.join("/"));
-            }
-        }
-        out
+        unit_paths_from(&raw)
     }
 
     /// Normalized → plain (`None` without a controller or for a non-finite answer). UI thread
@@ -2755,8 +2736,67 @@ mod window {
 #[path = "host_object_tests.rs"]
 mod host_object_tests;
 
+/// The deepest unit path kept; a deeper (or cyclic) chain stops here.
+const UNIT_DEPTH_MAX: usize = 64;
+
+/// Each unit's path from the root, from (id, parent id, name) rows: names joined by `/`, the root
+/// (id 0) and unnamed units left out, a unit with no names omitted. A walk stops at an unknown
+/// parent, at a unit it has already visited (a cycle in a broken table) and at `UNIT_DEPTH_MAX`.
+fn unit_paths_from(raw: &[(i32, i32, String)]) -> std::collections::HashMap<i32, String> {
+    use std::collections::{HashMap, HashSet};
+    let mut by_id: HashMap<i32, (i32, &str)> = HashMap::with_capacity(raw.len());
+    for (id, parent, name) in raw {
+        by_id.entry(*id).or_insert((*parent, name.as_str()));
+    }
+    let mut out = HashMap::new();
+    for (id, ..) in raw {
+        let (mut names, mut cur) = (Vec::new(), *id);
+        let mut seen = HashSet::new();
+        while names.len() < UNIT_DEPTH_MAX && cur != 0 && seen.insert(cur) {
+            let Some(&(parent, name)) = by_id.get(&cur) else { break };
+            if !name.is_empty() {
+                names.push(name);
+            }
+            cur = parent;
+        }
+        names.reverse();
+        if !names.is_empty() {
+            out.insert(*id, names.join("/"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    fn units(rows: &[(i32, i32, &str)]) -> Vec<(i32, i32, String)> {
+        rows.iter().map(|&(i, p, n)| (i, p, n.to_string())).collect()
+    }
+
+    #[test]
+    fn unit_paths_nest_from_the_root_and_stop_at_unknown_parents() {
+        let m = unit_paths_from(&units(&[(0, -1, "Root"), (1, 0, "Osc"), (2, 1, "A"), (3, 99, "Lost"), (4, 1, "")]));
+        assert_eq!(m.get(&1).map(String::as_str), Some("Osc"));
+        assert_eq!(m.get(&2).map(String::as_str), Some("Osc/A"));
+        assert_eq!(m.get(&3).map(String::as_str), Some("Lost"));
+        assert_eq!(m.get(&4).map(String::as_str), Some("Osc"));
+        assert!(!m.contains_key(&0));
+    }
+
+    #[test]
+    fn a_cyclic_unit_table_terminates_fast_with_bounded_paths() {
+        let n = 4096;
+        let mut rows: Vec<(i32, i32, String)> = (1..=n).map(|i| (i, if i == n { 1 } else { i + 1 }, format!("U{i}"))).collect();
+        rows.push((n + 1, n + 1, "Self".to_string()));
+        let t = std::time::Instant::now();
+        let m = unit_paths_from(&rows);
+        let took = t.elapsed();
+        eprintln!("cyclic unit table of {} units: {took:?}", rows.len());
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        assert!(m.values().all(|p| p.split('/').count() <= UNIT_DEPTH_MAX));
+        assert_eq!(m.get(&(n + 1)).map(String::as_str), Some("Self"), "a self-loop visits its unit once");
+    }
+
     use super::*;
 
     #[cfg(not(target_os = "macos"))]

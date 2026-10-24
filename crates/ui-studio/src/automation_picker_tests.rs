@@ -161,8 +161,11 @@ mod grouping {
     #[test]
     fn a_leaf_name_repeated_inside_a_group_shows_its_path() {
         let m = DeviceModel::build([("1", "Level", "Osc/A"), ("2", "Level", "Osc/A"), ("3", "Level", "Osc/B")]);
-        assert_eq!(m.leaf_label(0), "Osc > A > Level");
+        assert_eq!(m.leaf_label(0), "Osc > A > Level (1)");
+        assert_eq!(m.leaf_label(1), "Osc > A > Level (2)");
         assert_eq!(m.leaf_label(2), "Level");
+        assert_eq!(m.path_label(1), "Osc > A > Level (2)");
+        assert_eq!(m.path_label(2), "Osc > B > Level");
     }
 
     #[test]

@@ -47,8 +47,9 @@ pub(crate) struct DeviceModel {
     pub by_id: HashMap<String, usize>,
     /// Whether any parameter has a group; without one the picker is a flat list.
     pub grouped: bool,
-    /// Entries whose leaf name repeats within their group show their full path.
-    pub dup: Vec<bool>,
+    /// Entries whose leaf name repeats within their group show their full path and a 1-based
+    /// index among the repeats; 0 for a name that is unique in its group.
+    pub dup: Vec<usize>,
 }
 
 impl DeviceModel {
@@ -80,7 +81,17 @@ impl DeviceModel {
         for e in &m.entries {
             *seen.entry((e.group.as_str(), e.leaf.as_str())).or_default() += 1;
         }
-        m.dup = m.entries.iter().map(|e| seen[&(e.group.as_str(), e.leaf.as_str())] > 1).collect();
+        let mut ordinal: HashMap<(&str, &str), usize> = HashMap::new();
+        m.dup = m
+            .entries
+            .iter()
+            .map(|e| {
+                let k = (e.group.as_str(), e.leaf.as_str());
+                let n = ordinal.entry(k).or_default();
+                *n += 1;
+                if seen[&k] > 1 { *n } else { 0 }
+            })
+            .collect();
         m
     }
 
@@ -99,8 +110,19 @@ impl DeviceModel {
     }
 
     /// The label for `i` where its group is not shown.
-    pub fn leaf_label(&self, i: usize) -> &str {
-        if self.dup[i] { &self.entries[i].path } else { &self.entries[i].leaf }
+    pub fn leaf_label(&self, i: usize) -> String {
+        match self.dup[i] {
+            0 => self.entries[i].leaf.clone(),
+            n => format!("{} ({n})", self.entries[i].path),
+        }
+    }
+
+    /// The label for `i` where the full path is shown (search matches, Recent).
+    pub fn path_label(&self, i: usize) -> String {
+        match self.dup[i] {
+            0 => self.entries[i].path.clone(),
+            n => format!("{} ({n})", self.entries[i].path),
+        }
     }
 }
 
@@ -161,14 +183,19 @@ fn leaves(ui: &mut Ui, v: &DeviceView, list: &[usize], current: &str, menu: &mut
     let mut picked = None;
     if list.len() > ROWS_ABOVE {
         let h = ui.spacing().interact_size.y;
-        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show_rows(ui, h, list.len(), |ui, rows| {
-            for &i in &list[rows] {
-                picked = picked.take().or(leaf(ui, v, i, v.model.leaf_label(i), current, menu));
-            }
-        });
+        egui::ScrollArea::vertical().id_salt(("picker_leaves", v.slot)).max_height(300.0).auto_shrink([false, true]).show_rows(
+            ui,
+            h,
+            list.len(),
+            |ui, rows| {
+                for &i in &list[rows] {
+                    picked = picked.take().or(leaf(ui, v, i, &v.model.leaf_label(i), current, menu));
+                }
+            },
+        );
     } else {
         for &i in list {
-            picked = picked.take().or(leaf(ui, v, i, v.model.leaf_label(i), current, menu));
+            picked = picked.take().or(leaf(ui, v, i, &v.model.leaf_label(i), current, menu));
         }
     }
     picked
@@ -203,7 +230,7 @@ pub(crate) fn device(ui: &mut Ui, v: &DeviceView, matches: Option<&[usize]>, cur
         ui.label(egui::RichText::new(v.name).small().color(dim));
         let shown = &m[..m.len().min(MATCH_MAX)];
         for &i in shown {
-            picked = picked.take().or(leaf(ui, v, i, &v.model.entries[i].path, current, menu));
+            picked = picked.take().or(leaf(ui, v, i, &v.model.path_label(i), current, menu));
         }
         if m.len() > shown.len() {
             ui.label(egui::RichText::new(format!("{} more: refine the search", m.len() - shown.len())).small().color(dim));
@@ -215,7 +242,7 @@ pub(crate) fn device(ui: &mut Ui, v: &DeviceView, matches: Option<&[usize]>, cur
     if !recent.is_empty() {
         ui.label(egui::RichText::new("Recent").small().color(dim));
         for i in recent {
-            picked = picked.take().or(leaf(ui, v, i, &v.model.entries[i].path, current, menu));
+            picked = picked.take().or(leaf(ui, v, i, &v.model.path_label(i), current, menu));
         }
     }
     let rest = if v.model.grouped { tree(ui, v, &v.model.root, current, menu) } else { leaves(ui, v, &v.model.root.leaves, current, menu) };
