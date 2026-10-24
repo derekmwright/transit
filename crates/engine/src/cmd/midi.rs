@@ -48,6 +48,24 @@ pub fn specs() -> Vec<CommandSpec> {
             chord_add
         ),
         cmd!("midi.notes_move", "Move Notes", [], None, "{clip, indices: [n], ticks?: 0, semitones?: 0}", always, notes_move),
+        cmd!(
+            "midi.notes_transpose",
+            "Transpose Notes",
+            [],
+            None,
+            "{clip, indices: [n], semitones}; pitches clamp to 0..127",
+            always,
+            notes_transpose
+        ),
+        cmd!(
+            "midi.notes_constrain",
+            "Constrain Notes to Scale",
+            [],
+            None,
+            "{clip, indices: [n], root: 0..11 (C=0), scale: major|minor}; nearest tone, ties downward; minor is natural minor",
+            always,
+            notes_constrain
+        ),
     ]
 }
 
@@ -177,6 +195,52 @@ fn notes_move(e: &mut Engine, p: &Value) -> Result<Value> {
     seq.sort();
     Ok(json!({"moved": idx.len()}))
 }
+
+/// Validate the complete selection before editing; repeated indices edit a note only once.
+fn pitch_edit(e: &mut Engine, p: &Value, command: &str, pitch: impl Fn(u8) -> u8) -> Result<Value> {
+    let id = clip_id(p, command)?;
+    let raw = p.get("indices").and_then(Value::as_array).ok_or_else(|| bad(command, "indices array required"))?;
+    let mut selected = raw
+        .iter()
+        .map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| bad(command, "invalid note index")))
+        .collect::<Result<Vec<_>>>()?;
+    selected.sort_unstable();
+    selected.dedup();
+    let seq = seq_mut(e, id, command)?;
+    if selected.iter().any(|&i| i >= seq.notes.len()) {
+        return Err(bad(command, "index out of range"));
+    }
+    let mut edited = Vec::with_capacity(selected.len());
+    for i in selected {
+        let note = &mut seq.notes[i];
+        note.pitch = pitch(note.pitch);
+        edited.push(*note);
+    }
+    seq.sort();
+    Ok(json!({"notes": edited}))
+}
+
+fn notes_transpose(e: &mut Engine, p: &Value) -> Result<Value> {
+    let command = "midi.notes_transpose";
+    let delta = p.get("semitones").and_then(Value::as_i64).ok_or_else(|| bad(command, "integer semitones required"))?;
+    pitch_edit(e, p, command, |pitch| i64::from(pitch).saturating_add(delta).clamp(0, 127) as u8)
+}
+
+fn notes_constrain(e: &mut Engine, p: &Value) -> Result<Value> {
+    use soundcraft_midi::scale::{KeyScale, Scale};
+    let command = "midi.notes_constrain";
+    let root = p.get("root").and_then(Value::as_u64).filter(|&n| n < 12).ok_or_else(|| bad(command, "root must be 0..11"))? as u8;
+    let scale = match p.get("scale").and_then(Value::as_str) {
+        Some("major") => Scale::Major,
+        Some("minor") => Scale::Minor,
+        _ => return Err(bad(command, "scale must be major or minor")),
+    };
+    let key = KeyScale { root, scale };
+    pitch_edit(e, p, command, |pitch| key.nearest(pitch))
+}
+
+#[cfg(test)]
+mod pitch_tests;
 
 #[cfg(test)]
 mod tests {
