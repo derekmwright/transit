@@ -279,3 +279,18 @@ fn a_tempo_change_that_squeezes_a_loop_below_the_minimum_cycle_is_refused_and_ro
     e.execute("event.tempo", &json!({"bpm": 160.0})).unwrap();
     assert_eq!(e.session().find_clip(id).unwrap().1.looping, Some(soundcraft_model::ClipLoop { start: 0, end: 75 }));
 }
+
+#[test]
+fn opening_a_session_that_needs_an_unknown_feature_posts_one_warning() {
+    let (e, _, _) = tiny_loop();
+    let mut v: serde_json::Value = serde_json::from_str(&e.session().to_json().unwrap()).unwrap();
+    assert_eq!(v["needs"], json!(["clip_loop"]), "a looped session is marked");
+    let mut r = Engine::new(Session::default());
+    crate::io::open_session_bytes(&mut r, "a.transit", v.to_string().as_bytes()).unwrap();
+    assert!(r.messages.iter().all(|m| !m.contains("does not know")), "known feature: no warning");
+    v["needs"] = json!(["clip_loop", "from_the_future"]);
+    crate::io::open_session_bytes(&mut r, "b.transit", v.to_string().as_bytes()).unwrap();
+    let warned: Vec<_> = r.messages.iter().filter(|m| m.contains("from_the_future")).collect();
+    assert_eq!(warned.len(), 1, "{:?}", r.messages);
+    assert!(r.session().find_clip(ClipId(1)).is_some() || !r.session().tracks.is_empty(), "the session still opens");
+}

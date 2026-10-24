@@ -989,8 +989,12 @@ pub(crate) fn open_session_linked(e: &mut Engine, path: &str, links: &Path) -> R
     }
     missing.extend(relink_videos(&mut s, links));
     s.folder = Some(dir);
+    let notes = std::mem::take(&mut s.load_notes);
     e.replace_session(s);
     e.path = Some(path.to_string());
+    for n in notes {
+        e.message(n);
+    }
     for m in &missing {
         e.message(format!("missing media: {m}"));
     }
@@ -1136,7 +1140,11 @@ pub fn open_session_bytes(e: &mut Engine, name: &str, bytes: &[u8]) -> Result<Ve
     // Movies are referenced by path, never copied into a session: none can be found here.
     missing.extend(s.videos.iter().map(|v| v.path.clone()));
     let stem = Path::new(name).file_stem().and_then(|x| x.to_str()).filter(|x| !x.is_empty()).unwrap_or("Untitled").to_string();
+    let notes = std::mem::take(&mut s.load_notes);
     e.replace_session(s);
+    for n in notes {
+        e.message(n);
+    }
     e.path = Some(format!("{}.{BUNDLE_EXTENSION}", sanitize_name(&stem)));
     for m in &missing {
         e.message(format!("missing media: {m}"));

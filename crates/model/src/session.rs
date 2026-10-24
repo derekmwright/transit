@@ -337,6 +337,10 @@ pub struct Session {
     /// The folder relative source paths point into: where the session was opened or last saved.
     #[serde(skip)]
     pub folder: Option<std::path::PathBuf>,
+    /// Notes from loading: features the file needs that this build does not know ([`Session::KNOWN_NEEDS`]).
+    /// Shown to the user once; never saved.
+    #[serde(skip)]
+    pub load_notes: Vec<String>,
 }
 
 impl Default for Session {
@@ -347,6 +351,16 @@ impl Default for Session {
 
 impl Session {
     pub const FORMAT_VERSION: u32 = 1;
+
+    /// Features a file can list under `needs` (see [`Session::to_json`]) that this build understands.
+    pub const KNOWN_NEEDS: [&'static str; 1] = ["clip_loop"];
+
+    /// The `needs` entries this session's content requires: a reader that does not know one would
+    /// silently drop or misplay it. Empty for a session that uses none.
+    pub fn needs(&self) -> Vec<&'static str> {
+        let looped = self.tracks.iter().any(|t| t.playlists.iter().any(|p| p.clips.iter().any(|c| c.looping.is_some())));
+        if looped { vec!["clip_loop"] } else { Vec::new() }
+    }
 
     pub fn new(name: impl Into<String>, sample_rate: SampleRate) -> Self {
         let mut s = Session {
@@ -371,6 +385,7 @@ impl Session {
             midi_originals: std::collections::BTreeMap::new(),
             pool: SourcePool::default(),
             folder: None,
+            load_notes: Vec::new(),
         };
         s.edit.pre_roll = sample_rate.samples(2.0);
         s.edit.post_roll = sample_rate.samples(2.0);
@@ -603,8 +618,21 @@ impl Session {
 
     // ---- persistence ---------------------------------------------------------------------
 
+    /// The saved form. A session that uses a feature an older reader would drop without a word
+    /// (a clip loop, ADR 0019) also lists it under a top-level `needs`; older builds ignore the
+    /// key, newer ones warn on load when they do not know an entry. Sessions that use none are
+    /// byte-identical to before.
     pub fn to_json(&self) -> Result<String, SessionError> {
-        serde_json::to_string_pretty(self).map_err(|e| SessionError::Format(e.to_string()))
+        let fmt = |e: serde_json::Error| SessionError::Format(e.to_string());
+        let needs = self.needs();
+        if needs.is_empty() {
+            return serde_json::to_string_pretty(self).map_err(fmt);
+        }
+        let mut v = serde_json::to_value(self).map_err(fmt)?;
+        if let Some(o) = v.as_object_mut() {
+            o.insert("needs".into(), serde_json::json!(needs));
+        }
+        serde_json::to_string_pretty(&v).map_err(fmt)
     }
 
     /// Parse a session; decoded audio must be attached separately (`pool`).
@@ -614,8 +642,26 @@ impl Session {
         if ver > u64::from(Self::FORMAT_VERSION) {
             return Err(SessionError::Version(u32::try_from(ver).unwrap_or(u32::MAX)));
         }
+        let unknown: Vec<String> = v
+            .get("needs")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|n| !Self::KNOWN_NEEDS.contains(n))
+                    .map(|n| n.chars().take(40).collect::<String>())
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut s: Session = serde_json::from_value(v).map_err(|e| SessionError::Format(e.to_string()))?;
         s.sanitize();
+        if !unknown.is_empty() {
+            s.load_notes.push(format!(
+                "this session uses features this version does not know ({}): parts of it may be missing or sound different, and saving it from here can drop them",
+                unknown.join(", ")
+            ));
+        }
         Ok(s)
     }
 
@@ -803,6 +849,47 @@ mod tests {
         let mut c = c.clone();
         c.trim_start_to(100);
         assert_eq!(c.source_offset(), 580);
+    }
+
+    fn looped_session() -> Session {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+        let mut c = crate::Clip::midi(crate::ClipId(500), "l", 0, 1000, Default::default());
+        c.looping = Some(crate::ClipLoop { start: 0, end: 100 });
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        s
+    }
+
+    #[test]
+    fn a_session_with_a_loop_lists_it_under_needs_and_one_without_stays_as_before() {
+        let looped = looped_session();
+        let v: serde_json::Value = serde_json::from_str(&looped.to_json().unwrap()).unwrap();
+        assert_eq!(v["needs"], serde_json::json!(["clip_loop"]));
+        // This build knows the feature: it loads without a note and keeps the loop.
+        let back = Session::from_json(&looped.to_json().unwrap()).unwrap();
+        assert!(back.load_notes.is_empty());
+        assert!(back.tracks[0].clips()[0].looping.is_some());
+        // No loop, no marker: the file is what an older build wrote.
+        let plain = Session::default();
+        let v: serde_json::Value = serde_json::from_str(&plain.to_json().unwrap()).unwrap();
+        assert!(v.get("needs").is_none());
+        assert!(Session::from_json(&plain.to_json().unwrap()).unwrap().load_notes.is_empty());
+        // Loading ignores the marker for the data: removing it still loads the loop (an older build's view).
+        let mut v: serde_json::Value = serde_json::from_str(&looped.to_json().unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("needs");
+        let no_marker = Session::from_json(&v.to_string()).unwrap();
+        assert!(no_marker.load_notes.is_empty() && no_marker.tracks[0].clips()[0].looping.is_some());
+    }
+
+    #[test]
+    fn a_session_that_needs_an_unknown_feature_warns_on_load_and_is_not_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(&looped_session().to_json().unwrap()).unwrap();
+        v["needs"] = serde_json::json!(["clip_loop", "seam_fade", 7]);
+        let s = Session::from_json(&v.to_string()).unwrap();
+        assert_eq!(s.load_notes.len(), 1);
+        assert!(s.load_notes[0].contains("seam_fade") && !s.load_notes[0].contains("clip_loop"), "{:?}", s.load_notes);
+        // The note is not saved back.
+        assert!(!s.to_json().unwrap().contains("load_notes"));
     }
 
     #[test]
