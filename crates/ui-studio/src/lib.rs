@@ -1062,6 +1062,8 @@ mod groups_tests;
 #[cfg(test)]
 mod keys_tests;
 #[cfg(test)]
+mod midi_output_header_tests;
+#[cfg(test)]
 mod midi_record_tests;
 #[cfg(test)]
 mod param_capture_tests;

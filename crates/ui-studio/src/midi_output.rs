@@ -1,10 +1,7 @@
 //! MIDI output destination picker (#61), using only the Player's cached output status and the
 //! `midi.output` command. Drawn as the small "Out" button at the end of a MIDI strip's input row;
 //! it turns red with a warning when the destination's device is missing.
-//!
-//! TODO(#61): header picker. Once `arrange.rs` is free, call `OutputView::header_badge` from
-//! `arrange::track_header` next to the kind subtitle, so "device missing" shows on the track
-//! header too. Until then the mixer strip's Out button and its tooltip carry it.
+//! The arranger track header shows the same state as a compact chip (#69) and opens this picker.
 
 use serde_json::{Value, json};
 use soundcraft_model::{MAX_MIDI_OUT_OFFSET_MS, MidiOutChannel, MidiOutPort, MidiOutput, TrackId};
@@ -20,6 +17,13 @@ pub(crate) enum State {
     Connected,
     Missing,
     Failed(String),
+}
+
+/// What the track header draws for an external destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeaderChip {
+    pub(crate) text: String,
+    pub(crate) missing: bool,
 }
 
 pub(crate) struct OutputView {
@@ -101,6 +105,19 @@ impl OutputView {
     /// the track header's once the TODO above lands); `None` when there is nothing to say.
     pub(crate) fn header_badge(&self, track: TrackId, output: &MidiOutput) -> Option<String> {
         self.missing(track, output).then(|| format!("{} (device missing)", self.port_label(output)))
+    }
+
+    /// The compact destination chip for the arranger track header (#69): port short name and
+    /// channel, and whether the device is missing. `None` for Internal tracks.
+    pub(crate) fn header_chip(&self, track: TrackId, output: &MidiOutput) -> Option<HeaderChip> {
+        let MidiOutput::External { channel, .. } = output else { return None };
+        let name = self.port_label(output);
+        let name = if name.chars().count() > 16 { format!("{}…", name.chars().take(15).collect::<String>()) } else { name };
+        let channel = match channel {
+            MidiOutChannel::AsRecorded => "as rec".to_string(),
+            MidiOutChannel::Channel(c) => format!("Ch {}", c + 1),
+        };
+        Some(HeaderChip { text: format!("{name} · {channel}"), missing: self.missing(track, output) })
     }
 
     fn port_label(&self, output: &MidiOutput) -> String {
@@ -245,6 +262,22 @@ mod tests {
         assert!(!view.missing(TrackId(3), &MidiOutput::Internal));
         assert_eq!(view.header_badge(TrackId(4), &out), None);
         assert!(OutputView::read(None).ports.is_empty());
+    }
+
+    #[test]
+    fn the_header_chip_names_external_destinations_only() {
+        let view =
+            OutputView { ports: Vec::new(), states: vec![(TrackId(3), State::Missing), (TrackId(4), State::Connected)], status: String::new() };
+        let out = external("usb");
+        assert_eq!(view.header_chip(TrackId(4), &out), Some(HeaderChip { text: "Synth OUT · Ch 2".into(), missing: false }));
+        assert_eq!(view.header_chip(TrackId(3), &out), Some(HeaderChip { text: "Synth OUT · Ch 2".into(), missing: true }));
+        assert_eq!(view.header_chip(TrackId(3), &MidiOutput::Internal), None);
+        let long = MidiOutput::External {
+            port: MidiOutPort { backend: "fake".into(), name: "A Very Long Port Name Indeed".into(), ordinal: 0, id: String::new() },
+            channel: MidiOutChannel::AsRecorded,
+            offset_ms: 0.0,
+        };
+        assert_eq!(view.header_chip(TrackId(4), &long).unwrap().text, "A Very Long Por… · as rec");
     }
 
     #[test]

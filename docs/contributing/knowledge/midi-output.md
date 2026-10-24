@@ -12,7 +12,7 @@ instrument (#61). Input side: `midi.md`; clocks: `clocks.md`; device layer:
   `as_recorded` or 1 to 16. The offset is clamped to ±500 ms when read, since files are hostile.
 - `midi.output` (`crates/engine/src/cmd/midi_output.rs`): one undo step for any number of tracks;
   omitted fields keep their values. UI: the "Out" button at the end of a MIDI strip's input row
-  (`crates/ui-studio/src/midi_output.rs`).
+  (`crates/ui-studio/src/midi_output.rs`). The arranger track header shows the same destination as a compact chip (state dot, port and channel; red when the device is missing, label hidden at narrow widths) that opens the same picker (#69).
 
 ## Routing rule: instead of, not in addition to
 

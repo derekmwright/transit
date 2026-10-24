@@ -322,6 +322,8 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
     let selected_tracks = s.edit.selected_tracks.clone();
     let focus = app.focus_track();
     app.arrange.menu.clear();
+    // One status read per frame, and only when some track sends to an external port (#69).
+    let outputs = s.tracks.iter().any(|t| t.midi_output.is_external()).then(|| crate::midi_output::OutputView::read(app.player.as_ref()));
     for (i, t) in rows.iter().enumerate() {
         let y0 = tl.min.y + geo.tops[i] - app.arrange.vscroll;
         let header = Rect::from_min_max(pos2(list.min.x, y0), pos2(list.max.x, y0 + geo.heights[i]));
@@ -340,7 +342,7 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
         };
         if header.max.y >= list.min.y && header.min.y <= list.max.y {
             let selected = selected_tracks.contains(&t.id) || focus == Some(t.id);
-            track_header(app, ui, t, header, list, selected, &mut row);
+            track_header(app, ui, t, header, list, selected, outputs.as_ref(), &mut row);
         }
         let lane_fill = if i % 2 == 0 { TOKENS.lane } else { TOKENS.lane_alt };
         let row_rect = Rect::from_min_max(lane.min, pos2(lane.max.x, y0 + geo.heights[i]));
@@ -443,7 +445,17 @@ fn arrangement(app: &mut StudioApp, ui: &mut Ui) {
 }
 
 /// One track's header: color strip, name, M S R I toggles, volume readout.
-fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect, selected: bool, row: &mut TrackRow) {
+#[allow(clippy::too_many_arguments)]
+fn track_header(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    t: &Track,
+    r: Rect,
+    list: Rect,
+    selected: bool,
+    outputs: Option<&crate::midi_output::OutputView>,
+    row: &mut TrackRow,
+) {
     let p = ui.painter().with_clip_rect(list);
     let bg = if selected { TOKENS.header_selected } else { TOKENS.header };
     p.rect_filled(r.shrink2(vec2(0.0, 0.5)), 0.0, bg);
@@ -466,7 +478,7 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
         k => format!("{k:?}"),
     };
     row.subtitle = kind.clone();
-    p.text(pos2(tx + 12.0, r.min.y + 30.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.5), TOKENS.text_dim);
+    let subtitle = p.text(pos2(tx + 12.0, r.min.y + 30.0), Align2::LEFT_CENTER, kind, FontId::proportional(10.5), TOKENS.text_dim);
     // Toggles, right-aligned on the first line.
     let m = &t.mixer;
     let mut x = r.max.x - 6.0;
@@ -578,6 +590,11 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     // right-click opens the track menu.
     let name_area = Rect::from_min_max(r.min, pos2(r.max.x - 114.0, r.max.y));
     let resp = ui.interact(name_area.intersect(list), ui.id().with(("hdr", t.id.0)), Sense::click_and_drag());
+    // Interacted after the name area so the chip wins where they overlap.
+    if let Some(view) = outputs {
+        let frozen_button = if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) { 24.0 } else { 0.0 };
+        midi_output_chip(app, ui, &p, t, view, subtitle, vol.min.x - frozen_button, list);
+    }
     if resp.clicked() {
         let m = ui.input(|i| i.modifiers);
         app.click_header(t.id, m.shift, m.command || m.ctrl);
@@ -597,6 +614,41 @@ fn track_header(app: &mut StudioApp, ui: &mut Ui, t: &Track, r: Rect, list: Rect
     let kind = t.kind;
     let has_instrument = t.instrument.is_some();
     resp.context_menu(|ui| track_menu(app, ui, id, kind, has_instrument));
+}
+
+/// An external MIDI destination on the second header line (#69): a state dot, always, and the
+/// destination text when it fits between the subtitle and the volume readout (so the name and the
+/// subtitle are never clipped). Opens the mixer's picker and sends the same `midi.output` command.
+#[allow(clippy::too_many_arguments)]
+fn midi_output_chip(
+    app: &mut StudioApp,
+    ui: &mut Ui,
+    p: &egui::Painter,
+    t: &Track,
+    view: &crate::midi_output::OutputView,
+    subtitle: Rect,
+    right: f32,
+    list: Rect,
+) {
+    let Some(chip) = view.header_chip(t.id, &t.midi_output) else { return };
+    let font = FontId::proportional(10.0);
+    let text_w = p.layout_no_wrap(chip.text.clone(), font.clone(), TOKENS.text).size().x;
+    let dot = 8.0;
+    let full_w = dot + 4.0 + text_w;
+    let show_text = right - 6.0 - full_w >= subtitle.max.x + 6.0;
+    let w = if show_text { full_w } else { dot };
+    let cy = subtitle.center().y;
+    let b = Rect::from_min_size(pos2(right - 6.0 - w, cy - 7.0), vec2(w, 14.0));
+    let resp = ui.interact(b.intersect(list), ui.id().with(("midi-output-chip", t.id.0)), Sense::click());
+    let color = if chip.missing { TOKENS.record } else { TOKENS.accent };
+    p.circle_filled(pos2(b.min.x + dot / 2.0, cy), dot / 2.0, color);
+    if show_text {
+        p.text(pos2(b.min.x + dot + 4.0, cy), Align2::LEFT_CENTER, &chip.text, font, if chip.missing { TOKENS.record } else { TOKENS.text_dim });
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "MIDI output"));
+    if let Some(params) = view.popup(&resp, t.id, &t.midi_output) {
+        let _ = app.run("midi.output", params);
+    }
 }
 
 /// A group's disclosure chevron: collapses or expands its members (view state only).
