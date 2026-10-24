@@ -22,6 +22,12 @@ Issue #68. Read with [ADR 0018](../../adr/0018-plugin-host-thread.md) (the plug-
   access goes through `soundcraft_engine::io::presets` (checked roots).
 - State reads and live loads are `StateJob`s on the host thread, polled once per frame
   (`PluginStateReader::begin_save`/`begin_load`); the UI side is `ui-studio/src/plugin_header.rs`.
+- Each job (and each restore after an undo or redo) starts only once the audio side plays the
+  current document (`Player::plays`: its plan confirmed and rendered), so the plug-in has every
+  parameter value the session stores. Earlier, a read missed a value still on its way and a value
+  that arrived after a load overwrote the loaded state (issue #73). Tests that change a live state
+  directly also store the values the plug-in reports (`plugin.state_values`), or the session sends
+  its older values over it.
 - Commands: `plugin.preset_save` (not undoable), `plugin.preset_load` and `plugin.state_load` (one
   undo step each, recorded after the plug-in took the state), `plugin.preset_list`,
   `plugin.preset_delete`. Undoing or redoing a load asks the UI to load the stored state live

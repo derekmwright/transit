@@ -23,9 +23,13 @@ use soundcraft_mix::SlotGen;
 use soundcraft_model::{Insert, TrackId, b64};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// How often the user preset folders are listed again (another host may add presets).
 const LIST_EVERY_S: f64 = 2.0;
+
+/// How long a live state job waits for the audio side to play the document before it gives up.
+const PLAYS_WITHIN: Duration = Duration::from_secs(10);
 
 /// Said when a job's slot holds another instance by the time it finishes: its result is dropped.
 const SLOT_CHANGED: &str = "The plug-in in that slot changed while its preset loaded; nothing was stored";
@@ -77,7 +81,22 @@ enum Then {
     Load(Source),
 }
 
+/// A live state job that waits for the audio side to play the document (see [`Step::Waiting`]).
+enum Start {
+    Read(Then),
+    Load { state: Vec<u8>, source: Source },
+    Restore { state: Vec<u8> },
+}
+
 enum Step {
+    /// Not started yet: a live state read or load waits until the audio side plays the current
+    /// document (`Player::plays`), so the plug-in has every parameter value the session stores.
+    /// Before that, a read misses a value still on its way, and a value that arrives after a load
+    /// overwrites the loaded state (issue #73).
+    Waiting {
+        start: Start,
+        since: Instant,
+    },
     Read {
         job: StateJob<Option<Vec<u8>>>,
         then: Then,
@@ -99,9 +118,12 @@ enum Step {
 impl Step {
     fn doing(&self) -> &'static str {
         match self {
-            Step::Read { then: Then::Save(_), .. } => "Saving preset…",
-            Step::Read { then: Then::Copy, .. } => "Copying state…",
-            Step::Read { then: Then::Load(_), .. } | Step::Load { .. } | Step::Restore { .. } => "Loading preset…",
+            Step::Read { then: Then::Save(_), .. } | Step::Waiting { start: Start::Read(Then::Save(_)), .. } => "Saving preset…",
+            Step::Read { then: Then::Copy, .. } | Step::Waiting { start: Start::Read(Then::Copy), .. } => "Copying state…",
+            Step::Read { then: Then::Load(_), .. }
+            | Step::Load { .. }
+            | Step::Restore { .. }
+            | Step::Waiting { start: Start::Read(Then::Load(_)) | Start::Load { .. } | Start::Restore { .. }, .. } => "Loading preset…",
             Step::Default { .. } => "Loading the default state…",
         }
     }
@@ -342,11 +364,42 @@ impl StudioApp {
     /// Starts reading the live state at `key`.
     fn start_read(&mut self, key: (TrackId, usize), plugin: &str, then: Then) {
         let instance = self.instance_at(key);
+        self.start_live(key, plugin.to_owned(), instance, Start::Read(then));
+    }
+
+    /// Starts a live state job at `key` for `instance`: now when the audio side plays the
+    /// current document, else once it does (`Step::Waiting`).
+    fn start_live(&mut self, key: (TrackId, usize), plugin: String, instance: Option<SlotGen>, start: Start) {
+        let op = Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Waiting { start, since: Instant::now() } };
+        if instance.is_some() && !self.plays_session() {
+            self.plugin_header.ops.push(op);
+        } else {
+            self.begin_live(op);
+        }
+    }
+
+    /// Whether the audio side plays the document as it is now (`Player::plays`).
+    fn plays_session(&self) -> bool {
+        self.player.as_ref().is_some_and(|p| p.plays(&self.engine.session_arc()))
+    }
+
+    /// Begins a waiting op's job on the plug-in host thread.
+    fn begin_live(&mut self, op: Op) {
+        let Op { key, uid, plugin, instance, step: Step::Waiting { start, .. } } = op else { return };
         let Some(p) = &self.player else { return };
-        match p.begin_save_state(key.0, key.1) {
-            Ok(job) => {
-                self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin: plugin.to_owned(), instance, step: Step::Read { job, then } })
-            }
+        let step = match start {
+            Start::Read(then) => p.begin_save_state(key.0, key.1).map(|job| Step::Read { job, then }),
+            Start::Load { state, source } => p.begin_load_state(key.0, key.1, state).map(|job| Step::Load { job, source }),
+            Start::Restore { state } => match p.begin_load_state(key.0, key.1, state) {
+                Ok(job) => Ok(Step::Restore { job }),
+                Err(e) => {
+                    self.status = format!("Could not give the plug-in its earlier state: {e}");
+                    return;
+                }
+            },
+        };
+        match step {
+            Ok(step) => self.plugin_header.ops.push(Op { key, uid, plugin, instance, step }),
             Err(e) => self.status = format!("Preset: {e}"),
         }
     }
@@ -356,13 +409,9 @@ impl StudioApp {
         self.start_read(key, plugin, Then::Load(source));
     }
 
-    /// Loads `state` into the live instance at `key`.
+    /// Loads `state` into the live instance at `key` (the one the read before it was for).
     fn start_live_load(&mut self, key: (TrackId, usize), plugin: String, state: Vec<u8>, source: Source, instance: Option<SlotGen>) {
-        let Some(p) = &self.player else { return };
-        match p.begin_load_state(key.0, key.1, state) {
-            Ok(job) => self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Load { job, source } }),
-            Err(e) => self.status = format!("Preset: {e}"),
-        }
+        self.start_live(key, plugin, instance, Start::Load { state, source });
     }
 
     /// A finished live read.
@@ -450,16 +499,30 @@ impl StudioApp {
         for key in self.engine.take_state_restores() {
             let Some(state) = self.hosted_insert(key).and_then(|i| i.state_bytes()) else { continue };
             let plugin = self.hosted_insert(key).map(|i| i.plugin).unwrap_or_default();
+            // The undone (or redone) document's parameter values reach the plug-in first, then
+            // the stored state, and the values it reports after the load are stored.
             let instance = self.instance_at(key);
-            let Some(p) = &self.player else { continue };
-            match p.begin_load_state(key.0, key.1, state) {
-                Ok(job) => self.plugin_header.ops.push(Op { key, uid: self.uid_at(key), plugin, instance, step: Step::Restore { job } }),
-                Err(e) => self.status = format!("Could not give the plug-in its earlier state: {e}"),
-            }
+            self.start_live(key, plugin, instance, Start::Restore { state });
         }
+        let plays = self.plays_session();
         for mut op in std::mem::take(&mut self.plugin_header.ops) {
             let key = op.key;
             match op.step {
+                Step::Waiting { ref start, since } => {
+                    if !self.still_holds(key, &op) {
+                        if matches!(start, Start::Restore { .. }) {
+                            log::debug!("a live restore was waiting when its slot changed; dropped");
+                        } else {
+                            self.status = SLOT_CHANGED.into();
+                        }
+                    } else if plays {
+                        self.begin_live(op);
+                    } else if since.elapsed() > PLAYS_WITHIN {
+                        self.status = "The audio session is still updating; try again after it applies".into();
+                    } else {
+                        self.plugin_header.ops.push(op);
+                    }
+                }
                 Step::Read { ref mut job, .. } => match job.poll() {
                     JobPoll::Waiting => self.plugin_header.ops.push(op),
                     JobPoll::Ready(state) => {

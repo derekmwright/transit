@@ -1030,6 +1030,11 @@ impl Player {
     pub fn capture_states(&self, expected: &Arc<Session>) -> Result<PluginStates, PlayerError> {
         self.owner()?.capture_states(expected)
     }
+    /// Whether the audio side plays exactly `expected` (its plan confirmed and rendered): the
+    /// plug-ins have every parameter value it stores. Live state reads and loads wait for it.
+    pub fn plays(&self, expected: &Arc<Session>) -> bool {
+        self.owner().is_ok_and(|owner| owner.plays(expected))
+    }
     /// Preserve confirmed live state before a device reopen, including after a
     /// fault. None requires an explicit document-only recovery notice to the user.
     pub fn capture_states_for_reopen(&self, expected: &Arc<Session>) -> Result<Option<PluginStates>, PlayerError> {

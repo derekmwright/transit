@@ -85,14 +85,29 @@ fn state(gain: f64) -> Vec<u8> {
     soundcraft_vst3_host::preset::join_state(&gain.to_le_bytes(), &0.5f64.to_le_bytes()).unwrap()
 }
 
+/// Frames until the audio side plays the document as it is (its parameter values have reached
+/// the plug-ins), as the header's own state jobs wait (issue #73).
+fn until_plays(app: &mut StudioApp, ctx: &egui::Context) {
+    frames_until(app, ctx, "the audio side plays the document", |a| a.player.as_ref().unwrap().plays(&a.engine.session_arc()));
+}
+
+/// The live state, read once the plug-in has the session's values.
 fn live(app: &mut StudioApp, ctx: &egui::Context, t: TrackId, slot: usize) -> Vec<u8> {
+    until_plays(app, ctx);
     let job = app.player.as_ref().unwrap().begin_save_state(t, slot).unwrap();
     finish(app, ctx, job).expect("a state")
 }
 
+/// The plug-in moves to `data` on its own (as an edit in its window would): loaded live, and the
+/// values it then reports stored in the session, as the plug-in's own edits are. Without them the
+/// session would send its older values over the state (issue #73).
 fn set_live(app: &mut StudioApp, ctx: &egui::Context, t: TrackId, slot: usize, data: Vec<u8>) {
+    until_plays(app, ctx);
     let job = app.player.as_ref().unwrap().begin_load_state(t, slot, data).unwrap();
-    assert!(finish(app, ctx, job).is_some(), "the fixture takes the state");
+    let values = finish(app, ctx, job).expect("the fixture takes the state");
+    let params: serde_json::Map<String, serde_json::Value> = values.into_iter().map(|(id, v)| (id, serde_json::json!(v))).collect();
+    app.run("plugin.state_values", serde_json::json!({"track": t.0, "slot": slot, "params": params})).unwrap();
+    until_plays(app, ctx);
 }
 
 /// Runs frames until the live state is `want` (the session's parameters reach the plug-in a few
@@ -117,23 +132,43 @@ fn settle(app: &mut StudioApp, ctx: &egui::Context) {
     frames_until(app, ctx, "the preset operation", |a| !a.plugin_header.any_busy());
 }
 
-#[test]
-fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
-    // The host registry is process-global: run in a child so no other test sees the fixture.
-    if std::env::var_os("TRANSIT_HEADER_FIXTURE_CHILD").is_none() {
-        let name = "plugin_header_tests::header_presets_save_load_undo_step_and_paste_through_the_plug_in_host";
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env("TRANSIT_HEADER_FIXTURE_CHILD", "1")
-            .output()
-            .unwrap();
-        let (out, err) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success(), "{out}{err}");
-        assert!(out.contains("1 passed"), "the child ran no test: {out}");
-        return;
+/// Whether this is the child run of `test`; in the parent, runs it as a child and checks it
+/// passed. The host registry is process-global: in a child, no other test sees the fixture.
+fn in_child(test: &str) -> bool {
+    if std::env::var_os("TRANSIT_HEADER_FIXTURE_CHILD").is_some() {
+        return true;
     }
+    let name = format!("plugin_header_tests::{test}");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name.as_str(), "--nocapture"])
+        .env("TRANSIT_HEADER_FIXTURE_CHILD", "1")
+        .output()
+        .unwrap();
+    let (out, err) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{out}{err}");
+    assert!(out.contains("1 passed"), "the child ran no test: {out}");
+    false
+}
+
+type Shared<T> = std::sync::Arc<std::sync::Mutex<T>>;
+
+/// The app with the fixture gain on inserts A and B of "Drums", both live and their own edit
+/// recorded, and what its dialogs answer: Save As's file name, and the confirmations (and what
+/// they asked).
+struct Rig {
+    app: StudioApp,
+    ctx: egui::Context,
+    t: TrackId,
+    gain: String,
+    config: PathBuf,
+    name: Shared<String>,
+    yes: Shared<bool>,
+    questions: Shared<Vec<String>>,
+}
+
+fn rig(tag: &str) -> Rig {
     let gain = fixture_gain();
-    let config = std::env::temp_dir().join(format!("studio-header-config-{}", std::process::id()));
+    let config = std::env::temp_dir().join(format!("studio-header-config-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&config);
     let mut engine = soundcraft_engine::Engine::default();
     let t = engine.session_mut().add_track(soundcraft_model::TrackKind::Audio, soundcraft_model::ChannelFormat::Stereo, Some("Drums"));
@@ -171,6 +206,15 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
     frames_until(&mut app, &ctx, "the fixture's own edit recorded", |a| {
         a.engine.session().tracks[0].mixer.inserts.iter().take(2).all(|i| i.as_ref().is_some_and(|i| i.params.contains_key("7")))
     });
+    Rig { app, ctx, t, gain, config, name, yes, questions }
+}
+
+#[test]
+fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
+    if !in_child("header_presets_save_load_undo_step_and_paste_through_the_plug_in_host") {
+        return;
+    }
+    let Rig { mut app, ctx, t, gain, config, name, yes, questions } = rig("presets");
 
     let header = app.editor_header((t, 0)).expect("a header for the hosted insert");
     assert_eq!(header.title, "Drums \u{b7} Insert A \u{b7} Fixture Gain");
@@ -280,5 +324,28 @@ fn header_presets_save_load_undo_step_and_paste_through_the_plug_in_host() {
     *yes.lock().unwrap() = true;
     app.header_action(t, 0, HeaderAction::Delete);
     assert!(!file.exists());
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// Issue #73: a live state read waits until the plug-in has every value the session stores. A
+/// parameter set just before Save As is in the preset; the read used to run on the plug-in host
+/// thread before the value reached the plug-in, and saved the value before it.
+#[test]
+fn a_save_as_right_after_a_parameter_change_saves_the_changed_value() {
+    if !in_child("a_save_as_right_after_a_parameter_change_saves_the_changed_value") {
+        return;
+    }
+    let Rig { mut app, ctx, t, gain, config, name, .. } = rig("changed");
+    until_plays(&mut app, &ctx);
+    *name.lock().unwrap() = "Changed.vstpreset".into();
+    // Gain 0.5 of 0..2: 0.25 normalized, unlike the fixture's own edit (0.9).
+    app.run("mix.insert_param", serde_json::json!({"track": t.0, "slot": 0, "param": "7", "value": 0.5})).unwrap();
+    app.header_action(t, 0, HeaderAction::SaveAs);
+    assert_eq!(app.editor_header((t, 0)).unwrap().disabled.as_deref(), Some("Saving preset\u{2026}"), "disabled while it waits");
+    settle(&mut app, &ctx);
+    let file = soundcraft_engine::presets::path(&config, &gain, "Changed").unwrap();
+    let saved = soundcraft_engine::io::presets::read(&file, &gain).unwrap_or_else(|e| panic!("{e} ({})", app.status));
+    assert_eq!(saved, state(0.25), "the preset holds the value set before the save");
+    assert_eq!(live(&mut app, &ctx, t, 0), state(0.25));
     let _ = std::fs::remove_dir_all(&config);
 }
