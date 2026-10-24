@@ -12,6 +12,7 @@
 mod names;
 pub mod ops;
 mod rng;
+pub mod scale;
 mod sequence;
 mod smf;
 
