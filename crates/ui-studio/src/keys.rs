@@ -11,6 +11,7 @@
 //! Zoom, scroll, snap, pane height, new-note velocity and the audition switch are view state: [`KeysPrefs`] in
 //! [`crate::UiState`] and [`KeysState`] here, never the document.
 
+mod pitch;
 mod step;
 pub use step::StepState;
 
@@ -139,6 +140,8 @@ pub struct KeysPrefs {
     /// Hold threshold and repeat floor for step entry.
     pub step_hold: soundcraft_engine::step_input::HoldPrefs,
     pub step_bindings: soundcraft_engine::step_input::StepBindings,
+    /// Key/scale used by the explicit constrain operation, never a live-input filter.
+    pub key_scale: soundcraft_midi::scale::KeyScale,
     /// Explicit velocity for new notes and audition; note edits never change it.
     #[serde(deserialize_with = "read_velocity")]
     pub velocity: u8,
@@ -162,6 +165,7 @@ impl Default for KeysPrefs {
             step_velocity: 100,
             step_hold: soundcraft_engine::step_input::HoldPrefs::default(),
             step_bindings: soundcraft_engine::step_input::StepBindings::default(),
+            key_scale: soundcraft_midi::scale::KeyScale::default(),
             velocity: 100,
         }
     }
@@ -243,6 +247,8 @@ pub struct KeysLayout {
     pub snap: R4,
     pub snap_menu: Vec<MenuItem>,
     pub quantize: R4,
+    pub pitch: R4,
+    pub pitch_menu: Vec<MenuItem>,
     pub audition: R4,
     /// The Step toggle, whether Step entry is on, and its cursor and step length in ticks.
     pub step: R4,
@@ -650,14 +656,14 @@ impl StudioApp {
     }
 
     /// Ctrl+Up/Down: transpose the selection (all notes when none or all are selected:
-    /// `event.transpose`; otherwise `midi.notes_move`).
+    /// `event.transpose`; otherwise `midi.notes_transpose`).
     pub fn keys_transpose(&mut self, semitones: i64) -> Result<(), String> {
         let Some(clip) = self.keys.clip else { return Err("no clip".into()) };
         let notes = self.keys_notes();
         let sel = self.keys.selection.clone();
         let whole = sel.is_empty() || resolve(&notes, &sel).len() == notes.len();
         if !whole {
-            return self.keys_move(0, semitones);
+            return self.keys_pitch_edit("midi.notes_transpose", json!({"semitones": semitones}));
         }
         let key = self.keys_merge_key();
         self.ensure_clip_selected(clip);
@@ -1200,6 +1206,12 @@ fn header_row(app: &mut StudioApp, ui: &mut Ui, r: Rect, cv: &ClipView, layout: 
     {
         let _ = app.keys_quantize();
     }
+    let (b, resp) = button(ui, 54.0, "pitch");
+    let p = ui.painter();
+    p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });
+    p.text(b.center(), Align2::CENTER_CENTER, "Pitch", small.clone(), TOKENS.text);
+    layout.pitch = r4(b);
+    egui::Popup::menu(&resp).show(|ui| pitch::menu(app, ui, layout));
     let (b, resp) = button(ui, 104.0, "snap");
     let p = ui.painter();
     p.rect_filled(b, crate::theme::RADIUS, if resp.hovered() { TOKENS.button_hover } else { TOKENS.button });

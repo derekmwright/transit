@@ -126,6 +126,56 @@ fn mid(r: [f32; 4]) -> (f32, f32) {
 }
 
 #[test]
+fn pitch_menu_transposes_only_selected_notes_and_undoes_once() {
+    let mut t = T::open();
+    t.add(60, 0, 240);
+    t.add(126, 480, 240);
+    t.add(80, 960, 240);
+    let original = t.notes();
+    t.app.keys.selection = original[..2].to_vec();
+    t.frames(2);
+    let undo = t.undo_len();
+    t.click(mid(t.app.keys.layout.pitch));
+    let item = t.app.keys.layout.pitch_menu.iter().find(|m| m.label == "Up an octave").cloned().unwrap();
+    t.click(mid(item.rect));
+    assert_eq!(t.notes().iter().map(|n| n.pitch).collect::<Vec<_>>(), [72, 127, 80]);
+    assert_eq!(t.undo_len(), undo + 1);
+    assert_eq!(t.app.keys.selection, t.notes()[..2]);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.notes(), original);
+}
+
+#[test]
+fn pitch_menu_constrains_selection_and_key_preferences_round_trip() {
+    use soundcraft_midi::scale::{KeyScale, Scale};
+    let mut t = T::open();
+    t.add(64, 0, 240);
+    t.add(69, 480, 240);
+    t.add(71, 960, 240);
+    let original = t.notes();
+    t.app.keys.selection = original[..2].to_vec();
+    t.app.ui.keys.key_scale = KeyScale { root: 0, scale: Scale::Minor };
+    let saved = serde_json::to_vec(&t.app.ui).unwrap();
+    let restored: crate::UiState = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored.keys.key_scale, t.app.ui.keys.key_scale);
+    let legacy: crate::keys::KeysPrefs = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(legacy.key_scale, KeyScale::default());
+    t.frames(2);
+    let undo = t.undo_len();
+    t.click(mid(t.app.keys.layout.pitch));
+    let item = t.app.keys.layout.pitch_menu.iter().find(|m| m.label == "constrain").cloned().unwrap();
+    t.click(mid(item.rect));
+    assert_eq!(t.notes().iter().map(|n| n.pitch).collect::<Vec<_>>(), [63, 68, 71]);
+    assert_eq!(t.app.keys.selection, t.notes()[..2]);
+    assert_eq!(t.undo_len(), undo + 1);
+    t.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(t.notes(), original);
+    t.app.keys.selection.clear();
+    t.app.keys_constrain().unwrap();
+    assert_eq!(t.notes(), original, "empty selection does not change the clip");
+}
+
+#[test]
 fn the_view_switcher_shows_in_the_piano_roll_the_mixer_and_the_devices() {
     let mut t = T::new();
     let have = |r: [f32; 4]| r[2] > r[0] && r[3] > r[1];
