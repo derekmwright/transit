@@ -5,7 +5,7 @@
 
 use crate::StudioApp;
 use crate::theme::{self, CLIP_NAME_H, RULER_H, TOKENS};
-use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use egui::{Align2, Color32, CursorIcon, FontId, Id, LayerId, Order, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
 use soundcraft_model::{Clip, ClipContent, ClipId, ClipLoop, Session, Track, TrackId, TrackKind};
 use soundcraft_time::{BarBeat, Samples};
@@ -898,6 +898,11 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
     let looping = loop_drag(app, ui, map);
     let fading = crate::fades::drag(app, ui, map);
     let rh = geo.rh;
+    // The loop corner shows on the clip whose loop zone the pointer is over, and while it is being loop-dragged.
+    let hover = if app.arrange.gesture.is_none() { ui.input(|i| i.pointer.hover_pos()) } else { None };
+    let hot = |id: u64, rect: Rect| {
+        looping.as_ref().is_some_and(|l| l.clip.0 == id) || hover.is_some_and(|pos| rect.contains(pos) && zone(r4(rect), pos, true) == DragKind::Loop)
+    };
     let row_y = |t: TrackId| rows.iter().position(|r| r.id == t).map(|i| tl.min.y + geo.tops[i] - app.arrange.vscroll);
     for t in rows {
         let Some(y0) = row_y(t.id) else { continue };
@@ -924,9 +929,9 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
                         crate::fades::Side::In => live.fade_in = f.fade,
                         crate::fades::Side::Out => live.fade_out = f.fade,
                     }
-                    draw_clip(&p, s, map, tl, t, &live, rect, sel.contains(&c.id), alpha);
+                    draw_clip(&p, s, map, tl, t, &live, rect, sel.contains(&c.id), alpha, hot(c.id.0, rect));
                 }
-                _ => draw_clip(&p, s, map, tl, t, c, rect, sel.contains(&c.id), alpha),
+                _ => draw_clip(&p, s, map, tl, t, c, rect, sel.contains(&c.id), alpha, hot(c.id.0, rect)),
             }
         }
     }
@@ -959,7 +964,7 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
             g.fade_out = Default::default();
             let rect = span(a, b);
             if rect.max.x >= tl.min.x && rect.min.x <= tl.max.x {
-                draw_clip(&p, s, map, tl, t, &g, rect, false, 0.45);
+                draw_clip(&p, s, map, tl, t, &g, rect, false, 0.45, false);
             }
         }
         if let Some((a, b)) = l.cut() {
@@ -972,12 +977,12 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
         && let Some(t) = s.track(dest)
     {
         let rect = Rect::from_min_max(pos2(map.x(a), y0 + 1.0), pos2(map.x(b).max(map.x(a) + 2.0), y0 + rh - 1.0));
-        draw_clip(&p, s, map, tl, t, c, rect, true, 0.85);
+        draw_clip(&p, s, map, tl, t, c, rect, true, 0.85, false);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &Clip, rect: Rect, selected: bool, alpha: f32) {
+fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &Clip, rect: Rect, selected: bool, alpha: f32, hot: bool) {
     let base = theme::rgb(c.color.unwrap_or(t.color));
     let base = if c.muted { theme::darken(base, 0.5) } else { base };
     let (body_col, strip_col, name_col) = theme::clip_colors(base, selected);
@@ -986,7 +991,17 @@ fn draw_clip(p: &egui::Painter, s: &Session, map: Map, tl: Rect, t: &Track, c: &
     let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, (rect.min.y + CLIP_NAME_H).min(rect.max.y)));
     p.rect_filled(strip, crate::theme::top_corners(), strip_col.gamma_multiply(alpha));
     let name_x = rect.min.x.max(tl.min.x) + 4.0;
-    p.with_clip_rect(strip.intersect(tl)).text(pos2(name_x, strip.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(11.0), name_col);
+    let looped = c.looping.is_some_and(|l| l.is_valid());
+    let corner = corner_alpha(looped, hot).and_then(|a| loop_corner_rect(rect, strip).map(|r| (r, a)));
+    // The name stops short of the loop corner while it is drawn, so the two never overlap.
+    let mut name_clip = strip.intersect(tl);
+    if let Some((r, _)) = corner {
+        name_clip.max.x = name_clip.max.x.min(r.min.x - 2.0);
+    }
+    p.with_clip_rect(name_clip).text(pos2(name_x, strip.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(11.0), name_col);
+    if let Some((r, a)) = corner {
+        draw_loop_corner(&p, r, name_col.gamma_multiply(a * alpha));
+    }
     let body = Rect::from_min_max(pos2(rect.min.x, strip.max.y), rect.max).shrink2(vec2(0.0, 2.0));
     let ink = theme::darken(body_col, 0.62).gamma_multiply(alpha);
     if let Some(l) = c.looping.filter(|l| l.is_valid()) {
@@ -1109,6 +1124,72 @@ fn draw_cycles(
     }
 }
 
+/// Smallest loop glyph (points) worth drawing; a clip too narrow for it shows no corner.
+const LOOP_GLYPH_MIN: f32 = 6.0;
+/// The loop corner glyph's full size (points).
+const LOOP_GLYPH: f32 = 10.0;
+/// The loop cursor's size (points).
+const LOOP_CURSOR: f32 = 16.0;
+
+/// How strongly the loop corner shows: full while the pointer is in the zone or a loop drag is on,
+/// dim on a clip that already loops, none otherwise.
+fn corner_alpha(looped: bool, hot: bool) -> Option<f32> {
+    if hot {
+        Some(1.0)
+    } else if looped {
+        Some(0.5)
+    } else {
+        None
+    }
+}
+
+/// Where the loop corner glyph goes: the loop hot zone's part of the name `strip`, between the
+/// trim edge and the zone's inner end, so it never touches the trim edge or a neighboring clip.
+/// `None` when the zone is too narrow for a legible glyph.
+fn loop_corner_rect(rect: Rect, strip: Rect) -> Option<Rect> {
+    let w = rect.width();
+    let edge = EDGE.min(w / 4.0);
+    let zone_w = LOOP_ZONE_W.min(w / 3.0);
+    let size = (zone_w - edge - 2.0).min(LOOP_GLYPH).min(strip.height() - 2.0);
+    if size < LOOP_GLYPH_MIN {
+        return None;
+    }
+    let right = rect.max.x - edge - 1.0;
+    Some(Rect::from_center_size(pos2(right - size / 2.0, strip.center().y), vec2(size, size)))
+}
+
+/// The loop glyph: an open circular arrow, as line segments plus an arrowhead, in `r`.
+fn loop_glyph(r: Rect, color: Color32, width: f32) -> Vec<Shape> {
+    let c = r.center();
+    let rad = r.width().min(r.height()) * 0.36;
+    let at = |a: f32| pos2(c.x + rad * a.cos(), c.y + rad * a.sin());
+    let (a0, a1) = (-0.35_f32, std::f32::consts::TAU - 1.0);
+    let pts: Vec<Pos2> = (0..=14).map(|i| at(a0 + (a1 - a0) * i as f32 / 14.0)).collect();
+    let end = at(a1);
+    let (tx, ty) = (-a1.sin(), a1.cos());
+    let h = r.width() * 0.34;
+    let tip = pos2(end.x + tx * h, end.y + ty * h);
+    let (nx, ny) = (a1.cos(), a1.sin());
+    let head = vec![tip, pos2(end.x + nx * h * 0.8, end.y + ny * h * 0.8), pos2(end.x - nx * h * 0.8, end.y - ny * h * 0.8)];
+    vec![Shape::line(pts, Stroke::new(width, color)), Shape::convex_polygon(head, color, Stroke::new(width * 0.5, color))]
+}
+
+/// Paint the loop corner glyph in `r`.
+fn draw_loop_corner(p: &egui::Painter, r: Rect, color: Color32) {
+    p.extend(loop_glyph(r, color, 1.5));
+}
+
+/// The loop cursor: the stock cursor is hidden and a loop glyph with a dark outline is painted at
+/// `pos` on the topmost layer. Call every frame the pointer is over the zone or a loop drag runs;
+/// on the first frame it is not called the normal cursor is back.
+fn loop_cursor(ctx: &egui::Context, pos: Pos2) {
+    ctx.set_cursor_icon(CursorIcon::None);
+    let p = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("loop_cursor")));
+    let r = Rect::from_center_size(pos, vec2(LOOP_CURSOR, LOOP_CURSOR));
+    p.extend(loop_glyph(r, TOKENS.ink_dark, 4.0));
+    p.extend(loop_glyph(r, TOKENS.ink_light, 2.0));
+}
+
 /// What is under a point: a clip (and whether near its start or end edge) and the row's track.
 fn hit(layout: &Layout, pos: Pos2) -> (Option<(ClipId, TrackId, DragKind, Samples, Samples)>, Option<TrackId>) {
     let track = layout.tracks.iter().find(|r| pos.y >= r.lane[1] && pos.y < r.lane[3]).map(|r| TrackId(r.id));
@@ -1130,7 +1211,7 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
     {
         match hit(layout, pos).0 {
             Some((_, _, DragKind::TrimStart | DragKind::TrimEnd, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
-            Some((_, _, DragKind::Loop, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::Alias),
+            Some((_, _, DragKind::Loop, _, _)) => loop_cursor(ui.ctx(), pos),
             Some((_, _, DragKind::FadeIn, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe),
             Some((_, _, DragKind::FadeOut, _, _)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeNeSw),
             Some(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
@@ -1175,8 +1256,11 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         let copy = ui.input(|i| drag_copies(i.modifiers));
         ui.ctx().set_cursor_icon(if copy { CursorIcon::Copy } else { CursorIcon::Grabbing });
     }
-    if resp.dragged() && matches!(app.arrange.gesture, Some(Gesture::Clip { kind: DragKind::Loop, .. })) {
-        ui.ctx().set_cursor_icon(CursorIcon::Alias);
+    if resp.dragged()
+        && matches!(app.arrange.gesture, Some(Gesture::Clip { kind: DragKind::Loop, .. }))
+        && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
+    {
+        loop_cursor(ui.ctx(), pos);
     }
     if resp.drag_stopped() {
         let preview = drag_preview(app, ui, map, rows, tl, geo);
@@ -1693,5 +1777,72 @@ fn takes(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: Rect, list
                 app.dialog = Some(crate::Dialog::DeleteTake { track: t.id, index: k });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_corner_tests {
+    use super::*;
+
+    fn frame(ctx: &egui::Context, f: impl FnMut(&mut Ui)) -> egui::FullOutput {
+        let mut out = ctx.run_ui(Default::default(), f);
+        out.textures_delta.clear();
+        out
+    }
+
+    fn clip_rect(w: f32) -> (Rect, Rect) {
+        let rect = Rect::from_min_size(pos2(100.0, 50.0), vec2(w, 60.0));
+        let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + CLIP_NAME_H));
+        (rect, strip)
+    }
+
+    fn painted(w: f32, looped: bool, hot: bool) -> usize {
+        let ctx = egui::Context::default();
+        let (rect, strip) = clip_rect(w);
+        let mut n = 0;
+        let _ = frame(&ctx, |ui| {
+            let ctx = ui.ctx();
+            let p = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("t")));
+            if let Some((r, a)) = corner_alpha(looped, hot).and_then(|a| loop_corner_rect(rect, strip).map(|r| (r, a))) {
+                draw_loop_corner(&p, r, TOKENS.ink_light.gamma_multiply(a));
+                n += 1;
+            }
+        });
+        n
+    }
+
+    #[test]
+    fn looped_clip_shows_corner_without_hover() {
+        assert_eq!(painted(200.0, true, false), 1);
+        assert_eq!(painted(200.0, false, false), 0);
+        assert_eq!(painted(200.0, false, true), 1);
+        assert!(corner_alpha(true, false) < corner_alpha(true, true));
+    }
+
+    #[test]
+    fn narrow_clip_has_no_corner() {
+        assert_eq!(painted(30.0, true, true), 0);
+        assert_eq!(painted(120.0, true, true), 1);
+    }
+
+    #[test]
+    fn corner_stays_inside_the_loop_zone() {
+        for w in [45.0_f32, 60.0, 200.0] {
+            let (rect, strip) = clip_rect(w);
+            let r = loop_corner_rect(rect, strip).expect("fits");
+            assert!(rect.contains_rect(r) && strip.contains_rect(r));
+            assert!(rect.max.x - r.max.x >= EDGE.min(w / 4.0), "clear of the trim edge");
+            assert_eq!(zone(r4(rect), r.center(), true), DragKind::Loop, "inside the hot zone");
+        }
+    }
+
+    #[test]
+    fn cursor_is_hidden_in_zone_and_restored_after() {
+        let ctx = egui::Context::default();
+        let out = frame(&ctx, |ui| loop_cursor(ui.ctx(), pos2(10.0, 10.0)));
+        assert_eq!(out.platform_output.cursor_icon, CursorIcon::None);
+        assert!(!out.shapes.is_empty(), "the loop cursor glyph is painted");
+        let out = frame(&ctx, |_| {});
+        assert_eq!(out.platform_output.cursor_icon, CursorIcon::Default);
     }
 }
