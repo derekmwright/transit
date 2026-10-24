@@ -89,3 +89,89 @@ fn the_header_chip_opens_the_picker_and_sends_midi_output() {
     let track = app.engine.session().tracks.iter().find(|t| t.name == "Lead").unwrap().id;
     assert!(app.engine.session().track(track).unwrap().midi_output.is_internal(), "the choice ran midi.output");
 }
+
+fn instrument_rig() -> (StudioApp, egui::Context) {
+    let mut app = StudioApp::new(soundcraft_engine::Engine::default(), None, Services::default());
+    let t = app.run("track.new", json!({"kind": "instrument", "name": "Keys"})).unwrap()["tracks"][0].as_u64().unwrap();
+    app.run("midi.output", json!({"track": t, "port": {"backend": "fake", "name": "Synth OUT", "ordinal": 0, "id": ""}, "channel": 2})).unwrap();
+    (app, egui::Context::default())
+}
+
+/// The last frame's text rects and chip dots (the dot is the only 4 px radius circle).
+fn shapes(app: &mut StudioApp, ctx: &egui::Context, header_width: f32) -> (Vec<(String, Rect)>, Vec<Rect>) {
+    app.ui.header_width = header_width;
+    let mut last = (Vec::new(), Vec::new());
+    for i in 0..3u32 {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+            time: Some(f64::from(i) / 4.0),
+            ..Default::default()
+        };
+        app.raw_input_hook(&mut raw);
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        let mut dots = Vec::new();
+        for s in &out.shapes {
+            match &s.shape {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Circle(c) if c.radius == 4.0 => dots.push(Rect::from_center_size(c.center, vec2(8.0, 8.0))),
+                _ => {}
+            }
+        }
+        last = (texts, dots);
+    }
+    last
+}
+
+#[test]
+fn the_chip_never_lands_on_the_subtitle() {
+    for width in [160.0, 200.0, 236.0, 300.0] {
+        let (mut app, ctx) = instrument_rig();
+        let (texts, dots) = shapes(&mut app, &ctx, width);
+        let subtitle = texts.iter().find(|(t, _)| t == "Subtractive Synth").unwrap_or_else(|| panic!("subtitle at {width}: {texts:?}")).1;
+        for d in &dots {
+            assert!(!d.intersects(subtitle), "dot {d:?} overlaps subtitle {subtitle:?} at {width}");
+        }
+        for (t, r) in texts.iter().filter(|(t, _)| t.contains("Synth OUT")) {
+            assert!(!r.intersects(subtitle), "{t} {r:?} overlaps subtitle {subtitle:?} at {width}");
+        }
+        if width >= 236.0 {
+            assert_eq!(dots.len(), 1, "the dot is drawn when it fits, at {width}");
+        }
+    }
+    // The narrow header draws no chip shape at all.
+    let (mut app, ctx) = instrument_rig();
+    assert!(shapes(&mut app, &ctx, 160.0).1.is_empty());
+}
+
+#[test]
+fn right_click_on_the_chip_opens_the_track_menu() {
+    let (mut app, ctx) = rig(true);
+    app.ui.header_width = 236.0;
+    let shown = run(&mut app, &ctx, 0, 3, Vec::new());
+    let chip = shown.iter().find(|(t, _)| t == "Synth OUT · Ch 2").expect("the chip").1 - vec2(20.0, 0.0);
+    let right = vec![
+        egui::Event::PointerMoved(chip),
+        egui::Event::PointerButton { pos: chip, button: egui::PointerButton::Secondary, pressed: true, modifiers: egui::Modifiers::NONE },
+        egui::Event::PointerButton { pos: chip, button: egui::PointerButton::Secondary, pressed: false, modifiers: egui::Modifiers::NONE },
+    ];
+    let shown = run(&mut app, &ctx, 3, 3, right);
+    assert!(shown.iter().any(|(t, _)| t == "Delete Track"), "the track menu opened: {shown:?}");
+    assert!(!shown.iter().any(|(t, _)| t == "Instrument (internal)"), "the picker did not open: {shown:?}");
+}
+
+#[test]
+fn only_the_external_track_in_a_mixed_session_draws_a_chip() {
+    let (mut app, ctx) = rig(true);
+    app.run("track.new", json!({"kind": "midi", "name": "Pad"})).unwrap();
+    app.ui.header_width = 300.0;
+    let shown: Vec<String> = run(&mut app, &ctx, 0, 3, Vec::new()).into_iter().map(|(t, _)| t).collect();
+    assert_eq!(shown.iter().filter(|t| t.contains("Synth OUT")).count(), 1, "{shown:?}");
+    assert!(shown.iter().any(|t| t == "Pad"), "{shown:?}");
+    let (_, dots) = shapes(&mut app, &ctx, 300.0);
+    assert_eq!(dots.len(), 1, "the Internal header draws no dot");
+}
