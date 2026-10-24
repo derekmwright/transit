@@ -3702,3 +3702,27 @@ fn loop_ghost_cycles_show_the_notes_that_cycle_plays() {
     let spans = crate::arrange::loop_note_spans(s, &long, soundcraft_model::ClipLoop { start: 0, end: 2 * beat }, true, 0, 2 * beat);
     assert_eq!(spans[1], (3 * beat, 4 * beat, 64));
 }
+
+#[test]
+fn a_loop_drag_stops_at_the_next_clip_and_ctrl_overwrites_it_in_one_undo_step() {
+    let (mut r, clip, handle, px_bar) = loop_rig();
+    let bar = 4 * r.beat;
+    r.app.run("midi.new_clip", json!({"tracks": [r.t.0], "start": 2 * bar, "end": 5 * bar})).unwrap();
+    frames(&mut r.app, &r.ctx, 5, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar), (2 * bar, 5 * bar)]);
+    // Without the modifier the loop (and its ghosts) stop at the neighbor.
+    drag(&mut r.app, handle, (handle.0 + 3.0 * px_bar, handle.1), json!({}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 2 * bar), (2 * bar, 5 * bar)]);
+    r.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar), (2 * bar, 5 * bar)]);
+    // Ctrl: the loop runs on and the neighbor is trimmed, as one undo step.
+    let before = undo_len(&mut r.app);
+    drag(&mut r.app, handle, (handle.0 + 3.0 * px_bar, handle.1), json!({"cmd": true}));
+    frames(&mut r.app, &r.ctx, 20, &mut r.time);
+    assert_eq!(spans(&r.app, r.t), vec![(0, 4 * bar), (4 * bar, 5 * bar)]);
+    assert!(the_clip(&r.app, clip).looping.is_some());
+    assert_eq!(undo_len(&mut r.app), before + 1);
+    r.app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(spans(&r.app, r.t), vec![(0, bar), (2 * bar, 5 * bar)]);
+}

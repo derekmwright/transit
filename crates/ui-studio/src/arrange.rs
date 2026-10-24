@@ -1059,6 +1059,9 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
                 }
             }
         }
+        for (a, b) in overwritten(s, l) {
+            p.rect_filled(span(a, b), crate::theme::RADIUS, TOKENS.header.gamma_multiply(0.6));
+        }
         if let Some((a, b)) = l.cut() {
             p.rect_filled(span(a, b), crate::theme::RADIUS, TOKENS.header.gamma_multiply(0.6));
         }
@@ -1346,7 +1349,7 @@ fn timeline_input(app: &mut StudioApp, ui: &mut Ui, s: &Session, map: Map, tl: R
         && let Some(pos) = resp.hover_pos()
         && let Some((_, _, DragKind::Loop, _, _)) = hit(layout, pos).0
     {
-        resp.clone().on_hover_text("Drag right to loop this clip (Shift: no snap, Alt: independent copies). Drag back to shorten or unloop.");
+        resp.clone().on_hover_text("Drag right to loop this clip (Shift: no snap, Alt: independent copies, Ctrl/Cmd: overwrite the clips in the way instead of stopping at them). Drag back to shorten or unloop.");
     }
     if resp.drag_started()
         && let Some(press) = ui.input(|i| i.pointer.press_origin())
@@ -1523,6 +1526,8 @@ struct LoopDrag {
     looped: bool,
     /// Alt: plain copies instead of cycles.
     independent: bool,
+    /// Cmd/Ctrl: cut into the clips after this one instead of stopping at the next.
+    overwrite: bool,
 }
 
 impl LoopDrag {
@@ -1572,9 +1577,35 @@ fn loop_drag(app: &StudioApp, ui: &Ui, map: Map) -> Option<LoopDrag> {
     let dx = (f64::from(pos?.x - press.x) * map.spp).round() as Samples;
     let to = end.saturating_add(dx).max(0);
     let to = if m.shift { to } else { crate::automation::snap_delta(s, map.spp, &map.grid, 0, to) };
+    let overwrite = m.command && !m.alt;
+    // Without the modifier a longer loop stops at the next clip, as the command does.
+    let to = match (overwrite, next_clip_start(s, clip)) {
+        (false, Some(next)) if to > c.end() && !m.alt => to.min(next.max(c.end())),
+        _ => to,
+    };
     let l = c.looping.filter(|l| l.is_valid());
     let (cycle, first_end) = l.map_or((c.length, c.length), |l| (l.cycle(), l.end));
-    Some(LoopDrag { clip, from: c.end(), to, cycle, first_end, start: c.start, looped: l.is_some(), independent: m.alt })
+    Some(LoopDrag { clip, from: c.end(), to, cycle, first_end, start: c.start, looped: l.is_some(), independent: m.alt, overwrite })
+}
+
+/// Where the next clip on the clip's track starts, if any.
+fn next_clip_start(s: &Session, clip: ClipId) -> Option<Samples> {
+    let (track, c) = s.find_clip(clip)?;
+    s.track(track)?.clips().iter().filter(|o| o.id != clip && o.start > c.start).map(|o| o.start).min()
+}
+
+/// The spans of other clips on the track that an overwriting loop drag would cut into.
+fn overwritten(s: &Session, l: &LoopDrag) -> Vec<(Samples, Samples)> {
+    if !l.overwrite || l.independent || l.to <= l.from {
+        return Vec::new();
+    }
+    let Some((track, _)) = s.find_clip(l.clip) else { return Vec::new() };
+    let Some(t) = s.track(track) else { return Vec::new() };
+    t.clips()
+        .iter()
+        .filter(|o| o.id != l.clip)
+        .filter_map(|o| (o.start < l.to && o.end() > l.from).then(|| (o.start.max(l.from), o.end().min(l.to))))
+        .collect()
 }
 
 /// Commit a loop drag: one `clip.loop_to`, so one undo step.
@@ -1582,7 +1613,7 @@ fn commit_loop(app: &mut StudioApp, l: &LoopDrag) {
     if !l.changes() {
         return;
     }
-    let _ = app.run("clip.loop_to", json!({"clip": l.clip.0, "to": l.to, "independent": l.independent}));
+    let _ = app.run("clip.loop_to", json!({"clip": l.clip.0, "to": l.to, "independent": l.independent, "overwrite": l.overwrite}));
 }
 
 /// Turn a finished drag into commands.

@@ -213,3 +213,44 @@ fn retime_trims_a_looped_midi_clip_through_the_start_helper() {
     let want: Vec<(f64, u8)> = ons(&r, rt).into_iter().filter(|(a, _)| *a >= 10.0).collect();
     assert_eq!(ons(&s, t), want);
 }
+
+fn neighbors(e: &Engine, t: TrackId) -> Vec<(Samples, Samples)> {
+    e.session().track(t).unwrap().clips().iter().map(|c| (c.start, c.end())).collect()
+}
+
+fn with_neighbors(e: &mut Engine, t: TrackId, spans: &[(Samples, Samples)]) {
+    for &(a, b) in spans {
+        let src = e.session().track(t).unwrap().clips()[0].source().unwrap();
+        let id = e.session_mut().new_clip_id();
+        crate::edit::place_clip(e.session_mut(), t, Clip::audio(id, "n", src, 0, a, b - a));
+    }
+}
+
+#[test]
+fn a_loop_stops_at_the_next_clip_unless_it_overwrites() {
+    let (mut e, t, id) = audio();
+    with_neighbors(&mut e, t, &[(250, 350)]);
+    e.execute("clip.loop_to", &json!({"clip": id.0, "to": 330})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 250), (250, 350)], "stopped at the neighbor");
+    e.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 100), (250, 350)]);
+    // Overwriting: the loop reaches 330 and the neighbor keeps what is after it.
+    e.execute("clip.loop_to", &json!({"clip": id.0, "to": 330, "overwrite": true})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 330), (330, 350)]);
+    let c = e.session().find_clip(id).unwrap().1.clone();
+    assert!(c.looping.is_some());
+    // One undo step brings back the clip, the neighbor and the unlooped state.
+    e.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 100), (250, 350)]);
+    assert_eq!(e.session().find_clip(id).unwrap().1.looping, None);
+}
+
+#[test]
+fn an_overwriting_loop_removes_covered_clips_and_stops_at_an_edit_locked_one() {
+    let (mut e, t, id) = audio();
+    with_neighbors(&mut e, t, &[(120, 180), (200, 260), (300, 360)]);
+    let locked = e.session().track(t).unwrap().clips().iter().find(|c| c.start == 300).unwrap().id;
+    e.session_mut().find_clip_mut(locked).unwrap().edit_locked = true;
+    e.execute("clip.loop_to", &json!({"clip": id.0, "to": 340, "overwrite": true})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 300), (300, 360)], "covered clips gone, the locked clip untouched");
+}

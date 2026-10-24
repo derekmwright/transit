@@ -125,7 +125,7 @@ Issues labeled good first issue are scoped and documented enough to start with. 
 - Freeze, Unfreeze and Flatten a track (the snowflake on the track header); a frozen track plays its rendered audio, with its key sources running.
 - Group tracks: Track > New Group Track or the "+ Group" quick-add; Ctrl+G folds the selected tracks into a group, Ctrl+Shift+G ungroups, and you can drag track headers into a folder. Edit Group… is the separate edit-group feature.
 - Fade and crossfade handles on audio clips: hover a top corner and drag for length (Shift: no snap), Alt-drag to bend, click for the shape menu, double-click to reset; right-click overlapping clips for Crossfade.
-- Clip-internal loops: drag the loop handle at a clip header's upper right to repeat the clip in cycles (dividers show each cycle; Alt-drag makes independent copies). Edits inside the loop apply to every cycle.
+- Clip-internal loops: drag the loop handle at a clip header's upper right to repeat the clip in cycles (dividers show each cycle; Alt-drag makes independent copies, Ctrl/Cmd-drag overwrites the clips in the way). Edits inside the loop apply to every cycle.
 
 ### Mixer and routing
 

@@ -71,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Loop To",
             [],
             None,
-            "{clip, to: position, independent?: bool} - the loop handle: sets the clip's arrangement length to `to`, cycling its content (an unlooped clip is first looped over its whole length, which must be at least 64 samples); at or before the first cycle's end it unloops. independent = lay plain copies up to `to` instead (a trimmed last copy)",
+            "{clip, to: position, independent?: bool, overwrite?: bool} - the loop handle: sets the clip's arrangement length to `to`, cycling its content (an unlooped clip is first looped over its whole length, which must be at least 64 samples); at or before the first cycle's end it unloops. independent = lay plain copies up to `to` instead (a trimmed last copy). overwrite = a longer loop cuts into the clips after it (trimming or removing them, stopping at an edit-locked one) instead of stopping at the next clip; one undo step",
             always,
             loop_to
         ),
@@ -345,6 +345,7 @@ fn loop_to(e: &mut Engine, p: &Value) -> Result<Value> {
     let Some(&clip) = clip_ids_param(e, p).first() else { return Err(bad(id, "`clip` required")) };
     let to = position_param(e, id, p, "to")?.ok_or_else(|| bad(id, "`to` required"))?;
     let independent = p.get("independent").and_then(Value::as_bool).unwrap_or(false);
+    let overwrite = p.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
     let s = e.session_mut();
     let (track, base) = s.find_clip(clip).map(|(t, c)| (t, c.clone())).ok_or_else(|| bad(id, "no such clip"))?;
     if base.edit_locked {
@@ -368,7 +369,25 @@ fn loop_to(e: &mut Engine, p: &Value) -> Result<Value> {
     if !was_looped && let Some(c) = s.find_clip_mut(clip) {
         c.looping = Some(ClipLoop { start: 0, end: c.length });
     }
-    let target = if was_looped && to <= cycle_end { cycle_end } else { to };
+    let mut target = if was_looped && to <= cycle_end { cycle_end } else { to };
+    if overwrite && target > base.end() {
+        // Make room first: the neighbors under the new span are trimmed or removed, but the
+        // loop never runs into an edit-locked clip.
+        if let Some(lock) = s
+            .track(track)
+            .map(|t| t.clips())
+            .unwrap_or_default()
+            .iter()
+            .filter(|c| c.edit_locked && c.id != clip && c.end() > base.end())
+            .map(|c| c.start.max(base.end()))
+            .min()
+        {
+            target = target.min(lock);
+        }
+        if target > base.end() {
+            crate::edit::clear_range(s, track, soundcraft_time::Range::new(base.end(), target), false);
+        }
+    }
     if was_looped
         && to <= cycle_end
         && let Some(c) = s.find_clip_mut(clip)
