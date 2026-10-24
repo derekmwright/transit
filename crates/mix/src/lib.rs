@@ -2502,7 +2502,7 @@ pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Seq
 
 /// Where cycle `k` (1 is the first repeat) of a content point `rel` samples into a looped clip
 /// lands: the point must lie inside the loop range.
-fn cycle_at(clip_start: Samples, l: ClipLoop, rel: Samples, k: i64) -> Samples {
+pub fn cycle_at(clip_start: Samples, l: ClipLoop, rel: Samples, k: i64) -> Samples {
     clip_start.saturating_add(l.end).saturating_add(rel - l.start).saturating_add((k - 1).saturating_mul(l.cycle()))
 }
 
@@ -2515,12 +2515,18 @@ fn cycle_at(clip_start: Samples, l: ClipLoop, rel: Samples, k: i64) -> Samples {
 /// starts on a tick with a loop on ticks the frame is `(clip.start, loop)` unchanged.
 fn midi_loop_frame(s: &Session, clip: &Clip) -> Option<(Samples, ClipLoop)> {
     let l = clip.looping.filter(|l| l.is_valid())?;
+    Some(loop_frame(s, clip.start, l))
+}
+
+/// [`midi_loop_frame`] for a clip starting at `start` with loop `l`: playback, consolidate and the
+/// arranger's drawing all take their cycles from this one function, so what is drawn is what is heard.
+pub fn loop_frame(s: &Session, start: Samples, l: ClipLoop) -> (Samples, ClipLoop) {
     let sr = s.sample_rate;
-    let origin = s.tempo.tick_to_samples(s.tempo.samples_to_ticks(clip.start, sr), sr);
-    let snap = |x: Samples| s.tempo.tick_to_samples(s.tempo.samples_to_ticks(clip.start.saturating_add(x), sr), sr).saturating_sub(origin);
+    let origin = s.tempo.tick_to_samples(s.tempo.samples_to_ticks(start, sr), sr);
+    let snap = |x: Samples| s.tempo.tick_to_samples(s.tempo.samples_to_ticks(start.saturating_add(x), sr), sr).saturating_sub(origin);
     let snapped = ClipLoop { start: snap(l.start), end: snap(l.end) };
     // A range that rounds to under the minimum cycle keeps the sample frame.
-    Some(if snapped.is_valid() { (origin, snapped) } else { (clip.start, l) })
+    if snapped.is_valid() { (origin, snapped) } else { (start, l) }
 }
 
 /// The repeat cycles (`k >= 1`) in which a point `rel` samples into a looped clip, sounding for
@@ -4075,6 +4081,37 @@ mod tests {
         );
         render_block(&mut rig, 36_512);
         assert!(heard.lock().unwrap().is_empty());
+    }
+
+    /// Chase on a seek into a looped clip that starts between ticks measures cycles from the tick
+    /// grid origin, like playback: a controller whose next cycle lands a few samples after the seek
+    /// is not yet in effect (the clip start is 7 samples into tick 0; 25 samples per tick).
+    #[test]
+    fn controller_chase_in_a_looped_clip_that_starts_between_ticks_measures_from_the_grid_origin() {
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Instrument, ChannelFormat::Stereo, None);
+        s.track_mut(t).unwrap().instrument = Some(Insert::new("clap:test.ears"));
+        let q = soundcraft_time::TICKS_PER_QUARTER;
+        let bar = 4 * s.tempo.tick_to_samples(q, s.sample_rate);
+        let cc = |tick, value| soundcraft_midi::CtrlEvent { tick, channel: 0, kind: CtrlKind::Cc(1), value };
+        // Value 10 at beat 1, value 20 two ticks (50 samples) later.
+        let seq = soundcraft_midi::Sequence { ctrls: vec![cc(q, 10), cc(q + 2, 20)], ..Default::default() };
+        let cid = s.new_clip_id();
+        let mut c = Clip::midi(cid, "m", 7, 5 * bar - 7, seq);
+        c.looping = Some(ClipLoop { start: 0, end: bar - 7 });
+        s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ears = Ears { inner: soundcraft_dsp::create("gain").unwrap(), heard: Arc::clone(&heard) };
+        let mut rig = PlanRig::new(512).fake(t, INSTRUMENT_SLOT, ears);
+        rig.publish(&s);
+        render_block(&mut rig, 0);
+        heard.lock().unwrap().clear();
+        // The value-10 event's second sounding is at bar + 24000; seek 4 samples before it.
+        let seek = bar + 24_000 - 4;
+        render_block(&mut rig, seek);
+        let got = std::mem::take(&mut *heard.lock().unwrap());
+        assert!(got.contains(&(0, [0xB0, 1, 20])), "the latest value before the seek is 20: {got:?}");
+        assert!(!got.contains(&(0, [0xB0, 1, 10])), "10 sounds 4 samples after the seek, not before: {got:?}");
     }
 
     struct Keys {

@@ -112,7 +112,11 @@ pub fn move_material(s: &mut Session, at: &dyn Fn(Samples) -> Samples) -> Result
             move_clips(&mut pl.clips, at, ctx).map_err(|why| match why {
                 Squeezed::Clip(clip) => format!("the change squeezes clip `{clip}` on track `{}` to nothing", tr.name),
                 Squeezed::Loop(clip) => {
-                    format!("the change squeezes the loop of clip `{clip}` on track `{}` below {} samples", tr.name, soundcraft_model::MIN_CYCLE)
+                    format!(
+                        "the change squeezes the loop of clip `{clip}` on track `{}` below {} samples; shorten the loop or clear it before changing tempo",
+                        tr.name,
+                        soundcraft_model::MIN_CYCLE
+                    )
                 }
             })?;
             pl.sort();

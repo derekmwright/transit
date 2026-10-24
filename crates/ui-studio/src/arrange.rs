@@ -1013,7 +1013,9 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
         && let (Some(y0), Some(t)) = (row_y(track), s.track(track))
     {
         let span = |a: Samples, b: Samples| Rect::from_min_max(pos2(map.x(a), y0 + 1.0), pos2(map.x(b).max(map.x(a) + 2.0), y0 + rh - 1.0));
-        for (a, b) in l.ghosts() {
+        // An overwrite stops at an edit-locked clip, and so do the ghosts.
+        let stop = if l.overwrite && !l.independent { overwrite_stop(s, l) } else { Samples::MAX };
+        for (a, b) in l.ghosts().into_iter().filter(|(a, _)| *a < stop).map(|(a, b)| (a, b.min(stop))) {
             let mut g = base.clone();
             // The ghost plays the cycle as it would: its audio starts at the loop phase of `a`.
             let mut virt = base.clone();
@@ -1042,14 +1044,9 @@ fn clips(app: &StudioApp, ui: &Ui, s: &Session, map: Map, tl: Rect, rows: &[&Tra
                         let (body_col, ..) = theme::clip_colors(clip_base_color(&base, t), false);
                         let ink = theme::darken(body_col, 0.62).gamma_multiply(GHOST_ALPHA);
                         let wp = p.with_clip_rect(rect.intersect(tl));
-                        for (from, to, pitch) in loop_note_spans(
-                            s,
-                            &virt,
-                            virt.looping.unwrap_or(ClipLoop { start: 0, end: base.length }),
-                            true,
-                            virt.content_pos(a - base.start),
-                            a - base.start,
-                        ) {
+                        for (from, to, pitch) in
+                            loop_note_spans(s, &virt, virt.looping.unwrap_or(ClipLoop { start: 0, end: base.length }), true, a - base.start)
+                        {
                             let (x0, x1) = (map.x(base.start + from), map.x(base.start + to));
                             let fy = 1.0 - f32::from(pitch.saturating_sub(lo)) / span;
                             let y = body.min.y + 2.0 + fy * (body.height() - 6.0);
@@ -1159,7 +1156,15 @@ fn draw_cycles(
     ink: Color32,
 ) {
     let sx = |rel: Samples| rect.min.x + (rel as f64 / map.spp) as f32;
-    for (i, (a, b, phase)) in cycle_segments(c, l).enumerate() {
+    // A MIDI clip's seams sit where playback puts them: on the tick-rounded frame.
+    let seams = if matches!(c.content, ClipContent::Midi { .. }) {
+        let (origin, f) = soundcraft_mix::loop_frame(s, c.start, l);
+        let gap = origin - c.start;
+        ClipLoop { start: f.start + gap, end: f.end + gap }
+    } else {
+        l
+    };
+    for (i, (a, b, phase)) in cycle_segments(c, seams).enumerate() {
         let (x0, x1) = (sx(a), sx(b).max(sx(a) + 1.0));
         if x1 < tl.min.x || x0 > tl.max.x {
             continue;
@@ -1195,7 +1200,7 @@ fn draw_cycles(
             ClipContent::Midi { sequence } => {
                 if let Some((lo, span)) = pitch_span(&sequence.notes) {
                     let wp = p.with_clip_rect(seg.intersect(tl));
-                    for (from, to, pitch) in loop_note_spans(s, c, l, i > 0, phase, a) {
+                    for (from, to, pitch) in loop_note_spans(s, c, l, i > 0, a) {
                         let fy = 1.0 - f32::from(pitch.saturating_sub(lo)) / span;
                         let y = body.min.y + 2.0 + fy * (body.height() - 6.0);
                         let r = Rect::from_min_max(pos2(sx(from), y), pos2(sx(to.min(b)).max(sx(from) + 2.0), y + 2.5));
@@ -1221,20 +1226,27 @@ fn pitch_span(notes: &[soundcraft_midi::Note]) -> Option<(u8, f32)> {
 }
 
 /// The notes one cycle of a looped MIDI clip plays, as (clip-relative start, end, pitch) spans of
-/// the cycle that begins at clip time `a` with content position `phase` (ADR 0019): cycle 0 plays
-/// what starts before the loop end, a `later` cycle what starts inside the range, and a note
-/// crossing the seam ends there. Playback, the clip body and the loop-drag ghosts share this.
-pub(crate) fn loop_note_spans(s: &Session, c: &Clip, l: ClipLoop, later: bool, phase: Samples, a: Samples) -> Vec<(Samples, Samples, u8)> {
+/// the cycle that contains clip time `a` (ADR 0019): cycle 0 plays what starts before the loop end,
+/// a `later` cycle what starts inside the range, and a note crossing the seam ends there. The cycles
+/// come from [`soundcraft_mix::loop_frame`], the tick-rounded frame playback uses, so an off-tick
+/// loop edge draws where it is heard.
+pub(crate) fn loop_note_spans(s: &Session, c: &Clip, l: ClipLoop, later: bool, a: Samples) -> Vec<(Samples, Samples, u8)> {
     let ClipContent::Midi { sequence } = &c.content else { return Vec::new() };
+    let (origin, fl) = soundcraft_mix::loop_frame(s, c.start, l);
     let clip_tick = s.tempo.samples_to_ticks(c.start, s.sample_rate);
+    // Cycle `k >= 1` of the stepped frame that holds `a`.
+    let k = (a - (origin - c.start) - fl.end).div_euclid(fl.cycle().max(1)) + 1;
     let mut out = Vec::new();
     for n in sequence.notes.iter().take(5000) {
-        let on = s.tempo.tick_to_samples(clip_tick.saturating_add(n.start), s.sample_rate) - c.start;
-        let off = s.tempo.tick_to_samples(clip_tick.saturating_add(n.end()), s.sample_rate) - c.start;
-        if on >= l.end || (later && on < l.start) || (!later && on < 0) {
+        let on = s.tempo.tick_to_samples(clip_tick.saturating_add(n.start), s.sample_rate);
+        let off = s.tempo.tick_to_samples(clip_tick.saturating_add(n.end()), s.sample_rate);
+        let rel = on - origin;
+        if rel >= fl.end || (later && rel < fl.start) || (!later && rel < 0) {
             continue;
         }
-        out.push((a + on - phase, a + off.min(l.end) - phase, n.pitch));
+        let span = (off.min(origin + fl.end) - on).max(0);
+        let at = if later { soundcraft_mix::cycle_at(origin, fl, rel, k.max(1)) } else { on };
+        out.push((at - c.start, at + span - c.start, n.pitch));
     }
     out
 }
@@ -1594,17 +1606,35 @@ fn next_clip_start(s: &Session, clip: ClipId) -> Option<Samples> {
     s.track(track)?.clips().iter().filter(|o| o.id != clip && o.start > c.start).map(|o| o.start).min()
 }
 
-/// The spans of other clips on the track that an overwriting loop drag would cut into.
+/// Where an overwriting loop drag stops: the drop point, or the start of the edit-locked clip the
+/// commit will not run into (the same rule as `clip.loop_to`).
+fn overwrite_stop(s: &Session, l: &LoopDrag) -> Samples {
+    let Some((track, _)) = s.find_clip(l.clip) else { return l.to };
+    let lock = s
+        .track(track)
+        .map(|t| t.clips())
+        .unwrap_or_default()
+        .iter()
+        .filter(|o| o.edit_locked && o.id != l.clip && o.end() > l.from)
+        .map(|o| o.start.max(l.from))
+        .min();
+    lock.map_or(l.to, |x| l.to.min(x))
+}
+
+/// The spans of other clips on the track that an overwriting loop drag would cut into. An
+/// edit-locked clip stops the drag, so it and anything past it is not shaded.
 fn overwritten(s: &Session, l: &LoopDrag) -> Vec<(Samples, Samples)> {
     if !l.overwrite || l.independent || l.to <= l.from {
         return Vec::new();
     }
     let Some((track, _)) = s.find_clip(l.clip) else { return Vec::new() };
     let Some(t) = s.track(track) else { return Vec::new() };
+    let to = overwrite_stop(s, l);
     t.clips()
         .iter()
-        .filter(|o| o.id != l.clip)
-        .filter_map(|o| (o.start < l.to && o.end() > l.from).then(|| (o.start.max(l.from), o.end().min(l.to))))
+        .filter(|o| o.id != l.clip && !o.edit_locked)
+        .filter(|o| o.start < to && o.end() > l.from)
+        .map(|o| (o.start.max(l.from), o.end().min(to)))
         .collect()
 }
 
@@ -2129,5 +2159,38 @@ mod loop_corner_tests {
         // Pointer elsewhere on the clip: back to dim.
         rig.frames(3, Some(pos2(rect.min.x + 40.0, rect.min.y + CLIP_NAME_H / 2.0)));
         assert_eq!(name_and_glyph(&rig).1, Some(idle));
+    }
+
+    #[test]
+    fn the_overwrite_preview_does_not_shade_clips_the_commit_will_not_touch() {
+        use soundcraft_model::{ChannelFormat, Clip, TrackKind};
+        let mut s = Session::default();
+        let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+        let mut ids = Vec::new();
+        for (start, len, locked) in [(0, 1000, false), (1000, 500, false), (1500, 500, true), (2000, 500, false)] {
+            let id = s.new_clip_id();
+            let mut c = Clip::midi(id, "m", start, len, Default::default());
+            c.edit_locked = locked;
+            s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+            ids.push(id);
+        }
+        let drag = |to| LoopDrag {
+            clip: ids[0],
+            from: 1000,
+            to,
+            cycle: 1000,
+            first_end: 1000,
+            start: 0,
+            looped: false,
+            independent: false,
+            overwrite: true,
+        };
+        // Dragging across the locked clip shades the clip before it only.
+        assert_eq!(overwritten(&s, &drag(2400)), vec![(1000, 1500)]);
+        assert_eq!(overwrite_stop(&s, &drag(2400)), 1500);
+        // Short of it, as before.
+        assert_eq!(overwritten(&s, &drag(1200)), vec![(1000, 1200)]);
+        // A locked clip that abuts the clip stops the drag at once: nothing shaded.
+        assert!(overwritten(&s, &LoopDrag { from: 1500, start: 1000, clip: ids[1], ..drag(2400) }).is_empty());
     }
 }

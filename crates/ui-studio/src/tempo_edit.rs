@@ -125,17 +125,22 @@ impl StudioApp {
             return false;
         }
         let params = json!({"bpm": bpm, "at": self.tick_at(tick)});
-        match key {
-            Some(k) => self.engine.execute_merged("event.tempo", &params, k).is_ok(),
+        let result = match key {
+            Some(k) => self.engine.execute_merged("event.tempo", &params, k),
             None => {
                 self.engine.end_merge();
                 self.tempo_ui.serial += 1;
                 let k = format!("tempo:set:{}", self.tempo_ui.serial);
-                let ok = self.engine.execute_merged("event.tempo", &params, &k).is_ok();
+                let result = self.engine.execute_merged("event.tempo", &params, &k);
                 self.engine.end_merge();
-                ok
+                result
             }
+        };
+        // A refused change (a clip or loop the new tempo would squeeze away) says why.
+        if let Err(e) = &result {
+            self.status = format!("Tempo not changed: {e}");
         }
+        result.is_ok()
     }
 
     /// Set the meter of the event at `tick`, as one undo step.

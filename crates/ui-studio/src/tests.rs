@@ -3681,15 +3681,15 @@ fn loop_ghost_cycles_show_the_notes_that_cycle_plays() {
     let (c, beat) = two_note_clip(s, &[(60, 0), (64, 1)]);
     let l = soundcraft_model::ClipLoop { start: 0, end: 2 * beat };
     // A ghost cycle that begins at the seam plays both notes at their own offsets.
-    let spans = crate::arrange::loop_note_spans(s, &c, l, true, 0, 2 * beat);
+    let spans = crate::arrange::loop_note_spans(s, &c, l, true, 2 * beat);
     assert_eq!(spans, vec![(2 * beat, 3 * beat, 60), (3 * beat, 4 * beat, 64)]);
     // A loop range that starts at beat 1: later cycles skip the intro note, and a ghost that starts
     // at the loop start (phase 1 beat) puts the beat 1 note at the ghost's left edge.
     let l = soundcraft_model::ClipLoop { start: beat, end: 2 * beat };
-    let spans = crate::arrange::loop_note_spans(s, &c, l, true, beat, 2 * beat);
+    let spans = crate::arrange::loop_note_spans(s, &c, l, true, 2 * beat);
     assert_eq!(spans, vec![(2 * beat, 3 * beat, 64)], "the intro note is not in a ghost cycle");
     // The first pass (not a later cycle) keeps the intro note.
-    let first = crate::arrange::loop_note_spans(s, &c, l, false, 0, 0);
+    let first = crate::arrange::loop_note_spans(s, &c, l, false, 0);
     assert_eq!(first.len(), 2);
     // A note that crosses the seam ends at it.
     let (long, beat) = {
@@ -3699,8 +3699,44 @@ fn loop_ghost_cycles_show_the_notes_that_cycle_plays() {
         }
         (x, beat)
     };
-    let spans = crate::arrange::loop_note_spans(s, &long, soundcraft_model::ClipLoop { start: 0, end: 2 * beat }, true, 0, 2 * beat);
+    let spans = crate::arrange::loop_note_spans(s, &long, soundcraft_model::ClipLoop { start: 0, end: 2 * beat }, true, 2 * beat);
     assert_eq!(spans[1], (3 * beat, 4 * beat, 64));
+}
+
+#[test]
+fn an_off_tick_loop_edge_draws_its_cycle_notes_where_playback_plays_them() {
+    use soundcraft_model::{ChannelFormat, Clip, ClipLoop, Session, TrackKind};
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+    let (c, beat) = two_note_clip(&s, &[(60, 0), (64, 1)]);
+    // The loop edge is 10 samples past the second beat tick (25 samples per tick): playback rounds
+    // it to the tick, so the second cycle starts at beat 2.
+    let l = ClipLoop { start: 0, end: 2 * beat + 10 };
+    let mut clip = Clip::midi(ClipId(900), "m", 0, 4 * beat, Default::default());
+    clip.content = c.content.clone();
+    clip.looping = Some(l);
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(clip.clone());
+    let heard: Vec<(i64, u8)> = soundcraft_mix::clip_note_ons(&s, t, 0, (4 * beat) as usize);
+    let mut drawn: Vec<(i64, u8)> = crate::arrange::loop_note_spans(&s, &clip, l, false, 0).into_iter().map(|(a, _, k)| (a, k)).collect();
+    drawn.extend(crate::arrange::loop_note_spans(&s, &clip, l, true, l.end).into_iter().map(|(a, _, k)| (a, k)));
+    drawn.sort();
+    assert_eq!(drawn, heard);
+    assert_eq!(heard[2], (2 * beat, 60), "the second cycle starts on the rounded tick");
+}
+
+#[test]
+fn a_refused_tempo_change_says_why_in_the_status_line() {
+    use soundcraft_model::{ChannelFormat, Clip, ClipLoop, TrackKind};
+    let mut app = app();
+    let s = app.engine.session_mut();
+    let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+    let id = s.new_clip_id();
+    let mut c = Clip::midi(id, "tiny", 0, 1000, Default::default());
+    c.looping = Some(ClipLoop { start: 0, end: 100 });
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+    assert!(!app.set_tempo_at(0, 240.0, None));
+    assert!(app.status.contains("tiny") && app.status.contains("shorten the loop or clear it before changing tempo"), "{}", app.status);
+    assert_eq!(app.engine.session().tempo.tempos()[0].bpm, 120.0);
 }
 
 #[test]

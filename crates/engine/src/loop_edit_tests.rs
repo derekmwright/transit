@@ -255,6 +255,17 @@ fn an_overwriting_loop_removes_covered_clips_and_stops_at_an_edit_locked_one() {
     assert_eq!(neighbors(&e, t), vec![(0, 300), (300, 360)], "covered clips gone, the locked clip untouched");
 }
 
+#[test]
+fn an_overwriting_loop_does_not_delete_an_edit_locked_clip_that_abuts_it() {
+    let (mut e, t, id) = audio();
+    with_neighbors(&mut e, t, &[(100, 160)]);
+    let locked = e.session().track(t).unwrap().clips().iter().find(|c| c.start == 100).unwrap().id;
+    e.session_mut().find_clip_mut(locked).unwrap().edit_locked = true;
+    e.execute("clip.loop_to", &json!({"clip": id.0, "to": 300, "overwrite": true})).unwrap();
+    assert_eq!(neighbors(&e, t), vec![(0, 100), (100, 160)], "the locked clip is still there, untouched");
+    assert!(e.session().find_clip(locked).is_some());
+}
+
 /// A MIDI clip whose loop cycle is 100 samples: a tempo change that makes the cycle shorter than
 /// the 64-sample minimum is refused (K40, ADR 0019) instead of silently dropping the loop.
 fn tiny_loop() -> (Engine, TrackId, ClipId) {
