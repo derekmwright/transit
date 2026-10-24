@@ -20,6 +20,7 @@ UI code follows the same no-panic rule (`#![deny(clippy::unwrap_used, ...)]` in 
   `FakeConnection` to script devices without hardware (`audio_devices_tests.rs`).
 - **Long work** (plug-in scan, import) runs off the UI thread. Known gap: a heavy plug-in create can
   still block it (`../../known-issues/README.md`).
+- **Transport wait:** Play draws muted and pulses, with the reason as its tooltip, while a Play request is pending or a plug-in is still loading (`transport_wait()` in `transport.rs`, derived from `player_requests.play` and `Player::any_loading`). Clicks while pending are ignored; Stop cancels.
 - Strings are American English.
 
 ## Tests

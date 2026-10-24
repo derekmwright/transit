@@ -30,6 +30,46 @@ fn button(app: &mut StudioApp, ui: &mut Ui, name: &str, which: Icon, on: bool, o
     resp.on_hover_text(tooltip)
 }
 
+impl StudioApp {
+    /// Whether a Play request is waiting for the player to admit it.
+    pub fn play_pending(&self) -> bool {
+        self.player_requests.play.is_some()
+    }
+
+    /// Whether any plug-in instance is still being made (ADR 0018); its slot reads "Loading...".
+    pub fn plugins_loading(&self) -> bool {
+        self.player.as_ref().is_some_and(|p| p.any_loading())
+    }
+
+    /// Why Play is muted, or `None` when it is ready. A pending request wins over loading.
+    pub fn transport_wait(&self) -> Option<&'static str> {
+        if self.play_pending() {
+            Some("Play pending")
+        } else if self.plugins_loading() && !self.is_playing() {
+            Some("Waiting for plug-ins to load")
+        } else {
+            None
+        }
+    }
+}
+
+/// The Play button while waiting: dim icon, a gentle pulse, and the reason as the tooltip.
+fn play_button(app: &mut StudioApp, ui: &mut Ui, on: bool) -> egui::Response {
+    let Some(reason) = app.transport_wait() else {
+        return button(app, ui, "play", Icon::Play, on, TOKENS.accent);
+    };
+    let (r, resp) = ui.allocate_exact_size(vec2(34.0, 28.0), Sense::click());
+    let t = ui.input(|i| i.time) as f32;
+    let pulse = 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.6).sin();
+    let p = ui.painter();
+    p.rect_filled(r, crate::theme::RADIUS, TOKENS.button);
+    icons::paint_in(p, r, Icon::Play, TOKENS.text_dim.gamma_multiply(0.45 + 0.45 * pulse));
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+    app.arrange.layout.transport.insert("play".to_string(), [r.min.x, r.min.y, r.max.x, r.max.y]);
+    app.arrange.layout.transport_icons.insert("play".to_string(), Icon::Play.name().to_string());
+    resp.on_hover_text(reason)
+}
+
 /// `1. 1. 1. 000` (bar, beat, sixteenth, tick within the sixteenth).
 pub fn bars_beats(app: &StudioApp, at: Samples) -> String {
     let s = app.engine.session();
@@ -67,7 +107,8 @@ pub fn bar(app: &mut StudioApp, ui: &mut Ui) {
                         let _ = app.run("transport.stop", json!({}));
                     }
                 }
-                if button(app, ui, "play", Icon::Play, playing && !recording, TOKENS.accent).clicked() {
+                // A click while a play request is pending does nothing extra; Stop cancels it.
+                if play_button(app, ui, playing && !recording).clicked() && !app.play_pending() {
                     let _ = app.run("transport.play", json!({}));
                 }
                 // A record count-in pulses the button on each beat instead of lighting it.

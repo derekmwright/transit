@@ -280,3 +280,44 @@ fn double_click_stop_keeps_recorded_take_then_returns_to_zero() {
 fn first_stop_keeps_recorded_take_at_play_start_then_second_returns_to_zero() {
     recording_stop(1);
 }
+
+fn click_play(t: &mut T) {
+    let r = t.app.arrange.layout.transport["play"];
+    t.input("ui.click", json!({"x": (r[0] + r[2]) / 2.0, "y": (r[1] + r[3]) / 2.0, "count": 1}));
+}
+
+#[test]
+fn play_is_muted_with_a_reason_while_play_is_pending() {
+    let mut t = T::new();
+    assert_eq!(t.app.transport_wait(), None);
+    t.app.player_requests.play = Some(Default::default());
+    t.frames(2);
+    assert!(t.app.play_pending());
+    assert_eq!(t.app.transport_wait(), Some("Play pending"));
+    // The button is still laid out (the tooltip and click target), now in the muted state.
+    assert!(t.app.arrange.layout.transport.contains_key("play"));
+}
+
+#[test]
+fn clicking_play_while_pending_issues_no_second_play() {
+    let mut t = T::new();
+    t.app.player_requests.play = Some(Default::default());
+    t.frames(2);
+    click_play(&mut t);
+    assert_eq!(t.app.player_requests.play, Some(Default::default()), "the pending request is untouched");
+    assert!(!t.app.is_playing(), "no play started");
+    assert!(t.app.engine.transport_requests.is_empty(), "no request queued");
+}
+
+#[test]
+fn play_returns_to_normal_once_the_request_clears() {
+    let mut t = T::new();
+    t.app.player_requests.play = Some(Default::default());
+    t.frames(2);
+    assert!(t.app.transport_wait().is_some());
+    t.app.player_requests.play = None;
+    t.frames(2);
+    assert_eq!(t.app.transport_wait(), None);
+    click_play(&mut t);
+    assert!(t.app.is_playing(), "Play works again");
+}
