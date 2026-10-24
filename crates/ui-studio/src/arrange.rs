@@ -1190,8 +1190,10 @@ fn draw_cycles(
 const LOOP_GLYPH_MIN: f32 = 6.0;
 /// The loop corner glyph's full size (points).
 const LOOP_GLYPH: f32 = 10.0;
-/// The loop cursor's size (points).
-const LOOP_CURSOR: f32 = 16.0;
+/// The loop cursor badge's size (points).
+const LOOP_BADGE: f32 = 11.0;
+/// How far right and below the pointer tip the badge is centered (points).
+const LOOP_BADGE_OFFSET: f32 = 12.0;
 
 /// How strongly the loop corner shows: full while the pointer is in the zone or a loop drag is on,
 /// dim on a clip that already loops, none otherwise.
@@ -1220,36 +1222,46 @@ fn loop_corner_rect(rect: Rect, strip: Rect) -> Option<Rect> {
     Some(Rect::from_center_size(pos2(right - size / 2.0, strip.center().y), vec2(size, size)))
 }
 
-/// The loop glyph: an open circular arrow, as line segments plus an arrowhead, in `r`.
-fn loop_glyph(r: Rect, color: Color32, width: f32) -> Vec<Shape> {
+/// Points in the loop glyph's arc path (the shape signature the render tests look for).
+const LOOP_ARC_POINTS: usize = 13;
+
+/// The loop glyph: a three-quarter arc (gap at the upper right) ending in a small open arrowhead
+/// (two short strokes), in `r`. The stroke is 1.25 px at 11 px and scales with the glyph; `extra`
+/// widens it (the cursor badge's dark outline is the same shape drawn 2 px wider).
+fn loop_glyph(r: Rect, color: Color32, extra: f32) -> Vec<Shape> {
+    let size = r.width().min(r.height());
     let c = r.center();
-    let rad = r.width().min(r.height()) * 0.36;
+    let rad = size * 0.34;
     let at = |a: f32| pos2(c.x + rad * a.cos(), c.y + rad * a.sin());
-    let (a0, a1) = (-0.35_f32, std::f32::consts::TAU - 1.0);
-    let pts: Vec<Pos2> = (0..=14).map(|i| at(a0 + (a1 - a0) * i as f32 / 14.0)).collect();
+    // Screen angles run clockwise (y down): start at 3 o'clock, sweep 270 degrees, end at 12 o'clock.
+    let (a0, a1) = (0.0_f32, std::f32::consts::PI * 1.5);
+    let n = LOOP_ARC_POINTS - 1;
+    let pts: Vec<Pos2> = (0..=n).map(|i| at(a0 + (a1 - a0) * i as f32 / n as f32)).collect();
     let end = at(a1);
+    // Unit tangent (direction of travel) and outward normal at the end of the arc.
     let (tx, ty) = (-a1.sin(), a1.cos());
-    let h = r.width() * 0.34;
-    let tip = pos2(end.x + tx * h, end.y + ty * h);
     let (nx, ny) = (a1.cos(), a1.sin());
-    let head = vec![tip, pos2(end.x + nx * h * 0.8, end.y + ny * h * 0.8), pos2(end.x - nx * h * 0.8, end.y - ny * h * 0.8)];
-    vec![Shape::line(pts, Stroke::new(width, color)), Shape::convex_polygon(head, color, Stroke::new(width * 0.5, color))]
+    let h = size * 0.27;
+    let tip = pos2(end.x + tx * h * 0.7, end.y + ty * h * 0.7);
+    let barb = |s: f32| pos2(tip.x - tx * h + nx * h * s, tip.y - ty * h + ny * h * s);
+    let stroke = Stroke::new(size * 1.25 / 11.0 + extra, color);
+    vec![Shape::line(pts, stroke), Shape::line(vec![barb(-1.0), tip, barb(1.0)], stroke)]
 }
 
 /// Paint the loop corner glyph in `r`.
 fn draw_loop_corner(p: &egui::Painter, r: Rect, color: Color32) {
-    p.extend(loop_glyph(r, color, 1.5));
+    p.extend(loop_glyph(r, color, 0.0));
 }
 
-/// The loop cursor: the stock cursor is hidden and a loop glyph with a dark outline is painted at
-/// `pos` on the topmost layer. Call every frame the pointer is over the zone or a loop drag runs;
-/// on the first frame it is not called the normal cursor is back.
+/// The loop cursor: the OS arrow stays, and a small loop badge with a 1 px dark outline is painted
+/// at the arrow's lower right (Logic's pattern) on the topmost layer. Call every frame the pointer
+/// is over the zone or a loop drag runs; on the first frame it is not called the badge is gone.
 fn loop_cursor(ctx: &egui::Context, pos: Pos2) {
-    ctx.set_cursor_icon(CursorIcon::None);
+    ctx.set_cursor_icon(CursorIcon::Default);
     let p = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("loop_cursor")));
-    let r = Rect::from_center_size(pos, vec2(LOOP_CURSOR, LOOP_CURSOR));
-    p.extend(loop_glyph(r, TOKENS.ink_dark, 4.0));
-    p.extend(loop_glyph(r, TOKENS.ink_light, 2.0));
+    let r = Rect::from_center_size(pos + vec2(LOOP_BADGE_OFFSET, LOOP_BADGE_OFFSET), vec2(LOOP_BADGE, LOOP_BADGE));
+    p.extend(loop_glyph(r, TOKENS.ink_dark, 2.0));
+    p.extend(loop_glyph(r, TOKENS.ink_light, 0.0));
 }
 
 /// What is under a point: a clip (and whether near its start or end edge) and the row's track.
@@ -1898,14 +1910,40 @@ mod loop_corner_tests {
         }
     }
 
+    /// Every path painted in a frame that holds only the cursor badge (Tooltip layer), as (point count, bounds).
+    fn badge_paths(out: &egui::FullOutput) -> Vec<(usize, Rect)> {
+        fn walk(shape: &Shape, acc: &mut Vec<(usize, Rect)>) {
+            match shape {
+                Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                Shape::Path(p) => acc.push((p.points.len(), Rect::from_points(&p.points))),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for s in &out.shapes {
+            walk(&s.shape, &mut acc);
+        }
+        acc
+    }
+
     #[test]
-    fn cursor_is_hidden_in_zone_and_restored_after() {
+    fn cursor_is_the_os_arrow_with_a_badge_and_restored_after() {
         let ctx = egui::Context::default();
-        let out = frame(&ctx, |ui| loop_cursor(ui.ctx(), pos2(10.0, 10.0)));
-        assert_eq!(out.platform_output.cursor_icon, CursorIcon::None);
-        assert!(!out.shapes.is_empty(), "the loop cursor glyph is painted");
+        let tip = pos2(10.0, 10.0);
+        let out = frame(&ctx, |ui| loop_cursor(ui.ctx(), tip));
+        assert_eq!(out.platform_output.cursor_icon, CursorIcon::Default, "the OS arrow stays visible");
+        let paths = badge_paths(&out);
+        // Outline and fill, each an arc plus an arrowhead.
+        assert_eq!(paths.iter().filter(|(n, _)| *n == LOOP_ARC_POINTS).count(), 2, "outline and fill arcs");
+        assert_eq!(paths.iter().filter(|(n, _)| *n == 3).count(), 2, "outline and fill arrowheads");
+        let want = Rect::from_center_size(tip + vec2(LOOP_BADGE_OFFSET, LOOP_BADGE_OFFSET), vec2(LOOP_BADGE, LOOP_BADGE)).expand(1.5);
+        for (_, b) in &paths {
+            assert!(want.contains_rect(*b), "badge {b:?} stays near its 11 px cell {want:?}");
+            assert!(b.min.x > tip.x + 4.0 && b.min.y > tip.y + 4.0, "badge sits at the lower right of the tip");
+        }
         let out = frame(&ctx, |_| {});
         assert_eq!(out.platform_output.cursor_icon, CursorIcon::Default);
+        assert!(badge_paths(&out).is_empty(), "nothing painted after leaving");
     }
 
     /// A real app frame loop with one looped MIDI clip named "LoopName" on a lane.
@@ -1964,7 +2002,11 @@ mod loop_corner_tests {
             match shape {
                 Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, strip, name, glyph)),
                 Shape::Text(t) if t.galley.text() == "LoopName" => *name = Some(clip),
-                Shape::Path(path) if path.points.len() == 15 && path.stroke.width == 1.5 && strip.contains_rect(Rect::from_points(&path.points)) => {
+                Shape::Path(path)
+                    if path.points.len() == LOOP_ARC_POINTS
+                        && (path.stroke.width - 10.0 * 1.25 / 11.0).abs() < 0.01
+                        && strip.contains_rect(Rect::from_points(&path.points)) =>
+                {
                     if let egui::epaint::ColorMode::Solid(c) = path.stroke.color {
                         *glyph = Some(c.a());
                     }
