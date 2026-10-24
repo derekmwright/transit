@@ -11,39 +11,64 @@ use soundcraft_dsp::{HeaderAction, JobPoll, StateJob};
 use soundcraft_model::TrackId;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Builds the VST3 fixture, installs it as a bundle and adds its folder to the search path;
-/// returns the gain's id.
+/// Carries the fixture library the parent built to its children.
+const FIXTURE_LIB: &str = "TRANSIT_HEADER_FIXTURE_LIB";
+
+/// Builds the VST3 fixture once per test process (the parent, before it starts any child) and
+/// returns its library. The children only copy this file and never run cargo themselves: on
+/// macOS cargo puts `target/debug/<lib>` in place by copying rather than hard-linking, so every
+/// `cargo build`, even one with nothing to rebuild, deletes and rewrites that file, and a child
+/// copying it while a sibling child's cargo ran found it missing.
+fn fixture_lib() -> PathBuf {
+    static LIB: OnceLock<PathBuf> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vst3-host/tests/fixture/Cargo.toml");
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
+            .join("tmp/studio-vst3-header-fixture-target");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let st = Command::new(cargo)
+            .args(["build", "--quiet", "--manifest-path"])
+            .arg(&manifest)
+            .arg("--target-dir")
+            .arg(&target)
+            .env_remove("RUSTFLAGS")
+            .status()
+            .expect("run cargo");
+        assert!(st.success(), "building the VST3 fixture failed");
+        let lib = if cfg!(target_os = "macos") {
+            "libvst3_fixture.dylib"
+        } else if cfg!(windows) {
+            "vst3_fixture.dll"
+        } else {
+            "libvst3_fixture.so"
+        };
+        target.join("debug").join(lib)
+    })
+    .clone()
+}
+
+/// Installs the fixture library the parent built as a bundle and adds its folder to the search
+/// path; returns the gain's id.
 fn fixture_gain() -> String {
     soundcraft_vst3_host::set_scan_extra_dirs_only(true);
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vst3-host/tests/fixture/Cargo.toml");
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"))
-        .join("tmp/studio-vst3-header-fixture-target");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let st = Command::new(cargo)
-        .args(["build", "--quiet", "--manifest-path"])
-        .arg(&manifest)
-        .arg("--target-dir")
-        .arg(&target)
-        .env_remove("RUSTFLAGS")
-        .status()
-        .expect("run cargo");
-    assert!(st.success(), "building the VST3 fixture failed");
-    let (lib, folder, exe) = if cfg!(target_os = "macos") {
-        ("libvst3_fixture.dylib", "MacOS", "Fixture")
+    let lib = PathBuf::from(std::env::var_os(FIXTURE_LIB).expect("the parent passes the fixture it built"));
+    let (folder, exe) = if cfg!(target_os = "macos") {
+        ("MacOS", "Fixture")
     } else if cfg!(windows) {
-        ("vst3_fixture.dll", "x86_64-win", "Fixture.vst3")
+        ("x86_64-win", "Fixture.vst3")
     } else {
-        ("libvst3_fixture.so", if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
+        (if cfg!(target_arch = "aarch64") { "aarch64-linux" } else { "x86_64-linux" }, "Fixture.so")
     };
     let dir = std::env::temp_dir().join(format!("studio-vst3-header-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let bin = dir.join("Fixture.vst3/Contents").join(folder);
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::copy(target.join("debug").join(lib), bin.join(exe)).unwrap();
+    std::fs::copy(&lib, bin.join(exe)).unwrap_or_else(|e| panic!("copy {}: {e}", lib.display()));
     assert_eq!(soundcraft_vst3_host::add_search_dir(&dir), 3, "the fixture's plug-ins");
     soundcraft_vst3_host::scan_paths(&[dir]).into_iter().find(|d| d.name == "Fixture Gain").expect("the fixture's gain").id
 }
@@ -148,7 +173,8 @@ fn settle(app: &mut StudioApp, ctx: &egui::Context) {
 }
 
 /// Whether this is the child run of `test`; in the parent, runs it as a child and checks it
-/// passed. The host registry is process-global: in a child, no other test sees the fixture.
+/// passed. The host registry is process-global: in a child, no other test sees the fixture. The
+/// parent builds the fixture first and hands the child its path.
 fn in_child(test: &str) -> bool {
     if std::env::var_os("TRANSIT_HEADER_FIXTURE_CHILD").is_some() {
         return true;
@@ -157,6 +183,7 @@ fn in_child(test: &str) -> bool {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name.as_str(), "--nocapture"])
         .env("TRANSIT_HEADER_FIXTURE_CHILD", "1")
+        .env(FIXTURE_LIB, fixture_lib())
         .output()
         .unwrap();
     let (out, err) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
