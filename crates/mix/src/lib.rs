@@ -2320,18 +2320,26 @@ fn played_note(
 /// A looped clip (ADR 0019): the first pass plays what starts before the loop end; later cycles
 /// play what starts inside the range. A note crossing the seam ends at it and sounds again at its
 /// own position in the next cycle. One implementation, so playback and the chase cannot drift.
-fn note_spans(clip: &Clip, looping: Option<ClipLoop>, on: Samples, off: Samples, pos: Samples, end: Samples, mut f: impl FnMut(Samples, Samples)) {
+fn note_spans(
+    clip: &Clip,
+    looping: Option<(Samples, ClipLoop)>,
+    on: Samples,
+    off: Samples,
+    pos: Samples,
+    end: Samples,
+    mut f: impl FnMut(Samples, Samples),
+) {
     let mut emit = |on: Samples, off: Samples| {
         let off = off.min(clip.end());
         if on < clip.end() {
             f(on, off);
         }
     };
-    let Some(l) = looping else {
+    let Some((origin, l)) = looping else {
         emit(on, off);
         return;
     };
-    let (rel_on, seam) = (on.saturating_sub(clip.start), clip.start.saturating_add(l.end));
+    let (rel_on, seam) = (on.saturating_sub(origin), origin.saturating_add(l.end));
     if rel_on >= l.end {
         return;
     }
@@ -2341,8 +2349,8 @@ fn note_spans(clip: &Clip, looping: Option<ClipLoop>, on: Samples, off: Samples,
     }
     if rel_on >= l.start {
         let span = off.min(seam).saturating_sub(on).max(0);
-        for k in cycles_touching(clip.start, l, rel_on, span, pos, end) {
-            let at = cycle_at(clip.start, l, rel_on, k);
+        for k in cycles_touching(origin, l, rel_on, span, pos, end) {
+            let at = cycle_at(origin, l, rel_on, k);
             emit(at, at.saturating_add(span));
         }
     }
@@ -2375,7 +2383,7 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             let base = s.tempo.samples_to_ticks(clip.start, sr);
             let rtp = Rtp::of(s, t);
             let (dp, delay) = (rtp.transpose, rtp.delay);
-            let looping = clip.looping.filter(|l| l.is_valid());
+            let looping = midi_loop_frame(s, clip);
             for n0 in &sequence.notes {
                 let Some((n, on, off)) = played_note(s, clip, base, rtp, n0, looping.is_some()) else { continue };
                 note_spans(clip, looping, on, off, pos, end, |on, off| {
@@ -2399,9 +2407,9 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
             for c in sequence.ctrls.iter().filter(|c| c.tick >= 0 || looping.is_some()) {
                 let tick = c.tick.saturating_add(delay);
                 let tick = if looping.is_some() { tick } else { tick.max(0) };
-                if let Some(l) = looping {
+                if let Some((origin, l)) = looping {
                     let at = s.tempo.tick_to_samples(base.saturating_add(tick), sr);
-                    let rel = at.saturating_sub(clip.start);
+                    let rel = at.saturating_sub(origin);
                     if rel >= l.end {
                         continue;
                     }
@@ -2410,8 +2418,8 @@ fn visit_clip_events(s: &Session, t: &Track, pos: Samples, frames: usize, mut vi
                         visit(usize::try_from(at - pos).unwrap_or(0), ClipEvent::Control(msg, c.channel));
                     }
                     if rel >= l.start {
-                        for k in cycles_touching(clip.start, l, rel, 0, pos, end) {
-                            let at = cycle_at(clip.start, l, rel, k);
+                        for k in cycles_touching(origin, l, rel, 0, pos, end) {
+                            let at = cycle_at(origin, l, rel, k);
                             if at >= pos && at < end && at < clip.end() {
                                 visit(usize::try_from(at - pos).unwrap_or(0), ClipEvent::Control(msg, c.channel));
                             }
@@ -2450,7 +2458,7 @@ pub fn clip_note_ons(s: &Session, track: TrackId, pos: Samples, frames: usize) -
 /// events, ticks from the clip start, cut at the clip end (ADR 0019). `None` for an unlooped or
 /// non-MIDI clip, or when the result would be unreasonably large.
 pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Sequence> {
-    let l = clip.looping.filter(|l| l.is_valid())?;
+    let (origin, l) = midi_loop_frame(s, clip)?;
     let ClipContent::Midi { sequence } = &clip.content else { return None };
     let sr = s.sample_rate;
     let base = s.tempo.samples_to_ticks(clip.start, sr);
@@ -2463,15 +2471,15 @@ pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Seq
     let mut out = soundcraft_midi::Sequence::default();
     // Every sounding position of a content point `rel` samples in: the first pass, then each cycle.
     let places = |rel: Samples| {
-        let first = (0..l.end).contains(&rel).then_some(clip.start + rel);
-        let later = (rel >= l.start && rel < l.end).then(|| (1..).map(move |k| cycle_at(clip.start, l, rel, k)).take_while(|at| *at < end));
-        first.into_iter().chain(later.into_iter().flatten()).filter(|at| *at >= clip.start).collect::<Vec<_>>()
+        let first = (0..l.end).contains(&rel).then_some(origin + rel);
+        let later = (rel >= l.start && rel < l.end).then(|| (1..).map(move |k| cycle_at(origin, l, rel, k)).take_while(|at| *at < end));
+        first.into_iter().chain(later.into_iter().flatten()).filter(|at| *at >= origin).collect::<Vec<_>>()
     };
     for n in &sequence.notes {
         let on = s.tempo.tick_to_samples(base.saturating_add(n.start), sr);
         let off = s.tempo.tick_to_samples(base.saturating_add(n.start).saturating_add(n.length), sr);
-        let rel = on - clip.start;
-        let span = off.min(clip.start + l.end) - on;
+        let rel = on - origin;
+        let span = off.min(origin + l.end) - on;
         for at in places(rel) {
             let to = at.saturating_add(span.max(0)).min(end);
             let mut m = *n;
@@ -2482,7 +2490,7 @@ pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Seq
     }
     for c in &sequence.ctrls {
         let at = s.tempo.tick_to_samples(base.saturating_add(c.tick), sr);
-        for at in places(at - clip.start) {
+        for at in places(at - origin) {
             let mut m = *c;
             m.tick = tick(at);
             out.ctrls.push(m);
@@ -2496,6 +2504,23 @@ pub fn unroll_midi_loop(s: &Session, clip: &Clip) -> Option<soundcraft_midi::Seq
 /// lands: the point must lie inside the loop range.
 fn cycle_at(clip_start: Samples, l: ClipLoop, rel: Samples, k: i64) -> Samples {
     clip_start.saturating_add(l.end).saturating_add(rel - l.start).saturating_add((k - 1).saturating_mul(l.cycle()))
+}
+
+/// A looped MIDI clip's frame (ADR 0019): the sample its tick grid starts at and the loop range
+/// measured from there. Notes sound on the tick grid (`tick_to_samples(base + tick)`), and `base`
+/// is `clip.start` rounded to a tick, so a clip that starts between ticks has its grid origin up to
+/// half a tick away from `clip.start`. Cycles stepped from `clip.start` with the cycle measured
+/// there let every cycle slip by that gap against the grid; stepping from the grid origin with the
+/// loop edges rounded to ticks keeps every cycle on the first cycle's grid offset. For a clip that
+/// starts on a tick with a loop on ticks the frame is `(clip.start, loop)` unchanged.
+fn midi_loop_frame(s: &Session, clip: &Clip) -> Option<(Samples, ClipLoop)> {
+    let l = clip.looping.filter(|l| l.is_valid())?;
+    let sr = s.sample_rate;
+    let origin = s.tempo.tick_to_samples(s.tempo.samples_to_ticks(clip.start, sr), sr);
+    let snap = |x: Samples| s.tempo.tick_to_samples(s.tempo.samples_to_ticks(clip.start.saturating_add(x), sr), sr).saturating_sub(origin);
+    let snapped = ClipLoop { start: snap(l.start), end: snap(l.end) };
+    // A range that rounds to under the minimum cycle keeps the sample frame.
+    Some(if snapped.is_valid() { (origin, snapped) } else { (clip.start, l) })
 }
 
 /// The repeat cycles (`k >= 1`) in which a point `rel` samples into a looped clip, sounding for
@@ -2543,7 +2568,7 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
         }
         let base = s.tempo.samples_to_ticks(clip.start, sr);
         let until = pos.min(clip.end());
-        let looping = clip.looping.filter(|l| l.is_valid());
+        let looping = midi_loop_frame(s, clip);
         for c in sequence.ctrls.iter().filter(|c| c.tick >= 0 || looping.is_some()) {
             let slot = match c.kind {
                 CtrlKind::Cc(n) => usize::from(n & 0x7F),
@@ -2553,10 +2578,10 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
                 CtrlKind::PolyPressure(_) => continue,
             };
             let mut at = Some(s.tempo.tick_to_samples(base.saturating_add(c.tick), sr));
-            if let (Some(l), Some(first_pass)) = (looping, at) {
+            if let (Some((origin, l)), Some(first_pass)) = (looping, at) {
                 // The latest cycle that sounds before `until` (ADR 0019); a controller a start trim
                 // moved before the clip start only sounds in the cycles.
-                let rel = first_pass.saturating_sub(clip.start);
+                let rel = first_pass.saturating_sub(origin);
                 if rel >= l.end {
                     continue;
                 }
@@ -2564,9 +2589,9 @@ fn chase_controllers(s: &Session, t: &Track, pos: Samples, inst: &mut PluginSlot
                     at = None;
                 }
                 if rel >= l.start {
-                    let first = cycle_at(clip.start, l, rel, 1);
+                    let first = cycle_at(origin, l, rel, 1);
                     if until > first {
-                        at = Some(cycle_at(clip.start, l, rel, (until - 1 - first).div_euclid(l.cycle().max(1)) + 1));
+                        at = Some(cycle_at(origin, l, rel, (until - 1 - first).div_euclid(l.cycle().max(1)) + 1));
                     }
                 }
             }

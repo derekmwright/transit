@@ -136,3 +136,28 @@ fn the_latest_cycle_before_a_position_is_found_for_chase() {
     assert_eq!(latest(9 * beat), 6 * beat);
     assert_eq!(latest(11 * beat), 10 * beat);
 }
+
+/// A clip that starts between two ticks (7 samples, 25 per tick at 120 bpm and 48 kHz) whose loop
+/// range ends on a bar line. Notes sound on the tick grid, so every cycle of a note must sound
+/// exactly one bar after the last: the sample cycle (a bar minus 7) used to slip the grid 7
+/// samples per cycle, and the note on tick 0 never sounded at all.
+#[test]
+fn a_loop_on_a_clip_that_starts_between_ticks_keeps_every_cycle_on_the_grid_offset_of_the_first() {
+    let mut s = Session::default();
+    let t = s.add_track(TrackKind::Midi, ChannelFormat::Mono, None);
+    let beat = s.tempo.tick_to_samples(TICKS_PER_QUARTER, s.sample_rate);
+    let (start, bar, cycles) = (7, 4 * beat, 51);
+    let mut seq = Sequence::default();
+    seq.notes.push(note(60, 0, 1));
+    seq.notes.push(note(64, 2, 1));
+    let mut c = Clip::midi(ClipId(1), "m", start, cycles * bar - start, seq);
+    c.set_loop(Some(ClipLoop { start: 0, end: bar - start }));
+    s.track_mut(t).unwrap().playlist_mut().unwrap().clips.push(c);
+    let ons = |block: usize| -> Vec<(Samples, String)> {
+        collect(&s, t, cycles * bar + 100, block).into_iter().filter(|(_, w)| w.starts_with("on")).collect()
+    };
+    let want: Vec<(Samples, String)> =
+        (0..cycles).flat_map(|k| [(k * bar, "on 60".to_string()), (k * bar + 2 * beat, "on 64".to_string())]).collect();
+    assert_eq!(ons(1 << 20), want);
+    assert_eq!(ons(4096), want, "the same in small blocks");
+}
