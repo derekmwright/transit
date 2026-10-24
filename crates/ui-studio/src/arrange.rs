@@ -1845,4 +1845,104 @@ mod loop_corner_tests {
         let out = frame(&ctx, |_| {});
         assert_eq!(out.platform_output.cursor_icon, CursorIcon::Default);
     }
+
+    /// A real app frame loop with one looped MIDI clip named "LoopName" on a lane.
+    struct Rig {
+        app: crate::StudioApp,
+        ctx: egui::Context,
+        time: f64,
+        shapes: Vec<egui::epaint::ClippedShape>,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            let mut app = crate::StudioApp::new(soundcraft_engine::Engine::default(), None, crate::Services::default());
+            let r = app.run("track.new", json!({"kind": "instrument"})).unwrap();
+            let t = r["tracks"][0].as_u64().unwrap();
+            let c = app.run("midi.new_clip", json!({"tracks": [t], "start": 0, "end": 0})).unwrap();
+            let (id, end) = (c["clip"].as_u64().unwrap(), c["end"].as_i64().unwrap());
+            app.run("clip.rename", json!({"clips": [id], "name": "LoopName"})).unwrap();
+            app.run("clip.loop_to", json!({"clip": id, "to": end * 3})).unwrap();
+            let mut rig = Rig { app, ctx: egui::Context::default(), time: 0.0, shapes: Vec::new() };
+            rig.frames(3, None);
+            rig
+        }
+
+        fn frames(&mut self, n: usize, hover: Option<Pos2>) {
+            for _ in 0..n {
+                self.time += 1.0 / 60.0;
+                let mut raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))),
+                    time: Some(self.time),
+                    ..Default::default()
+                };
+                if let Some(pos) = hover {
+                    raw.events.push(egui::Event::PointerMoved(pos));
+                }
+                self.app.raw_input_hook(&mut raw);
+                let app = &mut self.app;
+                let mut out = self.ctx.run_ui(raw, |ui| {
+                    app.logic(ui.ctx());
+                    app.ui(ui);
+                });
+                out.textures_delta.clear();
+                self.shapes = out.shapes;
+            }
+        }
+
+        fn clip(&self) -> Rect {
+            let r = self.app.arrange.layout.clips.last().expect("a clip is laid out").rect;
+            Rect::from_min_max(pos2(r[0], r[1]), pos2(r[2], r[3]))
+        }
+    }
+
+    /// The name text's clip rect, and the alpha of the loop glyph's arc (a path inside the clip's name strip).
+    fn name_and_glyph(rig: &Rig) -> (Rect, Option<u8>) {
+        fn walk(shape: &Shape, clip: Rect, strip: Rect, name: &mut Option<Rect>, glyph: &mut Option<u8>) {
+            match shape {
+                Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, strip, name, glyph)),
+                Shape::Text(t) if t.galley.text() == "LoopName" => *name = Some(clip),
+                Shape::Path(path) if path.points.len() == 15 && path.stroke.width == 1.5 && strip.contains_rect(Rect::from_points(&path.points)) => {
+                    if let egui::epaint::ColorMode::Solid(c) = path.stroke.color {
+                        *glyph = Some(c.a());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let rect = rig.clip();
+        let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + CLIP_NAME_H));
+        let (mut name, mut glyph) = (None, None);
+        for s in &rig.shapes {
+            walk(&s.shape, s.clip_rect, strip, &mut name, &mut glyph);
+        }
+        (name.expect("the clip name is painted"), glyph)
+    }
+
+    #[test]
+    fn rendered_name_stops_before_the_loop_glyph() {
+        let rig = Rig::new();
+        let rect = rig.clip();
+        let strip = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + CLIP_NAME_H));
+        let glyph = loop_corner_rect(rect, strip).expect("a wide clip has a corner");
+        let (name_clip, drawn) = name_and_glyph(&rig);
+        assert!(drawn.is_some(), "the loop glyph is painted on a looped clip");
+        assert!(name_clip.max.x < glyph.min.x, "name clip {} must end before the glyph at {}", name_clip.max.x, glyph.min.x);
+    }
+
+    #[test]
+    fn hovering_the_loop_zone_paints_the_glyph_at_full_strength() {
+        let mut rig = Rig::new();
+        let rect = rig.clip();
+        let idle = name_and_glyph(&rig).1.expect("dim glyph without hover");
+        // Inside the loop zone: the name strip, between the trim edge and the zone's inner end.
+        let zone_pos = pos2(rect.max.x - EDGE - 4.0, rect.min.y + CLIP_NAME_H / 2.0);
+        assert_eq!(zone(r4(rect), zone_pos, false), DragKind::Loop);
+        rig.frames(3, Some(zone_pos));
+        let hot = name_and_glyph(&rig).1.expect("glyph painted while hovered");
+        assert!(hot > idle, "hover strengthens the glyph: {idle} -> {hot}");
+        // Pointer elsewhere on the clip: back to dim.
+        rig.frames(3, Some(pos2(rect.min.x + 40.0, rect.min.y + CLIP_NAME_H / 2.0)));
+        assert_eq!(name_and_glyph(&rig).1, Some(idle));
+    }
 }
