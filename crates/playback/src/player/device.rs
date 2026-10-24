@@ -1030,8 +1030,11 @@ impl Player {
     pub fn capture_states(&self, expected: &Arc<Session>) -> Result<PluginStates, PlayerError> {
         self.owner()?.capture_states(expected)
     }
-    /// Whether the audio side plays exactly `expected` (its plan confirmed and rendered): the
-    /// plug-ins have every parameter value it stores. Live state reads and loads wait for it.
+    /// Whether the audio side plays exactly `expected` (its plan confirmed and rendered). Live
+    /// state reads and loads wait for it. It guarantees that the values the document stores were
+    /// sent to each plug-in's parameter queue after that document was rendered, not that the
+    /// plug-in processed them, and a bypassed (or inactive) insert's values are not applied at
+    /// all. See issue #78.
     pub fn plays(&self, expected: &Arc<Session>) -> bool {
         self.owner().is_ok_and(|owner| owner.plays(expected))
     }

@@ -423,9 +423,10 @@ impl<T: Copy, R: Copy> RuntimeControl<T, R> {
         Ok(self.handles.capture_states())
     }
     /// Whether the audio side plays exactly `expected`: its plan is confirmed active and a block
-    /// of it has been rendered, so every parameter value the document stores has been sent to its
-    /// plug-ins. A live state read or load (a user preset, issue #68) waits for this; before it, a
-    /// read can miss a value still on its way, and a value that arrives after a load overwrites
+    /// of it has been rendered. That guarantees the values the document stores were sent to each
+    /// plug-in's parameter queue after the rendered document, not that the plug-in processed
+    /// them; a bypassed (or inactive) insert's values are not applied at all (issue #78).
+    /// A live state read or load (a user preset, issue #68) waits for this; before it, a read can miss a value still on its way, and a value that arrives after a load overwrites
     /// the loaded state (issue #73).
     pub fn plays(&self, expected: &Arc<Session>) -> bool {
         !self.faulted()

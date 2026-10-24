@@ -28,6 +28,10 @@ Issue #68. Read with [ADR 0018](../../adr/0018-plugin-host-thread.md) (the plug-
   that arrived after a load overwrote the loaded state (issue #73). Tests that change a live state
   directly also store the values the plug-in reports (`plugin.state_values`), or the session sends
   its older values over it.
+- Known issue: continuous document edits (automation writes, a plug-in streaming parameter
+  changes) can keep a header job waiting until the 10 s give-up, because `plays` needs the
+  document to stay unchanged for a rendered block. The job then drops with a status line and
+  stores nothing (issue #78 covers the wider delivery limits).
 - Commands: `plugin.preset_save` (not undoable), `plugin.preset_load` and `plugin.state_load` (one
   undo step each, recorded after the plug-in took the state), `plugin.preset_list`,
   `plugin.preset_delete`. Undoing or redoing a load asks the UI to load the stored state live

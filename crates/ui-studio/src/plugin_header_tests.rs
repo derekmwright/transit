@@ -80,6 +80,21 @@ fn finish<T>(app: &mut StudioApp, ctx: &egui::Context, mut job: StateJob<T>) -> 
     }
 }
 
+/// A state read finished without frames (the audio side does not step meanwhile).
+fn finish_without_frames(mut job: StateJob<Option<Vec<u8>>>) -> Vec<u8> {
+    let start = Instant::now();
+    loop {
+        match job.poll() {
+            JobPoll::Ready(v) => return v.expect("a state"),
+            JobPoll::Failed(e) => panic!("state job failed: {e}"),
+            JobPoll::Waiting => {
+                assert!(start.elapsed() < Duration::from_secs(20), "state job never finished");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 /// The fixture gain's state: component gain (normalized) and controller frequency.
 fn state(gain: f64) -> Vec<u8> {
     soundcraft_vst3_host::preset::join_state(&gain.to_le_bytes(), &0.5f64.to_le_bytes()).unwrap()
@@ -347,5 +362,82 @@ fn a_save_as_right_after_a_parameter_change_saves_the_changed_value() {
     let saved = soundcraft_engine::io::presets::read(&file, &gain).unwrap_or_else(|e| panic!("{e} ({})", app.status));
     assert_eq!(saved, state(0.25), "the preset holds the value set before the save");
     assert_eq!(live(&mut app, &ctx, t, 0), state(0.25));
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// Issue #73: a preset loaded right after a parameter change. The change is still on its way to
+/// the plug-in when the preset is picked; the live read that becomes the load's undo state must
+/// wait for it (else it stores the older value), and the preset must then win and stay.
+#[test]
+fn a_load_right_after_a_parameter_change_keeps_the_presets_value() {
+    if !in_child("a_load_right_after_a_parameter_change_keeps_the_presets_value") {
+        return;
+    }
+    let Rig { mut app, ctx, t, gain, config, .. } = rig("load-twin");
+    let file = soundcraft_engine::presets::path(&config, &gain, "Wins").unwrap();
+    soundcraft_engine::io::presets::write(&file, &gain, &state(0.75)).unwrap();
+    app.plugin_header = crate::plugin_header::HeaderState::default(); // forget the listing
+    assert_eq!(app.editor_header((t, 0)).unwrap().user, vec!["Wins".to_string()]);
+    until_plays(&mut app, &ctx);
+    // Gain 0.5 of 0..2 (0.25 normalized), unlike the preset's 0.75 and the fixture's own 0.9.
+    app.run("mix.insert_param", serde_json::json!({"track": t.0, "slot": 0, "param": "7", "value": 0.5})).unwrap();
+    app.header_action(t, 0, HeaderAction::User(0));
+    assert_eq!(app.editor_header((t, 0)).unwrap().disabled.as_deref(), Some("Loading preset\u{2026}"), "disabled while it waits");
+    settle(&mut app, &ctx);
+    assert_eq!(app.engine.undo_label(), Some("Load Preset"), "{}", app.status);
+    // Frames for any late value to arrive, then the live state must still be the preset's.
+    for _ in 0..20 {
+        frame(&mut app, &ctx);
+    }
+    assert_eq!(live(&mut app, &ctx, t, 0), state(0.75), "the preset's value won: {}", app.status);
+    let stored = app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params["7"];
+    assert!((stored - 1.5).abs() < 1e-3, "the session stores the preset's gain: {stored}");
+    // The load's undo step holds the state the plug-in had with the change applied, not the value before it.
+    app.run("edit.undo", serde_json::json!({})).unwrap();
+    frame(&mut app, &ctx);
+    settle(&mut app, &ctx);
+    let before = app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().state_bytes().unwrap();
+    assert_eq!(before, state(0.25), "the state before the load includes the change");
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+/// Issue #73: an undo restores the undone state even when the document changes again right
+/// after it. The restore starts from `logic` (before the audio side has played the undone
+/// document); if it did not wait, the document's newer value would arrive after the restored
+/// state and overwrite it.
+#[test]
+fn an_undo_right_after_a_parameter_change_restores_the_undone_state() {
+    if !in_child("an_undo_right_after_a_parameter_change_restores_the_undone_state") {
+        return;
+    }
+    let Rig { mut app, ctx, t, gain, config, .. } = rig("restore-twin");
+    let file = soundcraft_engine::presets::path(&config, &gain, "Wins").unwrap();
+    soundcraft_engine::io::presets::write(&file, &gain, &state(0.75)).unwrap();
+    app.plugin_header = crate::plugin_header::HeaderState::default(); // forget the listing
+    assert_eq!(app.editor_header((t, 0)).unwrap().user, vec!["Wins".to_string()]);
+    set_live(&mut app, &ctx, t, 0, state(0.25));
+    app.header_action(t, 0, HeaderAction::User(0));
+    settle(&mut app, &ctx);
+    assert_eq!(app.engine.undo_label(), Some("Load Preset"), "{}", app.status);
+    until_plays(&mut app, &ctx);
+    // Undo, then change the gain (0.4 of 0..2, 0.2 normalized) before the next frame: the restore
+    // starts in that frame, and the new value has not reached the plug-in.
+    app.run("edit.undo", serde_json::json!({})).unwrap();
+    app.run("mix.insert_param", serde_json::json!({"track": t.0, "slot": 0, "param": "7", "value": 0.4})).unwrap();
+    // One frame of logic only (the restore starts), then the audio side steps as usual.
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
+    out.textures_delta.clear();
+    // The audio side has not played the undone document, so the restore waits: after time enough
+    // for a restore that did not wait to run on the host thread, the plug-in still holds the load.
+    std::thread::sleep(Duration::from_millis(100));
+    let job = app.player.as_ref().unwrap().begin_save_state(t, 0).unwrap();
+    assert_eq!(finish_without_frames(job), state(0.75), "the restore waits for the audio side: {}", app.status);
+    settle(&mut app, &ctx);
+    for _ in 0..20 {
+        frame(&mut app, &ctx);
+    }
+    assert_eq!(live(&mut app, &ctx, t, 0), state(0.25), "the restored state is live and stays: {}", app.status);
+    let stored = app.engine.session().tracks[0].mixer.inserts[0].as_ref().unwrap().params["7"];
+    assert!((stored - 0.5).abs() < 1e-3, "the session stores the restored state's gain: {stored}");
     let _ = std::fs::remove_dir_all(&config);
 }

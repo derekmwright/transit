@@ -518,7 +518,12 @@ impl StudioApp {
                     } else if plays {
                         self.begin_live(op);
                     } else if since.elapsed() > PLAYS_WITHIN {
-                        self.status = "The audio session is still updating; try again after it applies".into();
+                        self.status = if matches!(start, Start::Restore { .. }) {
+                            "Plug-in state not restored: the audio session did not apply in time; undo again or reload the preset"
+                        } else {
+                            "The audio session is still updating; try again after it applies"
+                        }
+                        .into();
                     } else {
                         self.plugin_header.ops.push(op);
                     }
